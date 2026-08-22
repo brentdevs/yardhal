@@ -73,6 +73,10 @@ public class IrcReconnector(
         stateFlow.value = ReconnectState.Stopped
     }
 
+    public fun sendLine(line: String) {
+        currentConnection?.sendLine(line)
+    }
+
     private suspend fun runLoop() {
         while (desiredRunning && consecutiveFailures < policy.maxAttempts) {
             stateFlow.value = ReconnectState.Connecting

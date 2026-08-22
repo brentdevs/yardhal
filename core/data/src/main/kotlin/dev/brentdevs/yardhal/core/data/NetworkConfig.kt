@@ -17,6 +17,7 @@ public data class NetworkConfig(
     public val saslAuthcid: String? = null,
     @SerialName("saslPasswordRef") public val saslPasswordRef: String? = null,
     public val serverPasswordRef: String? = null,
+    @kotlinx.serialization.Transient public val saslPassword: String? = null,
 ) {
     init {
         require(id.isNotBlank())
