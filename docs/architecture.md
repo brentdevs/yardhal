@@ -101,8 +101,12 @@ Phases land in order; each phase ships with tests and updated docs.
   previews pending, two-pane tablet layout, traffic console, TOML theme
   engine applied to Material scheme ✅. Remaining: moderation surfaces
   beyond slash verbs, per-message link auto-open polish.
-- **Phase 7 — Bouncers**: not started (soju BOUNCER cap, ZNC playback +
-  management).
+- **Phase 7 — Bouncers**: ZNC `znc.in/playback` requested; playback
+  batches classified as history (no unread/highlight noise);
+  `*status`/`*playback` routed to the server buffer. soju `soju.im/bouncer`
+  detected with LISTNETWORKS issued and numerics surfaced in the server
+  buffer. Full network-management UI is follow-up work against a live
+  bouncer.
 - **Phase 8 — Extras**: share-target intent lands text into the composer;
   media uploads need a user-configured upload endpoint (Halyard-style
   filehost/HTTP PUT) before they are meaningful; widgets and an on-device
