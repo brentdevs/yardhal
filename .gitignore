@@ -1,0 +1,30 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Android / IDE
+local.properties
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Kotlin
+*.class
+kotlinc.xml
+
+# Nix
+result
+result-*
+.envrc
+.direnv/
+
+# Tools & caches
+.tools/
+.cache/
+ergo
+
+# OS
+.DS_Store
