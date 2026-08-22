@@ -86,6 +86,7 @@ public class LiveCoordinator(
         var quitRequested: Boolean = false
         var supportedCaps: Set<String> = emptySet()
         var hasWhox: Boolean = false
+        val openBatchTypes: MutableMap<String, String> = LinkedHashMap()
 
         fun isupportCasemapping(): CaseMapping = casemapping
     }
@@ -158,7 +159,17 @@ public class LiveCoordinator(
                 joinAutojoins(session)
                 refreshNetworkStates()
             }
-            is IrcEvent.CapabilitiesNegotiated -> session.supportedCaps = event.capabilities
+            is IrcEvent.CapabilitiesNegotiated -> {
+                session.supportedCaps = event.capabilities
+                if ("znc.in/playback" in event.capabilities) {
+                    val lastSeen = readMarkers.all().values.maxOrNull()
+                        ?: (clock() / 1000 - 7 * 24 * 3600)
+                    sendRaw(session, "PRIVMSG *playback :playback * start $lastSeen")
+                }
+                if ("soju.im/bouncer" in event.capabilities) {
+                    sendRaw(session, "BOUNCER LISTNETWORKS")
+                }
+            }
             is IrcEvent.MessageReceived -> handleInbound(session, event.message)
             is IrcEvent.Disconnected ->
                 if (!session.quitRequested) {
@@ -285,10 +296,11 @@ public class LiveCoordinator(
         when (action) {
             "+" -> {
                 val type = message.parameters.getOrNull(message.parameters.size - 1) ?: return
+                session.openBatchTypes[reference] = type
                 netsplitCollapser.onStart(reference, type, emptyList())
-                appendServerLine(session, message)
             }
             "-" -> {
+                session.openBatchTypes.remove(reference)
                 val summary = netsplitCollapser.onEnd(reference) ?: return
                 appendSystem(
                     session,
@@ -494,17 +506,21 @@ public class LiveCoordinator(
         val senderNick = message.prefix?.nick ?: return
         if (senderNick != session.ownNick && ignoreStore?.isIgnored(senderNick) == true) return
         val fromUs = senderNick == session.ownNick
+        val isServiceTarget = targetParam.startsWith("*")
         val ref =
-            if (targetParam.isNotEmpty() && targetParam[0] in "#&") {
-                ConversationRef.channel(session.config.id, targetParam, session.casemapping)
-            } else if (message.prefix?.isServer == true || fromUs) {
-                if (fromUs) {
-                    ConversationRef.directMessage(session.config.id, targetParam, session.casemapping)
-                } else {
-                    ConversationRef.server(session.config.id)
+            when {
+                targetParam.isNotEmpty() && targetParam[0] in "#&" ->
+                    ConversationRef.channel(session.config.id, targetParam, session.casemapping)
+                isServiceTarget -> ConversationRef.server(session.config.id)
+                message.prefix?.isServer == true || fromUs -> {
+                    if (fromUs) {
+                        ConversationRef.directMessage(session.config.id, targetParam, session.casemapping)
+                    } else {
+                        ConversationRef.server(session.config.id)
+                    }
                 }
-            } else {
-                ConversationRef.directMessage(session.config.id, senderNick, session.casemapping)
+                else ->
+                    ConversationRef.directMessage(session.config.id, senderNick, session.casemapping)
             }
 
         val decoded = IrcCtcp.decode(rawText)
@@ -521,7 +537,11 @@ public class LiveCoordinator(
                 .firstOrNull()?.text
             ?: rawText
         val timestampMs = parseServerTime(message.tag("time")) ?: clock()
-        val highlightsMe = !fromUs && MentionMatcher.containsMessage(body, session.ownNick, session.casemapping)
+        val batchRef = message.tag("batch")
+        val isZncPlayback = batchRef != null && session.openBatchTypes[batchRef] == "znc.in/playback"
+        val highlightsMe = !fromUs && !isZncPlayback &&
+            MentionMatcher.containsMessage(body, session.ownNick, session.casemapping)
+        val isPlayback = isZncPlayback
 
         appendChat(
             session = session,
@@ -534,6 +554,7 @@ public class LiveCoordinator(
             sentByUs = fromUs,
             highlightsMe = highlightsMe,
             replyToMsgid = message.tag("+draft/reply"),
+            playback = isPlayback,
         )
     }
 
@@ -614,6 +635,7 @@ public class LiveCoordinator(
         sentByUs: Boolean,
         highlightsMe: Boolean,
         replyToMsgid: String? = null,
+        playback: Boolean = false,
     ) {
         persistAsync(session, ref, sender, kind, text, msgid, timestampMs, sentByUs)
         updateBuffer(ref) { buffer ->
@@ -638,7 +660,7 @@ public class LiveCoordinator(
                 highlightsMe = highlightsMe,
                 msgid = msgid,
             )
-            val countsAsUnread = !sentByUs &&
+            val countsAsUnread = !sentByUs && !playback &&
                 kind in setOf(MessageKind.PRIVMSG, MessageKind.NOTICE, MessageKind.ACTION)
             buffer.copy(
                 messages = buffer.messages + entry,

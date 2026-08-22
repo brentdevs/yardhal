@@ -46,6 +46,8 @@ public fun YardhalAppRoot(
     coordinator: LiveCoordinator,
     presets: List<NetworkPresetUi>,
     onNetworkSaved: (NetworkDraft) -> Unit,
+    sharedTextProvider: () -> String? = { null },
+    onSharedConsumed: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val networks by coordinator.networks.collectAsStateWithLifecycle()
@@ -61,6 +63,14 @@ public fun YardhalAppRoot(
 
     val configuration = LocalConfiguration.current
     val wide = configuration.screenWidthDp >= 600
+    val sharedDraft = sharedTextProvider()
+    if (sharedDraft != null && selectedKey == null) {
+        val first = buffers.values
+            .filter { it.ref.kind != dev.brentdevs.yardhal.core.data.ConversationKind.SERVER }
+            .minByOrNull { it.displayName.lowercase() }
+        selectedKey = first?.key
+        onSharedConsumed()
+    }
 
     fun conversationBufferFor(key: String?): ConversationBuffer? = key?.let { buffers[it] }
 
@@ -117,6 +127,8 @@ public fun YardhalAppRoot(
                             onReact = { msgid, emoji -> coordinator.react(networkId, key, msgid, emoji) },
                             onSetReplyDraft = { message -> coordinator.setReplyDraft(networkId, key, message) },
                             onDelete = { msgid -> coordinator.deleteMessage(networkId, key, msgid) },
+                            sharedDraft = sharedDraft,
+                            onSharedConsumed = onSharedConsumed,
                             modifier = Modifier.fillMaxSize(),
                         )
                     }
@@ -155,6 +167,8 @@ public fun YardhalAppRoot(
                             onReact = { msgid, emoji -> coordinator.react(networkId, key, msgid, emoji) },
                             onSetReplyDraft = { message -> coordinator.setReplyDraft(networkId, key, message) },
                             onDelete = { msgid -> coordinator.deleteMessage(networkId, key, msgid) },
+                            sharedDraft = sharedDraft,
+                            onSharedConsumed = onSharedConsumed,
                             modifier = Modifier.fillMaxSize(),
                         )
                     }

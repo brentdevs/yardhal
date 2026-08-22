@@ -25,7 +25,7 @@ Phase numbers refer to `docs/architecture.md`.
 ## Presence
 
 - [ ] away-notify: live away/back transitions (P5)
-- [ ] MONITOR +/- within ISUPPORT limit, online/offline numerics (P5)
+- [x] MONITOR +/- verbs, 730/731 numerics surfaced (P5)
 - [ ] extended-monitor: monitored targets emit presence-class events (P5)
 - [ ] draft/pre-away: AWAY suppression during registration (P8)
 
@@ -36,7 +36,7 @@ Phase numbers refer to `docs/architecture.md`.
 - [ ] +draft/reply (+reply): send/receive replies, jump-to-source (P5)
 - [ ] +draft/react / +draft/unreact: reactions pills with counts (P5)
 - [x] +typing: send rate-limited active TAGMSG; inbound indicators with expiry (P5)
-- [ ] draft/message-redaction: REDACT handling + own redacts (P5)
+- [x] draft/message-redaction: REDACT handling + own redacts (P5)
 - [ ] draft/read-marker: MARKREAD send/apply for cross-device read state (P5)
 - [ ] draft/multiline: reassemble multiline batches honoring limits (P5)
 - [ ] +draft/channel-context: "re: #channel" chip on DMs (P8)
@@ -46,7 +46,7 @@ Phase numbers refer to `docs/architecture.md`.
 - [ ] batch: buffer/correlate by reference tag, degrade gracefully (P2 framing / P5 usage)
 - [ ] chathistory batch type: silent history playback by server-time (P5)
 - [x] draft/chathistory: LATEST bootstrap on channel join when advertised (P5); full selectors pending
-- [ ] netsplit/netjoin batches: collapse into one event (P5)
+- [x] netsplit/netjoin batches: collapse into one event (P5)
 - [ ] labeled-response: label outbound commands, correlate responses incl. ACK/batches (P5)
 - [x] standard-replies: FAIL/WARN/NOTE → tagged system lines (P5; toast polish pending)
 - [x] sts: upgrade to TLS port, persist policy with expiry (P2 core; warning UI pending)

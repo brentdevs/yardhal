@@ -35,9 +35,28 @@ public fun nickColor(nick: String): Color {
 }
 
 @Composable
-public fun YardhalTheme(content: @Composable () -> Unit) {
+public fun YardhalTheme(
+    themeDefinition: dev.brentdevs.yardhal.core.data.ThemeDefinition? = null,
+    content: @Composable () -> Unit,
+) {
+    val custom = themeDefinition?.let { def ->
+        fun c(value: Long): Color = Color(value.toULong().toLong())
+        val scheme = if (def.dark) darkColorScheme() else lightColorScheme()
+        scheme.copy(
+            background = c(def.colors.background),
+            surface = c(def.colors.background),
+            primary = c(def.colors.primary),
+            secondary = c(def.colors.secondary),
+            tertiary = c(def.colors.tertiary),
+            surfaceVariant = c(def.colors.surfaceVariant),
+        )
+    }
     MaterialTheme(
-        colorScheme = if (isSystemInDarkTheme()) DarkColors else LightColors,
+        colorScheme = when {
+            custom != null -> custom
+            isSystemInDarkTheme() -> DarkColors
+            else -> LightColors
+        },
         content = content,
     )
 }

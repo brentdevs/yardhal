@@ -15,6 +15,8 @@ class YardhalApplication : Application() {
 
     val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
+    var sharedText: String? = null
+
     lateinit var networkStore: NetworkStore
         private set
     lateinit var messageStore: MessageStore

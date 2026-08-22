@@ -80,6 +80,8 @@ public fun ConversationScreen(
     onReact: (String, String) -> Unit,
     onSetReplyDraft: (ChatMessage?) -> Unit,
     onDelete: (String) -> Unit,
+    sharedDraft: String? = null,
+    onSharedConsumed: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     var actionTarget by remember { mutableStateOf<ChatMessage?>(null) }
@@ -146,7 +148,15 @@ public fun ConversationScreen(
                         TextButton(onClick = { onSetReplyDraft(null) }) { Text("Cancel") }
                     }
                 }
-                ComposerBar(enabled = connected, members = buffer.members, onSend = onSend)
+                ComposerBar(
+                    enabled = connected,
+                    members = buffer.members,
+                    initialDraft = sharedDraft,
+                    onSend = { text ->
+                        onSharedConsumed()
+                        onSend(text)
+                    },
+                )
             }
         },
     ) { padding ->

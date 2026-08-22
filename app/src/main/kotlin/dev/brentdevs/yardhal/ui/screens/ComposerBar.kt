@@ -25,10 +25,11 @@ import androidx.compose.ui.unit.dp
 public fun ComposerBar(
     enabled: Boolean,
     members: List<String>,
+    initialDraft: String? = null,
     onSend: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    var draft by remember { mutableStateOf("") }
+    var draft by remember(initialDraft) { mutableStateOf(initialDraft ?: "") }
 
     fun suggestions(): List<String> {
         if (draft.isEmpty() || draft.contains(' ')) return emptyList()

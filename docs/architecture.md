@@ -92,18 +92,22 @@ Phases land in order; each phase ships with tests and updated docs.
   settings. ✅ (settings screen minimal)
 - **Phase 5 — IRCv3 breadth**: landed so far — server-time everywhere,
   chathistory LATEST bootstrap, gap-free history seeding from the store,
-  echo-message reconciliation, msgid-gated reactions/replies, typing
-  both ways, presence via NAMES+PREFIX parsing, standard-replies lines,
-  MARKREAD mirroring. Remaining: WHOX queries, monitor/extended-monitor,
-  netsplit collapse, multiline batches, redaction UI, metadata avatars.
-- **Phase 6 — Polish**: day separators, member list, nick completion,
-  network removal ✅. Remaining: TOML theme engine, whois panel,
-  channel modes/moderation UI, ignore list, LIST browser, link previews,
-  two-pane tablet layout, traffic console.
+  echo-message reconciliation, msgid-gated reactions/replies/redaction,
+  typing both ways, presence via NAMES + PREFIX and WHOX (354 away/account),
+  MONITOR verbs with status lines, standard-replies lines, MARKREAD
+  mirroring, netsplit/netjoin collapse. Remaining: multiline batches
+  (spec wip), metadata avatars.
+- **Phase 6 — Polish**: whois panel, ignore list, LIST browser, link
+  previews pending, two-pane tablet layout, traffic console, TOML theme
+  engine applied to Material scheme ✅. Remaining: moderation surfaces
+  beyond slash verbs, per-message link auto-open polish.
 - **Phase 7 — Bouncers**: not started (soju BOUNCER cap, ZNC playback +
   management).
-- **Phase 8 — Extras**: not started (media uploads, share-target,
-  shortcuts/widgets, catch-up digest).
+- **Phase 8 — Extras**: share-target intent lands text into the composer;
+  media uploads need a user-configured upload endpoint (Halyard-style
+  filehost/HTTP PUT) before they are meaningful; widgets and an on-device
+  catch-up digest are future work — Android has no FoundationModels
+  equivalent, so that feature needs a bundled model decision first.
 
 The authoritative IRCv3 obligation inventory lives in
 `docs/ircv3-checklist.md`; check items off as they land.

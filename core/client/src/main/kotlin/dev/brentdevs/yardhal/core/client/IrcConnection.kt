@@ -58,6 +58,7 @@ public data class IrcConnectionConfig(
             "setname",
             "cap-notify",
             "sasl",
+            "znc.in/playback",
         )
     }
 }

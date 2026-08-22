@@ -1,5 +1,6 @@
 package dev.brentdevs.yardhal
 
+import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -57,13 +58,17 @@ class MainActivity : ComponentActivity() {
         )
 
         setContent {
-            YardhalTheme {
+            YardhalTheme(
+                themeDefinition = loadBundledTheme(),
+            ) {
                 YardhalAppRoot(
                     coordinator = coordinator,
                     presets = NetworkPresets.ALL.map {
                         NetworkPresetUi(it.id, it.name, it.host, it.port, it.tls)
                     },
                     onNetworkSaved = { draft -> saveAndConnect(draft) },
+                    sharedTextProvider = { (application as YardhalApplication).sharedText },
+                    onSharedConsumed = { (application as YardhalApplication).sharedText = null },
                     modifier = Modifier,
                 )
             }
@@ -73,9 +78,26 @@ class MainActivity : ComponentActivity() {
             coordinator.startAll()
         }
 
+        consumeShareIntent(intent)
         requestNotificationPermission()
         observeConnectionCount()
     }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        consumeShareIntent(intent)
+    }
+
+    private fun consumeShareIntent(incoming: Intent?) {
+        if (incoming?.action != android.content.Intent.ACTION_SEND) return
+        val text = incoming.getStringExtra(android.content.Intent.EXTRA_TEXT) ?: return
+        (application as YardhalApplication).sharedText = text
+    }
+
+    private fun loadBundledTheme(): dev.brentdevs.yardhal.core.data.ThemeDefinition? = runCatching {
+        val text = assets.open("themes/night.toml").bufferedReader().use { it.readText() }
+        dev.brentdevs.yardhal.core.data.ThemeFileParser.parse(text)
+    }.getOrNull()
 
     private fun requestNotificationPermission() {
         androidx.core.content.ContextCompat.checkSelfPermission(
