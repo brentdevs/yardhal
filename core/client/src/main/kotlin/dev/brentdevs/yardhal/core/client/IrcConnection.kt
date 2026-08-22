@@ -82,6 +82,7 @@ public class IrcConnection(
     private val keepAlive: KeepAliveConfig = KeepAliveConfig(),
     private val socketFactory: SocketFactory? = null,
     private val nowMillis: () -> Long = System::currentTimeMillis,
+    private val rawTap: ((outbound: Boolean, line: String) -> Unit)? = null,
 ) {
     private val job = SupervisorJob()
     private val scope = CoroutineScope(job + Dispatchers.IO)
@@ -207,6 +208,7 @@ public class IrcConnection(
 
     private fun handleLine(line: String) {
         lastInboundMillis = nowMillis()
+        rawTap?.invoke(false, line)
         val message = IrcMessage.parse(line) ?: return
 
         val numeric = message.numeric
@@ -254,6 +256,7 @@ public class IrcConnection(
                     val stream: OutputStream = current.getOutputStream()
                     while (isActive) {
                         val line = outbound.receive()
+                        rawTap?.invoke(true, line)
                         stream.write((line + "\r\n").toByteArray(Charsets.UTF_8))
                         stream.flush()
                     }

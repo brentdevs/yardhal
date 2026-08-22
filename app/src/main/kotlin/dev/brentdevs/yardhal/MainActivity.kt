@@ -48,6 +48,7 @@ class MainActivity : ComponentActivity() {
                         saslAuthcid = config.saslAuthcid,
                         saslPassword = config.saslPassword,
                     ),
+                    rawTap = { outbound, line -> coordinator.ingestRaw(config.id, outbound, line) },
                 )
             },
             notifier = LiveCoordinator.HighlightNotifier { networkName, sender, conversation, text ->

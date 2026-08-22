@@ -2,14 +2,15 @@ package dev.brentdevs.yardhal.ui
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
-import androidx.compose.ui.unit.dp
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -18,17 +19,20 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.brentdevs.yardhal.coordinator.ConnectionStatus
-import dev.brentdevs.yardhal.core.data.ConversationRef
+import dev.brentdevs.yardhal.coordinator.ConversationBuffer
 import dev.brentdevs.yardhal.coordinator.LiveCoordinator
+import dev.brentdevs.yardhal.core.data.ConversationRef
 import dev.brentdevs.yardhal.ui.screens.AddNetworkSheet
 import dev.brentdevs.yardhal.ui.screens.ConversationScreen
 import dev.brentdevs.yardhal.ui.screens.NetworkDraft
 import dev.brentdevs.yardhal.ui.screens.NetworkOverviewScreen
 import dev.brentdevs.yardhal.ui.screens.NetworkPresetUi
-import dev.brentdevs.yardhal.ui.screens.WelcomeScreen
 import dev.brentdevs.yardhal.ui.theme.YardhalTheme
 
 private sealed interface AppDestination {
@@ -48,74 +52,33 @@ public fun YardhalAppRoot(
     val buffers by coordinator.buffers.collectAsStateWithLifecycle()
     val whoisInfo by coordinator.whois.collectAsStateWithLifecycle()
     val channelList by coordinator.channelList.collectAsStateWithLifecycle()
+    val rawLogVersion by coordinator.rawLogVersion.collectAsStateWithLifecycle()
 
-    var destination by remember { mutableStateOf<AppDestination>(AppDestination.Overview) }
+    var addNetworkVisible by remember { mutableStateOf(false) }
+    var selectedKey by remember { mutableStateOf<String?>(null) }
     var joinDialogVisible by remember { mutableStateOf(false) }
-    var pendingJoinNetworkId by remember { mutableStateOf<String?>(null) }
     var joinDraft by remember { mutableStateOf("") }
 
-    fun activeConversation(): Pair<String?, dev.brentdevs.yardhal.coordinator.ConversationBuffer?> {
-        val current = destination as? AppDestination.Conversation ?: return null to null
-        return current.storageKey to buffers[current.storageKey]
-    }
+    val configuration = LocalConfiguration.current
+    val wide = configuration.screenWidthDp >= 600
+
+    fun conversationBufferFor(key: String?): ConversationBuffer? = key?.let { buffers[it] }
 
     Surface(modifier = modifier.fillMaxSize()) {
-        when (val dest = destination) {
-            is AppDestination.AddNetwork -> AddNetworkSheet(
-                presets = presets,
-                onSave = {
-                    onNetworkSaved(it)
-                    destination = AppDestination.Overview
-                },
-                onDismiss = { destination = AppDestination.Overview },
-            )
-
-            is AppDestination.Conversation -> {
-                val key = dest.storageKey
-                val buffer = buffers[key]
-                val networkId = key.substringBefore("|")
-                val network = networks.firstOrNull { it.id == networkId }
-                if (buffer == null || network == null) {
-                    destination = AppDestination.Overview
-                } else {
-                    BackHandler { destination = AppDestination.Overview }
-                    ConversationScreen(
-                        buffer = buffer,
-                        networkName = network.name,
-                        connected = network.status == ConnectionStatus.REGISTERED,
-                        onSend = { text ->
-                            coordinator.sendText(networkId, key, text)
-                            coordinator.sendTyping(networkId, key)
-                        },
-                        onOpenJoin = {
-                            pendingJoinNetworkId = networkId
-                            joinDialogVisible = true
-                        },
-                        onLoadHistory = { coordinator.loadPersistedHistory(key) },
-                        onReact = { msgid, emoji -> coordinator.react(networkId, key, msgid, emoji) },
-                        onSetReplyDraft = { message -> coordinator.setReplyDraft(networkId, key, message) },
-                        onDelete = { msgid -> coordinator.deleteMessage(networkId, key, msgid) },
-                        modifier = Modifier.fillMaxSize(),
-                    )
-                }
-            }
-
-            AppDestination.Overview -> {
-                val conversationBuffers = buffers.values
-                    .filter { it.ref.kind != dev.brentdevs.yardhal.core.data.ConversationKind.SERVER }
-                    .sortedBy { it.displayName.lowercase() }
-                if (networks.isEmpty()) {
-                    WelcomeScreen(onAddNetwork = { destination = AppDestination.AddNetwork })
-                } else {
+        if (wide) {
+            Row(modifier = Modifier.fillMaxSize()) {
+                Box(modifier = Modifier.weight(0.38f)) {
                     NetworkOverviewScreen(
-                        buffers = conversationBuffers,
+                        buffers = buffers.values
+                            .filter { it.ref.kind != dev.brentdevs.yardhal.core.data.ConversationKind.SERVER }
+                            .sortedBy { it.displayName.lowercase() },
                         networks = networks,
                         onSelect = { key ->
                             coordinator.markRead(key)
-                            destination = AppDestination.Conversation(key)
+                            selectedKey = key
                         },
-                        onAddNetwork = { destination = AppDestination.AddNetwork },
-                        onRemoveNetwork = { networkId -> coordinator.removeNetwork(networkId) },
+                        onAddNetwork = { addNetworkVisible = true },
+                        onRemoveNetwork = { coordinator.removeNetwork(it) },
                         onBrowseChannels = {
                             networks.firstOrNull()?.let { coordinator.startChannelList(it.id) }
                         },
@@ -128,11 +91,119 @@ public fun YardhalAppRoot(
                                     ConversationRef.server(networkId).storageKey,
                                     "/join $channel",
                                 )
-                                destination = AppDestination.Overview
                             }
                         },
-                        modifier = Modifier.fillMaxSize(),
+                        onOpenDebug = {},
+                        rawLogVersion = rawLogVersion,
+                        rawLogProvider = { coordinator.rawLog(networks.firstOrNull()?.id ?: "") },
                     )
+                }
+                val key = selectedKey
+                val buffer = conversationBufferFor(key)
+                if (key != null && buffer != null) {
+                    Box(modifier = Modifier.weight(0.62f)) {
+                        val networkId = key.substringBefore("|")
+                        val network = networks.firstOrNull { it.id == networkId }
+                        ConversationScreen(
+                            buffer = buffer,
+                            networkName = network?.name ?: "",
+                            connected = network?.status == ConnectionStatus.REGISTERED,
+                            onSend = { text ->
+                                coordinator.sendText(networkId, key, text)
+                                coordinator.sendTyping(networkId, key)
+                            },
+                            onOpenJoin = { joinDialogVisible = true },
+                            onLoadHistory = { coordinator.loadPersistedHistory(key) },
+                            onReact = { msgid, emoji -> coordinator.react(networkId, key, msgid, emoji) },
+                            onSetReplyDraft = { message -> coordinator.setReplyDraft(networkId, key, message) },
+                            onDelete = { msgid -> coordinator.deleteMessage(networkId, key, msgid) },
+                            modifier = Modifier.fillMaxSize(),
+                        )
+                    }
+                }
+            }
+        } else {
+            when {
+                addNetworkVisible -> AddNetworkSheet(
+                    presets = presets,
+                    onSave = {
+                        onNetworkSaved(it)
+                        addNetworkVisible = false
+                    },
+                    onDismiss = { addNetworkVisible = false },
+                )
+
+                selectedKey != null -> {
+                    val key = selectedKey!!
+                    val buffer = conversationBufferFor(key)
+                    val networkId = key.substringBefore("|")
+                    val network = networks.firstOrNull { it.id == networkId }
+                    if (buffer == null || network == null) {
+                        selectedKey = null
+                    } else {
+                        BackHandler { selectedKey = null }
+                        ConversationScreen(
+                            buffer = buffer,
+                            networkName = network.name,
+                            connected = network.status == ConnectionStatus.REGISTERED,
+                            onSend = { text ->
+                                coordinator.sendText(networkId, key, text)
+                                coordinator.sendTyping(networkId, key)
+                            },
+                            onOpenJoin = { joinDialogVisible = true },
+                            onLoadHistory = { coordinator.loadPersistedHistory(key) },
+                            onReact = { msgid, emoji -> coordinator.react(networkId, key, msgid, emoji) },
+                            onSetReplyDraft = { message -> coordinator.setReplyDraft(networkId, key, message) },
+                            onDelete = { msgid -> coordinator.deleteMessage(networkId, key, msgid) },
+                            modifier = Modifier.fillMaxSize(),
+                        )
+                    }
+                }
+
+                else -> {
+                    if (networks.isEmpty()) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(24.dp),
+                            verticalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterVertically),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                        ) {
+                            Text("Welcome to Yardhal", style = MaterialTheme.typography.headlineSmall)
+                            Text("Your networks sail with you.", style = MaterialTheme.typography.titleMedium)
+                            Button(onClick = { addNetworkVisible = true }) { Text("Add a network") }
+                        }
+                    } else {
+                        NetworkOverviewScreen(
+                            buffers = buffers.values
+                                .filter { it.ref.kind != dev.brentdevs.yardhal.core.data.ConversationKind.SERVER }
+                                .sortedBy { it.displayName.lowercase() },
+                            networks = networks,
+                            onSelect = { key ->
+                                coordinator.markRead(key)
+                                selectedKey = key
+                            },
+                            onAddNetwork = { addNetworkVisible = true },
+                            onRemoveNetwork = { coordinator.removeNetwork(it) },
+                            onBrowseChannels = {
+                                networks.firstOrNull()?.let { coordinator.startChannelList(it.id) }
+                            },
+                            channelList = channelList,
+                            onJoinFromList = { channel ->
+                                val networkId = networks.firstOrNull()?.id
+                                if (networkId != null) {
+                                    coordinator.sendText(
+                                        networkId,
+                                        ConversationRef.server(networkId).storageKey,
+                                        "/join $channel",
+                                    )
+                                }
+                            },
+                            onOpenDebug = {},
+                            rawLogVersion = rawLogVersion,
+                            rawLogProvider = { coordinator.rawLog(networks.firstOrNull()?.id ?: "") },
+                        )
+                    }
                 }
             }
         }
@@ -164,6 +235,7 @@ public fun YardhalAppRoot(
     }
 
     if (joinDialogVisible) {
+        val activeNetworkId = selectedKey?.substringBefore("|") ?: networks.firstOrNull()?.id
         AlertDialog(
             onDismissRequest = { joinDialogVisible = false },
             title = { Text("Join channel") },
@@ -177,13 +249,15 @@ public fun YardhalAppRoot(
             },
             confirmButton = {
                 Button(
-                    enabled = joinDraft.startsWith("#") && joinDraft.length > 1,
+                    enabled = joinDraft.startsWith("#") && joinDraft.length > 1 && activeNetworkId != null,
                     onClick = {
-                        val networkId = pendingJoinNetworkId
-                        val currentKey = (destination as? AppDestination.Conversation)?.storageKey
-                            ?: "${networkId}|*server*"
+                        val networkId = activeNetworkId
                         if (networkId != null) {
-                            coordinator.sendText(networkId, currentKey, "/join $joinDraft")
+                            coordinator.sendText(
+                                networkId,
+                                ConversationRef.server(networkId).storageKey,
+                                "/join $joinDraft",
+                            )
                         }
                         joinDraft = ""
                         joinDialogVisible = false

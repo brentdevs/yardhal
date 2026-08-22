@@ -215,6 +215,26 @@ public class LiveCoordinator(
 
     private val netsplitCollapser = dev.brentdevs.yardhal.core.data.NetsplitCollapser()
 
+    public data class RawFrame(public val outbound: Boolean, public val line: String)
+
+    private val rawLogs = LinkedHashMap<String, ArrayDeque<RawFrame>>()
+    private val _rawLogVersion = MutableStateFlow(0)
+    public val rawLogVersion: StateFlow<Int> = _rawLogVersion.asStateFlow()
+
+    public fun ingestRaw(networkId: String, outbound: Boolean, line: String) {
+        val deque = rawLogs.getOrPut(networkId) { ArrayDeque() }
+        synchronized(deque) {
+            deque.addLast(RawFrame(outbound, line))
+            while (deque.size > 400) deque.removeFirst()
+        }
+        _rawLogVersion.value += 1
+    }
+
+    public fun rawLog(networkId: String): List<RawFrame> {
+        val deque = rawLogs.getOrPut(networkId) { ArrayDeque() }
+        return synchronized(deque) { deque.toList() }
+    }
+
     public data class ChannelListEntry(public val name: String, public val users: Int, public val topic: String)
 
     private val _channelList = MutableStateFlow<List<ChannelListEntry>>(emptyList())

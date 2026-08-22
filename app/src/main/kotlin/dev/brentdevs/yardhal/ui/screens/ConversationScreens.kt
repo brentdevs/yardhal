@@ -278,10 +278,37 @@ public fun NetworkOverviewScreen(
     onBrowseChannels: () -> Unit,
     channelList: List<dev.brentdevs.yardhal.coordinator.LiveCoordinator.ChannelListEntry>,
     onJoinFromList: (String) -> Unit,
+    onOpenDebug: () -> Unit,
+    rawLogVersion: Int,
+    rawLogProvider: () -> List<dev.brentdevs.yardhal.coordinator.LiveCoordinator.RawFrame>,
     modifier: Modifier = Modifier,
 ) {
     var pendingRemoval by remember { mutableStateOf<String?>(null) }
     var browseVisible by remember { mutableStateOf(false) }
+    var debugVisible by remember { mutableStateOf(false) }
+
+    if (debugVisible) {
+        val frames = remember(rawLogVersion) { rawLogProvider() }
+        AlertDialog(
+            onDismissRequest = { debugVisible = false },
+            title = { Text("Traffic · last ${frames.size}") },
+            text = {
+                LazyColumn(modifier = Modifier.padding(vertical = 4.dp)) {
+                    items(frames.size) { index ->
+                        val frame = frames[frames.size - 1 - index]
+                        Text(
+                            text = (if (frame.outbound) "→ " else "← ") + frame.line.take(160),
+                            style = MaterialTheme.typography.labelSmall,
+                            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { debugVisible = false }) { Text("Close") }
+            },
+        )
+    }
 
     if (browseVisible) {
         AlertDialog(
@@ -330,6 +357,7 @@ public fun NetworkOverviewScreen(
             TopAppBar(
                 title = { Text("Yardhal") },
                 actions = {
+                    TextButton(onClick = { debugVisible = true; onOpenDebug() }) { Text("Debug") }
                     TextButton(onClick = { browseVisible = true; onBrowseChannels() }) { Text("List") }
                 },
             )
