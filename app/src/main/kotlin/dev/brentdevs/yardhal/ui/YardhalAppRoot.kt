@@ -1,10 +1,15 @@
 package dev.brentdevs.yardhal.ui
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.ui.unit.dp
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -40,6 +45,7 @@ public fun YardhalAppRoot(
 ) {
     val networks by coordinator.networks.collectAsStateWithLifecycle()
     val buffers by coordinator.buffers.collectAsStateWithLifecycle()
+    val whoisInfo by coordinator.whois.collectAsStateWithLifecycle()
 
     var destination by remember { mutableStateOf<AppDestination>(AppDestination.Overview) }
     var joinDialogVisible by remember { mutableStateOf(false) }
@@ -112,6 +118,31 @@ public fun YardhalAppRoot(
                 }
             }
         }
+    }
+
+    if (whoisInfo != null) {
+        val info = whoisInfo!!
+        AlertDialog(
+            onDismissRequest = coordinator::dismissWhois,
+            title = { Text("Whois · ${info.nick}") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    info.realName?.let { Text(it) }
+                    if (info.user != null || info.host != null) {
+                        Text("${info.user ?: "?"}@${info.host ?: "?"}", style = MaterialTheme.typography.bodySmall)
+                    }
+                    info.account?.let { Text("Account: $it", style = MaterialTheme.typography.bodySmall) }
+                    info.server?.let { Text("Server: $it ${info.serverInfo.orEmpty()}", style = MaterialTheme.typography.bodySmall) }
+                    info.idleSeconds?.let { Text("Idle: ${it / 60} min", style = MaterialTheme.typography.bodySmall) }
+                    if (info.channels.isNotEmpty()) {
+                        Text(info.channels.joinToString(" "), style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = coordinator::dismissWhois) { Text("Close") }
+            },
+        )
     }
 
     if (joinDialogVisible) {

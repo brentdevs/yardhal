@@ -33,6 +33,11 @@ public data class ChatMessage(
     public val replyToMsgid: String? = null,
 )
 
+public data class PresenceState(
+    public val away: Boolean,
+    public val account: String? = null,
+)
+
 public data class ConversationBuffer(
     public val ref: ConversationRef,
     public val displayName: String,
@@ -40,6 +45,7 @@ public data class ConversationBuffer(
     public val messages: List<ChatMessage> = emptyList(),
     public val hasUnread: Boolean = false,
     public val members: List<String> = emptyList(),
+    public val memberPresence: Map<String, PresenceState> = emptyMap(),
     public val typingUsers: Map<String, Long> = emptyMap(),
     public val reactions: Map<String, Map<String, Set<String>>> = emptyMap(),
     public val replyDraft: ChatMessage? = null,

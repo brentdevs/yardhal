@@ -230,10 +230,21 @@ public fun ConversationScreen(
             text = {
                 LazyColumn {
                     items(buffer.members.size) { index ->
-                        Text(
-                            text = buffer.members[index],
-                            modifier = Modifier.padding(vertical = 2.dp),
-                        )
+                        val nick = buffer.members[index]
+                        val presence = buffer.memberPresence[nick]
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = if (presence?.away == true) "○" else "●",
+                                color = if (presence?.away == true) {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                } else {
+                                    MaterialTheme.colorScheme.primary
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                modifier = Modifier.padding(end = 6.dp),
+                            )
+                            Text(nick)
+                        }
                     }
                 }
             },

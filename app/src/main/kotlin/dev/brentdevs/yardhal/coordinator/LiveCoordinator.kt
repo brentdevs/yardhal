@@ -56,6 +56,19 @@ public class LiveCoordinator(
     private val _buffers = MutableStateFlow<Map<String, ConversationBuffer>>(emptyMap())
     public val buffers: StateFlow<Map<String, ConversationBuffer>> = _buffers.asStateFlow()
 
+    private val _whois = MutableStateFlow<dev.brentdevs.yardhal.core.data.WhoisInfo?>(null)
+    public val whois: StateFlow<dev.brentdevs.yardhal.core.data.WhoisInfo?> = _whois.asStateFlow()
+
+    public fun dismissWhois() {
+        _whois.value = null
+    }
+
+    private var ignoreStore: dev.brentdevs.yardhal.core.data.IgnoreStore? = null
+
+    public fun attachIgnores(store: dev.brentdevs.yardhal.core.data.IgnoreStore) {
+        ignoreStore = store
+    }
+
     private val sessions = LinkedHashMap<String, Session>()
 
     private companion object {
@@ -72,6 +85,7 @@ public class LiveCoordinator(
         var collectorJob: Job? = null
         var quitRequested: Boolean = false
         var supportedCaps: Set<String> = emptySet()
+        var hasWhox: Boolean = false
 
         fun isupportCasemapping(): CaseMapping = casemapping
     }
@@ -184,6 +198,10 @@ public class LiveCoordinator(
             numeric == 332 -> handleTopicNumeric(session, message)
             numeric == 353 -> accumulateNames(session, message)
             numeric == 366 -> finalizeNames(session, message)
+            numeric == 354 -> handleWhoXLine(session, message)
+            numeric != null && numeric in 301..319 && numeric != 305 && numeric != 306 ->
+                handleWhoisNumeric(session, numeric, message)
+            numeric == 730 || numeric == 731 -> appendServerLine(session, message, "monitor")
             numeric == 5 -> applyIsupportTokens(session, message)
             numeric != null && numeric in 400..599 -> appendServerLine(session, message, "error")
             else -> appendServerLine(session, message)
@@ -213,6 +231,37 @@ public class LiveCoordinator(
         val members = pendingNames.remove(key)?.sortedBy { it.lowercase() } ?: return
         updateBufferKey(key) { it.copy(members = members) }
     }
+
+    private var whoxQuerySent: Boolean = false
+
+    private fun handleWhoXLine(session: Session, message: IrcMessage) {
+        if (message.parameters.size < 5) return
+        val fields = message.parameters.drop(1)
+        val account = fields.getOrNull(0)?.takeIf { it != "0" }
+        val flags = fields.getOrNull(1)
+        val nick = fields.getOrNull(3) ?: return
+        updateMemberPresence(session, nick, away = flags?.contains('G') == true, account = account)
+    }
+
+    private fun updateMemberPresence(session: Session, nick: String, away: Boolean, account: String?) {
+        for ((key, buffer) in _buffers.value) {
+            if (buffer.ref.networkId != session.config.id) continue
+            if (buffer.members.any { it.equals(nick, ignoreCase = true) }) {
+                updateBufferKey(key) { it.copy(memberPresence = it.memberPresence + (nick to PresenceState(away, account))) }
+            }
+        }
+    }
+
+    private fun handleWhoisNumeric(session: Session, numeric: Int, message: IrcMessage) {
+        if (!whoisExpected) return
+        whoisAccumulator.handle(numeric, message.parameters)?.let { complete ->
+            whoisExpected = false
+            _whois.value = complete
+        }
+    }
+
+    private val whoisAccumulator = dev.brentdevs.yardhal.core.data.WhoisAccumulator()
+    private var whoisExpected: Boolean = false
 
     private fun handleTagmsg(session: Session, message: IrcMessage) {
         val sender = message.prefix?.nick ?: return
@@ -304,6 +353,7 @@ public class LiveCoordinator(
                     parsePrefixToken(token.removePrefix("PREFIX="))?.let { prefixModes = it }
                 token.startsWith("CHATHISTORY=") ->
                     chathistoryLimit = token.substringAfter('=').toIntOrNull()?.coerceAtMost(200) ?: 0
+                token == "WHOX" -> session.hasWhox = true
             }
         }
     }
@@ -323,6 +373,7 @@ public class LiveCoordinator(
         val targetParam = message.parameters[0]
         val rawText = message.parameters[1]
         val senderNick = message.prefix?.nick ?: return
+        if (senderNick != session.ownNick && ignoreStore?.isIgnored(senderNick) == true) return
         val fromUs = senderNick == session.ownNick
         val ref =
             if (targetParam.isNotEmpty() && targetParam[0] in "#&") {
@@ -662,7 +713,10 @@ public class LiveCoordinator(
             is SlashCommand.Away ->
                 sendRaw(session, if (command.message == null) "AWAY" else "AWAY :${command.message}")
             is SlashCommand.Quit -> disconnect(session.config.id, command.reason ?: "")
-            is SlashCommand.Whois -> sendRaw(session, "WHOIS ${command.target} ${command.target}")
+            is SlashCommand.Whois -> {
+                whoisExpected = true
+                sendRaw(session, "WHOIS ${command.target} ${command.target}")
+ }
             is SlashCommand.Kick -> {
                 val channel = command.channel ?: active.rawTarget
                 sendRaw(
@@ -688,6 +742,29 @@ public class LiveCoordinator(
                 IrcCtcp.encode(command.command, command.arguments),
                 suppressOptimistic = true,
             )
+            is SlashCommand.Op -> {
+                val channel = command.channel ?: active.rawTarget
+                sendRaw(session, "MODE $channel ${if (command.grant) "+o" else "-o"} ${command.nick}")
+            }
+            is SlashCommand.Voice -> {
+                val channel = command.channel ?: active.rawTarget
+                sendRaw(session, "MODE $channel ${if (command.grant) "+v" else "-v"} ${command.nick}")
+            }
+            is SlashCommand.MonitorAdd -> sendRaw(session, "MONITOR + ${command.nick}")
+            is SlashCommand.MonitorRemove -> sendRaw(session, "MONITOR - ${command.nick}")
+            is SlashCommand.MonitorList -> sendRaw(session, "MONITOR L")
+            is SlashCommand.WhoQuery -> sendRaw(
+                session,
+                if (command.useWhox && session.hasWhox) "WHO ${command.target} %afhn" else "WHO ${command.target}",
+            )
+            is SlashCommand.IgnoreAdd -> {
+                ignoreStore?.add(command.mask)
+                appendSystem(session, active, "Ignoring ${command.mask}")
+            }
+            is SlashCommand.IgnoreRemove -> {
+                ignoreStore?.remove(command.mask)
+                appendSystem(session, active, "No longer ignoring ${command.mask}")
+            }
             is SlashCommand.Help -> appendSystem(
                 session,
                 active,

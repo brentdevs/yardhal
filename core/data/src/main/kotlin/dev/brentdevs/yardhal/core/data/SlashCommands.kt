@@ -18,6 +18,14 @@ public sealed interface SlashCommand {
     public data class Ban(public val channel: String?, public val mask: String?) : SlashCommand
     public data class Mode(public val target: String?, public val params: List<String>) : SlashCommand
     public data class CtcpQuery(public val target: String, public val command: String, public val arguments: String) : SlashCommand
+    public data class Op(public val channel: String?, public val nick: String, public val grant: Boolean) : SlashCommand
+    public data class Voice(public val channel: String?, public val nick: String, public val grant: Boolean) : SlashCommand
+    public data class MonitorAdd(public val nick: String) : SlashCommand
+    public data class MonitorRemove(public val nick: String) : SlashCommand
+    public data object MonitorList : SlashCommand
+    public data class WhoQuery(public val target: String, public val useWhox: Boolean) : SlashCommand
+    public data class IgnoreAdd(public val mask: String) : SlashCommand
+    public data class IgnoreRemove(public val mask: String) : SlashCommand
     public data class Raw(public val line: String) : SlashCommand
     public data object Help : SlashCommand
 }
@@ -55,6 +63,17 @@ public object SlashCommandParser {
             "ban" -> parseBan(rest, currentChannel)
             "m", "mode" -> parseMode(rest, currentChannel)
             "ctcp" -> parseCtcp(rest)
+            "op" -> parsePrivChange(rest, currentChannel, mode = "+o") { c, n -> SlashCommand.Op(c, n, grant = true) }
+            "deop" -> parsePrivChange(rest, currentChannel, mode = "-o") { c, n -> SlashCommand.Op(c, n, grant = false) }
+            "voice", "v" -> parsePrivChange(rest, currentChannel, mode = "+v") { c, n -> SlashCommand.Voice(c, n, grant = true) }
+            "devoice" -> parsePrivChange(rest, currentChannel, mode = "-v") { c, n -> SlashCommand.Voice(c, n, grant = false) }
+            "monitor" -> parseMonitor(rest)
+            "who" -> {
+                val target = tokensOf(rest).firstOrNull() ?: currentChannel ?: return null
+                SlashCommand.WhoQuery(target, useWhox = true)
+            }
+            "ignore" -> tokensOf(rest).firstOrNull()?.let { SlashCommand.IgnoreAdd(it) }
+            "unignore" -> tokensOf(rest).firstOrNull()?.let { SlashCommand.IgnoreRemove(it) }
             "quote", "raw" -> rawLine(rest)
             else -> rawLine(body)
         }
@@ -66,6 +85,38 @@ public object SlashCommandParser {
         return SlashCommand.Raw(
             body.substring(0, spaceIndex).uppercase() + " " + body.substring(spaceIndex + 1),
         )
+    }
+
+    private fun parsePrivChange(
+        rest: String,
+        currentChannel: String?,
+        mode: String,
+        build: (String?, String) -> SlashCommand,
+    ): SlashCommand? {
+        val tokens = tokensOf(rest)
+        if (tokens.isEmpty()) return null
+        val first = tokens.first()
+        return if (firstIsChannelLeader(first)) {
+            val nick = tokens.getOrNull(1) ?: return null
+            build(first, nick)
+        } else {
+            currentChannel ?: return null
+            build(currentChannel, first)
+        }
+    }
+
+    private fun parseMonitor(rest: String): SlashCommand {
+        val trimmed = rest.trim()
+        val parts = tokensOf(trimmed)
+        val sub = parts.firstOrNull()?.lowercase()
+        val target = parts.getOrNull(1)
+        return when {
+            sub == "+" && target != null -> SlashCommand.MonitorAdd(target)
+            sub == "-" && target != null -> SlashCommand.MonitorRemove(target)
+            sub == "l" || sub == "ls" || trimmed.isEmpty() -> SlashCommand.MonitorList
+            target == null -> SlashCommand.MonitorAdd(sub ?: return SlashCommand.MonitorList)
+            else -> SlashCommand.MonitorAdd(trimmed)
+        }
     }
 
     private fun String.upperFirst(): String =
