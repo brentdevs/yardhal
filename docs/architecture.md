@@ -81,27 +81,29 @@ Phases land in order; each phase ships with tests and updated docs.
 - **Phase 0 — Scaffold**: Nix dev shell, Gradle multi-module skeleton,
   Compose shell app, quality gate, CI. ✅
 - **Phase 1 — Protocol core**: wire grammar, tags escaping, prefixes,
-  numerics, CTCP, ISUPPORT, casemapping, mIRC formatting parse.
+  numerics, CTCP, ISUPPORT, casemapping, mIRC formatting parse. ✅
 - **Phase 2 — Connection**: TLS, CAP LS 302, SASL PLAIN, registration,
   ping keepalive, reconnect/backoff, STS persist + upgrade; loopback +
-  Ergo harness green.
-- **Phase 3 — Data + brain**: stores, reducer skeleton, slash commands,
-  credential vault, network presets.
+  Ergo harness green. ✅
+- **Phase 3 — Data + brain**: stores, reducer-style coordinator routing,
+  slash commands, credential vault, network presets. ✅
 - **Phase 4 — MVP UI**: network/channel lists, transcript, composer with
   nick completion, join sheet, foreground service + notifications,
-  settings. Daily-drivable on Libera-class networks.
-- **Phase 5 — IRCv3 breadth**: chathistory backfill + gap fill,
-  echo-message/msgid affordances, replies, reactions, typing, presence
-  stack (away/account-notify, extended-join, WHOX, multi-prefix,
-  monitor), standard-replies + labeled-response errors, netsplit
-  collapse, read-marker, multiline, redaction, metadata avatars.
-- **Phase 6 — Polish**: TOML theme engine, whois panel, channel modes +
-  moderation UI, ignore list, LIST browser, link previews, two-pane
-  tablet layout, traffic console.
-- **Phase 7 — Bouncers**: soju BOUNCER cap multi-network, ZNC playback +
-  management.
-- **Phase 8 — Extras**: media uploads, share-target, shortcuts/widgets,
-  catch-up digest.
+  settings. ✅ (settings screen minimal)
+- **Phase 5 — IRCv3 breadth**: landed so far — server-time everywhere,
+  chathistory LATEST bootstrap, gap-free history seeding from the store,
+  echo-message reconciliation, msgid-gated reactions/replies, typing
+  both ways, presence via NAMES+PREFIX parsing, standard-replies lines,
+  MARKREAD mirroring. Remaining: WHOX queries, monitor/extended-monitor,
+  netsplit collapse, multiline batches, redaction UI, metadata avatars.
+- **Phase 6 — Polish**: day separators, member list, nick completion,
+  network removal ✅. Remaining: TOML theme engine, whois panel,
+  channel modes/moderation UI, ignore list, LIST browser, link previews,
+  two-pane tablet layout, traffic console.
+- **Phase 7 — Bouncers**: not started (soju BOUNCER cap, ZNC playback +
+  management).
+- **Phase 8 — Extras**: not started (media uploads, share-target,
+  shortcuts/widgets, catch-up digest).
 
 The authoritative IRCv3 obligation inventory lives in
 `docs/ircv3-checklist.md`; check items off as they land.
