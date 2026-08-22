@@ -75,11 +75,15 @@ public fun YardhalAppRoot(
                         buffer = buffer,
                         networkName = network.name,
                         connected = network.status == ConnectionStatus.REGISTERED,
-                        onSend = { text -> coordinator.sendText(networkId, key, text) },
+                        onSend = { text ->
+                            coordinator.sendText(networkId, key, text)
+                            coordinator.sendTyping(networkId, key)
+                        },
                         onOpenJoin = {
                             pendingJoinNetworkId = networkId
                             joinDialogVisible = true
                         },
+                        onLoadHistory = { coordinator.loadPersistedHistory(key) },
                         modifier = Modifier.fillMaxSize(),
                     )
                 }

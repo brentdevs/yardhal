@@ -6,14 +6,14 @@ Phase numbers refer to `docs/architecture.md`.
 
 ## Baseline
 
-- [ ] Modern IRC baseline: message grammar, numerics, ISUPPORT/CASEMAPPING handling (P1)
-- [ ] capability-negotiation 302: CAP LS 302, REQ/ACK, CAP NEW/DEL at runtime (P2)
-- [ ] message-tags: parse/escape tags, enlarged limits, ERR_INPUTTOOLONG 417, request cap (P1/P2)
-- [ ] server-time: use time tag as authoritative timestamp, especially in playback (P5)
+- [x] Modern IRC baseline: message grammar, numerics, ISUPPORT/CASEMAPPING handling (P1)
+- [x] capability-negotiation 302: CAP LS 302, REQ/ACK, CAP NEW/DEL at runtime (P2)
+- [x] message-tags: parse/escape tags, enlarged limits, request cap (P1/P2; 417 surfacing pending)
+- [x] server-time: use time tag as authoritative timestamp, especially in playback (P5)
 
 ## Identity & access
 
-- [ ] sasl 3.1: AUTHENTICATE flow during negotiation (PLAIN) (P2)
+- [x] sasl 3.1: AUTHENTICATE flow during negotiation (PLAIN) (P2)
 - [ ] sasl 3.2: mechanism list parsing, post-registration re-auth (P2+)
 - [ ] account-notify: ACCOUNT updates member account state (P5)
 - [ ] account-tag: verified-account badge input (P5)
@@ -31,11 +31,11 @@ Phase numbers refer to `docs/architecture.md`.
 
 ## Messaging affordances
 
-- [ ] message-ids: persist msgid; gate reply/react/redact/read-marker UI on it (P3 stores / P5 UI)
+- [x] message-ids: persist msgid (P3); reply/react/redact UI gating pending
 - [ ] echo-message: render own messages from echo, dedupe pending copy (P5)
 - [ ] +draft/reply (+reply): send/receive replies, jump-to-source (P5)
 - [ ] +draft/react / +draft/unreact: reactions pills with counts (P5)
-- [ ] +typing: rate-limited active/paused/done, indicators with expiry (P5)
+- [x] +typing: send rate-limited active TAGMSG; inbound indicators with expiry (P5)
 - [ ] draft/message-redaction: REDACT handling + own redacts (P5)
 - [ ] draft/read-marker: MARKREAD send/apply for cross-device read state (P5)
 - [ ] draft/multiline: reassemble multiline batches honoring limits (P5)
@@ -45,17 +45,17 @@ Phase numbers refer to `docs/architecture.md`.
 
 - [ ] batch: buffer/correlate by reference tag, degrade gracefully (P2 framing / P5 usage)
 - [ ] chathistory batch type: silent history playback by server-time (P5)
-- [ ] draft/chathistory: BEFORE/AFTER/AROUND/LATEST/TARGETS with msgid/timestamps (P5)
+- [x] draft/chathistory: LATEST bootstrap on channel join when advertised (P5); full selectors pending
 - [ ] netsplit/netjoin batches: collapse into one event (P5)
 - [ ] labeled-response: label outbound commands, correlate responses incl. ACK/batches (P5)
-- [ ] standard-replies: FAIL/WARN/NOTE → structured errors + toasts (P5)
-- [ ] sts: upgrade to TLS port, persist policy with expiry, warning UI (P2 core / P4 UI)
-- [ ] SNI: hostname in ClientHello (platform TLS does this by default) (P2)
+- [x] standard-replies: FAIL/WARN/NOTE → tagged system lines (P5; toast polish pending)
+- [x] sts: upgrade to TLS port, persist policy with expiry (P2 core; warning UI pending)
+- [x] SNI: hostname in ClientHello (platform TLS does this by default) (P2)
 - [ ] STARTTLS: NOT implemented (deprecated); direct TLS only
 
 ## Metadata & misc
 
-- [ ] WHOX: %field selectors + numeric 354 when advertised (P5)
+- [x] NAMES/353/366 member lists via multi-prefix-aware parser (P5); WHOX %fields pending
 - [ ] multi-prefix: all status prefixes in NAMES/WHO (P5)
 - [ ] userhost-in-names: full nick!user@host in NAMES (P5)
 - [ ] no-implicit-names: suppress NAMES burst on JOIN, fetch lazily (P5)

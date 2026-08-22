@@ -31,6 +31,7 @@ public fun ConversationScreen(
     connected: Boolean,
     onSend: (String) -> Unit,
     onOpenJoin: () -> Unit,
+    onLoadHistory: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Scaffold(
@@ -55,8 +56,26 @@ public fun ConversationScreen(
                 },
             )
         },
-        bottomBar = { ComposerBar(enabled = connected, onSend = onSend) },
+        bottomBar = {
+            androidx.compose.foundation.layout.Column {
+                val typers = buffer.activeTypers(System.currentTimeMillis())
+                if (typers.isNotEmpty()) {
+                    Text(
+                        text = when (typers.size) {
+                            1 -> "${typers[0]} is typing…"
+                            2 -> "${typers[0]} and ${typers[1]} are typing…"
+                            else -> "several people are typing…"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(start = 16.dp, bottom = 2.dp),
+                    )
+                }
+                ComposerBar(enabled = connected, onSend = onSend)
+            }
+        },
     ) { padding ->
+        androidx.compose.runtime.LaunchedEffect(buffer.key) { onLoadHistory() }
         if (buffer.messages.isEmpty()) {
             Box(modifier = Modifier.padding(padding).fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text(

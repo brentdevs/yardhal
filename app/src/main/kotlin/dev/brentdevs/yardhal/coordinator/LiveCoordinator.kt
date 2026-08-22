@@ -58,6 +58,12 @@ public class LiveCoordinator(
 
     private val sessions = LinkedHashMap<String, Session>()
 
+    private companion object {
+        const val TYPING_TTL_MS = 6_000L
+        const val TYPING_SEND_INTERVAL_MS = 4_000L
+        const val HISTORY_PAGE_SIZE = 200
+    }
+
     private inner class Session(val config: NetworkConfig) {
         var casemapping: CaseMapping = CaseMapping.RFC1459
         var ownNick: String = config.nick
@@ -165,26 +171,91 @@ public class LiveCoordinator(
         when {
             message.command.equals("PRIVMSG", true) || message.command.equals("NOTICE", true) ->
                 handleChatMessage(session, message)
+            message.command.equals("TAGMSG", true) -> handleTagmsg(session, message)
             message.command.equals("JOIN", true) -> handleJoin(session, message)
             message.command.equals("PART", true) -> handlePart(session, message)
             message.command.equals("TOPIC", true) -> handleTopicVerb(session, message)
             message.command.equals("NICK", true) -> handleNickChange(session, message)
+            message.command.equals("FAIL", true) || message.command.equals("WARN", true) ->
+                appendServerLine(session, message, message.command.lowercase())
+            message.command.equals("NOTE", true) -> appendServerLine(session, message, "note")
             numeric == 332 -> handleTopicNumeric(session, message)
+            numeric == 353 -> accumulateNames(session, message)
+            numeric == 366 -> finalizeNames(session, message)
             numeric == 5 -> applyIsupportTokens(session, message)
             numeric != null && numeric in 400..599 -> appendServerLine(session, message, "error")
-            numeric != null && numeric == 433 -> appendServerLine(session, message, "nick taken")
             else -> appendServerLine(session, message)
         }
     }
 
-    private fun applyIsupportTokens(session: Session, message: IrcMessage) {
-        val tokens = message.parameters.drop(1).dropLast(1).filter { it.contains('=') || it.isNotEmpty() }
-        val casemappingToken = tokens.firstOrNull { it.startsWith("CASEMAPPING=") }
-        if (casemappingToken != null) {
-            dev.brentdevs.yardhal.core.protocol.CaseMapping.fromWireName(
-                casemappingToken.removePrefix("CASEMAPPING="),
-            )?.let { session.casemapping = it }
+    private val pendingNames = LinkedHashMap<String, MutableSet<String>>()
+    private var prefixModes: dev.brentdevs.yardhal.core.protocol.ChannelPrefixModes =
+        dev.brentdevs.yardhal.core.protocol.ChannelPrefixModes.DEFAULT
+    private var chathistoryLimit: Int = 0
+
+    private fun accumulateNames(session: Session, message: IrcMessage) {
+        if (message.parameters.size < 2) return
+        val (channelRaw, members) = dev.brentdevs.yardhal.core.data.NamesParser.parseNamesLine(
+            message.parameters.drop(1),
+            prefixModes,
+        )
+        val channel = channelRaw ?: return
+        val key = ConversationRef.channel(session.config.id, channel, session.casemapping).storageKey
+        pendingNames.getOrPut(key) { LinkedHashSet() }.addAll(members)
+    }
+
+    private fun finalizeNames(session: Session, message: IrcMessage) {
+        if (message.parameters.size < 2) return
+        val channel = message.parameters[1]
+        val key = ConversationRef.channel(session.config.id, channel, session.casemapping).storageKey
+        val members = pendingNames.remove(key)?.sortedBy { it.lowercase() } ?: return
+        updateBufferKey(key) { it.copy(members = members) }
+    }
+
+    private fun handleTagmsg(session: Session, message: IrcMessage) {
+        val typingValue = message.tag("+typing") ?: return
+        val sender = message.prefix?.nick ?: return
+        val targetParam = message.parameters.firstOrNull() ?: return
+        val ref =
+            if (targetParam.isNotEmpty() && targetParam[0] in "#&") {
+                ConversationRef.channel(session.config.id, targetParam, session.casemapping)
+            } else {
+                ConversationRef.directMessage(session.config.id, sender, session.casemapping)
+            }
+        updateBuffer(ref) { buffer ->
+            val fresh = buffer.typingUsers.filterValues { it > clock() }.toMutableMap()
+            when (typingValue) {
+                "active" -> fresh[sender] = clock() + TYPING_TTL_MS
+                else -> fresh.remove(sender)
+            }
+            buffer.copy(typingUsers = fresh)
         }
+    }
+
+    private fun applyIsupportTokens(session: Session, message: IrcMessage) {
+        val tokens = message.parameters.drop(1).dropLast(1).filter { it.isNotEmpty() }
+        for (token in tokens) {
+            when {
+                token.startsWith("CASEMAPPING=") ->
+                    dev.brentdevs.yardhal.core.protocol.CaseMapping.fromWireName(
+                        token.removePrefix("CASEMAPPING="),
+                    )?.let { session.casemapping = it }
+                token.startsWith("PREFIX=") ->
+                    parsePrefixToken(token.removePrefix("PREFIX="))?.let { prefixModes = it }
+                token.startsWith("CHATHISTORY=") ->
+                    chathistoryLimit = token.substringAfter('=').toIntOrNull()?.coerceAtMost(200) ?: 0
+            }
+        }
+    }
+
+    private fun parsePrefixToken(raw: String): dev.brentdevs.yardhal.core.protocol.ChannelPrefixModes? {
+        if (!raw.startsWith('(')) return null
+        val close = raw.indexOf(')')
+        if (close < 0) return null
+        val modes = raw.substring(1, close)
+        val symbols = raw.substring(close + 1)
+        if (modes.length != symbols.length || modes.isEmpty()) return null
+        return dev.brentdevs.yardhal.core.protocol.ChannelPrefixModes(modes.toList(), symbols.toList())
     }
 
     private fun handleChatMessage(session: Session, message: IrcMessage) {
@@ -243,6 +314,7 @@ public class LiveCoordinator(
             buffer(ref)
             sendRaw(session, "TOPIC $channel")
             sendRaw(session, "MODE $channel")
+            requestChathistory(session, ref)
         } else {
             appendSystem(session, ref, "→ $nick joined", MessageKind.JOIN)
         }
@@ -330,7 +402,12 @@ public class LiveCoordinator(
                 highlightsMe = highlightsMe,
                 msgid = msgid,
             )
-            buffer.copy(messages = buffer.messages + entry)
+            val countsAsUnread = !sentByUs &&
+                kind in setOf(MessageKind.PRIVMSG, MessageKind.NOTICE, MessageKind.ACTION)
+            buffer.copy(
+                messages = buffer.messages + entry,
+                hasUnread = buffer.hasUnread || countsAsUnread,
+            )
         }
         if (highlightsMe && !sentByUs) {
             notifier.onHighlight(session.config.name, sender, ConversationNames.forRef(ref), text)
@@ -383,6 +460,57 @@ public class LiveCoordinator(
         val latest = _buffers.value[storageKey]?.messages?.maxOfOrNull { it.timestampMs } ?: return
         readMarkers.advance(storageKey, latest)
         updateBufferKey(storageKey) { it.copy(hasUnread = false) }
+    }
+
+    private val historyLoaded = MutableStateFlow<Set<String>>(emptySet())
+
+    public fun loadPersistedHistory(storageKey: String): Boolean {
+        if (storageKey in historyLoaded.value) return false
+        historyLoaded.value = historyLoaded.value + storageKey
+        val buffer = _buffers.value[storageKey] ?: return false
+        scope.launch {
+            val stored = messageStore.recent(buffer.ref, HISTORY_PAGE_SIZE)
+            if (stored.isEmpty()) return@launch
+            updateBufferKey(storageKey) { current ->
+                val existingMsgids = current.messages.mapNotNull { it.msgid }.toSet()
+                val existingSignatures = current.messages.map { it.sender to it.timestampMs }.toSet()
+                val restored = stored
+                    .filter { it.msgid == null || it.msgid !in existingMsgids }
+                    .filter { row -> (row.senderNick to row.timestampMs) !in existingSignatures }
+                    .map { row ->
+                        ChatMessage(
+                            localId = idGenerator.getAndIncrement(),
+                            sender = row.senderNick,
+                            kind = row.kind,
+                            text = row.text,
+                            timestampMs = row.timestampMs,
+                            sentByUs = row.sentByUs,
+                            highlightsMe = false,
+                            msgid = row.msgid,
+                        )
+                    }
+                current.copy(messages = restored + current.messages)
+            }
+        }
+        return true
+    }
+
+    private fun requestChathistory(session: Session, ref: ConversationRef) {
+        if (chathistoryLimit <= 0 || ref.kind != ConversationKind.CHANNEL) return
+        val count = minOf(chathistoryLimit, 100)
+        sendRaw(session, "CHATHISTORY LATEST ${ref.rawTarget} * $count")
+    }
+
+    private var lastTypingSentAt: Long = 0
+
+    public fun sendTyping(networkId: String, storageKey: String) {
+        val session = sessions[networkId] ?: return
+        val buffer = _buffers.value[storageKey] ?: return
+        if (buffer.ref.kind == ConversationKind.SERVER) return
+        val now = clock()
+        if (now - lastTypingSentAt < TYPING_SEND_INTERVAL_MS) return
+        lastTypingSentAt = now
+        sendRaw(session, "@+typing=active TAGMSG ${buffer.ref.rawTarget}")
     }
 
     private fun updateBufferKey(storageKey: String, transform: (ConversationBuffer) -> ConversationBuffer) {

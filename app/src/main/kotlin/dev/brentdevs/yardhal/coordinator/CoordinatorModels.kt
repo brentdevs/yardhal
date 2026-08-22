@@ -39,8 +39,12 @@ public data class ConversationBuffer(
     public val messages: List<ChatMessage> = emptyList(),
     public val hasUnread: Boolean = false,
     public val members: List<String> = emptyList(),
+    public val typingUsers: Map<String, Long> = emptyMap(),
 ) {
     public val key: String get() = ref.storageKey
+
+    public fun activeTypers(nowMs: Long): List<String> =
+        typingUsers.filterValues { it > nowMs }.keys.sorted()
 }
 
 public object ConversationNames {
