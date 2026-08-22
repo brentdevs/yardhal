@@ -77,6 +77,10 @@ public class IrcReconnector(
         currentConnection?.sendLine(line)
     }
 
+    public fun send(message: dev.brentdevs.yardhal.core.protocol.IrcMessage) {
+        currentConnection?.send(message)
+    }
+
     private suspend fun runLoop() {
         while (desiredRunning && consecutiveFailures < policy.maxAttempts) {
             stateFlow.value = ReconnectState.Connecting

@@ -84,6 +84,8 @@ public fun YardhalAppRoot(
                             joinDialogVisible = true
                         },
                         onLoadHistory = { coordinator.loadPersistedHistory(key) },
+                        onReact = { msgid, emoji -> coordinator.react(networkId, key, msgid, emoji) },
+                        onSetReplyDraft = { message -> coordinator.setReplyDraft(networkId, key, message) },
                         modifier = Modifier.fillMaxSize(),
                     )
                 }
@@ -104,6 +106,7 @@ public fun YardhalAppRoot(
                             destination = AppDestination.Conversation(key)
                         },
                         onAddNetwork = { destination = AppDestination.AddNetwork },
+                        onRemoveNetwork = { networkId -> coordinator.removeNetwork(networkId) },
                         modifier = Modifier.fillMaxSize(),
                     )
                 }

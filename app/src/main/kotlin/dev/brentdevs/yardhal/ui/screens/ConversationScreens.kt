@@ -3,25 +3,70 @@ package dev.brentdevs.yardhal.ui.screens
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Badge
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import dev.brentdevs.yardhal.coordinator.ChatMessage
 import dev.brentdevs.yardhal.coordinator.ConversationBuffer
+import dev.brentdevs.yardhal.ui.components.DaySeparator
 import dev.brentdevs.yardhal.ui.components.MessageRow
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+
+private sealed interface TranscriptEntry {
+    public data class DayHeader(public val label: String) : TranscriptEntry
+    public data class Message(public val value: ChatMessage) : TranscriptEntry
+}
+
+private fun buildTranscript(buffer: ConversationBuffer): List<TranscriptEntry> {
+    val zone = ZoneId.systemDefault()
+    val ordered = buffer.messages.asReversed()
+    val entries = ArrayList<TranscriptEntry>(ordered.size + 4)
+    var lastDate: LocalDate? = null
+    for (message in ordered) {
+        val date = Instant.ofEpochMilli(message.timestampMs).atZone(zone).toLocalDate()
+        if (date != lastDate) {
+            entries.add(TranscriptEntry.DayHeader(formatDayLabel(date)))
+            lastDate = date
+        }
+        entries.add(TranscriptEntry.Message(message))
+    }
+    return entries
+}
+
+private fun formatDayLabel(date: LocalDate): String {
+    val today = LocalDate.now()
+    return when (date) {
+        today -> "Today"
+        today.minusDays(1) -> "Yesterday"
+        else -> date.format(DateTimeFormatter.ofPattern("MMMM d, yyyy"))
+    }
+}
+
+private val QUICK_REACTIONS = listOf("👍", "❤️", "😂", "🎉", "👀", "🙏")
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -32,8 +77,13 @@ public fun ConversationScreen(
     onSend: (String) -> Unit,
     onOpenJoin: () -> Unit,
     onLoadHistory: () -> Unit,
+    onReact: (String, String) -> Unit,
+    onSetReplyDraft: (ChatMessage?) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    var actionTarget by remember { mutableStateOf<ChatMessage?>(null) }
+    var membersVisible by remember { mutableStateOf(false) }
+
     Scaffold(
         modifier = modifier.fillMaxSize(),
         topBar = {
@@ -52,12 +102,17 @@ public fun ConversationScreen(
                     }
                 },
                 actions = {
-                    androidx.compose.material3.TextButton(onClick = onOpenJoin) { Text("Join") }
+                    if (buffer.members.isNotEmpty()) {
+                        TextButton(onClick = { membersVisible = true }) {
+                            Text("${buffer.members.size}")
+                        }
+                    }
+                    TextButton(onClick = onOpenJoin) { Text("Join") }
                 },
             )
         },
         bottomBar = {
-            androidx.compose.foundation.layout.Column {
+            Column {
                 val typers = buffer.activeTypers(System.currentTimeMillis())
                 if (typers.isNotEmpty()) {
                     Text(
@@ -71,11 +126,30 @@ public fun ConversationScreen(
                         modifier = Modifier.padding(start = 16.dp, bottom = 2.dp),
                     )
                 }
-                ComposerBar(enabled = connected, onSend = onSend)
+                val reply = buffer.replyDraft
+                if (reply != null) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "↩ Replying to ${reply.sender}: ${reply.text.take(48)}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.weight(1f),
+                            maxLines = 1,
+                        )
+                        TextButton(onClick = { onSetReplyDraft(null) }) { Text("Cancel") }
+                    }
+                }
+                ComposerBar(enabled = connected, members = buffer.members, onSend = onSend)
             }
         },
     ) { padding ->
-        androidx.compose.runtime.LaunchedEffect(buffer.key) { onLoadHistory() }
+        LaunchedEffectOnce(key = buffer.key, effect = onLoadHistory)
         if (buffer.messages.isEmpty()) {
             Box(modifier = Modifier.padding(padding).fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text(
@@ -87,13 +161,92 @@ public fun ConversationScreen(
             LazyColumn(
                 modifier = Modifier.padding(padding).fillMaxSize(),
                 reverseLayout = true,
+                contentPadding = PaddingValues(vertical = 4.dp),
             ) {
-                items(buffer.messages.asReversed(), key = { it.localId }) { message: ChatMessage ->
-                    MessageRow(message = message)
+                val entries = buildTranscript(buffer)
+                items(entries.size, key = { index ->
+                    when (val entry = entries[index]) {
+                        is TranscriptEntry.DayHeader -> "header-${entry.label}-$index"
+                        is TranscriptEntry.Message -> "msg-${entry.value.localId}"
+                    }
+                }) { index ->
+                    when (val entry = entries[index]) {
+                        is TranscriptEntry.DayHeader -> DaySeparator(entry.label)
+                        is TranscriptEntry.Message -> {
+                            val message = entry.value
+                            MessageRow(
+                                message = message,
+                                reactions = buffer.reactions[message.msgid].orEmpty()
+                                    .filterValues { it.isNotEmpty() },
+                                quotedText = message.replyToMsgid?.let { target ->
+                                    buffer.messages.firstOrNull { it.msgid == target }?.let { "${it.sender}: ${it.text.take(60)}" }
+                                },
+                                onLongPress = {
+                                    if (message.msgid != null || !message.sentByUs) actionTarget = message
+                                },
+                                onToggleReaction = { emoji ->
+                                    message.msgid?.let { msgid -> onReact(msgid, emoji) }
+                                },
+                            )
+                        }
+                    }
                 }
             }
         }
     }
+
+    if (actionTarget != null) {
+        val target = actionTarget!!
+        AlertDialog(
+            onDismissRequest = { actionTarget = null },
+            title = { Text(target.sender.ifEmpty { "Message" }) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        QUICK_REACTIONS.forEach { emoji ->
+                            TextButton(onClick = {
+                                target.msgid?.let { msgid -> onReact(msgid, emoji) }
+                                actionTarget = null
+                            }) { Text(emoji) }
+                        }
+                    }
+                    TextButton(onClick = {
+                        if (!target.sentByUs) onSetReplyDraft(target)
+                        actionTarget = null
+                    }) { Text("Reply") }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { actionTarget = null }) { Text("Close") }
+            },
+        )
+    }
+
+    if (membersVisible) {
+        AlertDialog(
+            onDismissRequest = { membersVisible = false },
+            title = { Text("Members · ${buffer.members.size}") },
+            text = {
+                LazyColumn {
+                    items(buffer.members.size) { index ->
+                        Text(
+                            text = buffer.members[index],
+                            modifier = Modifier.padding(vertical = 2.dp),
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { membersVisible = false }) { Text("Done") }
+            },
+        )
+    }
+}
+
+@Composable
+private fun LaunchedEffectOnce(key: Any?, effect: () -> Unit) {
+    androidx.compose.runtime.LaunchedEffect(key) { effect() }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -103,30 +256,37 @@ public fun NetworkOverviewScreen(
     networks: List<dev.brentdevs.yardhal.coordinator.UiNetwork>,
     onSelect: (String) -> Unit,
     onAddNetwork: () -> Unit,
+    onRemoveNetwork: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    var pendingRemoval by remember { mutableStateOf<String?>(null) }
+
     Scaffold(
         modifier = modifier.fillMaxSize(),
         topBar = { TopAppBar(title = { Text("Yardhal") }) },
         floatingActionButton = {
-            androidx.compose.material3.ExtendedFloatingActionButton(onClick = onAddNetwork) {
+            ExtendedFloatingActionButton(onClick = onAddNetwork) {
                 Text("+ Network")
             }
         },
     ) { padding ->
         LazyColumn(
             modifier = Modifier.padding(padding).fillMaxSize(),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp),
+            contentPadding = PaddingValues(12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            items(networks, key = { it.id }) { network ->
-                Card(modifier = Modifier.fillMaxWidth()) {
+            items(networks.size, key = { networks[it].id }) { index ->
+                val network = networks[index]
+                Card(
+                    onClick = {},
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
                     Row(
                         modifier = Modifier.padding(12.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Column {
+                        Column(modifier = Modifier.weight(1f)) {
                             Text(network.name, style = MaterialTheme.typography.titleSmall)
                             Text(
                                 when (network.status) {
@@ -139,10 +299,12 @@ public fun NetworkOverviewScreen(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
+                        TextButton(onClick = { pendingRemoval = network.id }) { Text("Remove") }
                     }
                 }
             }
-            items(buffers, key = { it.key }) { buffer ->
+            items(buffers.size, key = { buffers[it].key }) { index ->
+                val buffer = buffers[index]
                 Card(
                     onClick = { onSelect(buffer.key) },
                     modifier = Modifier.fillMaxWidth(),
@@ -156,13 +318,30 @@ public fun NetworkOverviewScreen(
                             modifier = Modifier.weight(1f),
                             style = MaterialTheme.typography.bodyLarge,
                         )
-                        val last: ChatMessage? = buffer.messages.lastOrNull()
-                        if (last != null && last.sentByUs == false && buffer.hasUnread) {
-                            androidx.compose.material3.Badge { Text("•") }
+                        val last = buffer.messages.lastOrNull()
+                        if (last != null && !last.sentByUs && buffer.hasUnread) {
+                            Badge { Text("•") }
                         }
                     }
                 }
             }
         }
+    }
+
+    if (pendingRemoval != null) {
+        AlertDialog(
+            onDismissRequest = { pendingRemoval = null },
+            title = { Text("Remove network?") },
+            text = { Text("This forgets the connection and its local transcript.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingRemoval?.let(onRemoveNetwork)
+                    pendingRemoval = null
+                }) { Text("Remove") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingRemoval = null }) { Text("Keep") }
+            },
+        )
     }
 }

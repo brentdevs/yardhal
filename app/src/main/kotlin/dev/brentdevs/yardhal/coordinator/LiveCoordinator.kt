@@ -71,6 +71,7 @@ public class LiveCoordinator(
         var reconnector: IrcReconnector? = null
         var collectorJob: Job? = null
         var quitRequested: Boolean = false
+        var supportedCaps: Set<String> = emptySet()
 
         fun isupportCasemapping(): CaseMapping = casemapping
     }
@@ -143,6 +144,7 @@ public class LiveCoordinator(
                 joinAutojoins(session)
                 refreshNetworkStates()
             }
+            is IrcEvent.CapabilitiesNegotiated -> session.supportedCaps = event.capabilities
             is IrcEvent.MessageReceived -> handleInbound(session, event.message)
             is IrcEvent.Disconnected ->
                 if (!session.quitRequested) {
@@ -213,7 +215,6 @@ public class LiveCoordinator(
     }
 
     private fun handleTagmsg(session: Session, message: IrcMessage) {
-        val typingValue = message.tag("+typing") ?: return
         val sender = message.prefix?.nick ?: return
         val targetParam = message.parameters.firstOrNull() ?: return
         val ref =
@@ -222,6 +223,37 @@ public class LiveCoordinator(
             } else {
                 ConversationRef.directMessage(session.config.id, sender, session.casemapping)
             }
+
+        val react = message.tag("+draft/react")
+        val unreact = message.tag("+draft/unreact")
+        if (react != null || unreact != null) {
+            val refs = (message.tag("+draft/refs") ?: message.tag("+draft/msgids"))
+                ?.split(',')?.filter { it.isNotEmpty() } ?: emptyList()
+            if (refs.isEmpty()) return
+            updateBuffer(ref) { buffer ->
+                var reactions = buffer.reactions
+                for (msgid in refs) {
+                    val perMessage = reactions[msgid]?.toMutableMap() ?: mutableMapOf()
+                    when {
+                        react != null -> {
+                            val nicks = perMessage[react].orEmpty().toMutableSet()
+                            nicks.add(sender)
+                            perMessage[react] = nicks
+                        }
+                        unreact != null -> {
+                            val nicks = perMessage[unreact].orEmpty().toMutableSet()
+                            nicks.remove(sender)
+                            if (nicks.isEmpty()) perMessage.remove(unreact) else perMessage[unreact] = nicks
+                        }
+                    }
+                    reactions = reactions + (msgid to perMessage.toMap())
+                }
+                buffer.copy(reactions = reactions)
+            }
+            return
+        }
+
+        val typingValue = message.tag("+typing") ?: return
         updateBuffer(ref) { buffer ->
             val fresh = buffer.typingUsers.filterValues { it > clock() }.toMutableMap()
             when (typingValue) {
@@ -230,6 +262,34 @@ public class LiveCoordinator(
             }
             buffer.copy(typingUsers = fresh)
         }
+    }
+
+    public fun react(networkId: String, storageKey: String, msgid: String, emoji: String) {
+        val session = sessions[networkId] ?: return
+        val buffer = _buffers.value[storageKey] ?: return
+        val own = session.ownNick
+        updateBufferKey(storageKey) { current ->
+            var reactions = current.reactions
+            if (!current.messages.any { it.msgid == msgid }) return@updateBufferKey current
+            val perMessage = (reactions[msgid] ?: emptyMap()).toMutableMap()
+            when {
+                perMessage[emoji].orEmpty().contains(own) -> {
+                    val remaining = perMessage[emoji].orEmpty().toMutableSet().apply { remove(own) }
+                    sendRaw(session, "@+draft/unreact=$emoji;+draft/refs=$msgid TAGMSG ${buffer.ref.rawTarget}")
+                    if (remaining.isEmpty()) perMessage.remove(emoji) else perMessage[emoji] = remaining
+                }
+                else -> {
+                    sendRaw(session, "@+draft/react=$emoji;+draft/refs=$msgid TAGMSG ${buffer.ref.rawTarget}")
+                    perMessage[emoji] = perMessage[emoji].orEmpty() + own
+                }
+            }
+            reactions = if (perMessage.isEmpty()) reactions - msgid else reactions + (msgid to perMessage.toMap())
+            current.copy(reactions = reactions)
+        }
+    }
+
+    public fun setReplyDraft(networkId: String, storageKey: String, message: ChatMessage?) {
+        updateBufferKey(storageKey) { it.copy(replyDraft = message) }
     }
 
     private fun applyIsupportTokens(session: Session, message: IrcMessage) {
@@ -303,6 +363,7 @@ public class LiveCoordinator(
             timestampMs = timestampMs,
             sentByUs = fromUs,
             highlightsMe = highlightsMe,
+            replyToMsgid = message.tag("+draft/reply"),
         )
     }
 
@@ -378,6 +439,7 @@ public class LiveCoordinator(
         timestampMs: Long,
         sentByUs: Boolean,
         highlightsMe: Boolean,
+        replyToMsgid: String? = null,
     ) {
         persistAsync(session, ref, sender, kind, text, msgid, timestampMs, sentByUs)
         updateBuffer(ref) { buffer ->
@@ -460,6 +522,20 @@ public class LiveCoordinator(
         val latest = _buffers.value[storageKey]?.messages?.maxOfOrNull { it.timestampMs } ?: return
         readMarkers.advance(storageKey, latest)
         updateBufferKey(storageKey) { it.copy(hasUnread = false) }
+        val networkId = storageKey.substringBefore("|")
+        val session = sessions[networkId] ?: return
+        if ("draft/read-marker" !in session.supportedCaps) return
+        val target = session.bufferTargetFor(storageKey) ?: return
+        val iso = java.time.Instant.ofEpochMilli(latest).toString()
+        sendRaw(session, "MARKREAD $target timestamp=$iso")
+    }
+
+    private fun Session.bufferTargetFor(storageKey: String): String? {
+        val buffer = _buffers.value[storageKey] ?: return null
+        return when (buffer.ref.kind) {
+            dev.brentdevs.yardhal.core.data.ConversationKind.SERVER -> null
+            else -> buffer.ref.rawTarget
+        }
     }
 
     private val historyLoaded = MutableStateFlow<Set<String>>(emptySet())
@@ -538,13 +614,22 @@ public class LiveCoordinator(
         val session = sessions[networkId] ?: return
         val activeBuffer = _buffers.value[storageKey] ?: return
         val command = SlashCommandParser.parse(input, activeBuffer.ref.rawTarget) ?: return
-        dispatchCommand(session, activeBuffer.ref, command)
+        val replyTo = activeBuffer.replyDraft?.takeIf { command is SlashCommand.PlainMessage }
+        if (replyTo != null) {
+            updateBufferKey(storageKey) { it.copy(replyDraft = null) }
+        }
+        dispatchCommand(session, activeBuffer.ref, command, replyToMsgid = replyTo?.msgid)
     }
 
-    private fun dispatchCommand(session: Session, active: ConversationRef, command: SlashCommand) {
+    private fun dispatchCommand(
+        session: Session,
+        active: ConversationRef,
+        command: SlashCommand,
+        replyToMsgid: String? = null,
+    ) {
         when (command) {
-            is SlashCommand.PlainMessage -> sendMessage(session, active, command.text)
-            is SlashCommand.EscapedMessage -> sendMessage(session, active, "/" + command.text)
+            is SlashCommand.PlainMessage -> sendMessage(session, active, command.text, replyToMsgid = replyToMsgid)
+            is SlashCommand.EscapedMessage -> sendMessage(session, active, "/" + command.text, replyToMsgid = replyToMsgid)
             is SlashCommand.Action -> sendMessage(
                 session,
                 active,
@@ -628,6 +713,7 @@ public class LiveCoordinator(
         optimisticKind: MessageKind = MessageKind.PRIVMSG,
         optimisticText: String? = null,
         suppressOptimistic: Boolean = false,
+        replyToMsgid: String? = null,
     ) {
         if (!suppressOptimistic) {
             appendChat(
@@ -640,9 +726,20 @@ public class LiveCoordinator(
                 timestampMs = clock(),
                 sentByUs = true,
                 highlightsMe = false,
+                replyToMsgid = replyToMsgid,
             )
         }
-        sendRaw(session, "PRIVMSG ${ref.rawTarget} :$wireText")
+        if (replyToMsgid != null) {
+            session.reconnector?.send(
+                IrcMessage(
+                    tags = mapOf("+draft/reply" to replyToMsgid),
+                    command = "PRIVMSG",
+                    parameters = listOf(ref.rawTarget, wireText),
+                ),
+            )
+        } else {
+            sendRaw(session, "PRIVMSG ${ref.rawTarget} :$wireText")
+        }
     }
 }
 

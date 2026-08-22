@@ -30,6 +30,7 @@ public data class ChatMessage(
     public val sentByUs: Boolean,
     public val highlightsMe: Boolean,
     public val msgid: String?,
+    public val replyToMsgid: String? = null,
 )
 
 public data class ConversationBuffer(
@@ -40,6 +41,8 @@ public data class ConversationBuffer(
     public val hasUnread: Boolean = false,
     public val members: List<String> = emptyList(),
     public val typingUsers: Map<String, Long> = emptyMap(),
+    public val reactions: Map<String, Map<String, Set<String>>> = emptyMap(),
+    public val replyDraft: ChatMessage? = null,
 ) {
     public val key: String get() = ref.storageKey
 
