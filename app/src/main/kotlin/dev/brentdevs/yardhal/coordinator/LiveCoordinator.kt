@@ -187,8 +187,11 @@ public class LiveCoordinator(
         when {
             message.command.equals("PRIVMSG", true) || message.command.equals("NOTICE", true) ->
                 handleChatMessage(session, message)
+            message.command.equals("BATCH", true) -> handleBatchFrame(session, message)
+            message.command.equals("REDACT", true) -> handleRedact(session, message)
             message.command.equals("TAGMSG", true) -> handleTagmsg(session, message)
             message.command.equals("JOIN", true) -> handleJoin(session, message)
+            message.command.equals("QUIT", true) -> handleQuit(session)
             message.command.equals("PART", true) -> handlePart(session, message)
             message.command.equals("TOPIC", true) -> handleTopicVerb(session, message)
             message.command.equals("NICK", true) -> handleNickChange(session, message)
@@ -199,12 +202,108 @@ public class LiveCoordinator(
             numeric == 353 -> accumulateNames(session, message)
             numeric == 366 -> finalizeNames(session, message)
             numeric == 354 -> handleWhoXLine(session, message)
+            numeric == 322 -> accumulateListEntry(session, message)
+            numeric == 323 -> finalizeChannelList()
             numeric != null && numeric in 301..319 && numeric != 305 && numeric != 306 ->
                 handleWhoisNumeric(session, numeric, message)
             numeric == 730 || numeric == 731 -> appendServerLine(session, message, "monitor")
             numeric == 5 -> applyIsupportTokens(session, message)
             numeric != null && numeric in 400..599 -> appendServerLine(session, message, "error")
             else -> appendServerLine(session, message)
+        }
+    }
+
+    private val netsplitCollapser = dev.brentdevs.yardhal.core.data.NetsplitCollapser()
+
+    public data class ChannelListEntry(public val name: String, public val users: Int, public val topic: String)
+
+    private val _channelList = MutableStateFlow<List<ChannelListEntry>>(emptyList())
+    public val channelList: StateFlow<List<ChannelListEntry>> = _channelList.asStateFlow()
+
+    private var channelListNetworkId: String? = null
+
+    public fun startChannelList(networkId: String) {
+        channelListNetworkId = networkId
+        _channelList.value = emptyList()
+        sessions[networkId]?.let { sendRaw(it, "LIST") }
+    }
+
+    private fun accumulateListEntry(session: Session, message: IrcMessage) {
+        if (message.parameters.size < 3) return
+        if (session.config.id != channelListNetworkId) return
+        _channelList.value = _channelList.value + ChannelListEntry(
+            name = message.parameters[1],
+            users = message.parameters[2].toIntOrNull() ?: 0,
+            topic = message.parameters.getOrNull(3).orEmpty(),
+        )
+    }
+
+    private fun finalizeChannelList() {
+        _channelList.value = _channelList.value.sortedByDescending { it.users }
+    }
+
+    public fun deleteMessage(networkId: String, storageKey: String, msgid: String) {
+        val session = sessions[networkId] ?: return
+        val buffer = _buffers.value[storageKey] ?: return
+        sendRaw(session, "REDACT ${buffer.ref.rawTarget} $msgid")
+        updateBufferKey(storageKey) { current ->
+            val index = current.messages.indexOfFirst { it.msgid == msgid }
+            if (index < 0) {
+                current
+            } else {
+                val messages = current.messages.toMutableList()
+                messages[index] = messages[index].copy(text = "message deleted", kind = MessageKind.SYSTEM)
+                current.copy(messages = messages)
+            }
+        }
+    }
+
+    private fun handleBatchFrame(session: Session, message: IrcMessage) {
+        if (message.parameters.size < 2) return
+        val reference = message.parameters.last().removePrefix("+").removePrefix("-")
+        val action = message.parameters[message.parameters.size - 2]
+        when (action) {
+            "+" -> {
+                val type = message.parameters.getOrNull(message.parameters.size - 1) ?: return
+                netsplitCollapser.onStart(reference, type, emptyList())
+                appendServerLine(session, message)
+            }
+            "-" -> {
+                val summary = netsplitCollapser.onEnd(reference) ?: return
+                appendSystem(
+                    session,
+                    ConversationRef.server(session.config.id),
+                    summary.toString(),
+                    MessageKind.SYSTEM,
+                )
+            }
+        }
+    }
+
+    private fun handleRedact(session: Session, message: IrcMessage) {
+        if (message.parameters.size < 2) return
+        val msgid = message.parameters[1]
+        updateAllBuffersForNetwork(session.config.id) { buffer ->
+            val index = buffer.messages.indexOfFirst { it.msgid == msgid }
+            if (index < 0) {
+                buffer
+            } else {
+                val messages = buffer.messages.toMutableList()
+                messages[index] = messages[index].copy(text = "message deleted", kind = MessageKind.SYSTEM)
+                buffer.copy(messages = messages)
+            }
+        }
+    }
+
+    private fun updateAllBuffersForNetwork(networkId: String, transform: (ConversationBuffer) -> ConversationBuffer) {
+        _buffers.value = _buffers.value.mapValues { (_, buffer) ->
+            if (buffer.ref.networkId == networkId) transform(buffer) else buffer
+        }
+    }
+
+    private fun handleQuit(session: Session) {
+        if (netsplitCollapser.isSuppressing("QUIT")) {
+            netsplitCollapser.recordSuppressed("QUIT")
         }
     }
 
@@ -421,6 +520,10 @@ public class LiveCoordinator(
     private fun handleJoin(session: Session, message: IrcMessage) {
         val nick = message.prefix?.nick ?: return
         val channel = message.parameters.firstOrNull() ?: return
+        if (nick != session.ownNick && netsplitCollapser.isSuppressing("JOIN")) {
+            netsplitCollapser.recordSuppressed("JOIN")
+            return
+        }
         val ref = ConversationRef.channel(session.config.id, channel, session.casemapping)
         if (nick == session.ownNick) {
             buffer(ref)

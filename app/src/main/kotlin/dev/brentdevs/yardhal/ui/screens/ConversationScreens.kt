@@ -79,6 +79,7 @@ public fun ConversationScreen(
     onLoadHistory: () -> Unit,
     onReact: (String, String) -> Unit,
     onSetReplyDraft: (ChatMessage?) -> Unit,
+    onDelete: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var actionTarget by remember { mutableStateOf<ChatMessage?>(null) }
@@ -214,6 +215,12 @@ public fun ConversationScreen(
                         if (!target.sentByUs) onSetReplyDraft(target)
                         actionTarget = null
                     }) { Text("Reply") }
+                    if (target.sentByUs && target.msgid != null) {
+                        TextButton(onClick = {
+                            onDelete(target.msgid!!)
+                            actionTarget = null
+                        }) { Text("Delete") }
+                    }
                 }
             },
             confirmButton = {},
@@ -268,13 +275,65 @@ public fun NetworkOverviewScreen(
     onSelect: (String) -> Unit,
     onAddNetwork: () -> Unit,
     onRemoveNetwork: (String) -> Unit,
+    onBrowseChannels: () -> Unit,
+    channelList: List<dev.brentdevs.yardhal.coordinator.LiveCoordinator.ChannelListEntry>,
+    onJoinFromList: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var pendingRemoval by remember { mutableStateOf<String?>(null) }
+    var browseVisible by remember { mutableStateOf(false) }
+
+    if (browseVisible) {
+        AlertDialog(
+            onDismissRequest = { browseVisible = false },
+            title = { Text("Channels · ${channelList.size}") },
+            text = {
+                if (channelList.isEmpty()) {
+                    Text("Loading list…")
+                } else {
+                    LazyColumn(modifier = Modifier.padding(vertical = 4.dp)) {
+                        items(channelList.size) { index ->
+                            val entry = channelList[index]
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 2.dp),
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(entry.name, style = MaterialTheme.typography.bodyMedium)
+                                    if (entry.topic.isNotBlank()) {
+                                        Text(
+                                            entry.topic,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                        )
+                                    }
+                                }
+                                Badge { Text("${entry.users}") }
+                                TextButton(onClick = { onJoinFromList(entry.name) }) { Text("Join") }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { browseVisible = false }) { Text("Close") }
+            },
+        )
+    }
 
     Scaffold(
         modifier = modifier.fillMaxSize(),
-        topBar = { TopAppBar(title = { Text("Yardhal") }) },
+        topBar = {
+            TopAppBar(
+                title = { Text("Yardhal") },
+                actions = {
+                    TextButton(onClick = { browseVisible = true; onBrowseChannels() }) { Text("List") }
+                },
+            )
+        },
         floatingActionButton = {
             ExtendedFloatingActionButton(onClick = onAddNetwork) {
                 Text("+ Network")

@@ -21,6 +21,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.brentdevs.yardhal.coordinator.ConnectionStatus
+import dev.brentdevs.yardhal.core.data.ConversationRef
 import dev.brentdevs.yardhal.coordinator.LiveCoordinator
 import dev.brentdevs.yardhal.ui.screens.AddNetworkSheet
 import dev.brentdevs.yardhal.ui.screens.ConversationScreen
@@ -46,6 +47,7 @@ public fun YardhalAppRoot(
     val networks by coordinator.networks.collectAsStateWithLifecycle()
     val buffers by coordinator.buffers.collectAsStateWithLifecycle()
     val whoisInfo by coordinator.whois.collectAsStateWithLifecycle()
+    val channelList by coordinator.channelList.collectAsStateWithLifecycle()
 
     var destination by remember { mutableStateOf<AppDestination>(AppDestination.Overview) }
     var joinDialogVisible by remember { mutableStateOf(false) }
@@ -92,6 +94,7 @@ public fun YardhalAppRoot(
                         onLoadHistory = { coordinator.loadPersistedHistory(key) },
                         onReact = { msgid, emoji -> coordinator.react(networkId, key, msgid, emoji) },
                         onSetReplyDraft = { message -> coordinator.setReplyDraft(networkId, key, message) },
+                        onDelete = { msgid -> coordinator.deleteMessage(networkId, key, msgid) },
                         modifier = Modifier.fillMaxSize(),
                     )
                 }
@@ -113,6 +116,21 @@ public fun YardhalAppRoot(
                         },
                         onAddNetwork = { destination = AppDestination.AddNetwork },
                         onRemoveNetwork = { networkId -> coordinator.removeNetwork(networkId) },
+                        onBrowseChannels = {
+                            networks.firstOrNull()?.let { coordinator.startChannelList(it.id) }
+                        },
+                        channelList = channelList,
+                        onJoinFromList = { channel ->
+                            val networkId = networks.firstOrNull()?.id
+                            if (networkId != null) {
+                                coordinator.sendText(
+                                    networkId,
+                                    ConversationRef.server(networkId).storageKey,
+                                    "/join $channel",
+                                )
+                                destination = AppDestination.Overview
+                            }
+                        },
                         modifier = Modifier.fillMaxSize(),
                     )
                 }
