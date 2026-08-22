@@ -29,6 +29,7 @@ nix develop          # JDK 21 + Gradle 8.14.x + writable Android SDK clone
 make check           # assembleDebug + every module's unit tests (the gate)
 make build           # just :app:assembleDebug
 make test            # just unit tests
+make test-ircd       # real Ergo round-trip (downloads pinned server to .tools/ first time)
 ```
 
 The first `nix develop` provisions a writable SDK clone at

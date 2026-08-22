@@ -1,4 +1,4 @@
-.PHONY: check build test clean sdk
+.PHONY: check build test clean sdk test-ircd
 
 ANDROID_HOME ?= $(error ANDROID_HOME is not set; run inside `nix develop`)
 
@@ -14,6 +14,10 @@ test:
 	./gradlew $(GRADLE_FLAGS) test
 
 check: build test
+
+test-ircd:
+	bash scripts/ensure-ergo.sh
+	./gradlew $(GRADLE_FLAGS) :core:client:test --tests "*ErgoRoundTripTest*" --rerun-tasks
 
 clean:
 	./gradlew clean
