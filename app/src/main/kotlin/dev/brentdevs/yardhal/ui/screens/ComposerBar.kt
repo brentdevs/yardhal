@@ -12,6 +12,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -25,6 +26,7 @@ import androidx.compose.ui.unit.dp
 public fun ComposerBar(
     enabled: Boolean,
     members: List<String>,
+    onAttach: () -> Unit = {},
     initialDraft: String? = null,
     onSend: (String) -> Unit,
     modifier: Modifier = Modifier,
@@ -80,6 +82,13 @@ public fun ComposerBar(
                 enabled = enabled,
                 maxLines = 4,
             )
+            IconButton(onClick = onAttach, enabled = enabled) {
+                Icon(
+                    imageVector = Icons.Filled.AttachFile,
+                    contentDescription = "Attach file",
+                    tint = if (enabled) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.outline,
+                )
+            }
             IconButton(onClick = { submit() }, enabled = enabled && draft.isNotBlank()) {
                 Icon(
                     imageVector = Icons.AutoMirrored.Filled.Send,

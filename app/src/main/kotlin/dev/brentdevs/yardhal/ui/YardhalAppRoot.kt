@@ -22,6 +22,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.brentdevs.yardhal.coordinator.ConnectionStatus
@@ -62,6 +63,7 @@ public fun YardhalAppRoot(
     var joinDraft by remember { mutableStateOf("") }
 
     val configuration = LocalConfiguration.current
+    val context = LocalContext.current
     val wide = configuration.screenWidthDp >= 600
     val sharedDraft = sharedTextProvider()
     if (sharedDraft != null && selectedKey == null) {
@@ -70,6 +72,28 @@ public fun YardhalAppRoot(
             .minByOrNull { it.displayName.lowercase() }
         selectedKey = first?.key
         onSharedConsumed()
+    }
+
+    val pickLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri != null && selectedKey != null) {
+            val key = selectedKey!!
+            val networkId = key.substringBefore("|")
+            val resolver = context.contentResolver
+            val mime = resolver.getType(uri) ?: "application/octet-stream"
+            val name = queryDisplayName(resolver, uri)
+            val bytes: ByteArray? = runCatching {
+                resolver.openInputStream(uri)?.use { input -> input.readBytes() }
+            }.getOrNull()
+            if (bytes != null) {
+                coordinator.uploadAndShare(networkId, key, name, mime, bytes)
+            }
+        }
+    }
+
+    fun launchAttachmentPicker() {
+        pickLauncher.launch(arrayOf("*/*"))
     }
 
     fun conversationBufferFor(key: String?): ConversationBuffer? = key?.let { buffers[it] }
@@ -129,6 +153,7 @@ public fun YardhalAppRoot(
                             onDelete = { msgid -> coordinator.deleteMessage(networkId, key, msgid) },
                             sharedDraft = sharedDraft,
                             onSharedConsumed = onSharedConsumed,
+                            onPickFile = { launchAttachmentPicker() },
                             modifier = Modifier.fillMaxSize(),
                         )
                     }
@@ -169,6 +194,7 @@ public fun YardhalAppRoot(
                             onDelete = { msgid -> coordinator.deleteMessage(networkId, key, msgid) },
                             sharedDraft = sharedDraft,
                             onSharedConsumed = onSharedConsumed,
+                            onPickFile = { launchAttachmentPicker() },
                             modifier = Modifier.fillMaxSize(),
                         )
                     }
@@ -284,3 +310,11 @@ public fun YardhalAppRoot(
         )
     }
 }
+
+private fun queryDisplayName(resolver: android.content.ContentResolver, uri: android.net.Uri): String =
+    runCatching {
+        resolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            val index = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+            if (index >= 0 && cursor.moveToFirst()) cursor.getString(index) else null
+        }
+    }.getOrNull() ?: uri.lastPathSegment ?: "upload.bin"

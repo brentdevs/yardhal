@@ -63,6 +63,7 @@ Phase numbers refer to `docs/architecture.md`.
 - [ ] bot-mode: BOT ISUPPORT letter + badge (P5)
 - [ ] account-extban: ban-account option in moderation menus (P6)
 - [ ] draft/metadata-2: METADATA GET/SET/SUB, avatars/display names (P5)
+- [x] soju.im/FILEHOST ISUPPORT: endpoint discovery, TLS-policy enforcement, authenticated POST with multipart fallback, attachment-tagged messages (P8)
 - [ ] UTF8ONLY: always transmit UTF-8, skip legacy encoding heuristics (P5)
 - [ ] draft/extended-isupport: full ISUPPORT set pre-registration (P5)
 - [ ] draft/ICON: network icon ISUPPORT token fetch/cache (P6)

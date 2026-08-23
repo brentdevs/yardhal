@@ -31,6 +31,7 @@ public data class ChatMessage(
     public val highlightsMe: Boolean,
     public val msgid: String?,
     public val replyToMsgid: String? = null,
+    public val attachmentUrl: String? = null,
 )
 
 public data class PresenceState(

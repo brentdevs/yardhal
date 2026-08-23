@@ -89,6 +89,14 @@ private fun ChatLine(
                 maxLines = 1,
             )
         }
+        if (message.attachmentUrl != null) {
+            Text(
+                text = "📎 ${message.attachmentUrl}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+                maxLines = 1,
+            )
+        }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(
                 text = formatTime(message.timestampMs),

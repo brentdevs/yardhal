@@ -107,11 +107,14 @@ Phases land in order; each phase ships with tests and updated docs.
   detected with LISTNETWORKS issued and numerics surfaced in the server
   buffer. Full network-management UI is follow-up work against a live
   bouncer.
-- **Phase 8 — Extras**: share-target intent lands text into the composer;
-  media uploads need a user-configured upload endpoint (Halyard-style
-  filehost/HTTP PUT) before they are meaningful; widgets and an on-device
-  catch-up digest are future work — Android has no FoundationModels
-  equivalent, so that feature needs a bundled model decision first.
+- **Phase 8 — Extras**: media uploads landed via the soju.im/FILEHOST
+  ISUPPORT extension (endpoint discovered from 005, HTTPS enforced on TLS
+  connections, SASL credentials reused as HTTP Basic, 201+Location resolved,
+  multipart retried on body-format rejections) with a composer paperclip,
+  SAF document picker and attachment-tag rendering. Share-target lands text
+  into the composer. Widgets and an on-device catch-up digest are future
+  work — Android has no FoundationModels equivalent, so that feature needs a
+  bundled model decision first.
 
 The authoritative IRCv3 obligation inventory lives in
 `docs/ircv3-checklist.md`; check items off as they land.

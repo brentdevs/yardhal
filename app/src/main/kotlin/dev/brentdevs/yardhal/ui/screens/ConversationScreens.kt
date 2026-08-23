@@ -82,6 +82,7 @@ public fun ConversationScreen(
     onDelete: (String) -> Unit,
     sharedDraft: String? = null,
     onSharedConsumed: () -> Unit = {},
+    onPickFile: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     var actionTarget by remember { mutableStateOf<ChatMessage?>(null) }
@@ -151,6 +152,7 @@ public fun ConversationScreen(
                 ComposerBar(
                     enabled = connected,
                     members = buffer.members,
+                    onAttach = onPickFile,
                     initialDraft = sharedDraft,
                     onSend = { text ->
                         onSharedConsumed()

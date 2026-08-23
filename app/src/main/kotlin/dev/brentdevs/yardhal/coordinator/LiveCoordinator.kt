@@ -86,6 +86,7 @@ public class LiveCoordinator(
         var quitRequested: Boolean = false
         var supportedCaps: Set<String> = emptySet()
         var hasWhox: Boolean = false
+        var filehostEndpoint: String? = null
         val openBatchTypes: MutableMap<String, String> = LinkedHashMap()
 
         fun isupportCasemapping(): CaseMapping = casemapping
@@ -472,6 +473,42 @@ public class LiveCoordinator(
         updateBufferKey(storageKey) { it.copy(replyDraft = message) }
     }
 
+    public fun uploadAndShare(
+        networkId: String,
+        storageKey: String,
+        fileName: String,
+        mimeType: String,
+        bytes: ByteArray,
+    ) {
+        val session = sessions[networkId] ?: return
+        val endpoint = session.filehostEndpoint ?: run {
+            appendSystem(session, _buffers.value[storageKey]?.ref ?: ConversationRef.server(networkId), "This network does not advertise a filehost (soju.im/FILEHOST).")
+            return
+        }
+        val config = effectiveConfig(session.config)
+        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val uploaded = try {
+                dev.brentdevs.yardhal.core.client.FilehostUploader.upload(
+                    endpointUrl = endpoint,
+                    file = dev.brentdevs.yardhal.core.client.OutgoingFile(fileName, mimeType, bytes),
+                    ircConnectionIsTls = config.tls,
+                    saslUser = config.saslAuthcid,
+                    saslPassword = config.saslPassword,
+                )
+            } catch (error: dev.brentdevs.yardhal.core.client.FilehostException) {
+                appendSystem(session, _buffers.value[storageKey]?.ref ?: ConversationRef.server(networkId), "Upload failed: ${error.message}")
+                return@launch
+            }
+            sendMessage(
+                session = session,
+                ref = _buffers.value[storageKey]?.ref ?: return@launch,
+                wireText = uploaded.url,
+                optimisticText = uploaded.url,
+                attachmentUrl = uploaded.url,
+            )
+        }
+    }
+
     private fun applyIsupportTokens(session: Session, message: IrcMessage) {
         val tokens = message.parameters.drop(1).dropLast(1).filter { it.isNotEmpty() }
         for (token in tokens) {
@@ -485,6 +522,8 @@ public class LiveCoordinator(
                 token.startsWith("CHATHISTORY=") ->
                     chathistoryLimit = token.substringAfter('=').toIntOrNull()?.coerceAtMost(200) ?: 0
                 token == "WHOX" -> session.hasWhox = true
+                token.startsWith("soju.im/FILEHOST=") ->
+                    session.filehostEndpoint = token.removePrefix("soju.im/FILEHOST=")
             }
         }
     }
@@ -554,6 +593,7 @@ public class LiveCoordinator(
             sentByUs = fromUs,
             highlightsMe = highlightsMe,
             replyToMsgid = message.tag("+draft/reply"),
+            attachmentUrl = message.tag("+draft/attachment"),
             playback = isPlayback,
         )
     }
@@ -636,6 +676,7 @@ public class LiveCoordinator(
         highlightsMe: Boolean,
         replyToMsgid: String? = null,
         playback: Boolean = false,
+        attachmentUrl: String? = null,
     ) {
         persistAsync(session, ref, sender, kind, text, msgid, timestampMs, sentByUs)
         updateBuffer(ref) { buffer ->
@@ -645,7 +686,8 @@ public class LiveCoordinator(
                 }
                 if (index >= 0) {
                     val messages = buffer.messages.toMutableList()
-                    messages[index] = messages[index].copy(msgid = msgid, timestampMs = timestampMs)
+                    messages[index] = messages[index]
+                        .copy(msgid = msgid, timestampMs = timestampMs, attachmentUrl = attachmentUrl)
                     return@updateBuffer buffer.copy(messages = messages)
                 }
             }
@@ -659,6 +701,8 @@ public class LiveCoordinator(
                 sentByUs = sentByUs,
                 highlightsMe = highlightsMe,
                 msgid = msgid,
+                replyToMsgid = replyToMsgid,
+                attachmentUrl = attachmentUrl,
             )
             val countsAsUnread = !sentByUs && !playback &&
                 kind in setOf(MessageKind.PRIVMSG, MessageKind.NOTICE, MessageKind.ACTION)
@@ -936,6 +980,7 @@ public class LiveCoordinator(
         optimisticText: String? = null,
         suppressOptimistic: Boolean = false,
         replyToMsgid: String? = null,
+        attachmentUrl: String? = null,
     ) {
         if (!suppressOptimistic) {
             appendChat(
@@ -949,15 +994,16 @@ public class LiveCoordinator(
                 sentByUs = true,
                 highlightsMe = false,
                 replyToMsgid = replyToMsgid,
+                attachmentUrl = attachmentUrl,
             )
         }
-        if (replyToMsgid != null) {
+        val tags = buildMap {
+            if (replyToMsgid != null) put("+draft/reply", replyToMsgid)
+            if (attachmentUrl != null) put("+draft/attachment", attachmentUrl)
+        }
+        if (tags.isNotEmpty()) {
             session.reconnector?.send(
-                IrcMessage(
-                    tags = mapOf("+draft/reply" to replyToMsgid),
-                    command = "PRIVMSG",
-                    parameters = listOf(ref.rawTarget, wireText),
-                ),
+                IrcMessage(tags = tags, command = "PRIVMSG", parameters = listOf(ref.rawTarget, wireText)),
             )
         } else {
             sendRaw(session, "PRIVMSG ${ref.rawTarget} :$wireText")
