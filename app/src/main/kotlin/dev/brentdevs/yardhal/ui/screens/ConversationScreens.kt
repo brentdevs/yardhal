@@ -293,6 +293,8 @@ public fun NetworkOverviewScreen(
     onOpenDebug: () -> Unit,
     rawLogVersion: Int,
     rawLogProvider: () -> List<dev.brentdevs.yardhal.coordinator.LiveCoordinator.RawFrame>,
+    showBouncerButton: Boolean = false,
+    onOpenBouncer: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     var pendingRemoval by remember { mutableStateOf<String?>(null) }
@@ -369,6 +371,9 @@ public fun NetworkOverviewScreen(
             TopAppBar(
                 title = { Text("Yardhal") },
                 actions = {
+                    if (showBouncerButton) {
+                        TextButton(onClick = onOpenBouncer) { Text("Bouncer") }
+                    }
                     TextButton(onClick = { debugVisible = true; onOpenDebug() }) { Text("Debug") }
                     TextButton(onClick = { browseVisible = true; onBrowseChannels() }) { Text("List") }
                 },

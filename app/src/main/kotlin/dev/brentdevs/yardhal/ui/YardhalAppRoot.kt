@@ -2,6 +2,9 @@ package dev.brentdevs.yardhal.ui
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -56,11 +59,17 @@ public fun YardhalAppRoot(
     val whoisInfo by coordinator.whois.collectAsStateWithLifecycle()
     val channelList by coordinator.channelList.collectAsStateWithLifecycle()
     val rawLogVersion by coordinator.rawLogVersion.collectAsStateWithLifecycle()
+    val bouncerVersion by coordinator.bouncerVersion.collectAsStateWithLifecycle()
 
     var addNetworkVisible by remember { mutableStateOf(false) }
     var selectedKey by remember { mutableStateOf<String?>(null) }
     var joinDialogVisible by remember { mutableStateOf(false) }
     var joinDraft by remember { mutableStateOf("") }
+    var bouncerVisible by remember { mutableStateOf(false) }
+    var bouncerAddr by remember { mutableStateOf("ircs://") }
+    var bouncerName by remember { mutableStateOf("") }
+    var bouncerNick by remember { mutableStateOf("") }
+    var bouncerPassword by remember { mutableStateOf("") }
 
     val configuration = LocalConfiguration.current
     val context = LocalContext.current
@@ -128,6 +137,8 @@ public fun YardhalAppRoot(
                             }
                         },
                         onOpenDebug = {},
+                        showBouncerButton = coordinator.hasBouncerSession(),
+                        onOpenBouncer = { bouncerVisible = true },
                         rawLogVersion = rawLogVersion,
                         rawLogProvider = { coordinator.rawLog(networks.firstOrNull()?.id ?: "") },
                     )
@@ -247,6 +258,117 @@ public fun YardhalAppRoot(
                 }
             }
         }
+    }
+
+    if (bouncerVisible) {
+        val entries = remember(bouncerVersion) { coordinator.bouncerEntries() }
+        AlertDialog(
+            onDismissRequest = { bouncerVisible = false },
+            title = { Text("Bouncer networks") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (entries.isEmpty()) {
+                        Text("No networks reported yet.", style = MaterialTheme.typography.bodySmall)
+                    } else {
+                        LazyColumn(modifier = Modifier.padding(vertical = 2.dp)) {
+                            items(entries.size) { index ->
+                                val entry = entries[index]
+                                Column(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        modifier = Modifier.fillMaxWidth(),
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(entry.attributes.name ?: entry.netId, style = MaterialTheme.typography.bodyMedium)
+                                            Text(
+                                                text = listOfNotNull(
+                                                    entry.attributes.host,
+                                                    entry.attributes.port?.toString(),
+                                                    entry.attributes.state?.wireName,
+                                                    entry.attributes.error?.let { "error: $it" },
+                                                ).joinToString(" · "),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                maxLines = 1,
+                                            )
+                                        }
+                                    }
+                                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                        val connected = entry.attributes.state?.wireName == "connected"
+                                        TextButton(onClick = {
+                                            coordinator.connectBouncerNetwork(entry.networkId, entry.netId, connect = !connected)
+                                        }) { Text(if (connected) "Disconnect" else "Connect") }
+                                        if (!entry.isBoundToThisConnection) {
+                                            TextButton(onClick = {
+                                                coordinator.deleteBouncerNetwork(entry.networkId, entry.netId)
+                                            }) { Text("Delete") }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    androidx.compose.material3.HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                    Text("Add network", style = MaterialTheme.typography.titleSmall)
+                    OutlinedTextField(
+                        value = bouncerAddr,
+                        onValueChange = { bouncerAddr = it },
+                        label = { Text("Address (ircs://host[:port])") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    OutlinedTextField(
+                        value = bouncerName,
+                        onValueChange = { bouncerName = it },
+                        label = { Text("Name (optional)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(
+                            value = bouncerNick,
+                            onValueChange = { bouncerNick = it },
+                            label = { Text("Nick (optional)") },
+                            singleLine = true,
+                            modifier = Modifier.weight(1f),
+                        )
+                        OutlinedTextField(
+                            value = bouncerPassword,
+                            onValueChange = { bouncerPassword = it },
+                            label = { Text("Pass (optional)") },
+                            singleLine = true,
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                    TextButton(
+                        enabled = bouncerAddr.isNotBlank(),
+                        onClick = {
+                            val networkId = networks.firstOrNull()?.id
+                            if (networkId != null) {
+                                coordinator.addBouncerNetwork(
+                                    networkId,
+                                    dev.brentdevs.yardhal.core.data.BouncerNetworkDraft(
+                                        addr = bouncerAddr.trim(),
+                                        name = bouncerName.trim(),
+                                        nick = bouncerNick.trim(),
+                                        password = bouncerPassword,
+                                    ),
+                                )
+                                bouncerAddr = "ircs://"
+                                bouncerName = ""
+                                bouncerNick = ""
+                                bouncerPassword = ""
+                            }
+                        },
+                    ) { Text("Add") }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { bouncerVisible = false }) { Text("Close") }
+            },
+        )
     }
 
     if (whoisInfo != null) {

@@ -87,6 +87,9 @@ public class LiveCoordinator(
         var supportedCaps: Set<String> = emptySet()
         var hasWhox: Boolean = false
         var filehostEndpoint: String? = null
+        var isBouncerDiscovery: Boolean = false
+        val bouncerStore: dev.brentdevs.yardhal.core.data.BouncerNetworkStore =
+            dev.brentdevs.yardhal.core.data.BouncerNetworkStore()
         val openBatchTypes: MutableMap<String, String> = LinkedHashMap()
 
         fun isupportCasemapping(): CaseMapping = casemapping
@@ -167,8 +170,9 @@ public class LiveCoordinator(
                         ?: (clock() / 1000 - 7 * 24 * 3600)
                     sendRaw(session, "PRIVMSG *playback :playback * start $lastSeen")
                 }
-                if ("soju.im/bouncer" in event.capabilities) {
-                    sendRaw(session, "BOUNCER LISTNETWORKS")
+                if (dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.CAPABILITY in event.capabilities) {
+                    session.isBouncerDiscovery = true
+                    bumpBouncerVersion()
                 }
             }
             is IrcEvent.MessageReceived -> handleInbound(session, event.message)
@@ -202,6 +206,7 @@ public class LiveCoordinator(
             message.command.equals("BATCH", true) -> handleBatchFrame(session, message)
             message.command.equals("REDACT", true) -> handleRedact(session, message)
             message.command.equals("TAGMSG", true) -> handleTagmsg(session, message)
+            message.command.equals("BOUNCER", true) -> handleBouncerMessage(session, message)
             message.command.equals("JOIN", true) -> handleJoin(session, message)
             message.command.equals("QUIT", true) -> handleQuit(session)
             message.command.equals("PART", true) -> handlePart(session, message)
@@ -226,6 +231,86 @@ public class LiveCoordinator(
     }
 
     private val netsplitCollapser = dev.brentdevs.yardhal.core.data.NetsplitCollapser()
+
+    public data class BouncerEntry(
+        public val networkId: String,
+        public val netId: String,
+        public val attributes: dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.Attributes,
+        public val isBoundToThisConnection: Boolean,
+    )
+
+    private val _bouncerVersion = MutableStateFlow(0)
+    public val bouncerVersion: StateFlow<Int> = _bouncerVersion.asStateFlow()
+
+    private fun bumpBouncerVersion() {
+        _bouncerVersion.value += 1
+    }
+
+    public fun hasBouncerSession(): Boolean =
+        sessions.values.any { it.isBouncerDiscovery }
+
+    public fun bouncerEntries(): List<BouncerEntry> =
+        sessions.values.filter { it.isBouncerDiscovery }.flatMap { session ->
+            session.bouncerStore.all().map { (netId, attrs) ->
+                BouncerEntry(
+                    networkId = session.config.id,
+                    netId = netId,
+                    attributes = attrs,
+                    isBoundToThisConnection = session.bouncerStore.boundNetId == netId,
+                )
+            }
+        }
+
+    private fun handleBouncerMessage(session: Session, message: IrcMessage) {
+        val update = dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.parseNetwork(message.parameters)
+        if (update != null) {
+            if (session.bouncerStore.apply(update)) bumpBouncerVersion()
+            return
+        }
+        val addedId = dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.parseAddNetworkReply(message.parameters)
+        if (addedId != null) {
+            appendSystem(
+                session,
+                ConversationRef.server(session.config.id),
+                "soju mgmt: network created ($addedId)",
+            )
+        }
+    }
+
+    public fun addBouncerNetwork(networkId: String, draft: dev.brentdevs.yardhal.core.data.BouncerNetworkDraft) {
+        val session = sessions[networkId] ?: return
+        if (!session.isBouncerDiscovery) {
+            appendSystem(session, ConversationRef.server(networkId), "soju mgmt: not a discovery connection")
+            return
+        }
+        val validationError = draft.addrValidationError()
+        if (validationError != null) {
+            appendSystem(session, ConversationRef.server(networkId), "soju mgmt: $validationError")
+            return
+        }
+        val line = dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.addNetworkCommand(
+            draft.toAttributes(),
+        )
+        appendSystem(session, ConversationRef.server(networkId), "soju mgmt: → $line")
+        sendRaw(session, line)
+    }
+
+    public fun deleteBouncerNetwork(networkId: String, netId: String) {
+        sessions[networkId]?.let { sendRaw(it, dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.delNetworkCommand(netId)) }
+    }
+
+    public fun setBouncerEnabled(networkId: String, networkName: String, enabled: Boolean) {
+        sessions[networkId]?.let {
+            sendRaw(it, "PRIVMSG BouncerServ :${dev.brentdevs.yardhal.core.data.BouncerServCommand.networkUpdate(networkName, enabled)}")
+        }
+    }
+
+    public fun connectBouncerNetwork(networkId: String, netId: String, connect: Boolean) {
+        sessions[networkId]?.let {
+            val verb = if (connect) "CONNECTNETWORK" else "DISCONNECTNETWORK"
+            sendRaw(it, "BOUNCER $verb $netId")
+        }
+    }
 
     public data class RawFrame(public val outbound: Boolean, public val line: String)
 
@@ -524,6 +609,10 @@ public class LiveCoordinator(
                 token == "WHOX" -> session.hasWhox = true
                 token.startsWith("soju.im/FILEHOST=") ->
                     session.filehostEndpoint = token.removePrefix("soju.im/FILEHOST=")
+                token.startsWith(dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.ISUPPORT_NET_ID_TOKEN + "=") ->
+                    session.bouncerStore.bind(
+                        token.substringAfter('='),
+                    ).also { bumpBouncerVersion() }
             }
         }
     }

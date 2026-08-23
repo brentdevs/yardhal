@@ -71,3 +71,8 @@ Phase numbers refer to `docs/architecture.md`.
 - [ ] client-batch: infrastructure only; no production use until ratified
 - [ ] WebSocket transport: n/a (native TCP/TLS client)
 - [ ] WEBIRC: server-only, n/a
+
+## Bouncer extensions (soju)
+
+- [x] soju.im/bouncer-networks: capability + notify requested, BOUNCER NETWORK upsert/delete parsing with escaped attributes, ADDNETWORK/DELNETWORK, CONNECT/DISCONNECTNETWORK, BouncerServ service commands, draft diffing (P7)
+- [x] znc.in/playback: playback start request + batch classification (P7)
