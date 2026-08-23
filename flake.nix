@@ -20,8 +20,10 @@
         cmdLineToolsVersion = "11.0";
         buildToolsVersions = [ "35.0.0" ];
         platformVersions = [ "35" ];
-        includeEmulator = false;
-        includeSystemImages = false;
+        includeEmulator = true;
+        includeSystemImages = true;
+        systemImageTypes = [ "google_apis" ];
+        abiVersions = [ "x86_64" ];
         includeNDK = false;
       };
     in
