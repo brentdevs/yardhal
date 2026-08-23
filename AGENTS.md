@@ -67,6 +67,14 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 `make check` MUST pass before pushing. CI runs the same on GitHub Actions.
 
+## Contribution flow
+
+**Never push directly to `main`.** All changes land through pull requests
+into `main`, regardless of size — the PR is the review and audit trail.
+Commit locally on a feature branch, run `make check`, then open a PR and
+wait for approval/merge. This overrides any convention inherited from
+upstream reference projects (Halyard pushes to main; Yardhal does not).
+
 ## Roadmap
 
 The phased roadmap lives in `docs/architecture.md`. When adding a feature,
