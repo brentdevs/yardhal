@@ -120,6 +120,10 @@ public fun YardhalAppRoot(
                             coordinator.markRead(key)
                             selectedKey = key
                         },
+                        onSelectServer = { networkId ->
+                            coordinator.markRead(ConversationRef.server(networkId).storageKey)
+                            selectedKey = ConversationRef.server(networkId).storageKey
+                        },
                         onAddNetwork = { addNetworkVisible = true },
                         onRemoveNetwork = { coordinator.removeNetwork(it) },
                         onBrowseChannels = {
@@ -233,6 +237,10 @@ public fun YardhalAppRoot(
                             onSelect = { key ->
                                 coordinator.markRead(key)
                                 selectedKey = key
+                            },
+                            onSelectServer = { networkId ->
+                                coordinator.markRead(ConversationRef.server(networkId).storageKey)
+                                selectedKey = ConversationRef.server(networkId).storageKey
                             },
                             onAddNetwork = { addNetworkVisible = true },
                             onRemoveNetwork = { coordinator.removeNetwork(it) },

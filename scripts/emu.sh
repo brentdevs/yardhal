@@ -6,8 +6,8 @@ BOOT_TIMEOUT="${YARDHAL_BOOT_TIMEOUT:-300}"
 
 EMULATOR="$ANDROID_HOME/emulator/emulator"
 ADB="$ANDROID_HOME/platform-tools/adb"
-AVDMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager"
-SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+AVDMANAGER="$ANDROID_HOME/cmdline-tools/11.0/bin/avdmanager"
+SDKMANAGER="$ANDROID_HOME/cmdline-tools/11.0/bin/sdkmanager"
 
 if [ ! -x "$EMULATOR" ]; then
   echo "emulator binary missing from ANDROID_HOME — re-provision SDK" >&2
@@ -37,11 +37,6 @@ echo "Booting emulator (headless) ..."
   > /tmp/opencode/emulator.log 2>&1 &
 EMU_PID=$!
 echo $EMU_PID > /tmp/opencode/emulator.pid
-
-cleanup() {
-  kill "$EMU_PID" 2>/dev/null || true
-}
-trap cleanup EXIT
 
 "$ADB" wait-for-device
 echo "device detected, waiting for boot completion ..."

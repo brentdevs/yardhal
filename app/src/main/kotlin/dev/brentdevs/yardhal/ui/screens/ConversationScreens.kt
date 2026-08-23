@@ -285,6 +285,7 @@ public fun NetworkOverviewScreen(
     buffers: List<ConversationBuffer>,
     networks: List<dev.brentdevs.yardhal.coordinator.UiNetwork>,
     onSelect: (String) -> Unit,
+    onSelectServer: (String) -> Unit,
     onAddNetwork: () -> Unit,
     onRemoveNetwork: (String) -> Unit,
     onBrowseChannels: () -> Unit,
@@ -393,7 +394,7 @@ public fun NetworkOverviewScreen(
             items(networks.size, key = { networks[it].id }) { index ->
                 val network = networks[index]
                 Card(
-                    onClick = {},
+                    onClick = { onSelectServer(network.id) },
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Row(
