@@ -1,4 +1,4 @@
-.PHONY: check build test clean sdk test-ircd emu emu-install
+.PHONY: check build test clean sdk test-ircd emu emu-install emu-windowed play
 
 ANDROID_HOME ?= $(error ANDROID_HOME is not set; run inside `nix develop`)
 
@@ -22,7 +22,15 @@ test-ircd:
 	./gradlew $(GRADLE_FLAGS) :core:client:test --tests "*ErgoRoundTripTest*" --rerun-tasks
 
 emu:
+	bash scripts/emu.sh --headless
+
+emu-windowed:
 	bash scripts/emu.sh
+
+play: build emu-windowed
+	$(ADB) install -r app/build/outputs/apk/debug/app-debug.apk
+	$(ADB) shell am start -n dev.brentdevs.yardhal/.MainActivity
+	@echo "Yardhal is running in the emulator window."
 
 emu-install: build emu
 	$(ADB) install -r app/build/outputs/apk/debug/app-debug.apk

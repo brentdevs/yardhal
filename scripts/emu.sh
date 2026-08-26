@@ -27,9 +27,19 @@ if [ ! -d "$ANDROID_AVD_HOME/$AVD_NAME.avd" ]; then
   echo no | "$AVDMANAGER" create avd -n "$AVD_NAME" -k "$IMAGE" --device pixel_6 --force
 fi
 
-echo "Booting emulator (headless) ..."
+HEADLESS=0
+[ "${1:-}" = "--headless" ] && HEADLESS=1
+
+if [ "$HEADLESS" = "1" ]; then
+  echo "Booting emulator (headless) ..."
+  WINDOW_ARGS="-no-window"
+else
+  echo "Booting emulator (windowed) ..."
+  WINDOW_ARGS=""
+fi
+
 "$EMULATOR" -avd "$AVD_NAME" \
-  -no-window \
+  $WINDOW_ARGS \
   -no-boot-anim \
   -no-snapshot \
   -gpu swiftshader_indirect \
