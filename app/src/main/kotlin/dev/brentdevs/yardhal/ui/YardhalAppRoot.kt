@@ -61,6 +61,7 @@ public fun YardhalAppRoot(
     val channelList by coordinator.channelList.collectAsStateWithLifecycle()
     val rawLogVersion by coordinator.rawLogVersion.collectAsStateWithLifecycle()
     val bouncerVersion by coordinator.bouncerVersion.collectAsStateWithLifecycle()
+    val mutedKeys by coordinator.mutedState.collectAsStateWithLifecycle()
 
     var addNetworkVisible by remember { mutableStateOf(false) }
     var pendingPreset by remember { mutableStateOf<NetworkPresetUi?>(null) }
@@ -126,6 +127,10 @@ public fun YardhalAppRoot(
                             coordinator.markRead(ConversationRef.server(networkId).storageKey)
                             selectedKey = ConversationRef.server(networkId).storageKey
                         },
+                        mutedKeys = mutedKeys,
+                        onMarkRead = { key -> coordinator.markRead(key) },
+                        onToggleMute = { key -> coordinator.toggleMute(key) },
+                        onLeave = { key -> coordinator.leaveConversation(networkId = key.substringBefore("|"), storageKey = key) },
                         onAddNetwork = { addNetworkVisible = true },
                         onRemoveNetwork = { coordinator.removeNetwork(it) },
                         onBrowseChannels = {
@@ -164,10 +169,14 @@ public fun YardhalAppRoot(
                                 coordinator.sendTyping(networkId, key)
                             },
                             onOpenJoin = { joinDialogVisible = true },
-                            onLoadHistory = { coordinator.loadPersistedHistory(key) },
+                            onLoadHistory = {
+                                coordinator.loadPersistedHistory(key)
+                                coordinator.ensureMembers(networkId, key)
+                            },
                             onReact = { msgid, emoji -> coordinator.react(networkId, key, msgid, emoji) },
                             onSetReplyDraft = { message -> coordinator.setReplyDraft(networkId, key, message) },
                             onDelete = { msgid -> coordinator.deleteMessage(networkId, key, msgid) },
+                            onMemberAction = { action, nick -> coordinator.memberAction(networkId, key, action, nick) },
                             sharedDraft = sharedDraft,
                             onSharedConsumed = onSharedConsumed,
                             onPickFile = { launchAttachmentPicker() },
@@ -210,10 +219,14 @@ public fun YardhalAppRoot(
                                 coordinator.sendTyping(networkId, key)
                             },
                             onOpenJoin = { joinDialogVisible = true },
-                            onLoadHistory = { coordinator.loadPersistedHistory(key) },
+                            onLoadHistory = {
+                                coordinator.loadPersistedHistory(key)
+                                coordinator.ensureMembers(networkId, key)
+                            },
                             onReact = { msgid, emoji -> coordinator.react(networkId, key, msgid, emoji) },
                             onSetReplyDraft = { message -> coordinator.setReplyDraft(networkId, key, message) },
                             onDelete = { msgid -> coordinator.deleteMessage(networkId, key, msgid) },
+                            onMemberAction = { action, nick -> coordinator.memberAction(networkId, key, action, nick) },
                             sharedDraft = sharedDraft,
                             onSharedConsumed = onSharedConsumed,
                             onPickFile = { launchAttachmentPicker() },
@@ -249,6 +262,10 @@ public fun YardhalAppRoot(
                                 coordinator.markRead(ConversationRef.server(networkId).storageKey)
                                 selectedKey = ConversationRef.server(networkId).storageKey
                             },
+                        mutedKeys = mutedKeys,
+                        onMarkRead = { key -> coordinator.markRead(key) },
+                        onToggleMute = { key -> coordinator.toggleMute(key) },
+                        onLeave = { key -> coordinator.leaveConversation(networkId = key.substringBefore("|"), storageKey = key) },
                             onAddNetwork = { addNetworkVisible = true },
                             onRemoveNetwork = { coordinator.removeNetwork(it) },
                             onBrowseChannels = {

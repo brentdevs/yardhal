@@ -1,5 +1,6 @@
 package dev.brentdevs.yardhal.coordinator
 
+import dev.brentdevs.yardhal.core.data.ChannelMember
 import dev.brentdevs.yardhal.core.data.ConversationKind
 import dev.brentdevs.yardhal.core.data.ConversationRef
 import dev.brentdevs.yardhal.core.data.MessageKind
@@ -45,7 +46,7 @@ public data class ConversationBuffer(
     public val topic: String? = null,
     public val messages: List<ChatMessage> = emptyList(),
     public val hasUnread: Boolean = false,
-    public val members: List<String> = emptyList(),
+    public val members: List<ChannelMember> = emptyList(),
     public val memberPresence: Map<String, PresenceState> = emptyMap(),
     public val typingUsers: Map<String, Long> = emptyMap(),
     public val reactions: Map<String, Map<String, Set<String>>> = emptyMap(),

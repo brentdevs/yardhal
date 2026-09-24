@@ -118,6 +118,12 @@ public class LiveCoordinator(
                 val isAutojoined = ref.kind == ConversationKind.CHANNEL &&
                     ref.rawTarget in session.config.autojoin
                 if (!isAutojoined) buffer(ref)
+                if (ref.kind == ConversationKind.CHANNEL &&
+                    ref.rawTarget !in session.config.autojoin &&
+                    session.statusFlow.value == ConnectionStatus.REGISTERED
+                ) {
+                    sendRaw(session, "JOIN ${ref.rawTarget}")
+                }
             }
         }
     }
@@ -200,7 +206,14 @@ public class LiveCoordinator(
     }
 
     private fun joinAutojoins(session: Session) {
-        for (channel in session.config.autojoin) {
+        val channels = LinkedHashSet<String>()
+        for (channel in session.config.autojoin) channels.add(channel)
+        for ((key, buffer) in _buffers.value) {
+            if (buffer.ref.networkId == session.config.id && buffer.ref.kind == ConversationKind.CHANNEL) {
+                channels.add(buffer.ref.rawTarget)
+            }
+        }
+        for (channel in channels) {
             sendRaw(session, "JOIN $channel")
         }
     }
@@ -233,6 +246,8 @@ public class LiveCoordinator(
             numeric == 332 -> handleTopicNumeric(session, message)
             numeric == 331 || numeric == 353 || numeric == 366 || numeric == 367 ->
                 handleNamesRelatedNumeric(session, message, numeric)
+            numeric == 352 -> accumulateWhoLine(session, message)
+            numeric == 315 -> finalizeNames(session, message)
             numeric == 354 -> handleWhoXLine(session, message)
             numeric == 322 -> accumulateListEntry(session, message)
             numeric == 323 -> finalizeChannelList()
@@ -440,7 +455,7 @@ public class LiveCoordinator(
         }
     }
 
-    private val pendingNames = LinkedHashMap<String, MutableSet<String>>()
+    private val pendingNames = LinkedHashMap<String, MutableSet<dev.brentdevs.yardhal.core.data.ChannelMember>>()
     private var prefixModes: dev.brentdevs.yardhal.core.protocol.ChannelPrefixModes =
         dev.brentdevs.yardhal.core.protocol.ChannelPrefixModes.DEFAULT
     private var chathistoryLimit: Int = 0
@@ -460,7 +475,7 @@ public class LiveCoordinator(
         if (message.parameters.size < 2) return
         val channel = message.parameters[1]
         val key = ConversationRef.channel(session.config.id, channel, session.casemapping).storageKey
-        val members = pendingNames.remove(key)?.sortedBy { it.lowercase() } ?: return
+        val members = pendingNames.remove(key)?.sortedBy { it.nick.lowercase() } ?: return
         updateBufferKey(key) { it.copy(members = members) }
     }
 
@@ -487,6 +502,26 @@ public class LiveCoordinator(
         }
     }
 
+    private fun accumulateWhoLine(session: Session, message: IrcMessage) {
+        if (message.parameters.size < 7) return
+        val channel = message.parameters[1]
+        val rawNick = message.parameters[5]
+        val nick = rawNick.substringBefore('!').substringBefore('@')
+        val flags = message.parameters.getOrNull(6).orEmpty()
+        val symbol = prefixModes.symbols.firstOrNull { it in flags }
+        val key = ConversationRef.channel(session.config.id, channel, session.casemapping).storageKey
+        pendingNames.getOrPut(key) { LinkedHashSet() }
+            .add(dev.brentdevs.yardhal.core.data.ChannelMember(nick, symbol))
+    }
+
+    public fun ensureMembers(networkId: String, storageKey: String) {
+        val session = sessions[networkId] ?: return
+        val buffer = _buffers.value[storageKey] ?: return
+        if (buffer.ref.kind != ConversationKind.CHANNEL) return
+        if (buffer.members.isNotEmpty()) return
+        sendRaw(session, "WHO ${buffer.ref.rawTarget}")
+    }
+
     private fun handleWhoXLine(session: Session, message: IrcMessage) {
         if (message.parameters.size < 5) return
         val fields = message.parameters.drop(1)
@@ -499,7 +534,7 @@ public class LiveCoordinator(
     private fun updateMemberPresence(session: Session, nick: String, away: Boolean, account: String?) {
         for ((key, buffer) in _buffers.value) {
             if (buffer.ref.networkId != session.config.id) continue
-            if (buffer.members.any { it.equals(nick, ignoreCase = true) }) {
+            if (buffer.members.any { it.nick.equals(nick, ignoreCase = true) }) {
                 updateBufferKey(key) { it.copy(memberPresence = it.memberPresence + (nick to PresenceState(away, account))) }
             }
         }
@@ -592,6 +627,41 @@ public class LiveCoordinator(
 
     public fun setReplyDraft(networkId: String, storageKey: String, message: ChatMessage?) {
         updateBufferKey(storageKey) { it.copy(replyDraft = message) }
+    }
+
+    public fun memberAction(networkId: String, storageKey: String, action: dev.brentdevs.yardhal.ui.screens.MemberAction, nick: String) {
+        when (action) {
+            dev.brentdevs.yardhal.ui.screens.MemberAction.MESSAGE -> sendText(networkId, storageKey, "/msg $nick hello")
+            dev.brentdevs.yardhal.ui.screens.MemberAction.WHOIS -> sendText(networkId, storageKey, "/whois $nick")
+            dev.brentdevs.yardhal.ui.screens.MemberAction.KICK -> sendText(networkId, storageKey, "/kick $nick")
+            dev.brentdevs.yardhal.ui.screens.MemberAction.BAN -> sendText(networkId, storageKey, "/ban *!*$nick")
+            dev.brentdevs.yardhal.ui.screens.MemberAction.IGNORE -> {
+                ignoreStore?.add(nick)
+                sessions[networkId]?.let { session ->
+                    appendSystem(
+                        session,
+                        _buffers.value[storageKey]?.ref ?: ConversationRef.server(networkId),
+                        "Ignoring $nick",
+                    )
+                }
+            }
+        }
+    }
+
+    private val _mutedState = MutableStateFlow(mutes.all())
+    public val mutedState: StateFlow<Set<String>> = _mutedState.asStateFlow()
+
+    public fun toggleMute(storageKey: String) {
+        if (!mutes.unmute(storageKey)) mutes.mute(storageKey)
+        _mutedState.value = mutes.all()
+    }
+
+    public fun leaveConversation(networkId: String, storageKey: String) {
+        val buffer = _buffers.value[storageKey] ?: return
+        if (buffer.ref.kind == ConversationKind.CHANNEL) {
+            sendText(networkId, storageKey, "/part ${buffer.ref.rawTarget}")
+        }
+        _buffers.value = _buffers.value - storageKey
     }
 
     public fun uploadAndShare(
@@ -1070,7 +1140,7 @@ public class LiveCoordinator(
             is SlashCommand.MonitorList -> sendRaw(session, "MONITOR L")
             is SlashCommand.WhoQuery -> sendRaw(
                 session,
-                if (command.useWhox && session.hasWhox) "WHO ${command.target} %afhn" else "WHO ${command.target}",
+                if (command.useWhox && session.hasWhox) "WHO ${command.target} %acfhn" else "WHO ${command.target}",
             )
             is SlashCommand.IgnoreAdd -> {
                 ignoreStore?.add(command.mask)

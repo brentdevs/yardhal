@@ -11,10 +11,10 @@ class NamesParserTests {
     private val prefixes = ChannelPrefixModes.DEFAULT
 
     @Test
-    fun stripsHighestPrefixOnly() {
-        assertEquals("alice", NamesParser.stripPrefixes("@alice", prefixes))
-        assertEquals("bob", NamesParser.stripPrefixes("+bob", prefixes))
-        assertEquals("carol", NamesParser.stripPrefixes("carol", prefixes))
+    fun parsesHighestPrefixWithRole() {
+        assertEquals(ChannelMember("alice", '@'), NamesParser.parseMember("@alice", prefixes))
+        assertEquals(ChannelMember("bob", '+'), NamesParser.parseMember("+bob", prefixes))
+        assertEquals(ChannelMember("carol", null), NamesParser.parseMember("carol", prefixes))
     }
 
     @Test
@@ -24,7 +24,15 @@ class NamesParserTests {
             prefixes,
         )
         assertEquals("#room", channel)
-        assertEquals(listOf("alice", "bob", "carol", "dave"), members)
+        assertEquals(
+            listOf(
+                ChannelMember("alice", '@'),
+                ChannelMember("bob", '+'),
+                ChannelMember("carol", null),
+                ChannelMember("dave", null),
+            ),
+            members,
+        )
     }
 
     @Test
