@@ -41,6 +41,19 @@ public class MessageStore(private val dao: MessageDao) {
     public suspend fun latestTimestamp(conversation: ConversationRef): Long? =
         dao.latestTimestamp(conversation.networkId, conversation.normalizedTarget)
 
+    public suspend fun knownConversations(
+        networkId: String,
+        casemapping: dev.brentdevs.yardhal.core.protocol.CaseMapping = dev.brentdevs.yardhal.core.protocol.CaseMapping.RFC1459,
+    ): List<ConversationRef> =
+        dao.conversations(networkId).mapNotNull { target ->
+            val leader = target.firstOrNull()
+            when {
+                target == ConversationRef.SERVER_TARGET -> ConversationRef.server(networkId)
+                leader != null && leader in "#&" -> ConversationRef.channel(networkId, target, casemapping)
+                else -> ConversationRef.directMessage(networkId, target, casemapping)
+            }
+        }
+
     public suspend fun trimTo(conversation: ConversationRef, keep: Int) {
         dao.trim(conversation.networkId, conversation.normalizedTarget, keep)
     }

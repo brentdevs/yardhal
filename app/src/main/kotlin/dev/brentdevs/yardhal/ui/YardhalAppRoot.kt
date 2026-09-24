@@ -37,6 +37,7 @@ import dev.brentdevs.yardhal.ui.screens.ConversationScreen
 import dev.brentdevs.yardhal.ui.screens.NetworkDraft
 import dev.brentdevs.yardhal.ui.screens.NetworkOverviewScreen
 import dev.brentdevs.yardhal.ui.screens.NetworkPresetUi
+import dev.brentdevs.yardhal.ui.screens.WelcomeScreen
 import dev.brentdevs.yardhal.ui.theme.YardhalTheme
 
 private sealed interface AppDestination {
@@ -62,6 +63,7 @@ public fun YardhalAppRoot(
     val bouncerVersion by coordinator.bouncerVersion.collectAsStateWithLifecycle()
 
     var addNetworkVisible by remember { mutableStateOf(false) }
+    var pendingPreset by remember { mutableStateOf<NetworkPresetUi?>(null) }
     var selectedKey by remember { mutableStateOf<String?>(null) }
     var joinDialogVisible by remember { mutableStateOf(false) }
     var joinDraft by remember { mutableStateOf("") }
@@ -178,11 +180,16 @@ public fun YardhalAppRoot(
             when {
                 addNetworkVisible -> AddNetworkSheet(
                     presets = presets,
+                    initialPreset = pendingPreset,
                     onSave = {
                         onNetworkSaved(it)
                         addNetworkVisible = false
+                        pendingPreset = null
                     },
-                    onDismiss = { addNetworkVisible = false },
+                    onDismiss = {
+                        addNetworkVisible = false
+                        pendingPreset = null
+                    },
                 )
 
                 selectedKey != null -> {
@@ -217,17 +224,17 @@ public fun YardhalAppRoot(
 
                 else -> {
                     if (networks.isEmpty()) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .padding(24.dp),
-                            verticalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterVertically),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                        ) {
-                            Text("Welcome to Yardhal", style = MaterialTheme.typography.headlineSmall)
-                            Text("Your networks sail with you.", style = MaterialTheme.typography.titleMedium)
-                            Button(onClick = { addNetworkVisible = true }) { Text("Add a network") }
-                        }
+                        WelcomeScreen(
+                            onAddNetwork = {
+                                pendingPreset = null
+                                addNetworkVisible = true
+                            },
+                            presets = presets,
+                            onPickPreset = { picked ->
+                                pendingPreset = picked
+                                addNetworkVisible = true
+                            },
+                        )
                     } else {
                         NetworkOverviewScreen(
                             buffers = buffers.values

@@ -86,6 +86,7 @@ class ErgoRoundTripTest {
         removeLineContaining(lines, "\"[::1]:6667\":")
         removeBlock(lines, "\":6697\":", "min-tls-version")
         replaceFirst(lines, "path: ircd.db", "path: ${File(dataDir, "datastore").absolutePath}")
+        replaceFirst(lines, "lock-file:", "lock-file: ${File(dataDir, "ircd.lock").absolutePath}")
         return lines.joinToString("\n")
     }
 

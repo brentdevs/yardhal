@@ -7,7 +7,9 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
@@ -29,8 +31,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import dev.brentdevs.yardhal.coordinator.ChatMessage
 import dev.brentdevs.yardhal.coordinator.ConversationBuffer
-import dev.brentdevs.yardhal.ui.components.DaySeparator
+import dev.brentdevs.yardhal.ui.components.DayPill
 import dev.brentdevs.yardhal.ui.components.MessageRow
+import dev.brentdevs.yardhal.ui.components.StatusDot
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
@@ -38,21 +41,35 @@ import java.time.format.DateTimeFormatter
 
 private sealed interface TranscriptEntry {
     public data class DayHeader(public val label: String) : TranscriptEntry
-    public data class Message(public val value: ChatMessage) : TranscriptEntry
+    public data class Message(public val value: ChatMessage, public val groupedWithPrevious: Boolean) : TranscriptEntry
 }
+
+private const val GROUP_WINDOW_MS = 5 * 60 * 1000L
 
 private fun buildTranscript(buffer: ConversationBuffer): List<TranscriptEntry> {
     val zone = ZoneId.systemDefault()
     val ordered = buffer.messages.asReversed()
     val entries = ArrayList<TranscriptEntry>(ordered.size + 4)
     var lastDate: LocalDate? = null
+    var previousSender: String? = null
+    var previousTimestamp = 0L
     for (message in ordered) {
-        val date = Instant.ofEpochMilli(message.timestampMs).atZone(zone).toLocalDate()
+        val timestamp = message.timestampMs
+        val date = Instant.ofEpochMilli(timestamp).atZone(zone).toLocalDate()
         if (date != lastDate) {
             entries.add(TranscriptEntry.DayHeader(formatDayLabel(date)))
             lastDate = date
+            previousSender = null
         }
-        entries.add(TranscriptEntry.Message(message))
+        val groupable = message.kind != dev.brentdevs.yardhal.core.data.MessageKind.SYSTEM &&
+            message.kind != dev.brentdevs.yardhal.core.data.MessageKind.JOIN &&
+            message.kind != dev.brentdevs.yardhal.core.data.MessageKind.PART
+        val grouped = groupable &&
+            previousSender == message.sender &&
+            timestamp - previousTimestamp < GROUP_WINDOW_MS
+        entries.add(TranscriptEntry.Message(message, grouped))
+        previousSender = message.sender
+        previousTimestamp = timestamp
     }
     return entries
 }
@@ -184,11 +201,12 @@ public fun ConversationScreen(
                     }
                 }) { index ->
                     when (val entry = entries[index]) {
-                        is TranscriptEntry.DayHeader -> DaySeparator(entry.label)
+                        is TranscriptEntry.DayHeader -> DayPill(entry.label)
                         is TranscriptEntry.Message -> {
                             val message = entry.value
                             MessageRow(
                                 message = message,
+                                groupedWithPrevious = entry.groupedWithPrevious,
                                 reactions = buffer.reactions[message.msgid].orEmpty()
                                     .filterValues { it.isNotEmpty() },
                                 quotedText = message.replyToMsgid?.let { target ->
@@ -391,6 +409,16 @@ public fun NetworkOverviewScreen(
             contentPadding = PaddingValues(12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
+            if (networks.isNotEmpty()) {
+                item(key = "header-networks") {
+                    Text(
+                        text = "Networks",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(start = 4.dp, top = 4.dp, bottom = 2.dp),
+                    )
+                }
+            }
             items(networks.size, key = { networks[it].id }) { index ->
                 val network = networks[index]
                 Card(
@@ -398,25 +426,39 @@ public fun NetworkOverviewScreen(
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Row(
-                        modifier = Modifier.padding(12.dp),
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(network.name, style = MaterialTheme.typography.titleSmall)
-                            Text(
-                                when (network.status) {
-                                    dev.brentdevs.yardhal.coordinator.ConnectionStatus.REGISTERED ->
-                                        "${network.ownNick} · connected"
-                                    dev.brentdevs.yardhal.coordinator.ConnectionStatus.CONNECTING -> "connecting…"
-                                    dev.brentdevs.yardhal.coordinator.ConnectionStatus.DISCONNECTED -> "offline"
-                                },
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            StatusDot(network.status)
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column {
+                                Text(network.name, style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    when (network.status) {
+                                        dev.brentdevs.yardhal.coordinator.ConnectionStatus.REGISTERED ->
+                                            "${network.ownNick} · connected"
+                                        dev.brentdevs.yardhal.coordinator.ConnectionStatus.CONNECTING -> "connecting…"
+                                        dev.brentdevs.yardhal.coordinator.ConnectionStatus.DISCONNECTED -> "offline"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
                         }
                         TextButton(onClick = { pendingRemoval = network.id }) { Text("Remove") }
                     }
+                }
+            }
+            if (buffers.isNotEmpty()) {
+                item(key = "header-conversations") {
+                    Text(
+                        text = "Conversations",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(start = 4.dp, top = 8.dp, bottom = 2.dp),
+                    )
                 }
             }
             items(buffers.size, key = { buffers[it].key }) { index ->

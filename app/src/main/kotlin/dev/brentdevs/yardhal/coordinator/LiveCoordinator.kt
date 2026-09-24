@@ -104,8 +104,22 @@ public class LiveCoordinator(
         val session = Session(config)
         sessions[config.id] = session
         ensureBaseBuffers(session)
+        restoreKnownConversations(session)
         refreshNetworkStates()
         launchSession(session)
+    }
+
+    private fun restoreKnownConversations(session: Session) {
+        scope.launch {
+            val known = runCatching {
+                messageStore.knownConversations(session.config.id, session.casemapping)
+            }.getOrDefault(emptyList())
+            for (ref in known) {
+                val isAutojoined = ref.kind == ConversationKind.CHANNEL &&
+                    ref.rawTarget in session.config.autojoin
+                if (!isAutojoined) buffer(ref)
+            }
+        }
     }
 
     public fun disconnect(networkId: String, quitReason: String = "Yardhal") {
@@ -201,6 +215,7 @@ public class LiveCoordinator(
     private fun handleInbound(session: Session, message: IrcMessage) {
         val numeric = message.numeric
         when {
+            message.command.equals("CAP", true) -> return
             message.command.equals("PRIVMSG", true) || message.command.equals("NOTICE", true) ->
                 handleChatMessage(session, message)
             message.command.equals("BATCH", true) -> handleBatchFrame(session, message)
@@ -216,8 +231,8 @@ public class LiveCoordinator(
                 appendServerLine(session, message, message.command.lowercase())
             message.command.equals("NOTE", true) -> appendServerLine(session, message, "note")
             numeric == 332 -> handleTopicNumeric(session, message)
-            numeric == 353 -> accumulateNames(session, message)
-            numeric == 366 -> finalizeNames(session, message)
+            numeric == 331 || numeric == 353 || numeric == 366 || numeric == 367 ->
+                handleNamesRelatedNumeric(session, message, numeric)
             numeric == 354 -> handleWhoXLine(session, message)
             numeric == 322 -> accumulateListEntry(session, message)
             numeric == 323 -> finalizeChannelList()
@@ -450,6 +465,27 @@ public class LiveCoordinator(
     }
 
     private var whoxQuerySent: Boolean = false
+
+    private fun handleNamesRelatedNumeric(session: Session, message: IrcMessage, numeric: Int) {
+        if (numeric == 331) {
+            handleTopicNumeric(session, message)
+            return
+        }
+        if (numeric == 353) {
+            accumulateNames(session, message)
+            return
+        }
+        if (numeric == 366) {
+            finalizeNames(session, message)
+            return
+        }
+        if (message.parameters.size >= 2) {
+            val channel = message.parameters[1]
+            val ref = ConversationRef.channel(session.config.id, channel, session.casemapping)
+            val body = message.parameters.drop(2).joinToString(" ").ifEmpty { message.parameters[1] }
+            appendSystem(session, ref, body, MessageKind.SYSTEM)
+        }
+    }
 
     private fun handleWhoXLine(session: Session, message: IrcMessage) {
         if (message.parameters.size < 5) return
@@ -901,8 +937,9 @@ public class LiveCoordinator(
     }
 
     private fun requestChathistory(session: Session, ref: ConversationRef) {
-        if (chathistoryLimit <= 0 || ref.kind != ConversationKind.CHANNEL) return
-        val count = minOf(chathistoryLimit, 100)
+        val supported = chathistoryLimit > 0 || "draft/chathistory" in session.supportedCaps
+        if (!supported || ref.kind != ConversationKind.CHANNEL) return
+        val count = if (chathistoryLimit > 0) minOf(chathistoryLimit, 100) else 50
         sendRaw(session, "CHATHISTORY LATEST ${ref.rawTarget} * $count")
     }
 

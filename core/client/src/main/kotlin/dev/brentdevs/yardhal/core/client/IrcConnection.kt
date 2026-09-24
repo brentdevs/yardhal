@@ -105,6 +105,7 @@ public class IrcConnection(
     private var registeredNickname: String? = null
 
     private var nickUserSent: Boolean = false
+    private var nickCollisionRetried: Boolean = false
     private var negotiator: CapabilityNegotiator? = null
     private var saslHandler: SaslPlainHandler? = null
 
@@ -225,6 +226,11 @@ public class IrcConnection(
             numeric == 1 && registeredNickname == null -> {
                 registeredNickname = message.parameters.firstOrNull() ?: config.nick
                 emit(IrcEvent.Registered(registeredNickname!!, message.parameters.lastOrNull() ?: ""))
+            }
+            (numeric == 432 || numeric == 433) && registeredNickname == null && !nickCollisionRetried -> {
+                nickCollisionRetried = true
+                val retryNick = "${config.nick}_"
+                sendLine("NICK $retryNick")
             }
         }
         emit(IrcEvent.MessageReceived(message))
