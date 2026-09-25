@@ -1,9 +1,11 @@
 package dev.brentdevs.yardhal.core.data
 
 import androidx.room.Dao
+import androidx.room.RawQuery
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.sqlite.db.SupportSQLiteQuery
 
 @Dao
 public interface MessageDao {
@@ -49,4 +51,25 @@ public interface MessageDao {
 
     @Query("DELETE FROM messages WHERE networkId = :networkId")
     public suspend fun deleteNetwork(networkId: String)
+
+    @Query("SELECT * FROM messages")
+    public suspend fun allRows(): List<MessageRow>
+
+    @RawQuery(observedEntities = [MessageRow::class])
+    public suspend fun indexMessageRaw(query: SupportSQLiteQuery): Int
+
+    @RawQuery(observedEntities = [MessageRow::class])
+    public suspend fun deleteFtsForNetworkRaw(query: SupportSQLiteQuery): Int
+
+    @RawQuery(observedEntities = [MessageRow::class])
+    public suspend fun searchFtsRaw(query: SupportSQLiteQuery): List<FtsHit>
 }
+
+public data class FtsHit(
+    public val rowId: Long,
+    public val networkId: String,
+    public val conversation: String,
+    public val sender: String,
+    public val timestampMs: Long,
+    public val snippet: String,
+)

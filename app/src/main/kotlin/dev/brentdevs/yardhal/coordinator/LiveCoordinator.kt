@@ -40,6 +40,7 @@ public class LiveCoordinator(
     public val readMarkers: ReadMarkerStore,
     public val mutes: MuteStore,
     private val vault: CredentialVault,
+    private val channelOrder: dev.brentdevs.yardhal.core.data.ChannelOrderStore,
     private val connectionFactory: ConnectionFactory,
     private val notifier: HighlightNotifier = HighlightNotifier { _, _, _, _ -> },
     private val clock: () -> Long = System::currentTimeMillis,
@@ -214,6 +215,7 @@ public class LiveCoordinator(
             }
         }
         for (channel in channels) {
+            markJoining(ConversationRef.channel(session.config.id, channel, session.casemapping))
             sendRaw(session, "JOIN $channel")
         }
     }
@@ -248,6 +250,12 @@ public class LiveCoordinator(
                 handleNamesRelatedNumeric(session, message, numeric)
             numeric == 352 -> accumulateWhoLine(session, message)
             numeric == 315 -> finalizeNames(session, message)
+            numeric == 403 || numeric == 405 || numeric == 437 || numeric == 471 || numeric == 473 -> {
+                val channel = message.parameters.getOrNull(2) ?: message.parameters.getOrNull(1) ?: ""
+                val ref = ConversationRef.channel(session.config.id, channel, session.casemapping)
+                buffer(ref)
+                markJoinFailed(session, ref, message.parameters.drop(2).joinToString(" ").ifEmpty { "cannot join $channel" })
+            }
             numeric == 354 -> handleWhoXLine(session, message)
             numeric == 322 -> accumulateListEntry(session, message)
             numeric == 323 -> finalizeChannelList()
@@ -476,7 +484,10 @@ public class LiveCoordinator(
         val channel = message.parameters[1]
         val key = ConversationRef.channel(session.config.id, channel, session.casemapping).storageKey
         val members = pendingNames.remove(key)?.sortedBy { it.nick.lowercase() } ?: return
-        updateBufferKey(key) { it.copy(members = members) }
+        val ref = _buffers.value[key]?.ref
+        if (ref != null) {
+            updateBufferKey(key) { it.copy(members = members, joinState = JoinState.JOINED) }
+        }
     }
 
     private var whoxQuerySent: Boolean = false
@@ -651,6 +662,71 @@ public class LiveCoordinator(
     private val _mutedState = MutableStateFlow(mutes.all())
     public val mutedState: StateFlow<Set<String>> = _mutedState.asStateFlow()
 
+    public fun searchMessages(raw: String, onResult: (List<dev.brentdevs.yardhal.core.data.FtsHit>) -> Unit) {
+        scope.launch {
+            onResult(messageStore.search(raw))
+        }
+    }
+
+    private val _orderState = MutableStateFlow(channelOrder.snapshot())
+    public val orderState: StateFlow<dev.brentdevs.yardhal.core.data.ChannelOrderState> = _orderState.asStateFlow()
+
+    public fun togglePin(storageKey: String) {
+        channelOrder.togglePin(storageKey)
+        _orderState.value = channelOrder.snapshot()
+    }
+
+    public fun createGroup(name: String): String {
+        val id = "g-" + java.util.UUID.randomUUID()
+        channelOrder.createGroup(id, name)
+        _orderState.value = channelOrder.snapshot()
+        return id
+    }
+
+    public fun renameGroup(id: String, name: String) {
+        channelOrder.renameGroup(id, name)
+        _orderState.value = channelOrder.snapshot()
+    }
+
+    public fun deleteGroup(id: String) {
+        channelOrder.deleteGroup(id)
+        _orderState.value = channelOrder.snapshot()
+    }
+
+    public fun addToGroup(groupId: String, storageKey: String) {
+        channelOrder.removeFromEveryGroup(storageKey)
+        channelOrder.addToGroup(groupId, storageKey)
+        _orderState.value = channelOrder.snapshot()
+    }
+
+    public fun removeFromGroup(storageKey: String) {
+        channelOrder.removeFromEveryGroup(storageKey)
+        _orderState.value = channelOrder.snapshot()
+    }
+
+    public fun retryJoin(networkId: String, storageKey: String) {
+        val session = sessions[networkId] ?: return
+        val buffer = _buffers.value[storageKey] ?: return
+        if (buffer.ref.kind != ConversationKind.CHANNEL) return
+        updateBufferKey(storageKey) { it.copy(joinState = JoinState.JOINING) }
+        sendRaw(session, "JOIN ${buffer.ref.rawTarget}")
+    }
+
+    private fun markJoining(ref: ConversationRef) {
+        updateBuffer(ref) { it.copy(joinState = JoinState.JOINING) }
+    }
+
+    private fun markJoined(ref: ConversationRef) {
+        updateBufferKey(ref.storageKey) {
+            if (it.joinState == JoinState.JOINED) it else it.copy(joinState = JoinState.JOINED)
+        }
+    }
+
+    private fun markJoinFailed(session: Session, ref: ConversationRef, reason: String) {
+        updateBufferKey(ref.storageKey) { it.copy(joinState = JoinState.FAILED) }
+        appendSystem(session, ref, reason, MessageKind.SYSTEM)
+    }
+
     public fun toggleMute(storageKey: String) {
         if (!mutes.unmute(storageKey)) mutes.mute(storageKey)
         _mutedState.value = mutes.all()
@@ -662,6 +738,8 @@ public class LiveCoordinator(
             sendText(networkId, storageKey, "/part ${buffer.ref.rawTarget}")
         }
         _buffers.value = _buffers.value - storageKey
+        channelOrder.forget(storageKey)
+        _orderState.value = channelOrder.snapshot()
     }
 
     public fun uploadAndShare(
@@ -956,7 +1034,7 @@ public class LiveCoordinator(
     public fun markRead(storageKey: String) {
         val latest = _buffers.value[storageKey]?.messages?.maxOfOrNull { it.timestampMs } ?: return
         readMarkers.advance(storageKey, latest)
-        updateBufferKey(storageKey) { it.copy(hasUnread = false) }
+        updateBufferKey(storageKey) { it.copy(hasUnread = false, unreadFromTimestampMs = null) }
         val networkId = storageKey.substringBefore("|")
         val session = sessions[networkId] ?: return
         if ("draft/read-marker" !in session.supportedCaps) return
@@ -985,6 +1063,7 @@ public class LiveCoordinator(
             updateBufferKey(storageKey) { current ->
                 val existingMsgids = current.messages.mapNotNull { it.msgid }.toSet()
                 val existingSignatures = current.messages.map { it.sender to it.timestampMs }.toSet()
+                val marker = readMarkers.marker(storageKey)
                 val restored = stored
                     .filter { it.msgid == null || it.msgid !in existingMsgids }
                     .filter { row -> (row.senderNick to row.timestampMs) !in existingSignatures }
@@ -1000,7 +1079,12 @@ public class LiveCoordinator(
                             msgid = row.msgid,
                         )
                     }
-                current.copy(messages = restored + current.messages)
+                val firstUnread = current.messages.firstOrNull { it.timestampMs > marker }?.timestampMs
+                    ?: restored.firstOrNull { it.timestampMs > marker }?.timestampMs
+                current.copy(
+                    messages = restored + current.messages,
+                    unreadFromTimestampMs = firstUnread,
+                )
             }
         }
         return true
@@ -1080,7 +1164,9 @@ public class LiveCoordinator(
                 val channels = command.channels.joinToString(",")
                 sendRaw(session, if (command.keys.isEmpty()) "JOIN $channels" else "JOIN $channels ${command.keys.joinToString(",")}")
                 for (c in command.channels) {
-                    buffer(ConversationRef.channel(session.config.id, c, session.casemapping))
+                    val ref = ConversationRef.channel(session.config.id, c, session.casemapping)
+                    buffer(ref)
+                    markJoining(ref)
                 }
             }
             is SlashCommand.Part -> {

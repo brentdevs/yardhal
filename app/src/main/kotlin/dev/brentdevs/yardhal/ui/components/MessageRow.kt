@@ -202,3 +202,25 @@ public fun DayPill(label: String, modifier: Modifier = Modifier) {
 
 public fun formatTime(epochMs: Long): String =
     Instant.ofEpochMilli(epochMs).atZone(ZoneId.systemDefault()).format(TIME_FORMAT)
+
+@Composable
+public fun NewMessagesDivider(label: String, modifier: Modifier = Modifier) {
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(vertical = 8.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Surface(
+            shape = RoundedCornerShape(50),
+            color = MaterialTheme.colorScheme.primary,
+        ) {
+            Text(
+                text = label,
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 3.dp),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onPrimary,
+            )
+        }
+    }
+}

@@ -40,6 +40,13 @@ public data class PresenceState(
     public val account: String? = null,
 )
 
+public enum class JoinState {
+    IDLE,
+    JOINING,
+    JOINED,
+    FAILED,
+}
+
 public data class ConversationBuffer(
     public val ref: ConversationRef,
     public val displayName: String,
@@ -51,6 +58,8 @@ public data class ConversationBuffer(
     public val typingUsers: Map<String, Long> = emptyMap(),
     public val reactions: Map<String, Map<String, Set<String>>> = emptyMap(),
     public val replyDraft: ChatMessage? = null,
+    public val joinState: JoinState = JoinState.JOINED,
+    public val unreadFromTimestampMs: Long? = null,
 ) {
     public val key: String get() = ref.storageKey
 

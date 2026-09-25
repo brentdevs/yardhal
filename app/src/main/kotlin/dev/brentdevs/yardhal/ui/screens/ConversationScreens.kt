@@ -24,6 +24,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
@@ -32,6 +33,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -45,6 +47,7 @@ import dev.brentdevs.yardhal.coordinator.ChatMessage
 import dev.brentdevs.yardhal.coordinator.ConversationBuffer
 import dev.brentdevs.yardhal.ui.components.DayPill
 import dev.brentdevs.yardhal.ui.components.MessageRow
+import dev.brentdevs.yardhal.ui.components.NewMessagesDivider
 import dev.brentdevs.yardhal.ui.components.StatusDot
 import java.time.Instant
 import java.time.LocalDate
@@ -53,6 +56,7 @@ import java.time.format.DateTimeFormatter
 
 private sealed interface TranscriptEntry {
     public data class DayHeader(public val label: String) : TranscriptEntry
+    public data class UnreadDivider(public val label: String) : TranscriptEntry
     public data class Message(public val value: ChatMessage, public val groupedWithPrevious: Boolean) : TranscriptEntry
 }
 
@@ -64,6 +68,7 @@ private fun buildTranscript(buffer: ConversationBuffer): List<TranscriptEntry> {
     val zone = ZoneId.systemDefault()
     val ordered = buffer.messages.asReversed()
     val entries = ArrayList<TranscriptEntry>(ordered.size + 4)
+    val unreadFrom = buffer.unreadFromTimestampMs
     var lastDate: LocalDate? = null
     var previousSender: String? = null
     var previousTimestamp = 0L
@@ -74,6 +79,9 @@ private fun buildTranscript(buffer: ConversationBuffer): List<TranscriptEntry> {
             entries.add(TranscriptEntry.DayHeader(formatDayLabel(date)))
             lastDate = date
             previousSender = null
+        }
+        if (unreadFrom != null && timestamp < unreadFrom && previousTimestamp >= unreadFrom) {
+            entries.add(TranscriptEntry.UnreadDivider("New messages"))
         }
         val groupable = message.kind != dev.brentdevs.yardhal.core.data.MessageKind.SYSTEM &&
             message.kind != dev.brentdevs.yardhal.core.data.MessageKind.JOIN &&
@@ -111,6 +119,7 @@ public fun ConversationScreen(
     onReact: (String, String) -> Unit,
     onSetReplyDraft: (ChatMessage?) -> Unit,
     onDelete: (String) -> Unit,
+    onOpenSearch: () -> Unit = {},
     onMemberAction: (MemberAction, String) -> Unit = { _, _ -> },
     sharedDraft: String? = null,
     onSharedConsumed: () -> Unit = {},
@@ -120,6 +129,10 @@ public fun ConversationScreen(
     var actionTarget by remember { mutableStateOf<ChatMessage?>(null) }
     var membersVisible by remember { mutableStateOf(false) }
     var memberTarget by remember { mutableStateOf<String?>(null) }
+    val listState = androidx.compose.foundation.lazy.rememberLazyListState()
+    val entries = remember(buffer) { buildTranscript(buffer) }
+    val unreadIndex = entries.indexOfFirst { it is TranscriptEntry.UnreadDivider }
+    val coroutineScope = androidx.compose.runtime.rememberCoroutineScope()
 
     Scaffold(
         modifier = modifier.fillMaxSize(),
@@ -144,6 +157,12 @@ public fun ConversationScreen(
                             Text("${buffer.members.size}")
                         }
                     }
+                    if (unreadIndex >= 0) {
+                        TextButton(onClick = {
+                            coroutineScope.launch { listState.animateScrollToItem(unreadIndex) }
+                        }) { Text("Jump") }
+                    }
+                    TextButton(onClick = onOpenSearch) { Text("Search") }
                     TextButton(onClick = onOpenJoin) { Text("Join") }
                 },
             )
@@ -205,19 +224,21 @@ public fun ConversationScreen(
             }
         } else {
             LazyColumn(
+                state = listState,
                 modifier = Modifier.padding(padding).fillMaxSize(),
                 reverseLayout = true,
                 contentPadding = PaddingValues(vertical = 4.dp),
             ) {
-                val entries = buildTranscript(buffer)
                 items(entries.size, key = { index ->
                     when (val entry = entries[index]) {
                         is TranscriptEntry.DayHeader -> "header-${entry.label}-$index"
+                        is TranscriptEntry.UnreadDivider -> "unread-$index"
                         is TranscriptEntry.Message -> "msg-${entry.value.localId}"
                     }
                 }) { index ->
                     when (val entry = entries[index]) {
                         is TranscriptEntry.DayHeader -> DayPill(entry.label)
+                        is TranscriptEntry.UnreadDivider -> NewMessagesDivider(entry.label)
                         is TranscriptEntry.Message -> {
                             val message = entry.value
                             MessageRow(
@@ -392,10 +413,70 @@ private sealed interface OverviewEntry {
         public val network: dev.brentdevs.yardhal.coordinator.UiNetwork,
     ) : OverviewEntry
 
+    public data class SectionHeader(public val label: String) : OverviewEntry
+
     public data class BufferRow(
         public val buffer: ConversationBuffer,
+        public val pinned: Boolean,
         public val muted: Boolean,
+        public val inGroup: Boolean,
     ) : OverviewEntry
+}
+
+private fun buildOverviewEntries(
+    networks: List<dev.brentdevs.yardhal.coordinator.UiNetwork>,
+    buffers: List<ConversationBuffer>,
+    mutedKeys: Set<String>,
+    order: dev.brentdevs.yardhal.core.data.ChannelOrderState,
+): List<OverviewEntry> {
+    val entries = ArrayList<OverviewEntry>()
+    val comparison = compareByDescending<ConversationBuffer> { it.hasUnread }
+        .thenBy { it.ref.kind != dev.brentdevs.yardhal.core.data.ConversationKind.CHANNEL }
+        .thenBy { it.displayName.lowercase() }
+    for (network in networks.sortedBy { it.name.lowercase() }) {
+        entries.add(OverviewEntry.NetworkHeader(network))
+        val own = buffers.filter {
+            it.ref.networkId == network.id && it.ref.kind != dev.brentdevs.yardhal.core.data.ConversationKind.SERVER
+        }
+        val channels = own.filter { it.ref.kind == dev.brentdevs.yardhal.core.data.ConversationKind.CHANNEL }
+        val directs = own.filter { it.ref.kind == dev.brentdevs.yardhal.core.data.ConversationKind.DIRECT_MESSAGE }
+
+        fun rowFor(buffer: ConversationBuffer): OverviewEntry.BufferRow =
+            OverviewEntry.BufferRow(
+                buffer = buffer,
+                pinned = buffer.key in order.pinnedKeys,
+                muted = buffer.key in mutedKeys,
+                inGroup = order.groupOf(buffer.key) != null,
+            )
+
+        val pinnedBuffers = order.pinnedKeys.mapNotNull { key -> own.firstOrNull { it.key == key } }
+        if (pinnedBuffers.isNotEmpty()) {
+            entries.add(OverviewEntry.SectionHeader("Pinned"))
+            pinnedBuffers.forEach { entries.add(rowFor(it)) }
+        }
+
+        for (groupId in order.groupOrder) {
+            val group = order.groups.firstOrNull { it.id == groupId } ?: continue
+            val members = group.memberKeys.mapNotNull { key -> own.firstOrNull { it.key == key } }
+            if (members.isEmpty()) continue
+            entries.add(OverviewEntry.SectionHeader(group.name))
+            members.forEach { entries.add(rowFor(it)) }
+        }
+
+        val grouped = own.filter { order.groupOf(it.key) != null }.map { it.key }.toSet()
+        val pinnedSet = order.pinnedKeys.toSet()
+        val looseChannels = channels.filterNot { it.key in grouped || it.key in pinnedSet }.sortedWith(comparison)
+        if (looseChannels.isNotEmpty()) {
+            entries.add(OverviewEntry.SectionHeader("Channels"))
+            looseChannels.forEach { entries.add(rowFor(it)) }
+        }
+        val looseDirects = directs.filterNot { it.key in grouped || it.key in pinnedSet }.sortedWith(comparison)
+        if (looseDirects.isNotEmpty()) {
+            entries.add(OverviewEntry.SectionHeader("Direct Messages"))
+            looseDirects.forEach { entries.add(rowFor(it)) }
+        }
+    }
+    return entries
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -404,6 +485,7 @@ public fun NetworkOverviewScreen(
     buffers: List<ConversationBuffer>,
     networks: List<dev.brentdevs.yardhal.coordinator.UiNetwork>,
     mutedKeys: Set<String>,
+    orderState: dev.brentdevs.yardhal.core.data.ChannelOrderState,
     onSelect: (String) -> Unit,
     onSelectServer: (String) -> Unit,
     onAddNetwork: () -> Unit,
@@ -419,6 +501,10 @@ public fun NetworkOverviewScreen(
     onMarkRead: (String) -> Unit = {},
     onToggleMute: (String) -> Unit = {},
     onLeave: (String) -> Unit = {},
+    onTogglePin: (String) -> Unit = {},
+    onRetryJoin: (String) -> Unit = {},
+    onMoveToGroup: (String, String?) -> Unit = { _, _ -> },
+    onCreateGroup: (String, (String) -> Unit) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier,
 ) {
     var pendingRemoval by remember { mutableStateOf<String?>(null) }
@@ -426,23 +512,11 @@ public fun NetworkOverviewScreen(
     var debugVisible by remember { mutableStateOf(false) }
     var rowMenuFor by remember { mutableStateOf<String?>(null) }
     var pendingLeave by remember { mutableStateOf<ConversationBuffer?>(null) }
+    var moveTarget by remember { mutableStateOf<String?>(null) }
+    var newGroupName by remember { mutableStateOf("") }
 
-    val entries = remember(networks, buffers, mutedKeys) {
-        buildList {
-            for (network in networks.sortedBy { it.name.lowercase() }) {
-                add(OverviewEntry.NetworkHeader(network))
-                val own = buffers
-                    .filter { it.ref.networkId == network.id && it.ref.kind != dev.brentdevs.yardhal.core.data.ConversationKind.SERVER }
-                    .sortedWith(
-                        compareByDescending<ConversationBuffer> { it.hasUnread }
-                            .thenBy { it.ref.kind != dev.brentdevs.yardhal.core.data.ConversationKind.CHANNEL }
-                            .thenBy { it.displayName.lowercase() },
-                    )
-                for (buffer in own) {
-                    add(OverviewEntry.BufferRow(buffer, buffer.key in mutedKeys))
-                }
-            }
-        }
+    val entries = remember(networks, buffers, mutedKeys, orderState) {
+        buildOverviewEntries(networks, buffers, mutedKeys, orderState)
     }
 
     if (debugVisible) {
@@ -536,6 +610,7 @@ public fun NetworkOverviewScreen(
             items(entries.size, key = { index ->
                 when (val entry = entries[index]) {
                     is OverviewEntry.NetworkHeader -> "net-${entry.network.id}"
+                    is OverviewEntry.SectionHeader -> "section-${entry.label}-$index"
                     is OverviewEntry.BufferRow -> "buf-${entry.buffer.key}"
                 }
             }) { index ->
@@ -560,10 +635,59 @@ public fun NetworkOverviewScreen(
                             TextButton(onClick = { pendingRemoval = network.id }) { Text("Remove") }
                         }
                     }
+                    is OverviewEntry.SectionHeader -> {
+                        Text(
+                            text = entry.label,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(start = 42.dp, top = 10.dp, bottom = 2.dp),
+                        )
+                    }
                     is OverviewEntry.BufferRow -> {
                         val buffer = entry.buffer
                         val last = buffer.messages.lastOrNull()
                         val isChannel = buffer.ref.kind == dev.brentdevs.yardhal.core.data.ConversationKind.CHANNEL
+                        val dismissState = androidx.compose.material3.rememberSwipeToDismissBoxState(
+                            confirmValueChange = { value ->
+                                when (value) {
+                                    androidx.compose.material3.SwipeToDismissBoxValue.StartToEnd -> onTogglePin(buffer.key)
+                                    androidx.compose.material3.SwipeToDismissBoxValue.EndToStart -> {
+                                        onLeave(buffer.key)
+                                    }
+                                    else -> Unit
+                                }
+                                false
+                            },
+                        )
+                        androidx.compose.material3.SwipeToDismissBox(
+                            state = dismissState,
+                            enableDismissFromStartToEnd = true,
+                            enableDismissFromEndToStart = true,
+                            backgroundContent = {
+                                if (dismissState.dismissDirection != androidx.compose.material3.SwipeToDismissBoxValue.Settled) {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .padding(horizontal = 44.dp, vertical = 4.dp),
+                                        contentAlignment = if (dismissState.dismissDirection == androidx.compose.material3.SwipeToDismissBoxValue.EndToStart) {
+                                            Alignment.CenterEnd
+                                        } else {
+                                            Alignment.CenterStart
+                                        },
+                                    ) {
+                                        if (dismissState.dismissDirection == androidx.compose.material3.SwipeToDismissBoxValue.EndToStart) {
+                                            Text("Leave", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelMedium)
+                                        } else {
+                                            Text(
+                                                text = if (entry.pinned) "Unpin" else "Pin",
+                                                color = MaterialTheme.colorScheme.primary,
+                                                style = MaterialTheme.typography.labelMedium,
+                                            )
+                                        }
+                                    }
+                                }
+                            },
+                        ) {
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -584,6 +708,19 @@ public fun NetworkOverviewScreen(
                                     if (entry.muted) {
                                         Text(
                                             text = "  muted",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                    if (buffer.joinState == dev.brentdevs.yardhal.coordinator.JoinState.FAILED) {
+                                        Text(
+                                            text = "  ! failed",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.error,
+                                        )
+                                    } else if (buffer.joinState == dev.brentdevs.yardhal.coordinator.JoinState.JOINING) {
+                                        Text(
+                                            text = "  joining…",
                                             style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                                         )
@@ -614,6 +751,7 @@ public fun NetworkOverviewScreen(
                                         .background(MaterialTheme.colorScheme.primary),
                                 )
                             }
+                            }
                         }
                     }
                 }
@@ -633,15 +771,82 @@ public fun NetworkOverviewScreen(
                     onClick = { onMarkRead(buffer.buffer.key); rowMenuFor = null },
                 )
                 DropdownMenuItem(
+                    text = { Text(if (buffer.pinned) "Unpin" else "Pin") },
+                    onClick = { onTogglePin(buffer.buffer.key); rowMenuFor = null },
+                )
+                DropdownMenuItem(
                     text = { Text(if (buffer.muted) "Unmute" else "Mute") },
                     onClick = { onToggleMute(buffer.buffer.key); rowMenuFor = null },
                 )
+                DropdownMenuItem(
+                    text = { Text("Move to group…") },
+                    onClick = { moveTarget = buffer.buffer.key; rowMenuFor = null },
+                )
+                if (buffer.buffer.joinState == dev.brentdevs.yardhal.coordinator.JoinState.FAILED) {
+                    DropdownMenuItem(
+                        text = { Text("Retry join") },
+                        onClick = { onRetryJoin(buffer.buffer.key); rowMenuFor = null },
+                    )
+                }
                 DropdownMenuItem(
                     text = { Text("Leave") },
                     onClick = { pendingLeave = buffer.buffer; rowMenuFor = null },
                 )
             }
         }
+    }
+
+    if (moveTarget != null) {
+        AlertDialog(
+            onDismissRequest = { moveTarget = null; newGroupName = "" },
+            title = { Text("Move to group") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    for (group in orderState.groups) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onMoveToGroup(moveTarget!!, group.id); moveTarget = null },
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(group.name, modifier = Modifier.weight(1f))
+                            if (orderState.groupOf(moveTarget!!)?.id == group.id) {
+                                Text("current", style = MaterialTheme.typography.labelSmall)
+                            }
+                        }
+                    }
+                    if (orderState.groupOf(moveTarget!!) != null) {
+                        TextButton(onClick = {
+                            onMoveToGroup(moveTarget!!, null)
+                            moveTarget = null
+                        }) { Text("Remove from group") }
+                    }
+                    OutlinedTextField(
+                        value = newGroupName,
+                        onValueChange = { newGroupName = it },
+                        label = { Text("New group name") },
+                        singleLine = true,
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = newGroupName.isNotBlank(),
+                    onClick = {
+                        val key = moveTarget ?: return@TextButton
+                        val name = newGroupName.trim()
+                        onCreateGroup(name) { groupId ->
+                            onMoveToGroup(key, groupId)
+                        }
+                        moveTarget = null
+                        newGroupName = ""
+                    },
+                ) { Text("Create & move") }
+            },
+            dismissButton = {
+                TextButton(onClick = { moveTarget = null; newGroupName = "" }) { Text("Cancel") }
+            },
+        )
     }
 
     if (pendingLeave != null) {

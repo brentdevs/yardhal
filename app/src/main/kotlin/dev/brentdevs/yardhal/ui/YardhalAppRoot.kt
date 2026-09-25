@@ -1,6 +1,7 @@
 package dev.brentdevs.yardhal.ui
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.lazy.LazyColumn
@@ -62,12 +63,16 @@ public fun YardhalAppRoot(
     val rawLogVersion by coordinator.rawLogVersion.collectAsStateWithLifecycle()
     val bouncerVersion by coordinator.bouncerVersion.collectAsStateWithLifecycle()
     val mutedKeys by coordinator.mutedState.collectAsStateWithLifecycle()
+    val orderState by coordinator.orderState.collectAsStateWithLifecycle()
 
     var addNetworkVisible by remember { mutableStateOf(false) }
     var pendingPreset by remember { mutableStateOf<NetworkPresetUi?>(null) }
     var selectedKey by remember { mutableStateOf<String?>(null) }
     var joinDialogVisible by remember { mutableStateOf(false) }
     var joinDraft by remember { mutableStateOf("") }
+    var searchVisible by remember { mutableStateOf(false) }
+    var searchQuery by remember { mutableStateOf("") }
+    var searchResults by remember { mutableStateOf<List<dev.brentdevs.yardhal.core.data.FtsHit>>(emptyList()) }
     var bouncerVisible by remember { mutableStateOf(false) }
     var bouncerAddr by remember { mutableStateOf("ircs://") }
     var bouncerName by remember { mutableStateOf("") }
@@ -128,9 +133,16 @@ public fun YardhalAppRoot(
                             selectedKey = ConversationRef.server(networkId).storageKey
                         },
                         mutedKeys = mutedKeys,
+                        orderState = orderState,
                         onMarkRead = { key -> coordinator.markRead(key) },
                         onToggleMute = { key -> coordinator.toggleMute(key) },
                         onLeave = { key -> coordinator.leaveConversation(networkId = key.substringBefore("|"), storageKey = key) },
+                        onTogglePin = { key -> coordinator.togglePin(key) },
+                        onRetryJoin = { key -> coordinator.retryJoin(key.substringBefore("|"), key) },
+                        onMoveToGroup = { key, groupId ->
+                            if (groupId == null) coordinator.removeFromGroup(key) else coordinator.addToGroup(groupId, key)
+                        },
+                        onCreateGroup = { name, done -> done(coordinator.createGroup(name)) },
                         onAddNetwork = { addNetworkVisible = true },
                         onRemoveNetwork = { coordinator.removeNetwork(it) },
                         onBrowseChannels = {
@@ -176,6 +188,7 @@ public fun YardhalAppRoot(
                             onReact = { msgid, emoji -> coordinator.react(networkId, key, msgid, emoji) },
                             onSetReplyDraft = { message -> coordinator.setReplyDraft(networkId, key, message) },
                             onDelete = { msgid -> coordinator.deleteMessage(networkId, key, msgid) },
+                        onOpenSearch = { searchVisible = true },
                             onMemberAction = { action, nick -> coordinator.memberAction(networkId, key, action, nick) },
                             sharedDraft = sharedDraft,
                             onSharedConsumed = onSharedConsumed,
@@ -226,6 +239,7 @@ public fun YardhalAppRoot(
                             onReact = { msgid, emoji -> coordinator.react(networkId, key, msgid, emoji) },
                             onSetReplyDraft = { message -> coordinator.setReplyDraft(networkId, key, message) },
                             onDelete = { msgid -> coordinator.deleteMessage(networkId, key, msgid) },
+                        onOpenSearch = { searchVisible = true },
                             onMemberAction = { action, nick -> coordinator.memberAction(networkId, key, action, nick) },
                             sharedDraft = sharedDraft,
                             onSharedConsumed = onSharedConsumed,
@@ -263,9 +277,16 @@ public fun YardhalAppRoot(
                                 selectedKey = ConversationRef.server(networkId).storageKey
                             },
                         mutedKeys = mutedKeys,
+                        orderState = orderState,
                         onMarkRead = { key -> coordinator.markRead(key) },
                         onToggleMute = { key -> coordinator.toggleMute(key) },
                         onLeave = { key -> coordinator.leaveConversation(networkId = key.substringBefore("|"), storageKey = key) },
+                        onTogglePin = { key -> coordinator.togglePin(key) },
+                        onRetryJoin = { key -> coordinator.retryJoin(key.substringBefore("|"), key) },
+                        onMoveToGroup = { key, groupId ->
+                            if (groupId == null) coordinator.removeFromGroup(key) else coordinator.addToGroup(groupId, key)
+                        },
+                        onCreateGroup = { name, done -> done(coordinator.createGroup(name)) },
                             onAddNetwork = { addNetworkVisible = true },
                             onRemoveNetwork = { coordinator.removeNetwork(it) },
                             onBrowseChannels = {
@@ -399,6 +420,68 @@ public fun YardhalAppRoot(
             },
             confirmButton = {
                 TextButton(onClick = { bouncerVisible = false }) { Text("Close") }
+            },
+        )
+    }
+
+    if (searchVisible) {
+        AlertDialog(
+            onDismissRequest = { searchVisible = false },
+            title = { Text("Search messages") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OutlinedTextField(
+                        value = searchQuery,
+                        onValueChange = {
+                            searchQuery = it
+                            if (it.length >= 2) {
+                                coordinator.searchMessages(it) { hits -> searchResults = hits }
+                            } else if (it.isEmpty()) {
+                                searchResults = emptyList()
+                            }
+                        },
+                        placeholder = { Text("Search all conversations") },
+                        singleLine = true,
+                    )
+                    if (searchResults.isEmpty() && searchQuery.length >= 2) {
+                        Text(
+                            "No matches",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    LazyColumn(modifier = Modifier.padding(vertical = 4.dp)) {
+                        items(searchResults.size) { index ->
+                            val hit = searchResults[index]
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        val hitKey = "${hit.networkId}|${hit.conversation}"
+                                        coordinator.markRead(hitKey)
+                                        selectedKey = hitKey
+                                        searchVisible = false
+                                    }
+                                    .padding(vertical = 4.dp),
+                            ) {
+                                Text(
+                                    "${hit.sender} in ${hit.conversation}",
+                                    style = MaterialTheme.typography.labelMedium,
+                                )
+                                Text(
+                                    hit.snippet,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 2,
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { searchVisible = false }) { Text("Close") }
             },
         )
     }

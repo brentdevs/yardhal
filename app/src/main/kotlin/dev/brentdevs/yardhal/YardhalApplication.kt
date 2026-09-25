@@ -9,6 +9,7 @@ import dev.brentdevs.yardhal.core.data.ReadMarkerStore
 import dev.brentdevs.yardhal.core.data.YardhalDatabase
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.SupervisorJob
 
 class YardhalApplication : Application() {
@@ -37,5 +38,15 @@ class YardhalApplication : Application() {
         readMarkerStore = ReadMarkerStore(dir)
         muteStore = MuteStore(dir)
         vault = AndroidCredentialVault(this)
+        backfillSearchIndex()
+    }
+
+    private fun backfillSearchIndex() {
+        val prefs = getSharedPreferences("yardhal-meta", MODE_PRIVATE)
+        if (prefs.getBoolean("fts_backfill_v2", false)) return
+        appScope.launch {
+            runCatching { messageStore.reindexAll() }
+                .onSuccess { prefs.edit().putBoolean("fts_backfill_v2", true).apply() }
+        }
     }
 }
