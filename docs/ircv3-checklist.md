@@ -31,20 +31,21 @@ Phase numbers refer to `docs/architecture.md`.
 
 ## Messaging affordances
 
-- [x] message-ids: persist msgid (P3); reply/react/redact UI gating pending
-- [ ] echo-message: render own messages from echo, dedupe pending copy (P5)
-- [ ] +draft/reply (+reply): send/receive replies, jump-to-source (P5)
-- [ ] +draft/react / +draft/unreact: reactions pills with counts (P5)
+- [x] message-ids: persisted; reply/react/redact gated on msgid presence (P3/P5)
+- [x] echo-message: own messages reconciled against the server echo, msgid stamped (P5)
+- [x] +draft/reply: send/receive replies with quoted preview and jump-to-source (P5)
+- [x] +draft/react / +draft/unreact: reactions pills with counts, tap to toggle (P5)
 - [x] +typing: send rate-limited active TAGMSG; inbound indicators with expiry (P5)
 - [x] draft/message-redaction: REDACT handling + own redacts (P5)
-- [ ] draft/read-marker: MARKREAD send/apply for cross-device read state (P5)
+- [x] draft/read-marker: MARKREAD mirrored on read; unread divider + jump (P5)
 - [ ] draft/multiline: reassemble multiline batches honoring limits (P5)
 - [ ] +draft/channel-context: "re: #channel" chip on DMs (P8)
 
 ## History & transport
 
-- [ ] batch: buffer/correlate by reference tag, degrade gracefully (P2 framing / P5 usage)
-- [ ] chathistory batch type: silent history playback by server-time (P5)
+- [x] batch: netsplit/netjoin collapse + chathistory/playback classification (P5);
+  no general batch buffering needed (no BatchAssembler) (P2)
+- [x] chathistory batch type: replay routed as history (no unread/notification noise) (P5)
 - [x] draft/chathistory: LATEST bootstrap on channel join when advertised (P5); full selectors pending
 - [x] netsplit/netjoin batches: collapse into one event (P5)
 - [ ] labeled-response: label outbound commands, correlate responses incl. ACK/batches (P5)
@@ -56,9 +57,9 @@ Phase numbers refer to `docs/architecture.md`.
 ## Metadata & misc
 
 - [x] NAMES/353/366 member lists via multi-prefix-aware parser (P5); WHOX %fields pending
-- [ ] multi-prefix: all status prefixes in NAMES/WHO (P5)
+- [x] multi-prefix: prefix symbols retained; member sheet sections by role (P5)
 - [ ] userhost-in-names: full nick!user@host in NAMES (P5)
-- [ ] no-implicit-names: suppress NAMES burst on JOIN, fetch lazily (P5)
+- [x] no-implicit-names (equivalent): members fetched lazily via WHO on open (P5)
 - [ ] invite-notify: INVITE system lines for ops (P5)
 - [ ] bot-mode: BOT ISUPPORT letter + badge (P5)
 - [ ] account-extban: ban-account option in moderation menus (P6)
