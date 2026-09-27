@@ -1,6 +1,7 @@
 package dev.brentdevs.yardhal.core.data
 
 import java.security.MessageDigest
+import kotlinx.coroutines.CancellationException
 
 public class MessageStore(private val dao: MessageDao) {
 
@@ -94,7 +95,7 @@ public class MessageStore(private val dao: MessageDao) {
 
     public suspend fun search(raw: String, limit: Int = 50): List<FtsHit> {
         val query = FtsQuery.build(raw) ?: return emptyList()
-        return runCatching {
+        return try {
             dao.searchFtsRaw(
                 androidx.sqlite.db.SimpleSQLiteQuery(
                     "SELECT m.rowId AS rowId, m.networkId AS networkId, m.conversation AS conversation, " +
@@ -105,7 +106,11 @@ public class MessageStore(private val dao: MessageDao) {
                     arrayOf<Any>(query, limit),
                 ),
             ).map { hit -> hit.copy(snippet = decorateSnippet(hit.snippet)) }
-        }.getOrDefault(emptyList())
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            emptyList()
+        }
     }
 
     private fun decorateSnippet(raw: String): String = raw

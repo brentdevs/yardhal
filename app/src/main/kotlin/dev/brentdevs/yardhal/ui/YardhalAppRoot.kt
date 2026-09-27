@@ -19,6 +19,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -29,7 +30,6 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.brentdevs.yardhal.coordinator.ConnectionStatus
 import dev.brentdevs.yardhal.coordinator.ConversationBuffer
@@ -73,8 +73,6 @@ public fun YardhalAppRoot(
     var joinDialogVisible by remember { mutableStateOf(false) }
     var joinDraft by remember { mutableStateOf("") }
     var searchVisible by remember { mutableStateOf(false) }
-    val searchJob = remember { arrayOfNulls<kotlinx.coroutines.Job>(1) }
-    val scope = androidx.compose.runtime.rememberCoroutineScope()
     var searchQuery by remember { mutableStateOf("") }
     var searchResults by remember { mutableStateOf<List<dev.brentdevs.yardhal.core.data.FtsHit>>(emptyList()) }
     var bouncerVisible by remember { mutableStateOf(false) }
@@ -431,6 +429,14 @@ public fun YardhalAppRoot(
     }
 
     if (searchVisible) {
+        LaunchedEffect(searchQuery) {
+            val query = searchQuery
+            if (query.length >= 2) {
+                delay(250)
+                val hits = coordinator.searchMessages(query)
+                if (searchQuery == query) searchResults = hits
+            }
+        }
         AlertDialog(
             onDismissRequest = { searchVisible = false },
             title = { Text("Search messages") },
@@ -440,15 +446,7 @@ public fun YardhalAppRoot(
                         value = searchQuery,
                         onValueChange = { updated ->
                             searchQuery = updated
-                            searchJob[0]?.cancel()
-                            if (updated.length >= 2) {
-                                searchJob[0] = scope.launch {
-                                    delay(250)
-                                    coordinator.searchMessages(updated) { hits -> searchResults = hits }
-                                }
-                            } else {
-                                searchResults = emptyList()
-                            }
+                            searchResults = emptyList()
                         },
                         placeholder = { Text("Search all conversations") },
                         singleLine = true,

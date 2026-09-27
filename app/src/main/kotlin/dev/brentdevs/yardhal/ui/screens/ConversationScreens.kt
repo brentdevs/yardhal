@@ -459,7 +459,9 @@ private fun buildOverviewEntries(
                 inGroup = order.groupOf(buffer.key) != null,
             )
 
+        val displayedKeys = HashSet<String>()
         val pinnedBuffers = order.pinnedKeys.mapNotNull { key -> own.firstOrNull { it.key == key } }
+            .filter { displayedKeys.add(it.key) }
         if (pinnedBuffers.isNotEmpty()) {
             entries.add(OverviewEntry.SectionHeader("Pinned"))
             pinnedBuffers.forEach { entries.add(rowFor(it)) }
@@ -468,19 +470,18 @@ private fun buildOverviewEntries(
         for (groupId in order.groupOrder) {
             val group = order.groups.firstOrNull { it.id == groupId } ?: continue
             val members = group.memberKeys.mapNotNull { key -> own.firstOrNull { it.key == key } }
+                .filter { displayedKeys.add(it.key) }
             if (members.isEmpty()) continue
             entries.add(OverviewEntry.SectionHeader(group.name))
             members.forEach { entries.add(rowFor(it)) }
         }
 
-        val grouped = own.filter { order.groupOf(it.key) != null }.map { it.key }.toSet()
-        val pinnedSet = order.pinnedKeys.toSet()
-        val looseChannels = channels.filterNot { it.key in grouped || it.key in pinnedSet }.sortedWith(comparison)
+        val looseChannels = channels.filterNot { it.key in displayedKeys }.sortedWith(comparison)
         if (looseChannels.isNotEmpty()) {
             entries.add(OverviewEntry.SectionHeader("Channels"))
             looseChannels.forEach { entries.add(rowFor(it)) }
         }
-        val looseDirects = directs.filterNot { it.key in grouped || it.key in pinnedSet }.sortedWith(comparison)
+        val looseDirects = directs.filterNot { it.key in displayedKeys }.sortedWith(comparison)
         if (looseDirects.isNotEmpty()) {
             entries.add(OverviewEntry.SectionHeader("Direct Messages"))
             looseDirects.forEach { entries.add(rowFor(it)) }

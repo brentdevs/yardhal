@@ -33,7 +33,12 @@ public data class ChatMessage(
     public val msgid: String?,
     public val replyToMsgid: String? = null,
     public val attachmentUrl: String? = null,
-)
+    public val playback: Boolean = false,
+) {
+    public val countsAsUnread: Boolean
+        get() = !sentByUs && !playback &&
+            kind in setOf(MessageKind.PRIVMSG, MessageKind.NOTICE, MessageKind.ACTION)
+}
 
 public data class PresenceState(
     public val away: Boolean,
