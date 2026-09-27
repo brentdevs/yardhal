@@ -43,8 +43,7 @@ Phase numbers refer to `docs/architecture.md`.
 
 ## History & transport
 
-- [x] batch: netsplit/netjoin collapse + chathistory/playback classification (P5);
-  no general batch buffering needed (no BatchAssembler) (P2)
+- [x] batch: BATCH +/- frames tracked per session; netsplit/netjoin collapse; playback classified as history (P5)
 - [x] chathistory batch type: replay routed as history (no unread/notification noise) (P5)
 - [x] draft/chathistory: LATEST bootstrap on channel join when advertised (P5); full selectors pending
 - [x] netsplit/netjoin batches: collapse into one event (P5)
