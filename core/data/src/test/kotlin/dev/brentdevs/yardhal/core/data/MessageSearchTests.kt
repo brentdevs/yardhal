@@ -42,6 +42,10 @@ class MessageSearchTests {
         assertEquals(2, hits.size, hits.toString())
         assertTrue(hits.all { it.networkId == "n1" })
         assertEquals(setOf("#other", "#room"), hits.map { it.conversation }.toSet())
+        assertTrue(
+            hits.any { it.snippet.contains("[deploy]", ignoreCase = true) },
+            "snippet must come from the message body, got: " + hits.joinToString { it.snippet },
+        )
     }
 
     @Test

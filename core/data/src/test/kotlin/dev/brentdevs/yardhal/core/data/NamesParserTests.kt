@@ -18,6 +18,13 @@ class NamesParserTests {
     }
 
     @Test
+    fun keepsHighestRoleWhenMultiPrefixStacksPrefixes() {
+        val stacked = ChannelPrefixModes(listOf('o', 'v', 'h'), listOf('@', '+', '!'))
+        assertEquals(ChannelMember("alice", '@'), NamesParser.parseMember("@+alice", stacked))
+        assertEquals(ChannelMember("bob", '+'), NamesParser.parseMember("+!bob", stacked))
+    }
+
+    @Test
     fun parsesChannelAndMembers() {
         val (channel, members) = NamesParser.parseNamesLine(
             listOf("me", "=", "#room", "@alice +bob carol dave"),

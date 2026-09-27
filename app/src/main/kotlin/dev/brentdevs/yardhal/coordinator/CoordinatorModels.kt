@@ -60,6 +60,7 @@ public data class ConversationBuffer(
     public val replyDraft: ChatMessage? = null,
     public val joinState: JoinState = JoinState.JOINED,
     public val unreadFromTimestampMs: Long? = null,
+    public val readAtMs: Long = 0L,
 ) {
     public val key: String get() = ref.storageKey
 

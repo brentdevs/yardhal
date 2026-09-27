@@ -60,37 +60,40 @@ private sealed interface TranscriptEntry {
     public data class Message(public val value: ChatMessage, public val groupedWithPrevious: Boolean) : TranscriptEntry
 }
 
-private const val GROUP_WINDOW_MS = 5 * 60 * 1000L
-
 public enum class MemberAction { MESSAGE, WHOIS, KICK, BAN, IGNORE }
 
 private fun buildTranscript(buffer: ConversationBuffer): List<TranscriptEntry> {
     val zone = ZoneId.systemDefault()
     val ordered = buffer.messages.asReversed()
+    val grouped = dev.brentdevs.yardhal.core.data.MessageGrouper.group(
+        messages = ordered.map { it.timestampMs },
+        isGroupable = { index ->
+            when (ordered[index].kind) {
+                dev.brentdevs.yardhal.core.data.MessageKind.SYSTEM,
+                dev.brentdevs.yardhal.core.data.MessageKind.JOIN,
+                dev.brentdevs.yardhal.core.data.MessageKind.PART,
+                -> false
+                else -> true
+            }
+        },
+    )
     val entries = ArrayList<TranscriptEntry>(ordered.size + 4)
     val unreadFrom = buffer.unreadFromTimestampMs
     var lastDate: LocalDate? = null
-    var previousSender: String? = null
-    var previousTimestamp = 0L
-    for (message in ordered) {
+    var previousTimestamp = Long.MAX_VALUE
+    for (index in ordered.indices) {
+        val message = ordered[index]
         val timestamp = message.timestampMs
         val date = Instant.ofEpochMilli(timestamp).atZone(zone).toLocalDate()
         if (date != lastDate) {
             entries.add(TranscriptEntry.DayHeader(formatDayLabel(date)))
             lastDate = date
-            previousSender = null
+            previousTimestamp = Long.MAX_VALUE
         }
         if (unreadFrom != null && timestamp < unreadFrom && previousTimestamp >= unreadFrom) {
             entries.add(TranscriptEntry.UnreadDivider("New messages"))
         }
-        val groupable = message.kind != dev.brentdevs.yardhal.core.data.MessageKind.SYSTEM &&
-            message.kind != dev.brentdevs.yardhal.core.data.MessageKind.JOIN &&
-            message.kind != dev.brentdevs.yardhal.core.data.MessageKind.PART
-        val grouped = groupable &&
-            previousSender == message.sender &&
-            timestamp - previousTimestamp < GROUP_WINDOW_MS
-        entries.add(TranscriptEntry.Message(message, grouped))
-        previousSender = message.sender
+        entries.add(TranscriptEntry.Message(message, grouped[index].groupedWithPrevious))
         previousTimestamp = timestamp
     }
     return entries
@@ -121,6 +124,7 @@ public fun ConversationScreen(
     onDelete: (String) -> Unit,
     onOpenSearch: () -> Unit = {},
     onMemberAction: (MemberAction, String) -> Unit = { _, _ -> },
+    onOpenDm: (String) -> Unit = {},
     sharedDraft: String? = null,
     onSharedConsumed: () -> Unit = {},
     onPickFile: () -> Unit = {},
@@ -141,9 +145,10 @@ public fun ConversationScreen(
                 title = {
                     Column {
                         Text(buffer.displayName, style = MaterialTheme.typography.titleMedium)
-                        if (!buffer.topic.isNullOrBlank()) {
+                        val topic = buffer.topic
+                        if (!topic.isNullOrBlank()) {
                             Text(
-                                buffer.topic!!,
+                                text = topic,
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1,
@@ -264,7 +269,7 @@ public fun ConversationScreen(
     }
 
     if (actionTarget != null) {
-        val target = actionTarget!!
+        val target = actionTarget ?: return
         AlertDialog(
             onDismissRequest = { actionTarget = null },
             title = { Text(target.sender.ifEmpty { "Message" }) },
@@ -284,7 +289,7 @@ public fun ConversationScreen(
                     }) { Text("Reply") }
                     if (target.sentByUs && target.msgid != null) {
                         TextButton(onClick = {
-                            onDelete(target.msgid!!)
+                            target.msgid?.let { msgid -> onDelete(msgid) }
                             actionTarget = null
                         }) { Text("Delete") }
                     }
@@ -371,14 +376,14 @@ public fun ConversationScreen(
     }
 
     if (memberTarget != null && membersVisible) {
-        val nick = memberTarget!!
+        val nick = memberTarget ?: return
         AlertDialog(
             onDismissRequest = { memberTarget = null },
             title = { Text(nick) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    TextButton(onClick = { onMemberAction(MemberAction.MESSAGE, nick); memberTarget = null }) {
-                        Text("Send message")
+                    TextButton(onClick = { onOpenDm(nick); memberTarget = null }) {
+                        Text("Message")
                     }
                     TextButton(onClick = { onMemberAction(MemberAction.WHOIS, nick); memberTarget = null }) {
                         Text("WHOIS")
@@ -801,23 +806,24 @@ public fun NetworkOverviewScreen(
             onDismissRequest = { moveTarget = null; newGroupName = "" },
             title = { Text("Move to group") },
             text = {
+                val key = moveTarget ?: return@AlertDialog
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     for (group in orderState.groups) {
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clickable { onMoveToGroup(moveTarget!!, group.id); moveTarget = null },
+                                .clickable { onMoveToGroup(key, group.id); moveTarget = null },
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Text(group.name, modifier = Modifier.weight(1f))
-                            if (orderState.groupOf(moveTarget!!)?.id == group.id) {
+                            if (orderState.groupOf(key)?.id == group.id) {
                                 Text("current", style = MaterialTheme.typography.labelSmall)
                             }
                         }
                     }
-                    if (orderState.groupOf(moveTarget!!) != null) {
+                    if (orderState.groupOf(key) != null) {
                         TextButton(onClick = {
-                            onMoveToGroup(moveTarget!!, null)
+                            onMoveToGroup(key, null)
                             moveTarget = null
                         }) { Text("Remove from group") }
                     }
@@ -850,7 +856,7 @@ public fun NetworkOverviewScreen(
     }
 
     if (pendingLeave != null) {
-        val buffer = pendingLeave!!
+        val buffer = pendingLeave ?: return
         val isChannel = buffer.ref.kind == dev.brentdevs.yardhal.core.data.ConversationKind.CHANNEL
         AlertDialog(
             onDismissRequest = { pendingLeave = null },

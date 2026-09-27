@@ -22,7 +22,7 @@ public object NamesParser {
         var symbol: Char? = null
         var nick = token
         while (nick.isNotEmpty() && prefixes.symbols.contains(nick.first())) {
-            symbol = nick.first()
+            if (symbol == null) symbol = nick.first()
             nick = nick.drop(1)
         }
         return ChannelMember(nick = nick, symbol = symbol)

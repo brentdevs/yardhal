@@ -534,11 +534,11 @@ public class LiveCoordinator(
     }
 
     private fun handleWhoXLine(session: Session, message: IrcMessage) {
-        if (message.parameters.size < 5) return
+        if (message.parameters.size < 6) return
         val fields = message.parameters.drop(1)
         val account = fields.getOrNull(0)?.takeIf { it != "0" }
-        val flags = fields.getOrNull(1)
-        val nick = fields.getOrNull(3) ?: return
+        val flags = fields.getOrNull(2)
+        val nick = fields.getOrNull(4) ?: return
         updateMemberPresence(session, nick, away = flags?.contains('G') == true, account = account)
     }
 
@@ -640,9 +640,16 @@ public class LiveCoordinator(
         updateBufferKey(storageKey) { it.copy(replyDraft = message) }
     }
 
+    public fun directMessageKey(networkId: String, fromKey: String, nick: String): String {
+        val session = sessions[networkId]
+        val casemapping = session?.casemapping ?: dev.brentdevs.yardhal.core.protocol.CaseMapping.RFC1459
+        val ref = ConversationRef.directMessage(networkId, nick, casemapping)
+        buffer(ref)
+        return ref.storageKey
+    }
+
     public fun memberAction(networkId: String, storageKey: String, action: dev.brentdevs.yardhal.ui.screens.MemberAction, nick: String) {
         when (action) {
-            dev.brentdevs.yardhal.ui.screens.MemberAction.MESSAGE -> sendText(networkId, storageKey, "/msg $nick hello")
             dev.brentdevs.yardhal.ui.screens.MemberAction.WHOIS -> sendText(networkId, storageKey, "/whois $nick")
             dev.brentdevs.yardhal.ui.screens.MemberAction.KICK -> sendText(networkId, storageKey, "/kick $nick")
             dev.brentdevs.yardhal.ui.screens.MemberAction.BAN -> sendText(networkId, storageKey, "/ban *!*$nick")
@@ -656,6 +663,7 @@ public class LiveCoordinator(
                     )
                 }
             }
+            dev.brentdevs.yardhal.ui.screens.MemberAction.MESSAGE -> Unit
         }
     }
 
@@ -979,9 +987,16 @@ public class LiveCoordinator(
             )
             val countsAsUnread = !sentByUs && !playback &&
                 kind in setOf(MessageKind.PRIVMSG, MessageKind.NOTICE, MessageKind.ACTION)
+            val boundary = if (countsAsUnread && timestampMs > buffer.readAtMs) {
+                val existing = buffer.unreadFromTimestampMs
+                if (existing == null || existing <= buffer.readAtMs) timestampMs else minOf(existing, timestampMs)
+            } else {
+                buffer.unreadFromTimestampMs
+            }
             buffer.copy(
                 messages = buffer.messages + entry,
                 hasUnread = buffer.hasUnread || countsAsUnread,
+                unreadFromTimestampMs = boundary,
             )
         }
         if (highlightsMe && !sentByUs) {
@@ -1034,7 +1049,7 @@ public class LiveCoordinator(
     public fun markRead(storageKey: String) {
         val latest = _buffers.value[storageKey]?.messages?.maxOfOrNull { it.timestampMs } ?: return
         readMarkers.advance(storageKey, latest)
-        updateBufferKey(storageKey) { it.copy(hasUnread = false, unreadFromTimestampMs = null) }
+        updateBufferKey(storageKey) { it.copy(hasUnread = false, readAtMs = latest) }
         val networkId = storageKey.substringBefore("|")
         val session = sessions[networkId] ?: return
         if ("draft/read-marker" !in session.supportedCaps) return
@@ -1084,6 +1099,7 @@ public class LiveCoordinator(
                 current.copy(
                     messages = restored + current.messages,
                     unreadFromTimestampMs = firstUnread,
+                    readAtMs = marker,
                 )
             }
         }
