@@ -1,0 +1,10 @@
+[theme]
+name = "Yardhal Night"
+dark = true
+
+[colors]
+background = "#101418"
+primary = "#9ACBFF"
+secondary = "#526069"
+tertiary = "#CDBEEA"
+surface_variant = "#1C2126"
