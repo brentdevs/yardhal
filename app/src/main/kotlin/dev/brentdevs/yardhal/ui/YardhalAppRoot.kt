@@ -1,6 +1,7 @@
 package dev.brentdevs.yardhal.ui
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.lazy.LazyColumn
@@ -18,6 +19,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -27,6 +29,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.brentdevs.yardhal.coordinator.ConnectionStatus
 import dev.brentdevs.yardhal.coordinator.ConversationBuffer
@@ -37,6 +40,7 @@ import dev.brentdevs.yardhal.ui.screens.ConversationScreen
 import dev.brentdevs.yardhal.ui.screens.NetworkDraft
 import dev.brentdevs.yardhal.ui.screens.NetworkOverviewScreen
 import dev.brentdevs.yardhal.ui.screens.NetworkPresetUi
+import dev.brentdevs.yardhal.ui.screens.WelcomeScreen
 import dev.brentdevs.yardhal.ui.theme.YardhalTheme
 
 private sealed interface AppDestination {
@@ -60,11 +64,17 @@ public fun YardhalAppRoot(
     val channelList by coordinator.channelList.collectAsStateWithLifecycle()
     val rawLogVersion by coordinator.rawLogVersion.collectAsStateWithLifecycle()
     val bouncerVersion by coordinator.bouncerVersion.collectAsStateWithLifecycle()
+    val mutedKeys by coordinator.mutedState.collectAsStateWithLifecycle()
+    val orderState by coordinator.orderState.collectAsStateWithLifecycle()
 
     var addNetworkVisible by remember { mutableStateOf(false) }
+    var pendingPreset by remember { mutableStateOf<NetworkPresetUi?>(null) }
     var selectedKey by remember { mutableStateOf<String?>(null) }
     var joinDialogVisible by remember { mutableStateOf(false) }
     var joinDraft by remember { mutableStateOf("") }
+    var searchVisible by remember { mutableStateOf(false) }
+    var searchQuery by remember { mutableStateOf("") }
+    var searchResults by remember { mutableStateOf<List<dev.brentdevs.yardhal.core.data.FtsHit>>(emptyList()) }
     var bouncerVisible by remember { mutableStateOf(false) }
     var bouncerAddr by remember { mutableStateOf("ircs://") }
     var bouncerName by remember { mutableStateOf("") }
@@ -124,6 +134,17 @@ public fun YardhalAppRoot(
                             coordinator.markRead(ConversationRef.server(networkId).storageKey)
                             selectedKey = ConversationRef.server(networkId).storageKey
                         },
+                        mutedKeys = mutedKeys,
+                        orderState = orderState,
+                        onMarkRead = { key -> coordinator.markRead(key) },
+                        onToggleMute = { key -> coordinator.toggleMute(key) },
+                        onLeave = { key -> coordinator.leaveConversation(networkId = key.substringBefore("|"), storageKey = key) },
+                        onTogglePin = { key -> coordinator.togglePin(key) },
+                        onRetryJoin = { key -> coordinator.retryJoin(key.substringBefore("|"), key) },
+                        onMoveToGroup = { key, groupId ->
+                            if (groupId == null) coordinator.removeFromGroup(key) else coordinator.addToGroup(groupId, key)
+                        },
+                        onCreateGroup = { name, done -> done(coordinator.createGroup(name)) },
                         onAddNetwork = { addNetworkVisible = true },
                         onRemoveNetwork = { coordinator.removeNetwork(it) },
                         onBrowseChannels = {
@@ -162,10 +183,16 @@ public fun YardhalAppRoot(
                                 coordinator.sendTyping(networkId, key)
                             },
                             onOpenJoin = { joinDialogVisible = true },
-                            onLoadHistory = { coordinator.loadPersistedHistory(key) },
+                            onLoadHistory = {
+                                coordinator.loadPersistedHistory(key)
+                                coordinator.ensureMembers(networkId, key)
+                            },
                             onReact = { msgid, emoji -> coordinator.react(networkId, key, msgid, emoji) },
                             onSetReplyDraft = { message -> coordinator.setReplyDraft(networkId, key, message) },
                             onDelete = { msgid -> coordinator.deleteMessage(networkId, key, msgid) },
+                        onOpenSearch = { searchVisible = true },
+                            onMemberAction = { action, nick -> coordinator.memberAction(networkId, key, action, nick) },
+                            onOpenDm = { nick -> selectedKey = coordinator.directMessageKey(networkId, key, nick) },
                             sharedDraft = sharedDraft,
                             onSharedConsumed = onSharedConsumed,
                             onPickFile = { launchAttachmentPicker() },
@@ -178,11 +205,16 @@ public fun YardhalAppRoot(
             when {
                 addNetworkVisible -> AddNetworkSheet(
                     presets = presets,
+                    initialPreset = pendingPreset,
                     onSave = {
                         onNetworkSaved(it)
                         addNetworkVisible = false
+                        pendingPreset = null
                     },
-                    onDismiss = { addNetworkVisible = false },
+                    onDismiss = {
+                        addNetworkVisible = false
+                        pendingPreset = null
+                    },
                 )
 
                 selectedKey != null -> {
@@ -203,10 +235,16 @@ public fun YardhalAppRoot(
                                 coordinator.sendTyping(networkId, key)
                             },
                             onOpenJoin = { joinDialogVisible = true },
-                            onLoadHistory = { coordinator.loadPersistedHistory(key) },
+                            onLoadHistory = {
+                                coordinator.loadPersistedHistory(key)
+                                coordinator.ensureMembers(networkId, key)
+                            },
                             onReact = { msgid, emoji -> coordinator.react(networkId, key, msgid, emoji) },
                             onSetReplyDraft = { message -> coordinator.setReplyDraft(networkId, key, message) },
                             onDelete = { msgid -> coordinator.deleteMessage(networkId, key, msgid) },
+                        onOpenSearch = { searchVisible = true },
+                            onMemberAction = { action, nick -> coordinator.memberAction(networkId, key, action, nick) },
+                            onOpenDm = { nick -> selectedKey = coordinator.directMessageKey(networkId, key, nick) },
                             sharedDraft = sharedDraft,
                             onSharedConsumed = onSharedConsumed,
                             onPickFile = { launchAttachmentPicker() },
@@ -217,17 +255,17 @@ public fun YardhalAppRoot(
 
                 else -> {
                     if (networks.isEmpty()) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .padding(24.dp),
-                            verticalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterVertically),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                        ) {
-                            Text("Welcome to Yardhal", style = MaterialTheme.typography.headlineSmall)
-                            Text("Your networks sail with you.", style = MaterialTheme.typography.titleMedium)
-                            Button(onClick = { addNetworkVisible = true }) { Text("Add a network") }
-                        }
+                        WelcomeScreen(
+                            onAddNetwork = {
+                                pendingPreset = null
+                                addNetworkVisible = true
+                            },
+                            presets = presets,
+                            onPickPreset = { picked ->
+                                pendingPreset = picked
+                                addNetworkVisible = true
+                            },
+                        )
                     } else {
                         NetworkOverviewScreen(
                             buffers = buffers.values
@@ -242,6 +280,17 @@ public fun YardhalAppRoot(
                                 coordinator.markRead(ConversationRef.server(networkId).storageKey)
                                 selectedKey = ConversationRef.server(networkId).storageKey
                             },
+                        mutedKeys = mutedKeys,
+                        orderState = orderState,
+                        onMarkRead = { key -> coordinator.markRead(key) },
+                        onToggleMute = { key -> coordinator.toggleMute(key) },
+                        onLeave = { key -> coordinator.leaveConversation(networkId = key.substringBefore("|"), storageKey = key) },
+                        onTogglePin = { key -> coordinator.togglePin(key) },
+                        onRetryJoin = { key -> coordinator.retryJoin(key.substringBefore("|"), key) },
+                        onMoveToGroup = { key, groupId ->
+                            if (groupId == null) coordinator.removeFromGroup(key) else coordinator.addToGroup(groupId, key)
+                        },
+                        onCreateGroup = { name, done -> done(coordinator.createGroup(name)) },
                             onAddNetwork = { addNetworkVisible = true },
                             onRemoveNetwork = { coordinator.removeNetwork(it) },
                             onBrowseChannels = {
@@ -375,6 +424,72 @@ public fun YardhalAppRoot(
             },
             confirmButton = {
                 TextButton(onClick = { bouncerVisible = false }) { Text("Close") }
+            },
+        )
+    }
+
+    if (searchVisible) {
+        LaunchedEffect(searchQuery) {
+            val query = searchQuery
+            if (query.length >= 2) {
+                delay(250)
+                val hits = coordinator.searchMessages(query)
+                if (searchQuery == query) searchResults = hits
+            }
+        }
+        AlertDialog(
+            onDismissRequest = { searchVisible = false },
+            title = { Text("Search messages") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OutlinedTextField(
+                        value = searchQuery,
+                        onValueChange = { updated ->
+                            searchQuery = updated
+                            searchResults = emptyList()
+                        },
+                        placeholder = { Text("Search all conversations") },
+                        singleLine = true,
+                    )
+                    if (searchResults.isEmpty() && searchQuery.length >= 2) {
+                        Text(
+                            "No matches",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    LazyColumn(modifier = Modifier.padding(vertical = 4.dp)) {
+                        items(searchResults.size) { index ->
+                            val hit = searchResults[index]
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        val hitKey = coordinator.ensureConversation(hit.networkId, hit.conversation)
+                                        coordinator.markRead(hitKey)
+                                        selectedKey = hitKey
+                                        searchVisible = false
+                                    }
+                                    .padding(vertical = 4.dp),
+                            ) {
+                                Text(
+                                    "${hit.sender} in ${hit.conversation}",
+                                    style = MaterialTheme.typography.labelMedium,
+                                )
+                                Text(
+                                    hit.snippet,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 2,
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { searchVisible = false }) { Text("Close") }
             },
         )
     }

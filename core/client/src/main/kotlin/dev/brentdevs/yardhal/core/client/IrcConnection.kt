@@ -59,6 +59,7 @@ public data class IrcConnectionConfig(
             "cap-notify",
             "sasl",
             "znc.in/playback",
+            "draft/read-marker",
             dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.CAPABILITY,
             dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.NOTIFY_CAPABILITY,
         )
@@ -104,7 +105,12 @@ public class IrcConnection(
     @Volatile
     private var registeredNickname: String? = null
 
+    private companion object {
+        const val MAX_NICK_COLLISION_ATTEMPTS = 4
+    }
+
     private var nickUserSent: Boolean = false
+    private var nickCollisionAttempts: Int = 0
     private var negotiator: CapabilityNegotiator? = null
     private var saslHandler: SaslPlainHandler? = null
 
@@ -225,6 +231,13 @@ public class IrcConnection(
             numeric == 1 && registeredNickname == null -> {
                 registeredNickname = message.parameters.firstOrNull() ?: config.nick
                 emit(IrcEvent.Registered(registeredNickname!!, message.parameters.lastOrNull() ?: ""))
+            }
+            (numeric == 432 || numeric == 433) &&
+                registeredNickname == null &&
+                nickCollisionAttempts < MAX_NICK_COLLISION_ATTEMPTS -> {
+                nickCollisionAttempts += 1
+                val retryNick = config.nick + "_".repeat(nickCollisionAttempts)
+                sendLine("NICK $retryNick")
             }
         }
         emit(IrcEvent.MessageReceived(message))

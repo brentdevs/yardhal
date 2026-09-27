@@ -1,5 +1,6 @@
 package dev.brentdevs.yardhal.coordinator
 
+import dev.brentdevs.yardhal.core.data.ChannelMember
 import dev.brentdevs.yardhal.core.data.ConversationKind
 import dev.brentdevs.yardhal.core.data.ConversationRef
 import dev.brentdevs.yardhal.core.data.MessageKind
@@ -32,12 +33,24 @@ public data class ChatMessage(
     public val msgid: String?,
     public val replyToMsgid: String? = null,
     public val attachmentUrl: String? = null,
-)
+    public val playback: Boolean = false,
+) {
+    public val countsAsUnread: Boolean
+        get() = !sentByUs && !playback &&
+            kind in setOf(MessageKind.PRIVMSG, MessageKind.NOTICE, MessageKind.ACTION)
+}
 
 public data class PresenceState(
     public val away: Boolean,
     public val account: String? = null,
 )
+
+public enum class JoinState {
+    IDLE,
+    JOINING,
+    JOINED,
+    FAILED,
+}
 
 public data class ConversationBuffer(
     public val ref: ConversationRef,
@@ -45,11 +58,14 @@ public data class ConversationBuffer(
     public val topic: String? = null,
     public val messages: List<ChatMessage> = emptyList(),
     public val hasUnread: Boolean = false,
-    public val members: List<String> = emptyList(),
+    public val members: List<ChannelMember> = emptyList(),
     public val memberPresence: Map<String, PresenceState> = emptyMap(),
     public val typingUsers: Map<String, Long> = emptyMap(),
     public val reactions: Map<String, Map<String, Set<String>>> = emptyMap(),
     public val replyDraft: ChatMessage? = null,
+    public val joinState: JoinState = JoinState.JOINED,
+    public val unreadFromTimestampMs: Long? = null,
+    public val readAtMs: Long = 0L,
 ) {
     public val key: String get() = ref.storageKey
 

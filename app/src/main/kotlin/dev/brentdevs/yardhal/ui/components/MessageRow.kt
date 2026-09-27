@@ -1,20 +1,25 @@
 package dev.brentdevs.yardhal.ui.components
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -26,12 +31,13 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
-private val TIME_FORMAT = DateTimeFormatter.ofPattern("HH:mm")
+private val TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
 
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 public fun MessageRow(
     message: ChatMessage,
+    groupedWithPrevious: Boolean,
     reactions: Map<String, Set<String>>,
     quotedText: String?,
     onLongPress: () -> Unit,
@@ -39,103 +45,157 @@ public fun MessageRow(
     modifier: Modifier = Modifier,
 ) {
     when (message.kind) {
-        MessageKind.SYSTEM, MessageKind.JOIN, MessageKind.PART -> SystemLine(message.text, modifier)
-        else -> ChatLine(message, reactions, quotedText, onLongPress, onToggleReaction, modifier)
+        MessageKind.SYSTEM, MessageKind.JOIN, MessageKind.PART -> SystemLine(message, modifier)
+        else -> ChatLine(message, groupedWithPrevious, reactions, quotedText, onLongPress, onToggleReaction, modifier)
     }
 }
 
 @Composable
-private fun SystemLine(text: String, modifier: Modifier) {
-    Text(
-        text = text,
+private fun SystemLine(message: ChatMessage, modifier: Modifier) {
+    Row(
         modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 2.dp),
-        style = MaterialTheme.typography.bodySmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        fontStyle = FontStyle.Italic,
-    )
+            .padding(horizontal = 16.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = "·",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.width(14.dp),
+        )
+        Text(
+            text = message.text,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            fontStyle = FontStyle.Italic,
+        )
+    }
 }
 
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 private fun ChatLine(
     message: ChatMessage,
+    groupedWithPrevious: Boolean,
     reactions: Map<String, Set<String>>,
     quotedText: String?,
     onLongPress: () -> Unit,
     onToggleReaction: (String) -> Unit,
     modifier: Modifier,
 ) {
-    val highlightBackground =
-        if (message.highlightsMe) {
-            MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.35f)
-        } else {
-            Color.Transparent
-        }
-    Column(
+    HighlightedSurface(
+        highlighted = message.highlightsMe,
         modifier = modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(6.dp))
-            .background(highlightBackground)
-            .combinedClickable(onClick = {}, onLongClick = onLongPress)
-            .padding(horizontal = 12.dp, vertical = 2.dp),
+            .padding(horizontal = 10.dp, vertical = if (groupedWithPrevious) 1.dp else 4.dp),
     ) {
-        if (message.replyToMsgid != null) {
-            Text(
-                text = "↩ ${quotedText ?: "earlier message"}",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-            )
-        }
-        if (message.attachmentUrl != null) {
-            Text(
-                text = "📎 ${message.attachmentUrl}",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.primary,
-                maxLines = 1,
-            )
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(
-                text = formatTime(message.timestampMs),
-                style = MaterialTheme.typography.labelSmall,
-                fontFamily = FontFamily.Monospace,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            if (message.kind != MessageKind.ACTION) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .combinedClickable(onClick = {}, onLongClick = onLongPress)
+                .padding(horizontal = 2.dp, vertical = 1.dp),
+            verticalAlignment = Alignment.Top,
+        ) {
+            if (groupedWithPrevious) {
+                Spacer(modifier = Modifier.size(38.dp))
+            } else {
+                NickAvatar(nick = message.sender)
+            }
+            Spacer(modifier = Modifier.width(10.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                if (!groupedWithPrevious) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        text = message.sender,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = nickColor(message.sender),
+                    )
+                    Text(
+                        text = formatTime(message.timestampMs),
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = FontFamily.Monospace,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            if (message.replyToMsgid != null) {
                 Text(
-                    text = message.sender,
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    color = nickColor(message.sender),
+                    text = "↩ ${quotedText ?: "earlier message"}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    modifier = Modifier.padding(top = 1.dp),
                 )
             }
-        }
-        val bodyStyle =
-            if (message.kind == MessageKind.ACTION) {
-                MaterialTheme.typography.bodyMedium.copy(fontStyle = FontStyle.Italic, color = nickColor(message.sender))
-            } else {
-                MaterialTheme.typography.bodyMedium
+            if (message.attachmentUrl != null) {
+                Text(
+                    text = "📎 ${message.attachmentUrl}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    maxLines = 1,
+                )
             }
-        Text(text = message.text, style = bodyStyle)
-        if (reactions.isNotEmpty()) {
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 2.dp)) {
-                reactions.forEach { (emoji, nicks) ->
-                    Surface(
-                        shape = RoundedCornerShape(10.dp),
-                        color = MaterialTheme.colorScheme.surfaceVariant,
-                        onClick = { onToggleReaction(emoji) },
-                    ) {
-                        Text(
-                            text = "$emoji ${nicks.size}",
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp),
-                            style = MaterialTheme.typography.labelSmall,
-                        )
+            if (message.kind == MessageKind.ACTION) {
+                Text(
+                    text = "✦ ${message.text}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontStyle = FontStyle.Italic,
+                    color = nickColor(message.sender),
+                )
+            } else {
+                Text(
+                    text = formattedMessage(message.text),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+            if (reactions.isNotEmpty()) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.padding(top = 3.dp),
+                ) {
+                    for ((emoji, nicks) in reactions) {
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = MaterialTheme.colorScheme.surfaceVariant,
+                            onClick = { onToggleReaction(emoji) },
+                        ) {
+                            Text(
+                                text = "$emoji ${nicks.size}",
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                                style = MaterialTheme.typography.labelSmall,
+                            )
+                        }
                     }
                 }
             }
+        }
+    }
+    }
+}
+
+@Composable
+public fun DayPill(label: String, modifier: Modifier = Modifier) {
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(vertical = 10.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Surface(
+            shape = RoundedCornerShape(50),
+            color = MaterialTheme.colorScheme.surfaceVariant,
+        ) {
+            Text(
+                text = label,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 3.dp),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }
@@ -144,17 +204,23 @@ public fun formatTime(epochMs: Long): String =
     Instant.ofEpochMilli(epochMs).atZone(ZoneId.systemDefault()).format(TIME_FORMAT)
 
 @Composable
-public fun DaySeparator(label: String, modifier: Modifier = Modifier) {
-    Row(
+public fun NewMessagesDivider(label: String, modifier: Modifier = Modifier) {
+    Box(
         modifier = modifier
             .fillMaxWidth()
-            .padding(vertical = 6.dp),
-        horizontalArrangement = Arrangement.Center,
+            .padding(vertical = 8.dp),
+        contentAlignment = Alignment.Center,
     ) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        Surface(
+            shape = RoundedCornerShape(50),
+            color = MaterialTheme.colorScheme.primary,
+        ) {
+            Text(
+                text = label,
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 3.dp),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onPrimary,
+            )
+        }
     }
 }

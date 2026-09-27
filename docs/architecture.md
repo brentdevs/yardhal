@@ -44,7 +44,7 @@ Each layer depends only on the ones below it.
 
 ## Data flow on an inbound message
 
-Planned shape (ported from Halyard):
+Actual shape (ported from Halyard):
 
 1. Bytes off the TLS socket → `LineFramer` splits on `\r\n`.
 2. Each line parses to an `IrcMessage` (`core/protocol`).
@@ -97,15 +97,22 @@ Phases land in order; each phase ships with tests and updated docs.
   MONITOR verbs with status lines, standard-replies lines, MARKREAD
   mirroring, netsplit/netjoin collapse. Remaining: multiline batches
   (spec wip), metadata avatars.
-- **Phase 6 — Polish**: whois panel, ignore list, LIST browser, link
-  previews pending, two-pane tablet layout, traffic console, TOML theme
-  engine applied to Material scheme ✅. Remaining: moderation surfaces
-  beyond slash verbs, per-message link auto-open polish.
+- **Phase 6 — Polish**: ✅ whois panel, ignore list, LIST browser, two-pane
+  tablet layout, traffic console, TOML theme engine, per-network channel
+  tree with pins/custom groups/swipe actions/last-message previews,
+  role-sectioned member sheet with moderation actions, join-state machine
+  with retry, unread divider with jump-to-unread, and Room-FTS message
+  search with snippet results. Remaining: moderation surfaces beyond slash
+  verbs, per-message link auto-open polish.
 - **Phase 7 — Bouncers**: ZNC `znc.in/playback` requested; playback
   batches classified as history (no unread/highlight noise);
-  `*status`/`*playback` routed to the server buffer. soju `soju.im/bouncer`
-  detected with LISTNETWORKS issued and numerics surfaced in the server
-  buffer. Full network-management UI is follow-up work against a live
+  `*status`/`*playback` routed to the server buffer. soju
+  `soju.im/bouncer-networks` ported from Halyard: attribute model with
+  escape-aware tokenizer, BOUNCER NETWORK upsert/delete parsing,
+  ADDNETWORK/DELNETWORK/CONNECTNETWORK/DISCONNECTNETWORK, BouncerServ
+  service commands, draft-vs-baseline diffing, and a management dialog.
+  Known channels are re-joined on every connect so membership (and hence
+  NAMES/WHO) survives restarts. Full soju editor edge cases want a live
   bouncer.
 - **Phase 8 — Extras**: media uploads landed via the soju.im/FILEHOST
   ISUPPORT extension (endpoint discovered from 005, HTTPS enforced on TLS
@@ -115,6 +122,10 @@ Phases land in order; each phase ships with tests and updated docs.
   into the composer. Widgets and an on-device catch-up digest are future
   work — Android has no FoundationModels equivalent, so that feature needs a
   bundled model decision first.
+
+Deferred by design: multiline batches (spec WIP), metadata-2 avatars,
+link auto-open, catch-up digest, widgets. Each is tracked in
+`docs/ircv3-checklist.md` or above.
 
 The authoritative IRCv3 obligation inventory lives in
 `docs/ircv3-checklist.md`; check items off as they land.

@@ -41,14 +41,34 @@ NixOS-specific: Maven-shipped AAPT2 cannot exec here, so the Makefile passes
 (the androidenv-patched binary). If you invoke `./gradlew` directly on NixOS,
 add that flag yourself; on other OSes/CI it is unnecessary.
 
-Install on a device/emulator:
+## Run it
 
 ```sh
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+make devices         # list adb targets
+make install         # build + install on a connected phone + launch
+make play            # build + boot a windowed emulator + install + launch
+make emu-windowed    # boot the emulator without rebuilding
+make emu             # boot it headless (CI/automation)
 ```
 
-## Conventions
+The flake composes a Pixel 6 AVD (Android 15 image); it needs KVM and
+boots in ~15 seconds. Phones need Android 13+ with USB debugging on
+(`plugdev` group membership may be required on NixOS), or wireless
+debugging paired with `adb pair`.
 
+## Verify like a human
+
+Unit tests and the Ergo round-trip cover the protocol and connection
+layers, but UI work must be exercised on a running instance: boot with
+`make play` (or install on a device), drive the real app, and read the
+traffic console (Debug action on the overview) when the wire is
+ambiguous. Roughly every real bug in the UI layer has been found this
+way — CAP negotiation noise in the transcript, nick collisions wedging
+the connection, channel numerics landing in the wrong buffer, lost
+member-list role prefixes, and the search index missing on
+pre-existing installs.
+
+## Conventions
 - **Kotlin sources contain no comments** — no `//`, `/* */`, no KDoc on
   private code. Encode invariants in test names, assertions, and identifier
   names. Public API in `core/*` may carry KDoc where it aids Quick-doc-style

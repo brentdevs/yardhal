@@ -2,27 +2,44 @@ package dev.brentdevs.yardhal.core.data
 
 import dev.brentdevs.yardhal.core.protocol.ChannelPrefixModes
 
+public data class ChannelMember(
+    public val nick: String,
+    public val symbol: Char? = null,
+) {
+    public val isOperator: Boolean
+        get() = symbol == '@' || symbol == '&' || symbol == '~'
+
+    public val isVoice: Boolean
+        get() = symbol == '+'
+
+    public val looksLikeBot: Boolean
+        get() = nick.endsWith("bot", ignoreCase = true) || nick.endsWith("irobot", ignoreCase = true)
+}
+
 public object NamesParser {
 
-    public fun stripPrefixes(nick: String, prefixes: ChannelPrefixModes): String {
-        var result = nick
-        while (result.isNotEmpty() && prefixes.symbols.contains(result.first())) {
-            result = result.drop(1)
+    public fun parseMember(token: String, prefixes: ChannelPrefixModes): ChannelMember {
+        var symbol: Char? = null
+        var nick = token
+        while (nick.isNotEmpty() && prefixes.symbols.contains(nick.first())) {
+            if (symbol == null) symbol = nick.first()
+            nick = nick.drop(1)
         }
-        return result
+        nick = nick.substringBefore('!').substringBefore('@')
+        return ChannelMember(nick = nick, symbol = symbol)
     }
 
     public fun parseNamesLine(
         params: List<String>,
         prefixes: ChannelPrefixModes,
-    ): Pair<String?, List<String>> {
+    ): Pair<String?, List<ChannelMember>> {
         val payloadIndex = params.size - 1
         if (payloadIndex < 1) return null to emptyList()
         val channel = params.getOrNull(payloadIndex - 1)
         val members = params.last()
             .split(' ')
             .filter { it.isNotEmpty() }
-            .map { stripPrefixes(it, prefixes) }
+            .map { parseMember(it, prefixes) }
         return channel to members
     }
 }

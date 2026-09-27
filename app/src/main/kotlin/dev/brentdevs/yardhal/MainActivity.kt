@@ -10,6 +10,7 @@ import dev.brentdevs.yardhal.coordinator.ConnectionFactory
 import dev.brentdevs.yardhal.coordinator.LiveCoordinator
 import dev.brentdevs.yardhal.core.client.IrcConnection
 import dev.brentdevs.yardhal.core.client.IrcConnectionConfig
+import dev.brentdevs.yardhal.core.data.ChannelOrderStore
 import dev.brentdevs.yardhal.core.data.NetworkConfig
 import dev.brentdevs.yardhal.core.data.NetworkPresets
 import dev.brentdevs.yardhal.service.Notifications
@@ -37,6 +38,7 @@ class MainActivity : ComponentActivity() {
             readMarkers = app.readMarkerStore,
             mutes = app.muteStore,
             vault = app.vault,
+            channelOrder = ChannelOrderStore(filesDir),
             connectionFactory = ConnectionFactory { config ->
                 IrcConnection(
                     config = IrcConnectionConfig(

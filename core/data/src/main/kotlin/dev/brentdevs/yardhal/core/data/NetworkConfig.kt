@@ -57,9 +57,9 @@ public object NetworkPresets {
 
     public val ERGO_LOCAL: Preset = Preset(
         id = "ergo-local",
-        name = "Ergo (localhost)",
-        host = "127.0.0.1",
-        port = 6667,
+        name = "Ergo (emulator host)",
+        host = "10.0.2.2",
+        port = 16667,
         tls = false,
     )
 
