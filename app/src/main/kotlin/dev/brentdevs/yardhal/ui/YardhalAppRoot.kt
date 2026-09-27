@@ -467,7 +467,7 @@ public fun YardhalAppRoot(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .clickable {
-                                        val hitKey = "${hit.networkId}|${hit.conversation}"
+                                        val hitKey = coordinator.ensureConversation(hit.networkId, hit.conversation)
                                         coordinator.markRead(hitKey)
                                         selectedKey = hitKey
                                         searchVisible = false

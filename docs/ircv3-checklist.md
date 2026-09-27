@@ -37,7 +37,7 @@ Phase numbers refer to `docs/architecture.md`.
 - [x] +draft/react / +draft/unreact: reactions pills with counts, tap to toggle (P5)
 - [x] +typing: send rate-limited active TAGMSG; inbound indicators with expiry (P5)
 - [x] draft/message-redaction: REDACT handling + own redacts (P5)
-- [x] draft/read-marker: MARKREAD mirrored on read; unread divider + jump (P5)
+- [x] draft/read-marker: MARKREAD sent on read and applied inbound (cross-device), unread divider + jump (P5)
 - [ ] draft/multiline: reassemble multiline batches honoring limits (P5)
 - [ ] +draft/channel-context: "re: #channel" chip on DMs (P8)
 

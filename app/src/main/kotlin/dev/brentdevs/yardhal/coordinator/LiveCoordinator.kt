@@ -244,6 +244,7 @@ public class LiveCoordinator(
             message.command.equals("REDACT", true) -> handleRedact(session, message)
             message.command.equals("TAGMSG", true) -> handleTagmsg(session, message)
             message.command.equals("BOUNCER", true) -> handleBouncerMessage(session, message)
+            message.command.equals("MARKREAD", true) -> handleInboundMarkRead(session, message)
             message.command.equals("JOIN", true) -> handleJoin(session, message)
             message.command.equals("QUIT", true) -> handleQuit(session)
             message.command.equals("PART", true) -> handlePart(session, message)
@@ -257,7 +258,8 @@ public class LiveCoordinator(
                 handleNamesRelatedNumeric(session, message, numeric)
             numeric == 352 -> accumulateWhoLine(session, message)
             numeric == 315 -> finalizeNames(session, message)
-            numeric == 403 || numeric == 405 || numeric == 437 || numeric == 471 || numeric == 473 -> {
+            numeric == 403 || numeric == 405 || numeric == 437 || numeric == 471 ||
+                numeric == 473 || numeric == 474 || numeric == 475 -> {
                 val channel = message.parameters.getOrNull(1).orEmpty()
                 if (channel.isEmpty() || channel[0] !in "#&") return
                 val ref = ConversationRef.channel(session.config.id, channel, session.casemapping)
@@ -496,6 +498,21 @@ public class LiveCoordinator(
     }
 
 
+    private fun handleInboundMarkRead(session: Session, message: IrcMessage) {
+        val target = message.parameters.firstOrNull() ?: return
+        if (target.startsWith("*")) return
+        val markerParam = message.parameters.getOrNull(1) ?: return
+        val iso = markerParam.substringAfter("timestamp=", "")
+        if (iso.isEmpty()) return
+        val millis = runCatching { java.time.Instant.parse(iso).toEpochMilli() }.getOrNull() ?: return
+        val ref = ConversationRef.channel(session.config.id, target, session.casemapping)
+        readMarkers.advance(ref.storageKey, millis)
+        _buffers.update { current ->
+            val existing = current[ref.storageKey] ?: return@update current
+            if (millis <= existing.readAtMs) current else current + (ref.storageKey to existing.copy(readAtMs = millis, hasUnread = false))
+        }
+    }
+
     private fun handleNamesRelatedNumeric(session: Session, message: IrcMessage, numeric: Int) {
         if (numeric == 331) {
             handleTopicNumeric(session, message)
@@ -645,6 +662,19 @@ public class LiveCoordinator(
         val session = sessions[networkId]
         val casemapping = session?.casemapping ?: dev.brentdevs.yardhal.core.protocol.CaseMapping.RFC1459
         val ref = ConversationRef.directMessage(networkId, nick, casemapping)
+        buffer(ref)
+        return ref.storageKey
+    }
+
+    public fun ensureConversation(networkId: String, conversation: String): String {
+        val session = sessions[networkId]
+        val casemapping = session?.casemapping ?: dev.brentdevs.yardhal.core.protocol.CaseMapping.RFC1459
+        val ref = when {
+            conversation == ConversationRef.SERVER_TARGET -> ConversationRef.server(networkId)
+            conversation.firstOrNull()?.let { it in "#&" } == true ->
+                ConversationRef.channel(networkId, conversation, casemapping)
+            else -> ConversationRef.directMessage(networkId, conversation, casemapping)
+        }
         buffer(ref)
         return ref.storageKey
     }
@@ -897,6 +927,10 @@ public class LiveCoordinator(
         val channel = message.parameters.firstOrNull() ?: return
         val reason = message.parameters.getOrNull(1)
         val ref = ConversationRef.channel(session.config.id, channel, session.casemapping)
+        if (nick.equals(session.ownNick, ignoreCase = true)) {
+            _buffers.update { it - ref.storageKey }
+            return
+        }
         appendSystem(session, ref, if (reason == null) "← $nick left" else "← $nick left ($reason)", MessageKind.PART)
     }
 

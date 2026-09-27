@@ -104,8 +104,12 @@ public class IrcConnection(
     @Volatile
     private var registeredNickname: String? = null
 
+    private companion object {
+        const val MAX_NICK_COLLISION_ATTEMPTS = 4
+    }
+
     private var nickUserSent: Boolean = false
-    private var nickCollisionRetried: Boolean = false
+    private var nickCollisionAttempts: Int = 0
     private var negotiator: CapabilityNegotiator? = null
     private var saslHandler: SaslPlainHandler? = null
 
@@ -227,9 +231,11 @@ public class IrcConnection(
                 registeredNickname = message.parameters.firstOrNull() ?: config.nick
                 emit(IrcEvent.Registered(registeredNickname!!, message.parameters.lastOrNull() ?: ""))
             }
-            (numeric == 432 || numeric == 433) && registeredNickname == null && !nickCollisionRetried -> {
-                nickCollisionRetried = true
-                val retryNick = "${config.nick}_"
+            (numeric == 432 || numeric == 433) &&
+                registeredNickname == null &&
+                nickCollisionAttempts < MAX_NICK_COLLISION_ATTEMPTS -> {
+                nickCollisionAttempts += 1
+                val retryNick = config.nick + "_".repeat(nickCollisionAttempts)
                 sendLine("NICK $retryNick")
             }
         }

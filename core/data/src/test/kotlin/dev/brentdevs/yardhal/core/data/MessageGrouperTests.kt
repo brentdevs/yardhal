@@ -7,8 +7,12 @@ import kotlin.test.assertTrue
 
 class MessageGrouperTests {
 
-    private fun groupNewestFirst(vararg times: Long, groupable: (Int) -> Boolean = { true }) =
-        MessageGrouper.group(times.toList(), groupable)
+    private fun groupNewestFirst(vararg times: Long, senders: List<String>? = null, groupable: (Int) -> Boolean = { true }) =
+        MessageGrouper.group(
+            messages = times.toList(),
+            isGroupable = groupable,
+            senderOf = { senders?.getOrNull(it) ?: "nick" },
+        )
 
     @Test
     fun consecutiveSameSenderWithinWindowGroup() {
@@ -25,12 +29,26 @@ class MessageGrouperTests {
     }
 
     @Test
-    fun differentSendersNeverGroup() {
-        val grouped = MessageGrouper.group(
-            listOf(60_000L, 59_000L),
-            isGroupable = { it == 0 },
+    fun differentSendersNeverGroupEvenWithinWindow() {
+        val grouped = groupNewestFirst(
+            60_000L,
+            59_000L,
+            senders = listOf("bob", "alice"),
         )
         assertFalse(grouped[1].groupedWithPrevious)
+    }
+
+    @Test
+    fun groupBreaksWhenSenderChangesMidRun() {
+        val grouped = groupNewestFirst(
+            90_000L,
+            60_000L,
+            30_000L,
+            senders = listOf("carol", "bob", "bob"),
+        )
+        assertFalse(grouped[0].groupedWithPrevious)
+        assertFalse(grouped[1].groupedWithPrevious)
+        assertTrue(grouped[2].groupedWithPrevious)
     }
 
     @Test

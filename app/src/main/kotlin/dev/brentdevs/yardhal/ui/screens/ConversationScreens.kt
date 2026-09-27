@@ -75,11 +75,13 @@ private fun buildTranscript(buffer: ConversationBuffer): List<TranscriptEntry> {
                 else -> true
             }
         },
+        senderOf = { index -> ordered[index].sender },
     )
     val entries = ArrayList<TranscriptEntry>(ordered.size + 4)
     val unreadFrom = buffer.unreadFromTimestampMs
     var lastDate: LocalDate? = null
     var previousTimestamp = Long.MAX_VALUE
+    var renderedUnreadDivider = false
     for (index in ordered.indices) {
         val message = ordered[index]
         val timestamp = message.timestampMs
@@ -91,9 +93,13 @@ private fun buildTranscript(buffer: ConversationBuffer): List<TranscriptEntry> {
         }
         if (unreadFrom != null && timestamp < unreadFrom && previousTimestamp >= unreadFrom) {
             entries.add(TranscriptEntry.UnreadDivider("New messages"))
+            renderedUnreadDivider = true
         }
         entries.add(TranscriptEntry.Message(message, grouped[index].groupedWithPrevious))
         previousTimestamp = timestamp
+    }
+    if (unreadFrom != null && !renderedUnreadDivider) {
+        entries.add(TranscriptEntry.UnreadDivider("New messages"))
     }
     return entries
 }
