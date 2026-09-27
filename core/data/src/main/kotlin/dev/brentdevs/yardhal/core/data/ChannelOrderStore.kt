@@ -15,8 +15,11 @@ public data class ChannelOrderState(
     public val pinnedKeys: List<String> = emptyList(),
     public val groups: List<ChannelGroup> = emptyList(),
     public val groupOrder: List<String> = emptyList(),
+    public val partedKeys: List<String> = emptyList(),
 ) {
     public fun groupOf(key: String): ChannelGroup? = groups.firstOrNull { key in it.memberKeys }
+
+    public fun isParted(key: String): Boolean = key in partedKeys
 }
 
 public class ChannelOrderStore(directory: File) {
@@ -94,12 +97,30 @@ public class ChannelOrderStore(directory: File) {
     }
 
     @Synchronized
+    public fun markParted(key: String) {
+        if (key in state.partedKeys) return
+        state = state.copy(partedKeys = state.partedKeys + key)
+        persist()
+    }
+
+    @Synchronized
+    public fun clearParted(key: String) {
+        if (key !in state.partedKeys) return
+        state = state.copy(partedKeys = state.partedKeys - key)
+        persist()
+    }
+
+    @Synchronized
+    public fun isParted(key: String): Boolean = state.isParted(key)
+
+    @Synchronized
     public fun forget(key: String) {
         state = state.copy(
             pinnedKeys = state.pinnedKeys - key,
             groups = state.groups.map { group ->
                 if (key in group.memberKeys) group.copy(memberKeys = group.memberKeys - key) else group
             },
+            partedKeys = state.partedKeys - key,
         )
         persist()
     }

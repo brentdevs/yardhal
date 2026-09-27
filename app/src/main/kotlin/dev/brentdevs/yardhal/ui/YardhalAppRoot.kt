@@ -28,6 +28,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.brentdevs.yardhal.coordinator.ConnectionStatus
 import dev.brentdevs.yardhal.coordinator.ConversationBuffer
@@ -71,6 +73,8 @@ public fun YardhalAppRoot(
     var joinDialogVisible by remember { mutableStateOf(false) }
     var joinDraft by remember { mutableStateOf("") }
     var searchVisible by remember { mutableStateOf(false) }
+    val searchJob = remember { arrayOfNulls<kotlinx.coroutines.Job>(1) }
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
     var searchQuery by remember { mutableStateOf("") }
     var searchResults by remember { mutableStateOf<List<dev.brentdevs.yardhal.core.data.FtsHit>>(emptyList()) }
     var bouncerVisible by remember { mutableStateOf(false) }
@@ -434,11 +438,15 @@ public fun YardhalAppRoot(
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     OutlinedTextField(
                         value = searchQuery,
-                        onValueChange = {
-                            searchQuery = it
-                            if (it.length >= 2) {
-                                coordinator.searchMessages(it) { hits -> searchResults = hits }
-                            } else if (it.isEmpty()) {
+                        onValueChange = { updated ->
+                            searchQuery = updated
+                            searchJob[0]?.cancel()
+                            if (updated.length >= 2) {
+                                searchJob[0] = scope.launch {
+                                    delay(250)
+                                    coordinator.searchMessages(updated) { hits -> searchResults = hits }
+                                }
+                            } else if (updated.isEmpty()) {
                                 searchResults = emptyList()
                             }
                         },

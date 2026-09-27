@@ -52,14 +52,27 @@ class ChannelOrderStoreTests {
     }
 
     @Test
-    fun forgetDropsPinAndGroupMembership() {
+    fun partedChannelsStayPartedUntilCleared() {
+        val store = ChannelOrderStore(tmp.root)
+        store.markParted("n|#gone")
+        assertTrue(store.isParted("n|#gone"))
+        assertTrue(ChannelOrderStore(tmp.root).isParted("n|#gone"))
+
+        store.clearParted("n|#gone")
+        assertTrue(!store.isParted("n|#gone"))
+    }
+
+    @Test
+    fun forgetDropsPinGroupMembershipAndPartTombstone() {
         val store = ChannelOrderStore(tmp.root)
         store.togglePin("n|#gone")
         store.createGroup("g1", "G")
         store.addToGroup("g1", "n|#gone")
+        store.markParted("n|#gone")
         store.forget("n|#gone")
         val state = store.snapshot()
         assertTrue(state.pinnedKeys.isEmpty())
         assertTrue(state.groups.single().memberKeys.isEmpty())
+        assertTrue(!state.isParted("n|#gone"))
     }
 }
