@@ -59,6 +59,7 @@ public data class IrcConnectionConfig(
             "cap-notify",
             "sasl",
             "znc.in/playback",
+            "draft/read-marker",
             dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.CAPABILITY,
             dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.NOTIFY_CAPABILITY,
         )

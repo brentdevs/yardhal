@@ -25,6 +25,7 @@ public object NamesParser {
             if (symbol == null) symbol = nick.first()
             nick = nick.drop(1)
         }
+        nick = nick.substringBefore('!').substringBefore('@')
         return ChannelMember(nick = nick, symbol = symbol)
     }
 

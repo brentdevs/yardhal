@@ -424,24 +424,26 @@ public class LiveCoordinator(
     }
 
     private fun handleBatchFrame(session: Session, message: IrcMessage) {
-        if (message.parameters.size < 2) return
-        val reference = message.parameters.last().removePrefix("+").removePrefix("-")
-        val action = message.parameters[message.parameters.size - 2]
-        when (action) {
-            "+" -> {
-                val type = message.parameters.getOrNull(message.parameters.size - 1) ?: return
-                session.openBatchTypes[reference] = type
-                netsplitCollapser.onStart(reference, type, emptyList())
-            }
-            "-" -> {
-                session.openBatchTypes.remove(reference)
-                val summary = netsplitCollapser.onEnd(reference) ?: return
-                appendSystem(
-                    session,
-                    ConversationRef.server(session.config.id),
-                    summary.toString(),
-                    MessageKind.SYSTEM,
-                )
+        val head = message.parameters.firstOrNull() ?: return
+        if (message.command.equals("BATCH", true)) {
+            when {
+                head.startsWith("+") -> {
+                    val reference = head.drop(1)
+                    val type = message.parameters.getOrNull(1) ?: return
+                    session.openBatchTypes[reference] = type
+                    netsplitCollapser.onStart(reference, type, emptyList())
+                }
+                head.startsWith("-") -> {
+                    val reference = head.drop(1)
+                    session.openBatchTypes.remove(reference)
+                    val summary = netsplitCollapser.onEnd(reference) ?: return
+                    appendSystem(
+                        session,
+                        ConversationRef.server(session.config.id),
+                        summary.toString(),
+                        MessageKind.SYSTEM,
+                    )
+                }
             }
         }
     }
@@ -509,7 +511,17 @@ public class LiveCoordinator(
         readMarkers.advance(ref.storageKey, millis)
         _buffers.update { current ->
             val existing = current[ref.storageKey] ?: return@update current
-            if (millis <= existing.readAtMs) current else current + (ref.storageKey to existing.copy(readAtMs = millis, hasUnread = false))
+            if (millis <= existing.readAtMs) {
+                current
+            } else {
+                val stillUnread = existing.messages.any { it.timestampMs > millis && !it.sentByUs }
+                val boundary = existing.messages.firstOrNull { it.timestampMs > millis && !it.sentByUs }?.timestampMs
+                current + (ref.storageKey to existing.copy(
+                    readAtMs = millis,
+                    hasUnread = stillUnread,
+                    unreadFromTimestampMs = boundary,
+                ))
+            }
         }
     }
 
@@ -550,16 +562,39 @@ public class LiveCoordinator(
         val session = sessions[networkId] ?: return
         val buffer = _buffers.value[storageKey] ?: return
         if (buffer.ref.kind != ConversationKind.CHANNEL) return
-        if (buffer.members.isNotEmpty()) return
-        sendRaw(session, "WHO ${buffer.ref.rawTarget}")
+        val needsMembers = buffer.members.isEmpty()
+        val needsPresence = buffer.memberPresence.size < buffer.members.size
+        if (!needsMembers && !needsPresence) return
+        val query = if (session.hasWhox) "%acfhn" else ""
+        sendRaw(session, "WHO ${buffer.ref.rawTarget} $query".trimEnd())
     }
 
     private fun handleWhoXLine(session: Session, message: IrcMessage) {
         if (message.parameters.size < 6) return
         val fields = message.parameters.drop(1)
         val account = fields.getOrNull(0)?.takeIf { it != "0" }
+        val channel = fields.getOrNull(1)
         val flags = fields.getOrNull(2)
         val nick = fields.getOrNull(4) ?: return
+        if (channel != null && channel.isNotEmpty() && channel[0] in "#&") {
+            val key = ConversationRef.channel(session.config.id, channel, session.casemapping).storageKey
+            val symbol = session.prefixModes.symbols.firstOrNull { it in (flags ?: "") }
+            _buffers.update { current ->
+                val existing = current[key]
+                    ?: ConversationBuffer(
+                        ref = ConversationRef.channel(session.config.id, channel, session.casemapping),
+                        displayName = channel,
+                    )
+                if (existing.members.any { it.nick.equals(nick, ignoreCase = true) }) {
+                    current
+                } else {
+                    current + (key to existing.copy(
+                        members = (existing.members + dev.brentdevs.yardhal.core.data.ChannelMember(nick, symbol))
+                            .sortedBy { it.nick.lowercase() },
+                    ))
+                }
+            }
+        }
         updateMemberPresence(session, nick, away = flags?.contains('G') == true, account = account)
     }
 
@@ -929,6 +964,8 @@ public class LiveCoordinator(
         val ref = ConversationRef.channel(session.config.id, channel, session.casemapping)
         if (nick.equals(session.ownNick, ignoreCase = true)) {
             _buffers.update { it - ref.storageKey }
+            channelOrder.markParted(ref.storageKey)
+            _orderState.value = channelOrder.snapshot()
             return
         }
         appendSystem(session, ref, if (reason == null) "← $nick left" else "← $nick left ($reason)", MessageKind.PART)

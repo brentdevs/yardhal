@@ -446,7 +446,7 @@ public fun YardhalAppRoot(
                                     delay(250)
                                     coordinator.searchMessages(updated) { hits -> searchResults = hits }
                                 }
-                            } else if (updated.isEmpty()) {
+                            } else {
                                 searchResults = emptyList()
                             }
                         },

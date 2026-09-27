@@ -25,6 +25,12 @@ class NamesParserTests {
     }
 
     @Test
+    fun stripsUserhostWhenUserhostInNamesIsNegotiated() {
+        assertEquals(ChannelMember("alice", '@'), NamesParser.parseMember("@alice!u@host.tld", prefixes))
+        assertEquals(ChannelMember("bob", null), NamesParser.parseMember("bob!u@host.tld", prefixes))
+    }
+
+    @Test
     fun parsesChannelAndMembers() {
         val (channel, members) = NamesParser.parseNamesLine(
             listOf("me", "=", "#room", "@alice +bob carol dave"),
