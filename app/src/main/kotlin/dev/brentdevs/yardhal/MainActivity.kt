@@ -5,6 +5,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.ui.Modifier
 import dev.brentdevs.yardhal.coordinator.LiveCoordinator
 import dev.brentdevs.yardhal.core.data.NetworkConfig
@@ -27,7 +28,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             YardhalTheme(
-                themeDefinition = loadBundledTheme(),
+                themeDefinition = if (isSystemInDarkTheme()) loadBundledTheme() else null,
             ) {
                 YardhalAppRoot(
                     coordinator = coordinator,
