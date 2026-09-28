@@ -38,9 +38,9 @@ Each layer depends only on the ones below it.
   scrollback trimming), `ReadMarkerStore`, `MuteStore`,
   `SlashCommandParser`, mention matching, network presets.
   Credentials live in Android Keystore-backed storage.
-- **`app`** — Compose UI plus `LiveCoordinator`, the central owner of
-  per-network state. A foreground service keeps connections alive and
-  raises notifications.
+- **`app`** — Compose UI plus the application-owned `LiveCoordinator`, the
+  central owner of per-network state. The foreground service keeps the process
+  alive while networks are configured and raises notifications.
 
 ## Data flow on an inbound message
 

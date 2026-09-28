@@ -57,7 +57,7 @@ public class CapabilityNegotiator(
 
         when (verb) {
             "LS" -> {
-                available += splitNames(payload)
+                available += splitAdvertisedNames(payload)
                 if (!multiline && phase == Phase.LISTING) completeListing()
             }
             "ACK" -> {
@@ -70,7 +70,7 @@ public class CapabilityNegotiator(
                 if (!multiline && phase == Phase.REQUESTING) completeRequest()
             }
             "NEW" -> {
-                val names = splitNames(payload)
+                val names = splitAdvertisedNames(payload)
                 available += names
                 requestSubset(wanted intersect names)
             }
@@ -132,5 +132,8 @@ public class CapabilityNegotiator(
 
         internal fun splitNames(payload: String): Set<String> =
             payload.split(' ').filter { it.isNotEmpty() }.toSet()
+
+        internal fun splitAdvertisedNames(payload: String): Set<String> =
+            splitNames(payload).mapTo(LinkedHashSet()) { it.substringBefore('=') }
     }
 }

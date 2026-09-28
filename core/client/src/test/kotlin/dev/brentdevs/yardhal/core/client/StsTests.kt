@@ -17,7 +17,13 @@ class StsTests {
     }
 
     @Test
-    fun rejectsMissingPortOrDuration() {
+    fun secureAdvertisementUsesCurrentPort() {
+        assertEquals(6697, StsResolver.parseCapValue("duration=3600", now, currentPort = 6697)?.port)
+        assertEquals(6697, StsResolver.parseUpgradePort("port=6697"))
+    }
+
+    @Test
+    fun rejectsMissingOrInvalidRequiredValues() {
         assertNull(StsResolver.parseCapValue("port=6697", now))
         assertNull(StsResolver.parseCapValue("duration=3600", now))
         assertNull(StsResolver.parseCapValue("port=0,duration=3600", now))
@@ -36,10 +42,13 @@ class StsTests {
     }
 
     @Test
-    fun plainConnectionBlockedByActivePolicy() {
+    fun plainConnectionUpgradesUnderActivePolicy() {
         val store = InMemoryStsPolicyStore()
         store.save("host", StsPolicy(6697, now + 1000))
-        assertTrue(StsResolver.decide(store, "host", 6667, tlsRequested = false, nowEpochSeconds = now) is StsUpgradeDecision.BlockedByPolicy)
+        assertEquals(
+            StsUpgradeDecision.UpgradeRequired(6697),
+            StsResolver.decide(store, "host", 6667, tlsRequested = false, nowEpochSeconds = now),
+        )
     }
 
     @Test
@@ -77,5 +86,19 @@ class StsTests {
             StsUpgradeDecision.ConnectAsConfigured,
             StsResolver.decide(InMemoryStsPolicyStore(), "fresh.host", 6667, tlsRequested = false, nowEpochSeconds = now),
         )
+    }
+
+    @Test
+    fun zeroDurationDisablesPolicy() {
+        assertTrue(StsResolver.parseCapValue("duration=0", now, currentPort = 6697)?.isExpired(now) == true)
+    }
+
+    @Test
+    fun refreshesDurationWhenConnectionCloses() {
+        val store = InMemoryStsPolicyStore()
+        val policy = StsResolver.parseCapValue("duration=3600", now, currentPort = 6697) ?: error("missing policy")
+        store.save("host", policy)
+        StsResolver.refreshOnDisconnect(store, "host", now + 100)
+        assertEquals(now + 3700, store.load("host")?.expiresAtEpochSeconds)
     }
 }

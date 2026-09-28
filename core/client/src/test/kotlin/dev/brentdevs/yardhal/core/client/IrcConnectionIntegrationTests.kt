@@ -1,7 +1,9 @@
 package dev.brentdevs.yardhal.core.client
 
 import java.util.concurrent.atomic.AtomicInteger
+import java.net.Socket
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -108,7 +110,7 @@ class IrcConnectionIntegrationTests {
             server.start()
             server.lineListener = { line ->
                 when {
-                    line.startsWith("CAP LS") -> server.sendLine(":srv CAP * LS :sasl server-time echo-message")
+                    line.startsWith("CAP LS") -> server.sendLine(":srv CAP * LS :sasl=PLAIN,EXTERNAL server-time echo-message")
                     line.startsWith("CAP REQ :") -> {
                         val requested = line.removePrefix("CAP REQ :")
                         server.sendLine(":srv CAP * ACK :$requested")
@@ -130,7 +132,11 @@ class IrcConnectionIntegrationTests {
                     saslAuthcid = "jilles",
                     saslPassword = "sesame",
                 )
-                val connection = IrcConnection(config)
+                val tapped = java.util.concurrent.CopyOnWriteArrayList<String>()
+                val connection = IrcConnection(
+                    config.copy(serverPassword = "server-secret"),
+                    rawTap = { outbound, line -> if (outbound) tapped.add(line) },
+                )
                 val collector = EventCollector(scope, connection.events)
                 connection.start()
                 server.awaitClient()
@@ -145,6 +151,9 @@ class IrcConnectionIntegrationTests {
                 assertTrue(server.receivedLines.contains("AUTHENTICATE PLAIN"))
                 assertTrue(server.receivedLines.any { it.startsWith("AUTHENTICATE A") })
                 assertTrue(server.receivedLines.contains("CAP END"))
+                assertTrue(tapped.contains("PASS <redacted>"))
+                assertTrue(tapped.contains("AUTHENTICATE <redacted>"))
+                assertFalse(tapped.any { "server-secret" in it || "sesame" in it })
                 connection.disconnect()
             } finally {
                 scope.cancel()
@@ -183,6 +192,66 @@ class IrcConnectionIntegrationTests {
                     }
                 }
                 assertTrue(sawPongMessage)
+                connection.disconnect()
+            } finally {
+                scope.cancel()
+            }
+        }
+        Unit
+    }
+
+    @kotlinx.coroutines.DelicateCoroutinesApi
+    @org.junit.jupiter.api.Test
+    fun insecureStsAdvertisementStopsBeforeRegistration() = runBlocking {
+        LoopbackIrcServer().use { server ->
+            server.start()
+            val upgradePort = AtomicInteger(0)
+            server.lineListener = { line ->
+                if (line.startsWith("CAP LS")) server.sendLine(":srv CAP * LS :sts=port=6697 server-time")
+            }
+            val scope = newScope()
+            try {
+                val connection = IrcConnection(
+                    plainConfig("127.0.0.1", server.port, capabilities = setOf("server-time"))
+                        .copy(serverPassword = "secret"),
+                    onStsUpgrade = upgradePort::set,
+                )
+                val collector = EventCollector(scope, connection.events)
+                connection.start()
+                server.awaitClient()
+                while (collector.await() !is IrcEvent.Disconnected) Unit
+                assertEquals(6697, upgradePort.get())
+                assertFalse(server.receivedLines.any { it.startsWith("PASS ") || it.startsWith("NICK ") })
+            } finally {
+                scope.cancel()
+            }
+        }
+        Unit
+    }
+
+    @kotlinx.coroutines.DelicateCoroutinesApi
+    @org.junit.jupiter.api.Test
+    fun secureStsAdvertisementPersistsCurrentPort() = runBlocking {
+        LoopbackIrcServer().use { server ->
+            server.start()
+            server.lineListener = { line ->
+                when {
+                    line.startsWith("CAP LS") -> server.sendLine(":srv CAP * LS :sts=duration=3600")
+                    line.startsWith("USER") -> server.sendLine(":srv 001 yardhal-test :Welcome")
+                }
+            }
+            val scope = newScope()
+            try {
+                val store = InMemoryStsPolicyStore()
+                val config = plainConfig("127.0.0.1", server.port, capabilities = setOf("server-time"))
+                    .copy(tls = true)
+                val connection = IrcConnection(config, stsPolicyStore = store)
+                val collector = EventCollector(scope, connection.events)
+                connection.start(Socket("127.0.0.1", server.port))
+                server.awaitClient()
+                collector.awaitRegistered()
+                assertEquals(server.port, store.load("127.0.0.1")?.port)
+                assertTrue((store.load("127.0.0.1")?.expiresAtEpochSeconds ?: 0) > System.currentTimeMillis() / 1000)
                 connection.disconnect()
             } finally {
                 scope.cancel()

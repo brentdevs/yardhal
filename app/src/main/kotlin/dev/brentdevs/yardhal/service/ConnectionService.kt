@@ -36,11 +36,7 @@ public class ConnectionService : Service() {
         }
 
         public fun stop(context: Context) {
-            val intent = Intent(context, ConnectionService::class.java)
-                .putExtra(EXTRA_STOP, true)
-                .putExtra(EXTRA_NETWORK_COUNT, 0)
-            context.startService(intent)
+            context.stopService(Intent(context, ConnectionService::class.java))
         }
     }
 }
-

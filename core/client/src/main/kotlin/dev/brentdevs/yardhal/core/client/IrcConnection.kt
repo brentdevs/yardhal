@@ -87,6 +87,8 @@ public class IrcConnection(
     private val socketFactory: SocketFactory? = null,
     private val nowMillis: () -> Long = System::currentTimeMillis,
     private val rawTap: ((outbound: Boolean, line: String) -> Unit)? = null,
+    private val stsPolicyStore: StsPolicyStore? = null,
+    private val onStsUpgrade: ((Int) -> Unit)? = null,
 ) {
     private val job = SupervisorJob()
     private val scope = CoroutineScope(job + Dispatchers.IO)
@@ -98,6 +100,9 @@ public class IrcConnection(
 
     @Volatile
     private var socket: Socket? = null
+
+    private var connectedTls: Boolean = config.tls
+    private var connectedPort: Int = config.port
 
     @Volatile
     private var lastInboundMillis: Long = 0
@@ -141,17 +146,30 @@ public class IrcConnection(
 
     private suspend fun connect() {
         val created = withContext(Dispatchers.IO) {
+            val decision = stsPolicyStore?.let { store ->
+                StsResolver.decide(store, config.host, config.port, config.tls, nowMillis() / 1000)
+            }
+            val port = (decision as? StsUpgradeDecision.UpgradeRequired)?.port ?: config.port
+            val tls = config.tls || decision is StsUpgradeDecision.UpgradeRequired
             val raw = (socketFactory ?: SocketFactory.getDefault()).createSocket()
-            raw.tcpNoDelay = true
-            raw.connect(InetSocketAddress(config.host, config.port), config.connectTimeoutMillis)
-            if (config.tls) wrapTls(raw, config.host) else raw
+            try {
+                raw.tcpNoDelay = true
+                raw.connect(InetSocketAddress(config.host, port), config.connectTimeoutMillis)
+                val ready = if (tls) wrapTls(raw, config.host, port) else raw
+                connectedTls = tls
+                connectedPort = port
+                ready
+            } catch (error: Throwable) {
+                runCatching { raw.close() }
+                throw error
+            }
         }
         adoptSocket(created)
     }
 
-    private fun wrapTls(raw: Socket, host: String): SSLSocket {
+    private fun wrapTls(raw: Socket, host: String, port: Int): SSLSocket {
         val factory = SSLContext.getDefault().socketFactory
-        val ssl = factory.createSocket(raw, host, config.port, true) as SSLSocket
+        val ssl = factory.createSocket(raw, host, port, true) as SSLSocket
         ssl.startHandshake()
         val verified = javax.net.ssl.HttpsURLConnection.getDefaultHostnameVerifier()
             .verify(host, ssl.session)
@@ -167,7 +185,6 @@ public class IrcConnection(
     }
 
     private fun beginRegistration() {
-        config.serverPassword?.let { sendLine("PASS ${it}") }
         val wantsCaps = config.capabilities.isNotEmpty()
         if (wantsCaps) {
             val effectiveWanted =
@@ -211,6 +228,7 @@ public class IrcConnection(
     private fun sendNickUser() {
         if (nickUserSent) return
         nickUserSent = true
+        config.serverPassword?.let { sendLine("PASS ${it}") }
         sendLine("NICK ${config.nick}")
         sendLine("USER ${config.username} 0 * :${config.realName}")
     }
@@ -219,6 +237,7 @@ public class IrcConnection(
         lastInboundMillis = nowMillis()
         rawTap?.invoke(false, line)
         val message = IrcMessage.parse(line) ?: return
+        if (handleStsAdvertisement(message)) return
 
         val numeric = message.numeric
         if (numeric != null) saslHandler?.handleNumeric(numeric, message)
@@ -241,6 +260,27 @@ public class IrcConnection(
             }
         }
         emit(IrcEvent.MessageReceived(message))
+    }
+
+    private fun handleStsAdvertisement(message: IrcMessage): Boolean {
+        if (!message.command.equals("CAP", ignoreCase = true)) return false
+        val verb = message.parameters.getOrNull(1)?.uppercase()
+        if (verb != "LS" && verb != "NEW") return false
+        val value = message.parameters.lastOrNull()
+            ?.split(' ')
+            ?.firstOrNull { it.startsWith("sts=") }
+            ?.substringAfter('=')
+            ?: return false
+        if (!connectedTls) {
+            val port = StsResolver.parseUpgradePort(value) ?: return false
+            onStsUpgrade?.invoke(port)
+            disconnect()
+            return true
+        }
+        val store = stsPolicyStore ?: return false
+        val policy = StsResolver.parseCapValue(value, nowMillis() / 1000, connectedPort) ?: return false
+        if (policy.durationSeconds == 0L) store.delete(config.host) else store.save(config.host, policy)
+        return false
     }
 
     private fun launchReader() {
@@ -272,7 +312,7 @@ public class IrcConnection(
                     val stream: OutputStream = current.getOutputStream()
                     while (isActive) {
                         val line = outbound.receive()
-                        rawTap?.invoke(true, line)
+                        rawTap?.invoke(true, redactSensitiveOutbound(line))
                         stream.write((line + "\r\n").toByteArray(Charsets.UTF_8))
                         stream.flush()
                     }
@@ -328,9 +368,22 @@ public class IrcConnection(
 
     private fun shutdown(cause: Throwable?) {
         if (!closed.compareAndSet(false, true)) return
+        if (connectedTls && socket != null) {
+            stsPolicyStore?.let { StsResolver.refreshOnDisconnect(it, config.host, nowMillis() / 1000) }
+        }
         job.cancelChildren()
         eventChannel.trySend(IrcEvent.Disconnected(cause))
         eventChannel.close()
         outbound.close()
+    }
+}
+
+internal fun redactSensitiveOutbound(line: String): String {
+    val command = line.substringBefore(' ').uppercase()
+    val argument = line.substringAfter(' ', "")
+    return when {
+        command == "PASS" -> "PASS <redacted>"
+        command == "AUTHENTICATE" && argument !in setOf("PLAIN", "+", "*") -> "AUTHENTICATE <redacted>"
+        else -> line
     }
 }

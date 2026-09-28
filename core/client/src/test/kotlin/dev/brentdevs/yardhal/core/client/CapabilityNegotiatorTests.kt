@@ -118,4 +118,24 @@ class CapabilityNegotiatorTests {
         val harness = Harness()
         assertFalse(harness.negotiator.handle(IrcMessage.parse("PRIVMSG #a :hi")!!))
     }
+
+    @Test
+    fun advertisedValuesDoNotChangeCapabilityNames() {
+        val harness = Harness()
+        harness.negotiator.begin()
+        harness.negotiator.handle(harness.cap("LS", "sasl=PLAIN,EXTERNAL server-time"))
+        assertEquals("CAP REQ :sasl server-time", harness.sent.last())
+        harness.negotiator.handle(harness.cap("ACK", "sasl server-time"))
+        assertTrue(harness.saslStarted)
+    }
+
+    @Test
+    fun runtimeNewWithValueRequestsCapability() {
+        val harness = Harness()
+        harness.negotiator.begin()
+        harness.negotiator.handle(harness.cap("LS", "server-time"))
+        harness.negotiator.handle(harness.cap("ACK", "server-time"))
+        harness.negotiator.handle(harness.cap("NEW", "sasl=PLAIN"))
+        assertEquals("CAP REQ :sasl", harness.sent.last())
+    }
 }

@@ -49,7 +49,7 @@ Phase numbers refer to `docs/architecture.md`.
 - [x] netsplit/netjoin batches: collapse into one event (P5)
 - [ ] labeled-response: label outbound commands, correlate responses incl. ACK/batches (P5)
 - [x] standard-replies: FAIL/WARN/NOTE → tagged system lines (P5; toast polish pending)
-- [x] sts: upgrade to TLS port, persist policy with expiry (P2 core; warning UI pending)
+- [x] sts: upgrade to TLS port, persist and enforce policy with expiry (P2; warning UI pending)
 - [x] SNI: hostname in ClientHello (platform TLS does this by default) (P2)
 - [ ] STARTTLS: NOT implemented (deprecated); direct TLS only
 
