@@ -36,6 +36,32 @@ public interface MessageDao {
     )
     public suspend fun before(networkId: String, conversation: String, beforeMs: Long, limit: Int): List<MessageRow>
 
+    @Query(
+        "SELECT * FROM messages WHERE networkId = :networkId AND conversation = :conversation " +
+            "AND (timestampMs < :timestampMs OR (timestampMs = :timestampMs AND rowId <= :rowId)) " +
+            "ORDER BY timestampMs DESC, rowId DESC LIMIT :limit",
+    )
+    public suspend fun beforeIncluding(
+        networkId: String,
+        conversation: String,
+        timestampMs: Long,
+        rowId: Long,
+        limit: Int,
+    ): List<MessageRow>
+
+    @Query(
+        "SELECT * FROM messages WHERE networkId = :networkId AND conversation = :conversation " +
+            "AND (timestampMs > :timestampMs OR (timestampMs = :timestampMs AND rowId > :rowId)) " +
+            "ORDER BY timestampMs ASC, rowId ASC LIMIT :limit",
+    )
+    public suspend fun afterRow(
+        networkId: String,
+        conversation: String,
+        timestampMs: Long,
+        rowId: Long,
+        limit: Int,
+    ): List<MessageRow>
+
     @Query("SELECT DISTINCT conversation FROM messages WHERE networkId = :networkId")
     public suspend fun conversations(networkId: String): List<String>
 

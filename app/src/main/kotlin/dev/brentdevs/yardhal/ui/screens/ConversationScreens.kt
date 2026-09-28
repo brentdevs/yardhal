@@ -1,12 +1,12 @@
 package dev.brentdevs.yardhal.ui.screens
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
@@ -16,13 +16,19 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.People
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
@@ -32,6 +38,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -39,11 +46,14 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import dev.brentdevs.yardhal.coordinator.ChatMessage
 import dev.brentdevs.yardhal.coordinator.ConversationBuffer
+import dev.brentdevs.yardhal.coordinator.ConnectionStatus
+import dev.brentdevs.yardhal.coordinator.JoinState
+import dev.brentdevs.yardhal.core.data.ChatAppearancePreferences
 import dev.brentdevs.yardhal.ui.components.DayPill
 import dev.brentdevs.yardhal.ui.components.MessageRow
 import dev.brentdevs.yardhal.ui.components.NewMessagesDivider
@@ -114,20 +124,29 @@ private fun formatDayLabel(date: LocalDate): String {
 }
 
 private val QUICK_REACTIONS = listOf("👍", "❤️", "😂", "🎉", "👀", "🙏")
+private val HTTP_LINK = Regex("https?://\\S+")
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 public fun ConversationScreen(
     buffer: ConversationBuffer,
     networkName: String,
+    channels: List<String> = emptyList(),
     connected: Boolean,
-    onSend: (String) -> Unit,
+    canSendOffline: (String) -> Boolean = { false },
+    onSend: (String) -> Boolean,
     onOpenJoin: () -> Unit,
     onLoadHistory: () -> Unit,
     onReact: (String, String) -> Unit,
     onSetReplyDraft: (ChatMessage?) -> Unit,
     onDelete: (String) -> Unit,
     onOpenSearch: () -> Unit = {},
+    onOpenBuffers: (() -> Unit)? = null,
+    onRetryJoin: () -> Unit = {},
+    searchTargetRowId: Long? = null,
+    onSearchTargetShown: () -> Unit = {},
+    appearance: ChatAppearancePreferences = ChatAppearancePreferences(),
+    onOpenAppearance: () -> Unit = {},
     onMemberAction: (MemberAction, String) -> Unit = { _, _ -> },
     onOpenDm: (String) -> Unit = {},
     sharedDraft: String? = null,
@@ -138,10 +157,39 @@ public fun ConversationScreen(
     var actionTarget by remember { mutableStateOf<ChatMessage?>(null) }
     var membersVisible by remember { mutableStateOf(false) }
     var memberTarget by remember { mutableStateOf<String?>(null) }
+    var overflowVisible by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    fun openLink(url: String) {
+        val uri = android.net.Uri.parse(url)
+        if (uri.scheme !in setOf("http", "https")) return
+        runCatching {
+            context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, uri))
+        }
+    }
     val listState = androidx.compose.foundation.lazy.rememberLazyListState()
     val entries = remember(buffer) { buildTranscript(buffer) }
     val unreadIndex = entries.indexOfFirst { it is TranscriptEntry.UnreadDivider }
     val coroutineScope = androidx.compose.runtime.rememberCoroutineScope()
+    var focusedRowId by remember { mutableStateOf<Long?>(null) }
+
+    androidx.compose.runtime.LaunchedEffect(searchTargetRowId, entries) {
+        if (searchTargetRowId != null) {
+            val index = entries.indexOfFirst { entry ->
+                entry is TranscriptEntry.Message && entry.value.storedRowId == searchTargetRowId
+            }
+            if (index >= 0) {
+                listState.scrollToItem(index)
+                focusedRowId = searchTargetRowId
+                onSearchTargetShown()
+            }
+        }
+    }
+    androidx.compose.runtime.LaunchedEffect(focusedRowId) {
+        if (focusedRowId != null) {
+            delay(2500)
+            focusedRowId = null
+        }
+    }
 
     Scaffold(
         modifier = modifier.fillMaxSize(),
@@ -151,29 +199,51 @@ public fun ConversationScreen(
                     Column {
                         Text(buffer.displayName, style = MaterialTheme.typography.titleMedium)
                         val topic = buffer.topic
-                        if (!topic.isNullOrBlank()) {
-                            Text(
-                                text = topic,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 1,
-                            )
+                        Text(
+                            text = if (topic.isNullOrBlank()) networkName else "$networkName · $topic",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                        )
+                    }
+                },
+                navigationIcon = {
+                    if (onOpenBuffers != null) {
+                        IconButton(onClick = onOpenBuffers) {
+                            Icon(Icons.Filled.Menu, contentDescription = "Open conversations")
                         }
                     }
                 },
                 actions = {
                     if (buffer.members.isNotEmpty()) {
-                        TextButton(onClick = { membersVisible = true }) {
-                            Text("${buffer.members.size}")
+                        IconButton(onClick = { membersVisible = true }) {
+                            Icon(Icons.Filled.People, contentDescription = "Members · ${buffer.members.size}")
                         }
                     }
-                    if (unreadIndex >= 0) {
-                        TextButton(onClick = {
-                            coroutineScope.launch { listState.animateScrollToItem(unreadIndex) }
-                        }) { Text("Jump") }
+                    IconButton(onClick = onOpenSearch) {
+                        Icon(Icons.Filled.Search, contentDescription = "Search messages")
                     }
-                    TextButton(onClick = onOpenSearch) { Text("Search") }
-                    TextButton(onClick = onOpenJoin) { Text("Join") }
+                    Box {
+                        IconButton(onClick = { overflowVisible = true }) {
+                            Icon(Icons.Filled.MoreVert, contentDescription = "Conversation options")
+                        }
+                        DropdownMenu(expanded = overflowVisible, onDismissRequest = { overflowVisible = false }) {
+                            DropdownMenuItem(text = { Text("Join channel") }, onClick = {
+                                overflowVisible = false
+                                onOpenJoin()
+                            })
+                            if (unreadIndex >= 0) {
+                                DropdownMenuItem(text = { Text("Jump to unread") }, onClick = {
+                                    overflowVisible = false
+                                    coroutineScope.launch { listState.animateScrollToItem(unreadIndex) }
+                                })
+                            }
+                            DropdownMenuItem(text = { Text("Chat appearance") }, onClick = {
+                                overflowVisible = false
+                                onOpenAppearance()
+                            })
+                        }
+                    }
                 },
             )
         },
@@ -213,13 +283,13 @@ public fun ConversationScreen(
                 }
                 ComposerBar(
                     enabled = connected,
+                    canSendOffline = canSendOffline,
                     members = buffer.members.map { it.nick },
+                    channels = channels,
                     onAttach = onPickFile,
                     initialDraft = sharedDraft,
-                    onSend = { text ->
-                        onSharedConsumed()
-                        onSend(text)
-                    },
+                    onInitialDraftCaptured = onSharedConsumed,
+                    onSend = onSend,
                 )
             }
         },
@@ -227,45 +297,82 @@ public fun ConversationScreen(
         LaunchedEffectOnce(key = buffer.key, effect = onLoadHistory)
         if (buffer.messages.isEmpty()) {
             Box(modifier = Modifier.padding(padding).fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text(
-                    text = if (connected) "No messages yet — say hello." else "Connecting…",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        text = when {
+                            buffer.joinState == JoinState.FAILED -> "Could not join ${buffer.displayName}"
+                            connected -> "No messages yet — say hello."
+                            else -> "Offline · waiting for a connection"
+                        },
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    if (buffer.joinState == JoinState.FAILED) {
+                        TextButton(onClick = onRetryJoin) { Text("Retry join") }
+                    }
+                }
             }
         } else {
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.padding(padding).fillMaxSize(),
-                reverseLayout = true,
-                contentPadding = PaddingValues(vertical = 4.dp),
-            ) {
-                items(entries.size, key = { index ->
-                    when (val entry = entries[index]) {
-                        is TranscriptEntry.DayHeader -> "header-${entry.label}-$index"
-                        is TranscriptEntry.UnreadDivider -> "unread-$index"
-                        is TranscriptEntry.Message -> "msg-${entry.value.localId}"
+            Column(modifier = Modifier.padding(padding).fillMaxSize()) {
+                val statusText = when {
+                    buffer.joinState == JoinState.FAILED -> "Could not join ${buffer.displayName}"
+                    !connected -> "Offline · messages will resume after reconnection"
+                    buffer.joinState == JoinState.JOINING -> "Joining ${buffer.displayName}…"
+                    else -> null
+                }
+                if (statusText != null) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            statusText,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (buffer.joinState == JoinState.FAILED) {
+                            TextButton(onClick = onRetryJoin) { Text("Retry") }
+                        }
                     }
-                }) { index ->
-                    when (val entry = entries[index]) {
-                        is TranscriptEntry.DayHeader -> DayPill(entry.label)
-                        is TranscriptEntry.UnreadDivider -> NewMessagesDivider(entry.label)
-                        is TranscriptEntry.Message -> {
-                            val message = entry.value
-                            MessageRow(
-                                message = message,
-                                groupedWithPrevious = entry.groupedWithPrevious,
-                                reactions = buffer.reactions[message.msgid].orEmpty()
-                                    .filterValues { it.isNotEmpty() },
-                                quotedText = message.replyToMsgid?.let { target ->
-                                    buffer.messages.firstOrNull { it.msgid == target }?.let { "${it.sender}: ${it.text.take(60)}" }
-                                },
-                                onLongPress = {
-                                    if (message.msgid != null || !message.sentByUs) actionTarget = message
-                                },
-                                onToggleReaction = { emoji ->
-                                    message.msgid?.let { msgid -> onReact(msgid, emoji) }
-                                },
-                            )
+                }
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                    reverseLayout = true,
+                    contentPadding = PaddingValues(vertical = 4.dp),
+                ) {
+                    items(entries.size, key = { index ->
+                        when (val entry = entries[index]) {
+                            is TranscriptEntry.DayHeader -> "header-${entry.label}-$index"
+                            is TranscriptEntry.UnreadDivider -> "unread-$index"
+                            is TranscriptEntry.Message -> "msg-${entry.value.localId}"
+                        }
+                    }) { index ->
+                        when (val entry = entries[index]) {
+                            is TranscriptEntry.DayHeader -> DayPill(entry.label)
+                            is TranscriptEntry.UnreadDivider -> NewMessagesDivider(entry.label)
+                            is TranscriptEntry.Message -> {
+                                val message = entry.value
+                                MessageRow(
+                                    message = message,
+                                    groupedWithPrevious = entry.groupedWithPrevious,
+                                    focused = message.storedRowId != null && message.storedRowId == focusedRowId,
+                                    appearance = appearance,
+                                    reactions = buffer.reactions[message.msgid].orEmpty()
+                                        .filterValues { it.isNotEmpty() },
+                                    quotedText = message.replyToMsgid?.let { target ->
+                                        buffer.messages.firstOrNull { it.msgid == target }?.let { "${it.sender}: ${it.text.take(60)}" }
+                                    },
+                                    onLongPress = {
+                                        actionTarget = message
+                                    },
+                                    onToggleReaction = { emoji ->
+                                        message.msgid?.let { msgid -> onReact(msgid, emoji) }
+                                    },
+                                    onOpenAttachment = ::openLink,
+                                )
+                            }
                         }
                     }
                 }
@@ -275,12 +382,12 @@ public fun ConversationScreen(
 
     if (actionTarget != null) {
         val target = actionTarget ?: return
-        AlertDialog(
-            onDismissRequest = { actionTarget = null },
-            title = { Text(target.sender.ifEmpty { "Message" }) },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        ModalBottomSheet(onDismissRequest = { actionTarget = null }) {
+            Column(modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) {
+                Text(target.sender.ifEmpty { "Message" }, style = MaterialTheme.typography.titleMedium)
+                Text(target.text, style = MaterialTheme.typography.bodySmall, maxLines = 2)
+                if (target.msgid != null) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                         QUICK_REACTIONS.forEach { emoji ->
                             TextButton(onClick = {
                                 target.msgid?.let { msgid -> onReact(msgid, emoji) }
@@ -288,23 +395,33 @@ public fun ConversationScreen(
                             }) { Text(emoji) }
                         }
                     }
+                }
+                TextButton(onClick = {
+                    val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                    clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("Message", target.text))
+                    actionTarget = null
+                }) { Text("Copy message") }
+                val firstLink = HTTP_LINK.find(target.text)?.value?.trimEnd('.', ',', ';', ')')
+                if (firstLink != null) {
                     TextButton(onClick = {
-                        if (!target.sentByUs) onSetReplyDraft(target)
+                        openLink(firstLink)
+                        actionTarget = null
+                    }) { Text("Open link") }
+                }
+                if (!target.sentByUs && target.msgid != null) {
+                    TextButton(onClick = {
+                        onSetReplyDraft(target)
                         actionTarget = null
                     }) { Text("Reply") }
-                    if (target.sentByUs && target.msgid != null) {
-                        TextButton(onClick = {
-                            target.msgid?.let { msgid -> onDelete(msgid) }
-                            actionTarget = null
-                        }) { Text("Delete") }
-                    }
                 }
-            },
-            confirmButton = {},
-            dismissButton = {
-                TextButton(onClick = { actionTarget = null }) { Text("Close") }
-            },
-        )
+                if (target.sentByUs && target.msgid != null) {
+                    TextButton(onClick = {
+                        target.msgid?.let(onDelete)
+                        actionTarget = null
+                    }) { Text("Delete message") }
+                }
+            }
+        }
     }
 
     if (membersVisible) {
@@ -500,15 +617,16 @@ public fun NetworkOverviewScreen(
     onSelect: (String) -> Unit,
     onSelectServer: (String) -> Unit,
     onAddNetwork: () -> Unit,
+    onJoinChannel: (String?) -> Unit,
     onRemoveNetwork: (String) -> Unit,
-    onBrowseChannels: () -> Unit,
+    onBrowseChannels: (String) -> Unit,
     channelList: List<dev.brentdevs.yardhal.coordinator.LiveCoordinator.ChannelListEntry>,
-    onJoinFromList: (String) -> Unit,
-    onOpenDebug: () -> Unit,
+    onJoinFromList: (String, String) -> Boolean,
     rawLogVersion: Int,
-    rawLogProvider: () -> List<dev.brentdevs.yardhal.coordinator.LiveCoordinator.RawFrame>,
+    rawLogProvider: (String) -> List<dev.brentdevs.yardhal.coordinator.LiveCoordinator.RawFrame>,
     showBouncerButton: Boolean = false,
     onOpenBouncer: () -> Unit = {},
+    onOpenAppearance: () -> Unit = {},
     onMarkRead: (String) -> Unit = {},
     onToggleMute: (String) -> Unit = {},
     onLeave: (String) -> Unit = {},
@@ -520,7 +638,13 @@ public fun NetworkOverviewScreen(
 ) {
     var pendingRemoval by remember { mutableStateOf<String?>(null) }
     var browseVisible by remember { mutableStateOf(false) }
+    var browseJoinFailed by remember { mutableStateOf(false) }
     var debugVisible by remember { mutableStateOf(false) }
+    var browseNetworkId by remember { mutableStateOf<String?>(null) }
+    var browseQuery by remember { mutableStateOf("") }
+    var debugNetworkId by remember { mutableStateOf<String?>(null) }
+    var networkMenuFor by remember { mutableStateOf<String?>(null) }
+    var appMenuVisible by remember { mutableStateOf(false) }
     var rowMenuFor by remember { mutableStateOf<String?>(null) }
     var pendingLeave by remember { mutableStateOf<ConversationBuffer?>(null) }
     var moveTarget by remember { mutableStateOf<String?>(null) }
@@ -531,44 +655,69 @@ public fun NetworkOverviewScreen(
     }
 
     if (debugVisible) {
-        val frames = remember(rawLogVersion) { rawLogProvider() }
-        AlertDialog(
-            onDismissRequest = { debugVisible = false },
-            title = { Text("Traffic · last ${frames.size}") },
-            text = {
-                LazyColumn(modifier = Modifier.padding(vertical = 4.dp)) {
+        val frames = remember(rawLogVersion, debugNetworkId) { debugNetworkId?.let(rawLogProvider).orEmpty() }
+        ModalBottomSheet(onDismissRequest = { debugVisible = false }) {
+            Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
+                Text(
+                    "${networks.firstOrNull { it.id == debugNetworkId }?.name.orEmpty()} traffic · ${frames.size}",
+                    style = MaterialTheme.typography.titleLarge,
+                )
+                LazyColumn(modifier = Modifier.weight(1f)) {
                     items(frames.size) { index ->
                         val frame = frames[frames.size - 1 - index]
                         Text(
                             text = (if (frame.outbound) "→ " else "← ") + frame.line.take(160),
                             style = MaterialTheme.typography.labelSmall,
                             fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                            modifier = Modifier.padding(vertical = 4.dp),
                         )
                     }
                 }
-            },
-            confirmButton = {
-                TextButton(onClick = { debugVisible = false }) { Text("Close") }
-            },
-        )
+            }
+        }
     }
 
     if (browseVisible) {
-        AlertDialog(
-            onDismissRequest = { browseVisible = false },
-            title = { Text("Channels · ${channelList.size}") },
-            text = {
-                if (channelList.isEmpty()) {
-                    Text("Loading list…")
+        val browseReady = networks.any { it.id == browseNetworkId && it.status == ConnectionStatus.REGISTERED }
+        val filtered = channelList.filter { entry ->
+            entry.name.contains(browseQuery, ignoreCase = true) || entry.topic.contains(browseQuery, ignoreCase = true)
+        }
+        ModalBottomSheet(onDismissRequest = { browseVisible = false }) {
+            Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
+                Text(
+                    "${networks.firstOrNull { it.id == browseNetworkId }?.name.orEmpty()} channels · ${channelList.size}",
+                    style = MaterialTheme.typography.titleLarge,
+                )
+                if (!browseReady || browseJoinFailed) {
+                    Text(
+                        if (browseJoinFailed) "Could not send Join. Try again when connected."
+                        else "Connect to this network to join a channel.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                OutlinedTextField(
+                    value = browseQuery,
+                    onValueChange = { browseQuery = it },
+                    label = { Text("Filter channels") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                if (filtered.isEmpty()) {
+                    Text(
+                        if (channelList.isEmpty()) "Waiting for the channel list…" else "No channels match.",
+                        modifier = Modifier.padding(vertical = 16.dp),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 } else {
-                    LazyColumn(modifier = Modifier.padding(vertical = 4.dp)) {
-                        items(channelList.size) { index ->
-                            val entry = channelList[index]
+                    LazyColumn(modifier = Modifier.weight(1f)) {
+                        items(filtered.size) { index ->
+                            val entry = filtered[index]
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(vertical = 2.dp),
+                                    .padding(vertical = 6.dp),
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(entry.name, style = MaterialTheme.typography.bodyMedium)
@@ -582,35 +731,60 @@ public fun NetworkOverviewScreen(
                                     }
                                 }
                                 Badge { Text("${entry.users}") }
-                                TextButton(onClick = { onJoinFromList(entry.name) }) { Text("Join") }
+                                TextButton(
+                                    enabled = browseReady,
+                                    onClick = {
+                                        browseJoinFailed = browseNetworkId?.let { onJoinFromList(it, entry.name) } != true
+                                    },
+                                ) { Text("Join") }
                             }
                         }
                     }
                 }
-            },
-            confirmButton = {
-                TextButton(onClick = { browseVisible = false }) { Text("Close") }
-            },
-        )
+            }
+        }
     }
 
     Scaffold(
         modifier = modifier.fillMaxSize(),
         topBar = {
             TopAppBar(
-                title = { Text("Yardhal") },
+                title = { Text("Conversations") },
                 actions = {
-                    if (showBouncerButton) {
-                        TextButton(onClick = onOpenBouncer) { Text("Bouncer") }
+                    if (networks.isNotEmpty() || showBouncerButton) {
+                        Box {
+                            IconButton(onClick = { appMenuVisible = true }) {
+                                Icon(Icons.Filled.MoreVert, contentDescription = "App options")
+                            }
+                            DropdownMenu(expanded = appMenuVisible, onDismissRequest = { appMenuVisible = false }) {
+                                DropdownMenuItem(text = { Text("Add network") }, onClick = {
+                                    appMenuVisible = false
+                                    onAddNetwork()
+                                })
+                                if (showBouncerButton) {
+                                    DropdownMenuItem(text = { Text("Bouncer networks") }, onClick = {
+                                        appMenuVisible = false
+                                        onOpenBouncer()
+                                    })
+                                }
+                                DropdownMenuItem(text = { Text("Chat appearance") }, onClick = {
+                                    appMenuVisible = false
+                                    onOpenAppearance()
+                                })
+                            }
+                        }
                     }
-                    TextButton(onClick = { debugVisible = true; onOpenDebug() }) { Text("Debug") }
-                    TextButton(onClick = { browseVisible = true; onBrowseChannels() }) { Text("List") }
                 },
             )
         },
         floatingActionButton = {
-            ExtendedFloatingActionButton(onClick = onAddNetwork) {
-                Text("+ Network")
+            ExtendedFloatingActionButton(
+                onClick = {
+                    if (networks.isEmpty()) onAddNetwork()
+                    else onJoinChannel(networks.singleOrNull()?.id)
+                },
+            ) {
+                Text(if (networks.isEmpty()) "+ Network" else "+ Channel")
             }
         },
     ) { padding ->
@@ -632,6 +806,7 @@ public fun NetworkOverviewScreen(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clickable { onSelectServer(network.id) }
+                                .defaultMinSize(minHeight = 56.dp)
                                 .padding(start = 16.dp, end = 12.dp, top = 14.dp, bottom = 4.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
@@ -643,7 +818,43 @@ public fun NetworkOverviewScreen(
                                 fontWeight = FontWeight.SemiBold,
                                 modifier = Modifier.weight(1f),
                             )
-                            TextButton(onClick = { pendingRemoval = network.id }) { Text("Remove") }
+                            if (network.status != ConnectionStatus.REGISTERED) {
+                                Text(
+                                    if (network.status == ConnectionStatus.CONNECTING) "Connecting" else "Offline",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            Box {
+                                IconButton(onClick = { networkMenuFor = network.id }) {
+                                    Icon(Icons.Filled.MoreVert, contentDescription = "${network.name} options")
+                                }
+                                DropdownMenu(
+                                    expanded = networkMenuFor == network.id,
+                                    onDismissRequest = { networkMenuFor = null },
+                                ) {
+                                    DropdownMenuItem(text = { Text("Join channel") }, onClick = {
+                                        networkMenuFor = null
+                                        onJoinChannel(network.id)
+                                    })
+                                    DropdownMenuItem(text = { Text("Browse channels") }, onClick = {
+                                        networkMenuFor = null
+                                        browseNetworkId = network.id
+                                        browseJoinFailed = false
+                                        browseVisible = true
+                                        onBrowseChannels(network.id)
+                                    })
+                                    DropdownMenuItem(text = { Text("Traffic console") }, onClick = {
+                                        networkMenuFor = null
+                                        debugNetworkId = network.id
+                                        debugVisible = true
+                                    })
+                                    DropdownMenuItem(text = { Text("Remove network") }, onClick = {
+                                        networkMenuFor = null
+                                        pendingRemoval = network.id
+                                    })
+                                }
+                            }
                         }
                     }
                     is OverviewEntry.SectionHeader -> {
@@ -706,6 +917,7 @@ public fun NetworkOverviewScreen(
                                     onClick = { onSelect(buffer.key) },
                                     onLongClick = { rowMenuFor = buffer.key },
                                 )
+                                .defaultMinSize(minHeight = 56.dp)
                                 .padding(start = 42.dp, end = 16.dp, top = 6.dp, bottom = 6.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
@@ -755,12 +967,7 @@ public fun NetworkOverviewScreen(
                             }
                             if (buffer.hasUnread) {
                                 Spacer(modifier = Modifier.width(8.dp))
-                                Box(
-                                    modifier = Modifier
-                                        .size(8.dp)
-                                        .clip(CircleShape)
-                                        .background(MaterialTheme.colorScheme.primary),
-                                )
+                                Badge { Text("New") }
                             }
                             }
                         }

@@ -1,14 +1,19 @@
 package dev.brentdevs.yardhal
 
 import android.app.Application
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import dev.brentdevs.yardhal.coordinator.ConnectionFactory
 import dev.brentdevs.yardhal.coordinator.ConnectionStatus
 import dev.brentdevs.yardhal.coordinator.LiveCoordinator
 import dev.brentdevs.yardhal.core.client.IrcConnection
 import dev.brentdevs.yardhal.core.client.IrcConnectionConfig
 import dev.brentdevs.yardhal.core.data.ChannelOrderStore
+import dev.brentdevs.yardhal.core.data.ChatAppearanceStore
 import dev.brentdevs.yardhal.core.data.CredentialVault
 import dev.brentdevs.yardhal.core.data.FileStsPolicyStore
+import dev.brentdevs.yardhal.core.data.IgnoreStore
 import dev.brentdevs.yardhal.core.data.MessageStore
 import dev.brentdevs.yardhal.core.data.MuteStore
 import dev.brentdevs.yardhal.core.data.NetworkStore
@@ -25,7 +30,7 @@ class YardhalApplication : Application() {
 
     val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
-    var sharedText: String? = null
+    var sharedText: String? by mutableStateOf(null)
 
     lateinit var networkStore: NetworkStore
         private set
@@ -39,6 +44,8 @@ class YardhalApplication : Application() {
         private set
     lateinit var coordinator: LiveCoordinator
         private set
+    lateinit var chatAppearanceStore: ChatAppearanceStore
+        private set
 
     override fun onCreate() {
         super.onCreate()
@@ -49,6 +56,7 @@ class YardhalApplication : Application() {
         readMarkerStore = ReadMarkerStore(dir)
         muteStore = MuteStore(dir)
         vault = AndroidCredentialVault(this)
+        chatAppearanceStore = ChatAppearanceStore(dir)
         val stsPolicies = FileStsPolicyStore(dir)
         Notifications.ensureChannels(this)
         coordinator = LiveCoordinator(
@@ -82,6 +90,7 @@ class YardhalApplication : Application() {
                 Notifications.highlight(this, networkName, sender, conversation, text)
             },
         )
+        coordinator.attachIgnores(IgnoreStore(dir))
         coordinator.startAll()
         appScope.launch {
             coordinator.networks.collect { networks ->

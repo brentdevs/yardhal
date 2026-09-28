@@ -1,11 +1,12 @@
 package dev.brentdevs.yardhal.core.data
 
 import java.security.MessageDigest
-import kotlinx.coroutines.CancellationException
 
 public class MessageStore(private val dao: MessageDao) {
 
-    public suspend fun record(message: StoredMessage): Boolean {
+    public suspend fun record(message: StoredMessage): Boolean = recordWithRowId(message) != null
+
+    public suspend fun recordWithRowId(message: StoredMessage): Long? {
         val hash = contentHash(message)
         val row = MessageRow(
             networkId = message.networkId,
@@ -23,12 +24,12 @@ public class MessageStore(private val dao: MessageDao) {
         if (row.msgid != null) {
             val inserted = dao.insert(row)
             if (inserted != -1L) indexForFts(inserted, row.senderNick, row.text)
-            return inserted != -1L
+            return inserted.takeIf { it != -1L }
         }
-        if (dao.existsByHash(message.networkId, row.conversation, hash)) return false
+        if (dao.existsByHash(message.networkId, row.conversation, hash)) return null
         val inserted = dao.insert(row)
         if (inserted != -1L) indexForFts(inserted, row.senderNick, row.text)
-        return inserted != -1L
+        return inserted.takeIf { it != -1L }
     }
 
     private suspend fun indexForFts(rowId: Long, sender: String, body: String) {
@@ -51,6 +52,13 @@ public class MessageStore(private val dao: MessageDao) {
         dao.before(conversation.networkId, conversation.normalizedTarget, beforeMs, limit)
             .map { it.toStored(conversation) }
             .reversed()
+
+    public suspend fun around(conversation: ConversationRef, rowId: Long, timestampMs: Long): List<StoredMessage> {
+        val older = dao.beforeIncluding(conversation.networkId, conversation.normalizedTarget, timestampMs, rowId, 40)
+            .asReversed()
+        val newer = dao.afterRow(conversation.networkId, conversation.normalizedTarget, timestampMs, rowId, 30)
+        return (older + newer).map { it.toStored(conversation) }
+    }
 
     public suspend fun latestTimestamp(conversation: ConversationRef): Long? =
         dao.latestTimestamp(conversation.networkId, conversation.normalizedTarget)
@@ -93,24 +101,33 @@ public class MessageStore(private val dao: MessageDao) {
         dao.deleteNetwork(networkId)
     }
 
-    public suspend fun search(raw: String, limit: Int = 50): List<FtsHit> {
+    public suspend fun search(
+        raw: String,
+        limit: Int = 50,
+        networkId: String? = null,
+        conversation: String? = null,
+    ): List<FtsHit> {
         val query = FtsQuery.build(raw) ?: return emptyList()
-        return try {
-            dao.searchFtsRaw(
-                androidx.sqlite.db.SimpleSQLiteQuery(
-                    "SELECT m.rowId AS rowId, m.networkId AS networkId, m.conversation AS conversation, " +
-                        "m.senderNick AS sender, m.timestampMs AS timestampMs, " +
-                        "snippet(message_fts) AS snippet " +
-                        "FROM message_fts JOIN messages m ON m.rowId = message_fts.rowid " +
-                        "WHERE message_fts MATCH ? ORDER BY m.timestampMs DESC LIMIT ?",
-                    arrayOf<Any>(query, limit),
-                ),
-            ).map { hit -> hit.copy(snippet = decorateSnippet(hit.snippet)) }
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (_: Exception) {
-            emptyList()
+        val scopeSql = buildString {
+            if (networkId != null) append(" AND m.networkId = ?")
+            if (conversation != null) append(" AND m.conversation = ?")
         }
+        val args = buildList<Any> {
+            add(query)
+            if (networkId != null) add(networkId)
+            if (conversation != null) add(conversation)
+            add(limit)
+        }
+        return dao.searchFtsRaw(
+            androidx.sqlite.db.SimpleSQLiteQuery(
+                "SELECT m.rowId AS rowId, m.networkId AS networkId, m.conversation AS conversation, " +
+                    "m.senderNick AS sender, m.timestampMs AS timestampMs, " +
+                    "snippet(message_fts) AS snippet " +
+                    "FROM message_fts JOIN messages m ON m.rowId = message_fts.rowid " +
+                    "WHERE message_fts MATCH ?$scopeSql ORDER BY m.timestampMs DESC LIMIT ?",
+                args.toTypedArray(),
+            ),
+        ).map { hit -> hit.copy(snippet = decorateSnippet(hit.snippet)) }
     }
 
     private fun decorateSnippet(raw: String): String = raw

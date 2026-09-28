@@ -4,6 +4,7 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -16,6 +17,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -25,6 +27,7 @@ import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import dev.brentdevs.yardhal.coordinator.ChatMessage
+import dev.brentdevs.yardhal.core.data.ChatAppearancePreferences
 import dev.brentdevs.yardhal.core.data.MessageKind
 import dev.brentdevs.yardhal.ui.theme.nickColor
 import java.time.Instant
@@ -38,35 +41,42 @@ private val TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm"
 public fun MessageRow(
     message: ChatMessage,
     groupedWithPrevious: Boolean,
+    focused: Boolean = false,
+    appearance: ChatAppearancePreferences = ChatAppearancePreferences(),
     reactions: Map<String, Set<String>>,
     quotedText: String?,
     onLongPress: () -> Unit,
     onToggleReaction: (String) -> Unit,
+    onOpenAttachment: (String) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     when (message.kind) {
-        MessageKind.SYSTEM, MessageKind.JOIN, MessageKind.PART -> SystemLine(message, modifier)
-        else -> ChatLine(message, groupedWithPrevious, reactions, quotedText, onLongPress, onToggleReaction, modifier)
+        MessageKind.SYSTEM, MessageKind.JOIN, MessageKind.PART -> SystemLine(message, appearance, modifier)
+        else -> ChatLine(message, groupedWithPrevious, focused, appearance, reactions, quotedText, onLongPress, onToggleReaction, onOpenAttachment, modifier)
     }
 }
 
 @Composable
-private fun SystemLine(message: ChatMessage, modifier: Modifier) {
+private fun SystemLine(message: ChatMessage, appearance: ChatAppearancePreferences, modifier: Modifier) {
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 2.dp),
+            .padding(horizontal = 16.dp, vertical = if (appearance.compact) 1.dp else 2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
             text = "·",
-            style = MaterialTheme.typography.bodySmall,
+            style = MaterialTheme.typography.bodySmall.copy(
+                fontSize = MaterialTheme.typography.bodySmall.fontSize * appearance.textScale,
+            ),
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.width(14.dp),
         )
         Text(
             text = message.text,
-            style = MaterialTheme.typography.bodySmall,
+            style = MaterialTheme.typography.bodySmall.copy(
+                fontSize = MaterialTheme.typography.bodySmall.fontSize * appearance.textScale,
+            ),
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             fontStyle = FontStyle.Italic,
         )
@@ -78,22 +88,31 @@ private fun SystemLine(message: ChatMessage, modifier: Modifier) {
 private fun ChatLine(
     message: ChatMessage,
     groupedWithPrevious: Boolean,
+    focused: Boolean,
+    appearance: ChatAppearancePreferences,
     reactions: Map<String, Set<String>>,
     quotedText: String?,
     onLongPress: () -> Unit,
     onToggleReaction: (String) -> Unit,
+    onOpenAttachment: (String) -> Unit,
     modifier: Modifier,
 ) {
     HighlightedSurface(
-        highlighted = message.highlightsMe,
+        highlighted = message.highlightsMe || focused,
         modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = 10.dp, vertical = if (groupedWithPrevious) 1.dp else 4.dp),
+            .padding(horizontal = 10.dp, vertical = if (appearance.compact) 1.dp else if (groupedWithPrevious) 2.dp else 5.dp),
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .combinedClickable(onClick = {}, onLongClick = onLongPress)
+                .combinedClickable(
+                    onClick = onLongPress,
+                    onClickLabel = "Message actions",
+                    onLongClick = onLongPress,
+                    onLongClickLabel = "Message actions",
+                )
+                .defaultMinSize(minHeight = 48.dp)
                 .padding(horizontal = 2.dp, vertical = 1.dp),
             verticalAlignment = Alignment.Top,
         ) {
@@ -105,76 +124,78 @@ private fun ChatLine(
             Spacer(modifier = Modifier.width(10.dp))
             Column(modifier = Modifier.weight(1f)) {
                 if (!groupedWithPrevious) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            text = message.sender,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = nickColor(message.sender),
+                        )
+                        Text(
+                            text = formatTime(message.timestampMs),
+                            style = MaterialTheme.typography.labelSmall,
+                            fontFamily = FontFamily.Monospace,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                if (message.replyToMsgid != null) {
                     Text(
-                        text = message.sender,
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        color = nickColor(message.sender),
-                    )
-                    Text(
-                        text = formatTime(message.timestampMs),
+                        text = "↩ ${quotedText ?: "earlier message"}",
                         style = MaterialTheme.typography.labelSmall,
-                        fontFamily = FontFamily.Monospace,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        modifier = Modifier.padding(top = 1.dp),
                     )
                 }
-            }
-            if (message.replyToMsgid != null) {
-                Text(
-                    text = "↩ ${quotedText ?: "earlier message"}",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    modifier = Modifier.padding(top = 1.dp),
-                )
-            }
-            if (message.attachmentUrl != null) {
-                Text(
-                    text = "📎 ${message.attachmentUrl}",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.primary,
-                    maxLines = 1,
-                )
-            }
-            if (message.kind == MessageKind.ACTION) {
-                Text(
-                    text = "✦ ${message.text}",
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontStyle = FontStyle.Italic,
-                    color = nickColor(message.sender),
-                )
-            } else {
-                Text(
-                    text = formattedMessage(message.text),
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-            }
-            if (reactions.isNotEmpty()) {
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    modifier = Modifier.padding(top = 3.dp),
-                ) {
-                    for ((emoji, nicks) in reactions) {
-                        Surface(
-                            shape = RoundedCornerShape(12.dp),
-                            color = MaterialTheme.colorScheme.surfaceVariant,
-                            onClick = { onToggleReaction(emoji) },
-                        ) {
-                            Text(
-                                text = "$emoji ${nicks.size}",
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
-                                style = MaterialTheme.typography.labelSmall,
-                            )
+                if (message.attachmentUrl != null) {
+                    TextButton(onClick = { onOpenAttachment(message.attachmentUrl) }) {
+                        Text("📎 Open attachment", style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+                if (message.kind == MessageKind.ACTION) {
+                    Text(
+                        text = "✦ ${message.text}",
+                        style = MaterialTheme.typography.bodyMedium.copy(
+                            fontSize = MaterialTheme.typography.bodyMedium.fontSize * appearance.textScale,
+                        ),
+                        fontStyle = FontStyle.Italic,
+                        color = nickColor(message.sender),
+                    )
+                } else {
+                    Text(
+                        text = formattedMessage(message.text),
+                        style = MaterialTheme.typography.bodyMedium.copy(
+                            fontSize = MaterialTheme.typography.bodyMedium.fontSize * appearance.textScale,
+                        ),
+                    )
+                }
+                if (reactions.isNotEmpty()) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.padding(top = 3.dp),
+                    ) {
+                        for ((emoji, nicks) in reactions) {
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant,
+                                modifier = Modifier.defaultMinSize(minHeight = 48.dp),
+                                onClick = { onToggleReaction(emoji) },
+                            ) {
+                                Text(
+                                    text = "$emoji ${nicks.size}",
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                                    style = MaterialTheme.typography.labelSmall,
+                                )
+                            }
                         }
                     }
                 }
             }
         }
-    }
     }
 }
 

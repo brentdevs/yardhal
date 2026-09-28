@@ -319,6 +319,9 @@ public class LiveCoordinator(
     public fun hasBouncerSession(): Boolean =
         sessions.values.any { it.isBouncerDiscovery }
 
+    public fun bouncerSessionIds(): List<String> =
+        sessions.values.filter { it.isBouncerDiscovery }.map { it.config.id }
+
     public fun bouncerEntries(): List<BouncerEntry> =
         sessions.values.filter { it.isBouncerDiscovery }.flatMap { session ->
             session.bouncerStore.all().map { (netId, attrs) ->
@@ -766,8 +769,24 @@ public class LiveCoordinator(
     private val _mutedState = MutableStateFlow(mutes.all())
     public val mutedState: StateFlow<Set<String>> = _mutedState.asStateFlow()
 
-    public suspend fun searchMessages(raw: String): List<dev.brentdevs.yardhal.core.data.FtsHit> =
-        messageStore.search(raw)
+    public suspend fun searchMessages(
+        raw: String,
+        networkId: String? = null,
+        conversation: String? = null,
+    ): List<dev.brentdevs.yardhal.core.data.FtsHit> =
+        messageStore.search(raw, networkId = networkId, conversation = conversation)
+
+    public fun openSearchHit(hit: dev.brentdevs.yardhal.core.data.FtsHit): String {
+        val storageKey = ensureConversation(hit.networkId, hit.conversation)
+        val ref = _buffers.value[storageKey]?.ref ?: return storageKey
+        scope.launch {
+            val context = messageStore.around(ref, hit.rowId, hit.timestampMs)
+            updateBufferKey(storageKey) { current ->
+                current.copy(messages = mergeSearchContext(current.messages, context, idGenerator::getAndIncrement))
+            }
+        }
+        return storageKey
+    }
 
     private val _orderState = MutableStateFlow(channelOrder.snapshot())
     public val orderState: StateFlow<dev.brentdevs.yardhal.core.data.ChannelOrderState> = _orderState.asStateFlow()
@@ -1146,7 +1165,7 @@ public class LiveCoordinator(
         persist: Boolean = true,
         reconcilePendingEcho: Boolean = false,
     ) {
-        if (persist) persistAsync(session, ref, sender, kind, text, msgid, timestampMs, sentByUs)
+        val newLocalId = idGenerator.getAndIncrement()
         val muted = mutes.isMuted(ref.storageKey)
         updateBuffer(ref) { buffer ->
             if (reconcilePendingEcho && !playback) {
@@ -1162,7 +1181,7 @@ public class LiveCoordinator(
             }
             if (msgid != null && buffer.messages.any { it.msgid == msgid }) return@updateBuffer buffer
             val entry = ChatMessage(
-                localId = idGenerator.getAndIncrement(),
+                localId = newLocalId,
                 sender = sender,
                 kind = kind,
                 text = text,
@@ -1188,6 +1207,14 @@ public class LiveCoordinator(
                 unreadFromTimestampMs = boundary,
             )
         }
+        if (persist) {
+            val localId = if (msgid == null) {
+                newLocalId
+            } else {
+                _buffers.value[ref.storageKey]?.messages?.firstOrNull { it.msgid == msgid }?.localId ?: newLocalId
+            }
+            persistAsync(session, ref, sender, kind, text, msgid, timestampMs, sentByUs, localId)
+        }
         if (highlightsMe && !sentByUs) {
             if (highlightsMe && !muted) {
                 notifier.onHighlight(session.config.name, sender, ConversationNames.forRef(ref), text)
@@ -1204,9 +1231,10 @@ public class LiveCoordinator(
         msgid: String?,
         timestampMs: Long,
         sentByUs: Boolean,
+        localId: Long,
     ) {
         scope.launch {
-            messageStore.record(
+            val rowId = messageStore.recordWithRowId(
                 StoredMessage(
                     networkId = session.config.id,
                     conversation = ref,
@@ -1219,7 +1247,15 @@ public class LiveCoordinator(
                     sentByUs = sentByUs,
                     timestampMs = timestampMs,
                 ),
-            )
+            ) ?: return@launch
+            updateBufferKey(ref.storageKey) { current ->
+                val index = current.messages.indexOfFirst { it.localId == localId }
+                if (index < 0) current else {
+                    val updated = current.messages.toMutableList()
+                    updated[index] = updated[index].copy(storedRowId = rowId)
+                    current.copy(messages = updated)
+                }
+            }
         }
     }
 
@@ -1284,6 +1320,7 @@ public class LiveCoordinator(
                             sentByUs = row.sentByUs,
                             highlightsMe = false,
                             msgid = row.msgid,
+                            storedRowId = row.rowId,
                         )
                     }
                 val messages = restored + current.messages
@@ -1345,15 +1382,27 @@ public class LiveCoordinator(
         session.reconnector?.sendLine(line)
     }
 
-    public fun sendText(networkId: String, storageKey: String, input: String) {
-        val session = sessions[networkId] ?: return
-        val activeBuffer = _buffers.value[storageKey] ?: return
-        val command = SlashCommandParser.parse(input, activeBuffer.ref.rawTarget) ?: return
+    private fun SlashCommand.isLocal(): Boolean =
+        this is SlashCommand.Query || this is SlashCommand.IgnoreAdd ||
+            this is SlashCommand.IgnoreRemove || this is SlashCommand.Help
+
+    public fun sendText(networkId: String, storageKey: String, input: String): Boolean {
+        val session = sessions[networkId] ?: return false
+        val activeBuffer = _buffers.value[storageKey] ?: return false
+        val command = SlashCommandParser.parse(input, activeBuffer.ref.rawTarget) ?: return false
+        if (session.statusFlow.value != ConnectionStatus.REGISTERED && !command.isLocal()) return false
         val replyTo = activeBuffer.replyDraft?.takeIf { command is SlashCommand.PlainMessage }
         if (replyTo != null) {
             updateBufferKey(storageKey) { it.copy(replyDraft = null) }
         }
         dispatchCommand(session, activeBuffer.ref, command, replyToMsgid = replyTo?.msgid)
+        return true
+    }
+
+    public fun canSendOffline(networkId: String, storageKey: String, input: String): Boolean {
+        if (networkId !in sessions) return false
+        val activeBuffer = _buffers.value[storageKey] ?: return false
+        return SlashCommandParser.parse(input, activeBuffer.ref.rawTarget)?.isLocal() == true
     }
 
     private fun dispatchCommand(

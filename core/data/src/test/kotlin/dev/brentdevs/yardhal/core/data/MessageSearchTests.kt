@@ -17,10 +17,16 @@ class MessageSearchTests {
         return MessageStore(YardhalDatabase.inMemory(context).messageDao())
     }
 
-    private fun message(conversation: String, sender: String, text: String, timestampMs: Long): StoredMessage =
+    private fun message(
+        conversation: String,
+        sender: String,
+        text: String,
+        timestampMs: Long,
+        networkId: String = "n1",
+    ): StoredMessage =
         StoredMessage(
-            networkId = "n1",
-            conversation = ConversationRef.channel("n1", conversation),
+            networkId = networkId,
+            conversation = ConversationRef.channel(networkId, conversation),
             msgid = null,
             senderNick = sender,
             senderUser = null,
@@ -73,5 +79,35 @@ class MessageSearchTests {
         val store = newStore()
         store.record(message("#room", "alice", "hello", 1000))
         assertTrue(store.search("  ").isEmpty())
+    }
+
+    @Test
+    fun searchScopesBeforeApplyingResultLimit() = runBlocking {
+        val store = newStore()
+        store.record(message("#room", "alice", "deploy in room", 1000))
+        repeat(55) { index ->
+            store.record(message("#other", "bob", "deploy elsewhere $index", 2000L + index))
+        }
+        store.record(message("#room", "carol", "deploy on another network", 3000, networkId = "n2"))
+
+        val hits = store.search("deploy", limit = 1, networkId = "n1", conversation = "#room")
+        assertEquals(1, hits.size)
+        assertEquals("n1", hits.single().networkId)
+        assertEquals("#room", hits.single().conversation)
+    }
+
+    @Test
+    fun contextAroundSearchHitIncludesExactRowAndNeighbors() = runBlocking {
+        val store = newStore()
+        val ref = ConversationRef.channel("n1", "#room")
+        store.record(message("#room", "alice", "before", 1000))
+        store.record(message("#room", "alice", "target deploy", 1000))
+        store.record(message("#room", "alice", "after", 1000))
+        store.record(message("#other", "bob", "unrelated", 1000))
+
+        val hit = store.search("deploy").single()
+        val context = store.around(ref, hit.rowId, hit.timestampMs)
+        assertEquals(listOf("before", "target deploy", "after"), context.map { it.text })
+        assertEquals(hit.rowId, context[1].rowId)
     }
 }

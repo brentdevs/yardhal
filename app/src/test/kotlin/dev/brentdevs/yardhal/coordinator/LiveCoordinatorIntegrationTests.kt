@@ -8,6 +8,7 @@ import dev.brentdevs.yardhal.core.client.IrcConnectionConfig
 import dev.brentdevs.yardhal.core.data.ChannelOrderStore
 import dev.brentdevs.yardhal.core.data.ConversationRef
 import dev.brentdevs.yardhal.core.data.InMemoryCredentialVault
+import dev.brentdevs.yardhal.core.data.IgnoreStore
 import dev.brentdevs.yardhal.core.data.MessageStore
 import dev.brentdevs.yardhal.core.data.MuteStore
 import dev.brentdevs.yardhal.core.data.NetworkConfig
@@ -135,6 +136,8 @@ class LiveCoordinatorIntegrationTests {
                     },
                     stsPolicies = InMemoryStsPolicyStore(),
                 )
+                val ignores = IgnoreStore(directory)
+                coordinator.attachIgnores(ignores)
                 val ref = ConversationRef.channel(config.id, "#room")
                 coordinator.startAll()
                 await { coordinator.buffers.value[ref.storageKey]?.members?.any { it.nick == "alice" } == true }
@@ -156,6 +159,25 @@ class LiveCoordinatorIntegrationTests {
                     coordinator.buffers.value[ref.storageKey]?.messages
                         ?.filter { it.text == "ok" }?.map { it.msgid },
                 )
+                await {
+                    coordinator.buffers.value[ref.storageKey]?.messages
+                        ?.filter { it.text == "ok" }
+                        ?.let { it.size == 2 && it.all { message -> message.storedRowId != null } } == true
+                }
+                assertEquals(
+                    2,
+                    coordinator.buffers.value[ref.storageKey]?.messages
+                        ?.filter { it.text == "ok" }?.mapNotNull { it.storedRowId }?.distinct()?.size,
+                )
+                val repeatedRowId = coordinator.buffers.value[ref.storageKey]?.messages
+                    ?.firstOrNull { it.msgid == "echo-second" }?.storedRowId
+                val repeatedHit = coordinator.searchMessages("ok").first { it.rowId == repeatedRowId }
+                coordinator.openSearchHit(repeatedHit)
+                await {
+                    coordinator.buffers.value[ref.storageKey]?.messages
+                        ?.any { it.storedRowId == repeatedHit.rowId } == true
+                }
+                assertEquals(2, coordinator.buffers.value[ref.storageKey]?.messages?.count { it.text == "ok" })
 
                 server.send(":bob!u@h JOIN #room")
                 await { coordinator.buffers.value[ref.storageKey]?.members?.any { it.nick == "bob" } == true }
@@ -193,6 +215,15 @@ class LiveCoordinatorIntegrationTests {
                         ?.singleOrNull { it.text == "after nick" }?.sentByUs == true,
                 )
                 assertTrue(coordinator.buffers.value[ref.storageKey]?.members?.any { it.nick == "TesterCase" } == true)
+                server.close()
+                await { coordinator.networks.value.singleOrNull()?.status != ConnectionStatus.REGISTERED }
+                assertTrue(coordinator.canSendOffline(config.id, ref.storageKey, "/query alice"))
+                assertTrue(coordinator.sendText(config.id, ref.storageKey, "/query alice"))
+                assertTrue(coordinator.buffers.value.containsKey(ConversationRef.directMessage(config.id, "alice").storageKey))
+                assertTrue(coordinator.sendText(config.id, ref.storageKey, "/help"))
+                assertTrue(coordinator.sendText(config.id, ref.storageKey, "/ignore alice"))
+                assertTrue(ignores.isIgnored("alice"))
+                assertFalse(coordinator.sendText(config.id, ref.storageKey, "offline message"))
                 coordinator.disconnect(config.id)
             } finally {
                 scope.cancel()

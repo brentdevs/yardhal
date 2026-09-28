@@ -1,14 +1,19 @@
 package dev.brentdevs.yardhal.ui.screens
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Sailing
@@ -30,6 +35,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 
 @Composable
@@ -133,11 +139,17 @@ public fun AddNetworkSheet(
     Column(
         modifier = modifier
             .fillMaxSize()
+            .statusBarsPadding()
+            .imePadding()
+            .verticalScroll(rememberScrollState())
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         Text("New network", style = MaterialTheme.typography.titleLarge)
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
             presets.forEach { candidate ->
                 FilterChip(
                     selected = preset?.id == candidate.id,
@@ -146,6 +158,7 @@ public fun AddNetworkSheet(
                 )
             }
         }
+        Text("Connection", style = MaterialTheme.typography.titleSmall)
         OutlinedTextField(
             value = host,
             onValueChange = { host = it },
@@ -168,6 +181,7 @@ public fun AddNetworkSheet(
                 modifier = Modifier.padding(top = 8.dp),
             )
         }
+        Text("Identity", style = MaterialTheme.typography.titleSmall)
         OutlinedTextField(
             value = nick,
             onValueChange = { nick = it },
@@ -179,13 +193,7 @@ public fun AddNetworkSheet(
             value = password,
             onValueChange = { password = it },
             label = { Text("SASL password (optional)") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            value = channels,
-            onValueChange = { channels = it },
-            label = { Text("Autojoin channels (#a,#b)") },
+            visualTransformation = PasswordVisualTransformation(),
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
@@ -193,6 +201,14 @@ public fun AddNetworkSheet(
             value = name,
             onValueChange = { name = it },
             label = { Text("Display name") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Text("Channels", style = MaterialTheme.typography.titleSmall)
+        OutlinedTextField(
+            value = channels,
+            onValueChange = { channels = it },
+            label = { Text("Autojoin channels (#a,#b)") },
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
