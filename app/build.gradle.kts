@@ -4,6 +4,9 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+val releaseKeystore = providers.environmentVariable("YARDHAL_RELEASE_KEYSTORE").orNull
+val releaseKeyPassword = providers.environmentVariable("YARDHAL_RELEASE_KEY_PASSWORD").orNull
+
 android {
     namespace = "dev.brentdevs.yardhal"
     compileSdk = 35
@@ -12,12 +15,26 @@ android {
         applicationId = "dev.brentdevs.yardhal"
         minSdk = 33
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = providers.gradleProperty("yardhalVersionCode").orNull?.toInt() ?: 1
+        versionName = providers.gradleProperty("yardhalVersionName").orNull ?: "0.1.0"
+    }
+
+    signingConfigs {
+        if (releaseKeystore != null && releaseKeyPassword != null) {
+            create("yardhalRelease") {
+                storeFile = file(releaseKeystore)
+                storePassword = releaseKeyPassword
+                keyAlias = "yardhal"
+                keyPassword = releaseKeyPassword
+            }
+        }
     }
 
     buildTypes {
         release {
+            if (releaseKeystore != null && releaseKeyPassword != null) {
+                signingConfig = signingConfigs.getByName("yardhalRelease")
+            }
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),

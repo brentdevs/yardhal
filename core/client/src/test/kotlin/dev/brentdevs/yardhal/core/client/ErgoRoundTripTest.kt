@@ -32,7 +32,12 @@ class ErgoRoundTripTest {
     fun assumeErgoProvisioned() {
         ergoDir = File(System.getProperty("user.dir"), "../../.tools/ergo").canonicalFile
         val binary = File(ergoDir, "ergo")
-        assumeTrue(binary.exists() && binary.canExecute(), "Ergo not provisioned; run scripts/ensure-ergo.sh")
+        val provisioned = binary.exists() && binary.canExecute()
+        if (System.getenv("CI") == "true") {
+            assertTrue(provisioned, "Ergo not provisioned; run scripts/ensure-ergo.sh")
+        } else {
+            assumeTrue(provisioned, "Ergo not provisioned; run scripts/ensure-ergo.sh")
+        }
     }
 
     @AfterTest
