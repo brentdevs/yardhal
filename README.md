@@ -48,9 +48,9 @@ make devices           # list adb targets (also useful for wireless debugging)
 Requirements: an Android 13+ device with USB debugging enabled (Developer
 options → Build number ×7), or wireless debugging paired via `adb pair`.
 NixOS may require membership in `plugdev` for USB access
-(`sudo usermod -aG plugdev $USER`, then re-login). Debug builds are signed
-with the standard debug key and install anywhere; there is no release
-signing yet.
+(`sudo usermod -aG plugdev $USER`, then re-login). Debug builds use a debug
+key. APKs on GitHub Releases use a separate, stable release key, so an
+existing debug install must be removed before installing a Release APK.
 
 Prefer the emulator? A Pixel 6 AVD is provisioned by the flake and boots
 in ~15 seconds (KVM):
@@ -72,6 +72,25 @@ connect → CAP LS 302 → register → JOIN → PRIVMSG echo with msgid and
 server-time tags. The module layout also allows pure-JVM tests for
 `core/protocol` and `core/client`, with Robolectric only where Android
 APIs are touched.
+
+CI runs the debug build, Android lint, all unit tests, and the pinned Ergo
+round-trip on pull requests, main, and version tags. A tag such as `v0.1.0`
+on a commit in main also builds a signed APK, verifies its signature, and
+publishes the APK and SHA-256 checksum on [GitHub Releases](https://github.com/brentdevs/yardhal/releases).
+The tag supplies `versionName`; the workflow run number supplies an
+increasing `versionCode`. Create tags only after the commit has merged:
+
+```sh
+git switch main
+git pull --ff-only
+git tag -a v0.1.0 -m "Yardhal 0.1.0"
+git push origin v0.1.0
+```
+
+The release job reads `YARDHAL_RELEASE_KEYSTORE_BASE64` and
+`YARDHAL_RELEASE_KEY_PASSWORD` from repository Actions secrets. Keep a
+private backup of the signing keystore and password: Android requires the
+same key for future APK updates.
 
 ## Modules
 
