@@ -319,6 +319,9 @@ public class LiveCoordinator(
     public fun hasBouncerSession(): Boolean =
         sessions.values.any { it.isBouncerDiscovery }
 
+    public fun bouncerSessionIds(): List<String> =
+        sessions.values.filter { it.isBouncerDiscovery }.map { it.config.id }
+
     public fun bouncerEntries(): List<BouncerEntry> =
         sessions.values.filter { it.isBouncerDiscovery }.flatMap { session ->
             session.bouncerStore.all().map { (netId, attrs) ->
@@ -766,8 +769,49 @@ public class LiveCoordinator(
     private val _mutedState = MutableStateFlow(mutes.all())
     public val mutedState: StateFlow<Set<String>> = _mutedState.asStateFlow()
 
-    public suspend fun searchMessages(raw: String): List<dev.brentdevs.yardhal.core.data.FtsHit> =
-        messageStore.search(raw)
+    public suspend fun searchMessages(
+        raw: String,
+        networkId: String? = null,
+        conversation: String? = null,
+    ): List<dev.brentdevs.yardhal.core.data.FtsHit> =
+        messageStore.search(raw, networkId = networkId, conversation = conversation)
+
+    public fun openSearchHit(hit: dev.brentdevs.yardhal.core.data.FtsHit): String {
+        val storageKey = ensureConversation(hit.networkId, hit.conversation)
+        val ref = _buffers.value[storageKey]?.ref ?: return storageKey
+        scope.launch {
+            val context = messageStore.around(ref, hit.rowId, hit.timestampMs)
+            updateBufferKey(storageKey) { current ->
+                val merged = current.messages.toMutableList()
+                for (row in context) {
+                    val index = merged.indexOfFirst { message ->
+                        message.storedRowId == row.rowId ||
+                            (row.msgid != null && message.msgid == row.msgid) ||
+                            (message.sender == row.senderNick && message.timestampMs == row.timestampMs && message.text == row.text)
+                    }
+                    if (index >= 0) {
+                        merged[index] = merged[index].copy(storedRowId = row.rowId)
+                    } else {
+                        merged.add(
+                            ChatMessage(
+                                localId = idGenerator.getAndIncrement(),
+                                sender = row.senderNick,
+                                kind = row.kind,
+                                text = row.text,
+                                timestampMs = row.timestampMs,
+                                sentByUs = row.sentByUs,
+                                highlightsMe = false,
+                                msgid = row.msgid,
+                                storedRowId = row.rowId,
+                            ),
+                        )
+                    }
+                }
+                current.copy(messages = merged.sortedBy { it.timestampMs })
+            }
+        }
+        return storageKey
+    }
 
     private val _orderState = MutableStateFlow(channelOrder.snapshot())
     public val orderState: StateFlow<dev.brentdevs.yardhal.core.data.ChannelOrderState> = _orderState.asStateFlow()
@@ -1284,6 +1328,7 @@ public class LiveCoordinator(
                             sentByUs = row.sentByUs,
                             highlightsMe = false,
                             msgid = row.msgid,
+                            storedRowId = row.rowId,
                         )
                     }
                 val messages = restored + current.messages
@@ -1345,15 +1390,17 @@ public class LiveCoordinator(
         session.reconnector?.sendLine(line)
     }
 
-    public fun sendText(networkId: String, storageKey: String, input: String) {
-        val session = sessions[networkId] ?: return
-        val activeBuffer = _buffers.value[storageKey] ?: return
-        val command = SlashCommandParser.parse(input, activeBuffer.ref.rawTarget) ?: return
+    public fun sendText(networkId: String, storageKey: String, input: String): Boolean {
+        val session = sessions[networkId] ?: return false
+        if (session.statusFlow.value != ConnectionStatus.REGISTERED) return false
+        val activeBuffer = _buffers.value[storageKey] ?: return false
+        val command = SlashCommandParser.parse(input, activeBuffer.ref.rawTarget) ?: return false
         val replyTo = activeBuffer.replyDraft?.takeIf { command is SlashCommand.PlainMessage }
         if (replyTo != null) {
             updateBufferKey(storageKey) { it.copy(replyDraft = null) }
         }
         dispatchCommand(session, activeBuffer.ref, command, replyToMsgid = replyTo?.msgid)
+        return true
     }
 
     private fun dispatchCommand(

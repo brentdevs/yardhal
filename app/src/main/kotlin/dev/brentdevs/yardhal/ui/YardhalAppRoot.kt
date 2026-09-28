@@ -1,21 +1,32 @@
 package dev.brentdevs.yardhal.ui
 
 import androidx.activity.compose.BackHandler
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -23,32 +34,35 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.material3.rememberDrawerState
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.launch
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.brentdevs.yardhal.coordinator.ConnectionStatus
 import dev.brentdevs.yardhal.coordinator.ConversationBuffer
 import dev.brentdevs.yardhal.coordinator.LiveCoordinator
 import dev.brentdevs.yardhal.core.data.ConversationRef
+import dev.brentdevs.yardhal.core.data.ChatAppearanceStore
 import dev.brentdevs.yardhal.ui.screens.AddNetworkSheet
 import dev.brentdevs.yardhal.ui.screens.ConversationScreen
+import dev.brentdevs.yardhal.ui.screens.MessageSearchScreen
 import dev.brentdevs.yardhal.ui.screens.NetworkDraft
 import dev.brentdevs.yardhal.ui.screens.NetworkOverviewScreen
 import dev.brentdevs.yardhal.ui.screens.NetworkPresetUi
 import dev.brentdevs.yardhal.ui.screens.WelcomeScreen
-import dev.brentdevs.yardhal.ui.theme.YardhalTheme
 
-private sealed interface AppDestination {
-    public data object Overview : AppDestination
-    public data class Conversation(public val storageKey: String) : AppDestination
-    public data object AddNetwork : AppDestination
-}
-
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 public fun YardhalAppRoot(
     coordinator: LiveCoordinator,
@@ -69,21 +83,37 @@ public fun YardhalAppRoot(
 
     var addNetworkVisible by remember { mutableStateOf(false) }
     var pendingPreset by remember { mutableStateOf<NetworkPresetUi?>(null) }
-    var selectedKey by remember { mutableStateOf<String?>(null) }
+    var selectedKey by rememberSaveable { mutableStateOf<String?>(null) }
+    val conversationStateHolder = rememberSaveableStateHolder()
     var joinDialogVisible by remember { mutableStateOf(false) }
     var joinDraft by remember { mutableStateOf("") }
+    var joinNetworkId by remember { mutableStateOf<String?>(null) }
     var searchVisible by remember { mutableStateOf(false) }
-    var searchQuery by remember { mutableStateOf("") }
+    var searchQuery by rememberSaveable { mutableStateOf("") }
+    var searchNetworkScope by rememberSaveable { mutableStateOf<String?>(null) }
+    var searchConversationScope by rememberSaveable { mutableStateOf<String?>(null) }
+    var searchTargetRowId by remember { mutableStateOf<Long?>(null) }
+    var returnToSearch by remember { mutableStateOf(false) }
+    var searching by remember { mutableStateOf(false) }
+    var searchError by remember { mutableStateOf(false) }
+    var searchRetry by remember { mutableStateOf(0) }
     var searchResults by remember { mutableStateOf<List<dev.brentdevs.yardhal.core.data.FtsHit>>(emptyList()) }
     var bouncerVisible by remember { mutableStateOf(false) }
     var bouncerAddr by remember { mutableStateOf("ircs://") }
     var bouncerName by remember { mutableStateOf("") }
     var bouncerNick by remember { mutableStateOf("") }
     var bouncerPassword by remember { mutableStateOf("") }
+    var bouncerNetworkId by remember { mutableStateOf<String?>(null) }
+    var appearanceVisible by remember { mutableStateOf(false) }
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val drawerScope = rememberCoroutineScope()
 
     val configuration = LocalConfiguration.current
     val context = LocalContext.current
+    val appearanceStore = remember(context) { ChatAppearanceStore(context.filesDir) }
+    var appearance by remember { mutableStateOf(appearanceStore.snapshot()) }
     val wide = configuration.screenWidthDp >= 600
+    val paneWidth = (configuration.screenWidthDp * 0.38f).coerceIn(280f, 360f).dp
     val sharedDraft = sharedTextProvider()
     if (sharedDraft != null && selectedKey == null) {
         val first = buffers.values
@@ -96,8 +126,8 @@ public fun YardhalAppRoot(
     val pickLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.OpenDocument(),
     ) { uri ->
-        if (uri != null && selectedKey != null) {
-            val key = selectedKey!!
+        if (uri != null) {
+            val key = selectedKey ?: return@rememberLauncherForActivityResult
             val networkId = key.substringBefore("|")
             val resolver = context.contentResolver
             val mime = resolver.getType(uri) ?: "application/octet-stream"
@@ -117,139 +147,246 @@ public fun YardhalAppRoot(
 
     fun conversationBufferFor(key: String?): ConversationBuffer? = key?.let { buffers[it] }
 
+    val overviewScreen: @Composable (Modifier, () -> Unit) -> Unit = { overviewModifier, onSelected ->
+        NetworkOverviewScreen(
+            buffers = buffers.values
+                .filter { it.ref.kind != dev.brentdevs.yardhal.core.data.ConversationKind.SERVER }
+                .sortedBy { it.displayName.lowercase() },
+            networks = networks,
+            mutedKeys = mutedKeys,
+            orderState = orderState,
+            onSelect = { key ->
+                coordinator.markRead(key)
+                selectedKey = key
+                searchTargetRowId = null
+                returnToSearch = false
+                onSelected()
+            },
+            onSelectServer = { networkId ->
+                val key = ConversationRef.server(networkId).storageKey
+                coordinator.markRead(key)
+                selectedKey = key
+                searchTargetRowId = null
+                returnToSearch = false
+                onSelected()
+            },
+            onAddNetwork = { addNetworkVisible = true },
+            onJoinChannel = { networkId ->
+                joinNetworkId = networkId
+                joinDialogVisible = true
+            },
+            onRemoveNetwork = coordinator::removeNetwork,
+            onBrowseChannels = coordinator::startChannelList,
+            channelList = channelList,
+            onJoinFromList = { networkId, channel ->
+                coordinator.sendText(networkId, ConversationRef.server(networkId).storageKey, "/join $channel")
+            },
+            onOpenDebug = {},
+            rawLogVersion = rawLogVersion,
+            rawLogProvider = coordinator::rawLog,
+            showBouncerButton = coordinator.hasBouncerSession(),
+            onOpenBouncer = { bouncerVisible = true },
+            onOpenAppearance = { appearanceVisible = true },
+            onMarkRead = coordinator::markRead,
+            onToggleMute = coordinator::toggleMute,
+            onLeave = { key -> coordinator.leaveConversation(key.substringBefore("|"), key) },
+            onTogglePin = coordinator::togglePin,
+            onRetryJoin = { key -> coordinator.retryJoin(key.substringBefore("|"), key) },
+            onMoveToGroup = { key, groupId ->
+                if (groupId == null) coordinator.removeFromGroup(key) else coordinator.addToGroup(groupId, key)
+            },
+            onCreateGroup = { name, done -> done(coordinator.createGroup(name)) },
+            modifier = overviewModifier,
+        )
+    }
+
+    val conversationContent: @Composable (String, ConversationBuffer, String, Boolean, (() -> Unit)?) -> Unit =
+        { key, buffer, networkName, connected, onOpenBuffers ->
+            val networkId = key.substringBefore("|")
+            conversationStateHolder.SaveableStateProvider(key) {
+                ConversationScreen(
+                    buffer = buffer,
+                    networkName = networkName,
+                    channels = buffers.values.filter {
+                        it.ref.networkId == networkId &&
+                            it.ref.kind == dev.brentdevs.yardhal.core.data.ConversationKind.CHANNEL
+                    }.map { it.ref.rawTarget },
+                    connected = connected,
+                    onSend = { text ->
+                        val sent = coordinator.sendText(networkId, key, text)
+                        if (sent) coordinator.sendTyping(networkId, key)
+                        sent
+                    },
+                    onOpenJoin = {
+                        joinNetworkId = networkId
+                        joinDialogVisible = true
+                    },
+                    onLoadHistory = {
+                        coordinator.loadPersistedHistory(key)
+                        coordinator.ensureMembers(networkId, key)
+                    },
+                    onReact = { msgid, emoji -> coordinator.react(networkId, key, msgid, emoji) },
+                    onSetReplyDraft = { message -> coordinator.setReplyDraft(networkId, key, message) },
+                    onDelete = { msgid -> coordinator.deleteMessage(networkId, key, msgid) },
+                    onOpenBuffers = onOpenBuffers,
+                    onRetryJoin = { coordinator.retryJoin(networkId, key) },
+                    searchTargetRowId = searchTargetRowId,
+                    onSearchTargetShown = { searchTargetRowId = null },
+                    appearance = appearance,
+                    onOpenAppearance = { appearanceVisible = true },
+                    onOpenSearch = {
+                        searchVisible = true
+                        returnToSearch = false
+                    },
+                    onMemberAction = { action, nick -> coordinator.memberAction(networkId, key, action, nick) },
+                    onOpenDm = { nick ->
+                        selectedKey = coordinator.directMessageKey(networkId, key, nick)
+                        searchTargetRowId = null
+                        returnToSearch = false
+                    },
+                    sharedDraft = sharedDraft,
+                    onSharedConsumed = onSharedConsumed,
+                    onPickFile = { launchAttachmentPicker() },
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+        }
+
+    LaunchedEffect(searchVisible, searchQuery, searchNetworkScope, searchConversationScope, searchRetry) {
+        if (!searchVisible || searchQuery.length < 2) {
+            searchResults = emptyList()
+            searching = false
+            searchError = false
+        } else {
+            searching = true
+            searchResults = emptyList()
+            searchError = false
+            delay(250)
+            try {
+                searchResults = coordinator.searchMessages(searchQuery, searchNetworkScope, searchConversationScope)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                searchError = true
+            }
+            searching = false
+        }
+    }
+
+    BackHandler(searchVisible) {
+        searchVisible = false
+        returnToSearch = false
+    }
+
     Surface(modifier = modifier.fillMaxSize()) {
-        if (wide) {
+        if (addNetworkVisible) {
+            AddNetworkSheet(
+                presets = presets,
+                initialPreset = pendingPreset,
+                onSave = {
+                    onNetworkSaved(it)
+                    addNetworkVisible = false
+                    pendingPreset = null
+                },
+                onDismiss = {
+                    addNetworkVisible = false
+                    pendingPreset = null
+                },
+            )
+        } else if (searchVisible) {
+            val searchScreen: @Composable (Modifier) -> Unit = { searchModifier -> MessageSearchScreen(
+                query = searchQuery,
+                results = searchResults,
+                searching = searching,
+                error = searchError,
+                networks = networks,
+                buffers = buffers.values.toList(),
+                networkScope = searchNetworkScope,
+                conversationScope = searchConversationScope,
+                onQueryChange = { searchQuery = it },
+                onNetworkScopeChange = { scope ->
+                    searchNetworkScope = scope
+                    searchConversationScope = null
+                },
+                onConversationScopeChange = { searchConversationScope = it },
+                onRetry = { searchRetry += 1 },
+                onOpenHit = { hit ->
+                    selectedKey = coordinator.openSearchHit(hit)
+                    searchTargetRowId = hit.rowId
+                    returnToSearch = true
+                    searchVisible = false
+                },
+                onBack = {
+                    searchVisible = false
+                    returnToSearch = false
+                },
+                modifier = searchModifier,
+            ) }
+            if (wide) {
+                Row(modifier = Modifier.fillMaxSize()) {
+                    Box(modifier = Modifier.width(paneWidth)) {
+                        overviewScreen(Modifier.fillMaxSize()) { searchVisible = false }
+                    }
+                    searchScreen(Modifier.weight(1f))
+                }
+            } else {
+                searchScreen(Modifier.fillMaxSize())
+            }
+        } else if (wide) {
+            BackHandler(returnToSearch) {
+                searchVisible = true
+                returnToSearch = false
+            }
             Row(modifier = Modifier.fillMaxSize()) {
-                Box(modifier = Modifier.weight(0.38f)) {
-                    NetworkOverviewScreen(
-                        buffers = buffers.values
-                            .filter { it.ref.kind != dev.brentdevs.yardhal.core.data.ConversationKind.SERVER }
-                            .sortedBy { it.displayName.lowercase() },
-                        networks = networks,
-                        onSelect = { key ->
-                            coordinator.markRead(key)
-                            selectedKey = key
-                        },
-                        onSelectServer = { networkId ->
-                            coordinator.markRead(ConversationRef.server(networkId).storageKey)
-                            selectedKey = ConversationRef.server(networkId).storageKey
-                        },
-                        mutedKeys = mutedKeys,
-                        orderState = orderState,
-                        onMarkRead = { key -> coordinator.markRead(key) },
-                        onToggleMute = { key -> coordinator.toggleMute(key) },
-                        onLeave = { key -> coordinator.leaveConversation(networkId = key.substringBefore("|"), storageKey = key) },
-                        onTogglePin = { key -> coordinator.togglePin(key) },
-                        onRetryJoin = { key -> coordinator.retryJoin(key.substringBefore("|"), key) },
-                        onMoveToGroup = { key, groupId ->
-                            if (groupId == null) coordinator.removeFromGroup(key) else coordinator.addToGroup(groupId, key)
-                        },
-                        onCreateGroup = { name, done -> done(coordinator.createGroup(name)) },
-                        onAddNetwork = { addNetworkVisible = true },
-                        onRemoveNetwork = { coordinator.removeNetwork(it) },
-                        onBrowseChannels = {
-                            networks.firstOrNull()?.let { coordinator.startChannelList(it.id) }
-                        },
-                        channelList = channelList,
-                        onJoinFromList = { channel ->
-                            val networkId = networks.firstOrNull()?.id
-                            if (networkId != null) {
-                                coordinator.sendText(
-                                    networkId,
-                                    ConversationRef.server(networkId).storageKey,
-                                    "/join $channel",
-                                )
-                            }
-                        },
-                        onOpenDebug = {},
-                        showBouncerButton = coordinator.hasBouncerSession(),
-                        onOpenBouncer = { bouncerVisible = true },
-                        rawLogVersion = rawLogVersion,
-                        rawLogProvider = { coordinator.rawLog(networks.firstOrNull()?.id ?: "") },
-                    )
+                Box(modifier = Modifier.width(paneWidth)) {
+                    overviewScreen(Modifier.fillMaxSize()) {}
                 }
                 val key = selectedKey
                 val buffer = conversationBufferFor(key)
                 if (key != null && buffer != null) {
-                    Box(modifier = Modifier.weight(0.62f)) {
+                    Box(modifier = Modifier.weight(1f)) {
                         val networkId = key.substringBefore("|")
                         val network = networks.firstOrNull { it.id == networkId }
-                        ConversationScreen(
-                            buffer = buffer,
-                            networkName = network?.name ?: "",
-                            connected = network?.status == ConnectionStatus.REGISTERED,
-                            onSend = { text ->
-                                coordinator.sendText(networkId, key, text)
-                                coordinator.sendTyping(networkId, key)
-                            },
-                            onOpenJoin = { joinDialogVisible = true },
-                            onLoadHistory = {
-                                coordinator.loadPersistedHistory(key)
-                                coordinator.ensureMembers(networkId, key)
-                            },
-                            onReact = { msgid, emoji -> coordinator.react(networkId, key, msgid, emoji) },
-                            onSetReplyDraft = { message -> coordinator.setReplyDraft(networkId, key, message) },
-                            onDelete = { msgid -> coordinator.deleteMessage(networkId, key, msgid) },
-                        onOpenSearch = { searchVisible = true },
-                            onMemberAction = { action, nick -> coordinator.memberAction(networkId, key, action, nick) },
-                            onOpenDm = { nick -> selectedKey = coordinator.directMessageKey(networkId, key, nick) },
-                            sharedDraft = sharedDraft,
-                            onSharedConsumed = onSharedConsumed,
-                            onPickFile = { launchAttachmentPicker() },
-                            modifier = Modifier.fillMaxSize(),
-                        )
+                        conversationContent(key, buffer, network?.name.orEmpty(), network?.status == ConnectionStatus.REGISTERED, null)
+                    }
+                } else {
+                    Box(modifier = Modifier.weight(1f).fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Text("Choose a conversation", color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
             }
         } else {
             when {
-                addNetworkVisible -> AddNetworkSheet(
-                    presets = presets,
-                    initialPreset = pendingPreset,
-                    onSave = {
-                        onNetworkSaved(it)
-                        addNetworkVisible = false
-                        pendingPreset = null
-                    },
-                    onDismiss = {
-                        addNetworkVisible = false
-                        pendingPreset = null
-                    },
-                )
-
                 selectedKey != null -> {
-                    val key = selectedKey!!
+                    val key = selectedKey ?: return@Surface
                     val buffer = conversationBufferFor(key)
                     val networkId = key.substringBefore("|")
                     val network = networks.firstOrNull { it.id == networkId }
                     if (buffer == null || network == null) {
                         selectedKey = null
                     } else {
-                        BackHandler { selectedKey = null }
-                        ConversationScreen(
-                            buffer = buffer,
-                            networkName = network.name,
-                            connected = network.status == ConnectionStatus.REGISTERED,
-                            onSend = { text ->
-                                coordinator.sendText(networkId, key, text)
-                                coordinator.sendTyping(networkId, key)
+                        BackHandler(enabled = drawerState.currentValue == DrawerValue.Closed) {
+                            if (returnToSearch) {
+                                searchVisible = true
+                                returnToSearch = false
+                            } else {
+                                selectedKey = null
+                            }
+                        }
+                        ModalNavigationDrawer(
+                            drawerState = drawerState,
+                            drawerContent = {
+                                ModalDrawerSheet(modifier = Modifier.widthIn(max = 360.dp)) {
+                                    overviewScreen(Modifier.fillMaxSize()) {
+                                        drawerScope.launch { drawerState.close() }
+                                    }
+                                }
                             },
-                            onOpenJoin = { joinDialogVisible = true },
-                            onLoadHistory = {
-                                coordinator.loadPersistedHistory(key)
-                                coordinator.ensureMembers(networkId, key)
-                            },
-                            onReact = { msgid, emoji -> coordinator.react(networkId, key, msgid, emoji) },
-                            onSetReplyDraft = { message -> coordinator.setReplyDraft(networkId, key, message) },
-                            onDelete = { msgid -> coordinator.deleteMessage(networkId, key, msgid) },
-                        onOpenSearch = { searchVisible = true },
-                            onMemberAction = { action, nick -> coordinator.memberAction(networkId, key, action, nick) },
-                            onOpenDm = { nick -> selectedKey = coordinator.directMessageKey(networkId, key, nick) },
-                            sharedDraft = sharedDraft,
-                            onSharedConsumed = onSharedConsumed,
-                            onPickFile = { launchAttachmentPicker() },
-                            modifier = Modifier.fillMaxSize(),
-                        )
+                        ) {
+                            conversationContent(key, buffer, network.name, network.status == ConnectionStatus.REGISTERED) {
+                                drawerScope.launch { drawerState.open() }
+                            }
+                        }
                     }
                 }
 
@@ -267,49 +404,40 @@ public fun YardhalAppRoot(
                             },
                         )
                     } else {
-                        NetworkOverviewScreen(
-                            buffers = buffers.values
-                                .filter { it.ref.kind != dev.brentdevs.yardhal.core.data.ConversationKind.SERVER }
-                                .sortedBy { it.displayName.lowercase() },
-                            networks = networks,
-                            onSelect = { key ->
-                                coordinator.markRead(key)
-                                selectedKey = key
-                            },
-                            onSelectServer = { networkId ->
-                                coordinator.markRead(ConversationRef.server(networkId).storageKey)
-                                selectedKey = ConversationRef.server(networkId).storageKey
-                            },
-                        mutedKeys = mutedKeys,
-                        orderState = orderState,
-                        onMarkRead = { key -> coordinator.markRead(key) },
-                        onToggleMute = { key -> coordinator.toggleMute(key) },
-                        onLeave = { key -> coordinator.leaveConversation(networkId = key.substringBefore("|"), storageKey = key) },
-                        onTogglePin = { key -> coordinator.togglePin(key) },
-                        onRetryJoin = { key -> coordinator.retryJoin(key.substringBefore("|"), key) },
-                        onMoveToGroup = { key, groupId ->
-                            if (groupId == null) coordinator.removeFromGroup(key) else coordinator.addToGroup(groupId, key)
+                        overviewScreen(Modifier.fillMaxSize()) {}
+                    }
+                }
+            }
+        }
+    }
+
+    if (appearanceVisible) {
+        ModalBottomSheet(onDismissRequest = { appearanceVisible = false }) {
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                Text("Chat appearance", style = MaterialTheme.typography.titleLarge)
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    Text("Compact message spacing", modifier = Modifier.weight(1f))
+                    Switch(
+                        checked = appearance.compact,
+                        onCheckedChange = { compact ->
+                            appearance = appearance.copy(compact = compact)
+                            appearanceStore.update(appearance)
                         },
-                        onCreateGroup = { name, done -> done(coordinator.createGroup(name)) },
-                            onAddNetwork = { addNetworkVisible = true },
-                            onRemoveNetwork = { coordinator.removeNetwork(it) },
-                            onBrowseChannels = {
-                                networks.firstOrNull()?.let { coordinator.startChannelList(it.id) }
+                    )
+                }
+                Text("Message text size", style = MaterialTheme.typography.titleSmall)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("Small" to 0.9f, "Default" to 1f, "Large" to 1.15f).forEach { (label, scale) ->
+                        FilterChip(
+                            selected = appearance.textScale == scale,
+                            onClick = {
+                                appearance = appearance.copy(textScale = scale)
+                                appearanceStore.update(appearance)
                             },
-                            channelList = channelList,
-                            onJoinFromList = { channel ->
-                                val networkId = networks.firstOrNull()?.id
-                                if (networkId != null) {
-                                    coordinator.sendText(
-                                        networkId,
-                                        ConversationRef.server(networkId).storageKey,
-                                        "/join $channel",
-                                    )
-                                }
-                            },
-                            onOpenDebug = {},
-                            rawLogVersion = rawLogVersion,
-                            rawLogProvider = { coordinator.rawLog(networks.firstOrNull()?.id ?: "") },
+                            label = { Text(label) },
                         )
                     }
                 }
@@ -319,17 +447,34 @@ public fun YardhalAppRoot(
 
     if (bouncerVisible) {
         val entries = remember(bouncerVersion) { coordinator.bouncerEntries() }
-        AlertDialog(
-            onDismissRequest = { bouncerVisible = false },
-            title = { Text("Bouncer networks") },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        val bouncerIds = coordinator.bouncerSessionIds()
+        val selectedBouncerId = bouncerNetworkId ?: bouncerIds.singleOrNull()
+        ModalBottomSheet(onDismissRequest = { bouncerVisible = false }) {
+            Column(
+                modifier = Modifier.fillMaxWidth().heightIn(max = 700.dp).imePadding()
+                    .verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                    Text("Bouncer networks", style = MaterialTheme.typography.titleLarge)
+                    if (bouncerIds.size > 1) {
+                        Text("Management connection", style = MaterialTheme.typography.titleSmall)
+                        Row(
+                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            bouncerIds.forEach { id ->
+                                FilterChip(
+                                    selected = selectedBouncerId == id,
+                                    onClick = { bouncerNetworkId = id },
+                                    label = { Text(networks.firstOrNull { it.id == id }?.name ?: id) },
+                                )
+                            }
+                        }
+                    }
                     if (entries.isEmpty()) {
                         Text("No networks reported yet.", style = MaterialTheme.typography.bodySmall)
                     } else {
-                        LazyColumn(modifier = Modifier.padding(vertical = 2.dp)) {
-                            items(entries.size) { index ->
-                                val entry = entries[index]
+                            entries.forEach { entry ->
                                 Column(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
                                     Row(
                                         verticalAlignment = Alignment.CenterVertically,
@@ -337,7 +482,10 @@ public fun YardhalAppRoot(
                                         modifier = Modifier.fillMaxWidth(),
                                     ) {
                                         Column(modifier = Modifier.weight(1f)) {
-                                            Text(entry.attributes.name ?: entry.netId, style = MaterialTheme.typography.bodyMedium)
+                                            Text(
+                                                "${networks.firstOrNull { it.id == entry.networkId }?.name.orEmpty()} · ${entry.attributes.name ?: entry.netId}",
+                                                style = MaterialTheme.typography.bodyMedium,
+                                            )
                                             Text(
                                                 text = listOfNotNull(
                                                     entry.attributes.host,
@@ -363,7 +511,6 @@ public fun YardhalAppRoot(
                                         }
                                     }
                                 }
-                            }
                         }
                     }
 
@@ -395,14 +542,15 @@ public fun YardhalAppRoot(
                             value = bouncerPassword,
                             onValueChange = { bouncerPassword = it },
                             label = { Text("Pass (optional)") },
+                            visualTransformation = PasswordVisualTransformation(),
                             singleLine = true,
                             modifier = Modifier.weight(1f),
                         )
                     }
                     TextButton(
-                        enabled = bouncerAddr.isNotBlank(),
+                        enabled = bouncerAddr.isNotBlank() && selectedBouncerId != null,
                         onClick = {
-                            val networkId = networks.firstOrNull()?.id
+                            val networkId = selectedBouncerId
                             if (networkId != null) {
                                 coordinator.addBouncerNetwork(
                                     networkId,
@@ -420,87 +568,17 @@ public fun YardhalAppRoot(
                             }
                         },
                     ) { Text("Add") }
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = { bouncerVisible = false }) { Text("Close") }
-            },
-        )
-    }
-
-    if (searchVisible) {
-        LaunchedEffect(searchQuery) {
-            val query = searchQuery
-            if (query.length >= 2) {
-                delay(250)
-                val hits = coordinator.searchMessages(query)
-                if (searchQuery == query) searchResults = hits
             }
         }
-        AlertDialog(
-            onDismissRequest = { searchVisible = false },
-            title = { Text("Search messages") },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    OutlinedTextField(
-                        value = searchQuery,
-                        onValueChange = { updated ->
-                            searchQuery = updated
-                            searchResults = emptyList()
-                        },
-                        placeholder = { Text("Search all conversations") },
-                        singleLine = true,
-                    )
-                    if (searchResults.isEmpty() && searchQuery.length >= 2) {
-                        Text(
-                            "No matches",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    LazyColumn(modifier = Modifier.padding(vertical = 4.dp)) {
-                        items(searchResults.size) { index ->
-                            val hit = searchResults[index]
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable {
-                                        val hitKey = coordinator.ensureConversation(hit.networkId, hit.conversation)
-                                        coordinator.markRead(hitKey)
-                                        selectedKey = hitKey
-                                        searchVisible = false
-                                    }
-                                    .padding(vertical = 4.dp),
-                            ) {
-                                Text(
-                                    "${hit.sender} in ${hit.conversation}",
-                                    style = MaterialTheme.typography.labelMedium,
-                                )
-                                Text(
-                                    hit.snippet,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    maxLines = 2,
-                                )
-                            }
-                        }
-                    }
-                }
-            },
-            confirmButton = {},
-            dismissButton = {
-                TextButton(onClick = { searchVisible = false }) { Text("Close") }
-            },
-        )
     }
 
-    if (whoisInfo != null) {
-        val info = whoisInfo!!
-        AlertDialog(
-            onDismissRequest = coordinator::dismissWhois,
-            title = { Text("Whois · ${info.nick}") },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+    whoisInfo?.let { info ->
+        ModalBottomSheet(onDismissRequest = coordinator::dismissWhois) {
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text("Whois · ${info.nick}", style = MaterialTheme.typography.titleLarge)
                     info.realName?.let { Text(it) }
                     if (info.user != null || info.host != null) {
                         Text("${info.user ?: "?"}@${info.host ?: "?"}", style = MaterialTheme.typography.bodySmall)
@@ -512,25 +590,38 @@ public fun YardhalAppRoot(
                         Text(info.channels.joinToString(" "), style = MaterialTheme.typography.bodySmall)
                     }
                 }
-            },
-            confirmButton = {
-                TextButton(onClick = coordinator::dismissWhois) { Text("Close") }
-            },
-        )
+        }
     }
 
     if (joinDialogVisible) {
-        val activeNetworkId = selectedKey?.substringBefore("|") ?: networks.firstOrNull()?.id
+        val activeNetworkId = joinNetworkId ?: networks.singleOrNull()?.id
         AlertDialog(
             onDismissRequest = { joinDialogVisible = false },
             title = { Text("Join channel") },
             text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (networks.size > 1) {
+                    Text("Network", style = MaterialTheme.typography.labelMedium)
+                    Row(
+                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        networks.forEach { network ->
+                            FilterChip(
+                                selected = activeNetworkId == network.id,
+                                onClick = { joinNetworkId = network.id },
+                                label = { Text(network.name) },
+                            )
+                        }
+                    }
+                }
                 OutlinedTextField(
                     value = joinDraft,
                     onValueChange = { joinDraft = it },
                     placeholder = { Text("#channel") },
                     singleLine = true,
                 )
+                }
             },
             confirmButton = {
                 Button(
