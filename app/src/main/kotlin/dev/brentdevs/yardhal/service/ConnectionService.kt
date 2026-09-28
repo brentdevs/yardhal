@@ -16,9 +16,6 @@ public class ConnectionService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val count = intent?.getIntExtra(EXTRA_NETWORK_COUNT, 0) ?: 0
         startForeground(NOTIFICATION_ID, Notifications.ongoing(this, count))
-        if (count == 0 && intent?.getBooleanExtra(EXTRA_STOP, false) == true) {
-            stopSelf()
-        }
         return START_STICKY
     }
 
@@ -26,7 +23,6 @@ public class ConnectionService : Service() {
 
     public companion object {
         public const val EXTRA_NETWORK_COUNT: String = "network_count"
-        public const val EXTRA_STOP: String = "stop"
         private const val NOTIFICATION_ID: Int = 1
 
         public fun start(context: Context, networkCount: Int) {
