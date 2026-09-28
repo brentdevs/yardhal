@@ -83,6 +83,7 @@ APIs are touched.
 ## Documentation
 
 - `docs/architecture.md` — module map, data flow, roadmap, deferrals
+- `docs/ui-improvement-plan.md` — prioritized Android UI refresh and validation
 - `docs/ircv3-checklist.md` — spec-by-spec inventory of what is done
 - `AGENTS.md` — conventions and the contribution flow (PRs only)
 
