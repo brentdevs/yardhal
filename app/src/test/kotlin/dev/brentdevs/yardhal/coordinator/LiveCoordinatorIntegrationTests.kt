@@ -41,6 +41,7 @@ class LiveCoordinatorIntegrationTests {
         private val listener = ServerSocket(0, 1, InetAddress.getLoopbackAddress())
         private val executor = Executors.newSingleThreadExecutor()
         @Volatile private var socket: Socket? = null
+        private var repeatedMessages = 0
 
         val port: Int get() = listener.localPort
 
@@ -62,6 +63,15 @@ class LiveCoordinatorIntegrationTests {
                         }
                         line == "PRIVMSG #room :hello" ->
                             send("@msgid=echo-1;time=2024-01-01T00:00:00.000Z :tester!u@h PRIVMSG #room :hello")
+                        line == "PRIVMSG #room :ok" -> {
+                            repeatedMessages += 1
+                            if (repeatedMessages == 2) {
+                                send("@msgid=echo-first;time=2024-01-01T00:00:00.001Z :tester!u@h PRIVMSG #room :ok")
+                                send("@msgid=echo-second;time=2024-01-01T00:00:00.002Z :tester!u@h PRIVMSG #room :ok")
+                            }
+                        }
+                        line == "PRIVMSG #room :after nick" ->
+                            send("@msgid=echo-after;time=2024-01-01T00:00:00.003Z :TESTERCASE!u@h PRIVMSG #room :after nick")
                     }
                 }
             }
@@ -83,7 +93,7 @@ class LiveCoordinatorIntegrationTests {
     }
 
     @Test
-    fun serverEchoPersistsOnceAndMembershipTracksLiveEvents() = runBlocking {
+    fun echoesKeepMessageIdsOrderedAndMembershipTracksKickAndNickChanges() = runBlocking {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val directory = Files.createTempDirectory("yardhal-coordinator").toFile()
         val database = YardhalDatabase.inMemory(context)
@@ -132,7 +142,20 @@ class LiveCoordinatorIntegrationTests {
                 coordinator.sendText(config.id, ref.storageKey, "hello")
                 await { coordinator.buffers.value[ref.storageKey]?.messages?.singleOrNull()?.msgid == "echo-1" }
                 await { messages.recent(ref, 10).size == 1 }
-                assertEquals(1, messages.recent(ref, 10).size)
+                assertEquals("echo-1", messages.recent(ref, 10).single().msgid)
+
+                coordinator.sendText(config.id, ref.storageKey, "ok")
+                coordinator.sendText(config.id, ref.storageKey, "ok")
+                await {
+                    coordinator.buffers.value[ref.storageKey]?.messages
+                        ?.filter { it.text == "ok" }
+                        ?.let { it.size == 2 && it.all { message -> message.msgid != null } } == true
+                }
+                assertEquals(
+                    listOf("echo-first", "echo-second"),
+                    coordinator.buffers.value[ref.storageKey]?.messages
+                        ?.filter { it.text == "ok" }?.map { it.msgid },
+                )
 
                 server.send(":bob!u@h JOIN #room")
                 await { coordinator.buffers.value[ref.storageKey]?.members?.any { it.nick == "bob" } == true }
@@ -143,7 +166,33 @@ class LiveCoordinatorIntegrationTests {
                 server.send(":bobby!u@h QUIT :bye")
                 await { coordinator.buffers.value[ref.storageKey]?.members?.none { it.nick == "bobby" } == true }
                 assertFalse(coordinator.buffers.value[ref.storageKey]?.members?.any { it.nick == "alice" } == true)
-                assertTrue(coordinator.buffers.value[ref.storageKey]?.members?.any { it.nick == "tester" } == true)
+                server.send(":charlie!u@h JOIN #room")
+                await { coordinator.buffers.value[ref.storageKey]?.members?.any { it.nick == "charlie" } == true }
+                server.send(":operator!u@h KICK #room charlie :cleanup")
+                await { coordinator.buffers.value[ref.storageKey]?.members?.none { it.nick == "charlie" } == true }
+                server.send(":operator!u@h KICK #room tester :leave")
+                await {
+                    coordinator.buffers.value[ref.storageKey]?.let {
+                        it.joinState == JoinState.FAILED && it.members.isEmpty() &&
+                            it.messages.any { message -> message.text.contains("tester was kicked") }
+                    } == true
+                }
+                coordinator.retryJoin(config.id, ref.storageKey)
+                await { coordinator.buffers.value[ref.storageKey]?.joinState == JoinState.JOINED }
+
+                server.send(":TESTER!u@h NICK :TesterCase")
+                await { coordinator.networks.value.singleOrNull()?.ownNick == "TesterCase" }
+                assertTrue(coordinator.buffers.value[ref.storageKey]?.members?.any { it.nick == "TesterCase" } == true)
+                coordinator.sendText(config.id, ref.storageKey, "after nick")
+                await {
+                    coordinator.buffers.value[ref.storageKey]?.messages
+                        ?.singleOrNull { it.text == "after nick" }?.msgid == "echo-after"
+                }
+                assertTrue(
+                    coordinator.buffers.value[ref.storageKey]?.messages
+                        ?.singleOrNull { it.text == "after nick" }?.sentByUs == true,
+                )
+                assertTrue(coordinator.buffers.value[ref.storageKey]?.members?.any { it.nick == "TesterCase" } == true)
                 coordinator.disconnect(config.id)
             } finally {
                 scope.cancel()

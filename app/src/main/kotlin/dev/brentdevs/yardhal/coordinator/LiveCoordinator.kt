@@ -269,6 +269,7 @@ public class LiveCoordinator(
             message.command.equals("JOIN", true) -> handleJoin(session, message)
             message.command.equals("QUIT", true) -> handleQuit(session, message)
             message.command.equals("PART", true) -> handlePart(session, message)
+            message.command.equals("KICK", true) -> handleKick(session, message)
             message.command.equals("TOPIC", true) -> handleTopicVerb(session, message)
             message.command.equals("NICK", true) -> handleNickChange(session, message)
             message.command.equals("FAIL", true) || message.command.equals("WARN", true) ->
@@ -910,8 +911,8 @@ public class LiveCoordinator(
         val targetParam = message.parameters[0]
         val rawText = message.parameters[1]
         val senderNick = message.prefix?.nick ?: return
-        if (senderNick != session.ownNick && ignoreStore?.isIgnored(senderNick) == true) return
-        val fromUs = senderNick == session.ownNick
+        val fromUs = isOwnNick(session, senderNick)
+        if (!fromUs && ignoreStore?.isIgnored(senderNick) == true) return
         val isServiceTarget = targetParam.startsWith("*")
         val ref =
             when {
@@ -964,6 +965,7 @@ public class LiveCoordinator(
             replyToMsgid = message.tag("+draft/reply"),
             attachmentUrl = message.tag("+draft/attachment"),
             playback = isPlayback,
+            reconcilePendingEcho = fromUs,
         )
     }
 
@@ -971,12 +973,13 @@ public class LiveCoordinator(
         val nick = message.prefix?.nick ?: return
         val channel = message.parameters.firstOrNull() ?: return
         val ref = ConversationRef.channel(session.config.id, channel, session.casemapping)
-        if (nick != session.ownNick) addMember(session, ref, nick)
-        if (nick != session.ownNick && netsplitCollapser.isSuppressing("JOIN")) {
+        val fromUs = isOwnNick(session, nick)
+        if (!fromUs) addMember(session, ref, nick)
+        if (!fromUs && netsplitCollapser.isSuppressing("JOIN")) {
             netsplitCollapser.recordSuppressed("JOIN")
             return
         }
-        if (nick == session.ownNick) {
+        if (fromUs) {
             buffer(ref)
             sendRaw(session, "TOPIC $channel")
             sendRaw(session, "MODE $channel")
@@ -992,7 +995,7 @@ public class LiveCoordinator(
         val reason = message.parameters.getOrNull(1)
         val ref = ConversationRef.channel(session.config.id, channel, session.casemapping)
         removeMember(session, nick, ref.storageKey)
-        if (nick.equals(session.ownNick, ignoreCase = true)) {
+        if (isOwnNick(session, nick)) {
             _buffers.update { it - ref.storageKey }
             channelOrder.markParted(ref.storageKey)
             _orderState.value = channelOrder.snapshot()
@@ -1001,16 +1004,49 @@ public class LiveCoordinator(
         appendSystem(session, ref, if (reason == null) "← $nick left" else "← $nick left ($reason)", MessageKind.PART)
     }
 
+    private fun handleKick(session: Session, message: IrcMessage) {
+        if (message.parameters.size < 2) return
+        val channel = message.parameters[0]
+        if (channel.isEmpty() || channel[0] !in "#&") return
+        val kickedNick = message.parameters[1]
+        if (kickedNick.isEmpty()) return
+        val ref = ConversationRef.channel(session.config.id, channel, session.casemapping)
+        if (ref.storageKey !in _buffers.value) return
+        removeMember(session, kickedNick, ref.storageKey)
+        if (isOwnNick(session, kickedNick)) {
+            pendingNames.remove(ref.storageKey)
+            updateBufferKey(ref.storageKey) {
+                it.copy(
+                    members = emptyList(),
+                    memberPresence = emptyMap(),
+                    typingUsers = emptyMap(),
+                    joinState = JoinState.FAILED,
+                )
+            }
+        }
+        val actor = message.prefix?.nick ?: "server"
+        val reason = message.parameters.getOrNull(2)
+        appendSystem(
+            session,
+            ref,
+            "$kickedNick was kicked by $actor${reason?.let { " ($it)" }.orEmpty()}",
+            MessageKind.PART,
+        )
+    }
+
     private fun handleNickChange(session: Session, message: IrcMessage) {
         if (message.parameters.isEmpty()) return
         val oldNick = message.prefix?.nick ?: return
         val newNick = message.parameters.last()
         renameMember(session, oldNick, newNick)
-        if (oldNick == session.ownNick) {
+        if (isOwnNick(session, oldNick)) {
             session.ownNick = newNick
             refreshNetworkStates()
         }
     }
+
+    private fun isOwnNick(session: Session, nick: String): Boolean =
+        session.casemapping.fold(nick) == session.casemapping.fold(session.ownNick)
 
     private fun addMember(session: Session, ref: ConversationRef, nick: String) {
         val folded = session.casemapping.fold(nick)
@@ -1108,12 +1144,13 @@ public class LiveCoordinator(
         attachmentUrl: String? = null,
         pendingEcho: Boolean = false,
         persist: Boolean = true,
+        reconcilePendingEcho: Boolean = false,
     ) {
         if (persist) persistAsync(session, ref, sender, kind, text, msgid, timestampMs, sentByUs)
         val muted = mutes.isMuted(ref.storageKey)
         updateBuffer(ref) { buffer ->
-            if (sentByUs && !playback) {
-                val index = buffer.messages.indexOfLast {
+            if (reconcilePendingEcho && !playback) {
+                val index = buffer.messages.indexOfFirst {
                     it.pendingEcho && it.kind == kind && it.text == text
                 }
                 if (index >= 0) {
