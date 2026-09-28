@@ -34,6 +34,7 @@ public data class ChatMessage(
     public val replyToMsgid: String? = null,
     public val attachmentUrl: String? = null,
     public val playback: Boolean = false,
+    public val pendingEcho: Boolean = false,
 ) {
     public val countsAsUnread: Boolean
         get() = !sentByUs && !playback &&

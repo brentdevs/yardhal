@@ -46,8 +46,11 @@ public object Notifications {
             Intent(context, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        val text =
-            if (networkCount == 1) "Connected to 1 network" else "Connected to $networkCount networks"
+        val text = when (networkCount) {
+            0 -> "No networks connected"
+            1 -> "Connected to 1 network"
+            else -> "Connected to $networkCount networks"
+        }
         return NotificationCompat.Builder(context, CHANNEL_ONGOING)
             .setSmallIcon(R.drawable.ic_status)
             .setContentTitle("Yardhal")

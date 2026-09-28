@@ -4,6 +4,9 @@ import dev.brentdevs.yardhal.core.client.IrcConnection
 import dev.brentdevs.yardhal.core.client.IrcEvent
 import dev.brentdevs.yardhal.core.client.IrcReconnector
 import dev.brentdevs.yardhal.core.client.ReconnectPolicy
+import dev.brentdevs.yardhal.core.client.StsPolicyStore
+import dev.brentdevs.yardhal.core.client.StsResolver
+import dev.brentdevs.yardhal.core.client.StsUpgradeDecision
 import dev.brentdevs.yardhal.core.data.ConversationKind
 import dev.brentdevs.yardhal.core.data.ConversationRef
 import dev.brentdevs.yardhal.core.data.CredentialVault
@@ -31,7 +34,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 public fun interface ConnectionFactory {
-    public fun create(config: NetworkConfig): IrcConnection
+    public fun create(config: NetworkConfig, onStsUpgrade: (Int) -> Unit): IrcConnection
 }
 
 public class LiveCoordinator(
@@ -43,6 +46,7 @@ public class LiveCoordinator(
     private val vault: CredentialVault,
     private val channelOrder: dev.brentdevs.yardhal.core.data.ChannelOrderStore,
     private val connectionFactory: ConnectionFactory,
+    private val stsPolicies: StsPolicyStore,
     private val notifier: HighlightNotifier = HighlightNotifier { _, _, _, _ -> },
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
@@ -89,6 +93,7 @@ public class LiveCoordinator(
         var supportedCaps: Set<String> = emptySet()
         var hasWhox: Boolean = false
         var filehostEndpoint: String? = null
+        @Volatile var stsUpgradePort: Int? = null
         var isBouncerDiscovery: Boolean = false
         var prefixModes: dev.brentdevs.yardhal.core.protocol.ChannelPrefixModes =
             dev.brentdevs.yardhal.core.protocol.ChannelPrefixModes.DEFAULT
@@ -154,11 +159,14 @@ public class LiveCoordinator(
     }
 
     private fun launchSession(session: Session) {
-        val config = effectiveConfig(session.config)
         val reconnector = IrcReconnector(
             scope = scope,
             policy = ReconnectPolicy(initialDelayMillis = 1_000, maxDelayMillis = 30_000),
-            connectionFactory = { connectionFactory.create(effectiveConfig(session.config)) },
+            connectionFactory = {
+                connectionFactory.create(effectiveConfig(session.config, session.stsUpgradePort)) { port ->
+                    session.stsUpgradePort = port
+                }
+            },
         )
         session.reconnector = reconnector
         session.collectorJob = scope.launch {
@@ -178,9 +186,22 @@ public class LiveCoordinator(
         reconnector.start()
     }
 
-    private fun effectiveConfig(config: NetworkConfig): NetworkConfig {
+    private fun effectiveConfig(config: NetworkConfig, stsUpgradePort: Int? = null): NetworkConfig {
         val password = config.saslPasswordRef?.let { vault.readPassword(it) }
-        return config.copy(saslPassword = password)
+        val decision = StsResolver.decide(
+            stsPolicies,
+            config.host,
+            config.port,
+            config.tls,
+            clock() / 1000,
+        )
+        val policyPort = (decision as? StsUpgradeDecision.UpgradeRequired)?.port
+        val securePort = policyPort ?: stsUpgradePort
+        return config.copy(
+            port = securePort ?: config.port,
+            tls = config.tls || securePort != null,
+            saslPassword = password,
+        )
     }
 
     private suspend fun routeEvent(session: Session, event: IrcEvent) {
@@ -246,8 +267,9 @@ public class LiveCoordinator(
             message.command.equals("BOUNCER", true) -> handleBouncerMessage(session, message)
             message.command.equals("MARKREAD", true) -> handleInboundMarkRead(session, message)
             message.command.equals("JOIN", true) -> handleJoin(session, message)
-            message.command.equals("QUIT", true) -> handleQuit(session)
+            message.command.equals("QUIT", true) -> handleQuit(session, message)
             message.command.equals("PART", true) -> handlePart(session, message)
+            message.command.equals("KICK", true) -> handleKick(session, message)
             message.command.equals("TOPIC", true) -> handleTopicVerb(session, message)
             message.command.equals("NICK", true) -> handleNickChange(session, message)
             message.command.equals("FAIL", true) || message.command.equals("WARN", true) ->
@@ -469,7 +491,9 @@ public class LiveCoordinator(
         }
     }
 
-    private fun handleQuit(session: Session) {
+    private fun handleQuit(session: Session, message: IrcMessage) {
+        val nick = message.prefix?.nick ?: return
+        removeMember(session, nick)
         if (netsplitCollapser.isSuppressing("QUIT")) {
             netsplitCollapser.recordSuppressed("QUIT")
         }
@@ -825,7 +849,7 @@ public class LiveCoordinator(
             appendSystem(session, _buffers.value[storageKey]?.ref ?: ConversationRef.server(networkId), "This network does not advertise a filehost (soju.im/FILEHOST).")
             return
         }
-        val config = effectiveConfig(session.config)
+        val config = effectiveConfig(session.config, session.stsUpgradePort)
         scope.launch(kotlinx.coroutines.Dispatchers.IO) {
             val uploaded = try {
                 dev.brentdevs.yardhal.core.client.FilehostUploader.upload(
@@ -887,8 +911,8 @@ public class LiveCoordinator(
         val targetParam = message.parameters[0]
         val rawText = message.parameters[1]
         val senderNick = message.prefix?.nick ?: return
-        if (senderNick != session.ownNick && ignoreStore?.isIgnored(senderNick) == true) return
-        val fromUs = senderNick == session.ownNick
+        val fromUs = isOwnNick(session, senderNick)
+        if (!fromUs && ignoreStore?.isIgnored(senderNick) == true) return
         val isServiceTarget = targetParam.startsWith("*")
         val ref =
             when {
@@ -941,18 +965,21 @@ public class LiveCoordinator(
             replyToMsgid = message.tag("+draft/reply"),
             attachmentUrl = message.tag("+draft/attachment"),
             playback = isPlayback,
+            reconcilePendingEcho = fromUs,
         )
     }
 
     private fun handleJoin(session: Session, message: IrcMessage) {
         val nick = message.prefix?.nick ?: return
         val channel = message.parameters.firstOrNull() ?: return
-        if (nick != session.ownNick && netsplitCollapser.isSuppressing("JOIN")) {
+        val ref = ConversationRef.channel(session.config.id, channel, session.casemapping)
+        val fromUs = isOwnNick(session, nick)
+        if (!fromUs) addMember(session, ref, nick)
+        if (!fromUs && netsplitCollapser.isSuppressing("JOIN")) {
             netsplitCollapser.recordSuppressed("JOIN")
             return
         }
-        val ref = ConversationRef.channel(session.config.id, channel, session.casemapping)
-        if (nick == session.ownNick) {
+        if (fromUs) {
             buffer(ref)
             sendRaw(session, "TOPIC $channel")
             sendRaw(session, "MODE $channel")
@@ -967,7 +994,8 @@ public class LiveCoordinator(
         val channel = message.parameters.firstOrNull() ?: return
         val reason = message.parameters.getOrNull(1)
         val ref = ConversationRef.channel(session.config.id, channel, session.casemapping)
-        if (nick.equals(session.ownNick, ignoreCase = true)) {
+        removeMember(session, nick, ref.storageKey)
+        if (isOwnNick(session, nick)) {
             _buffers.update { it - ref.storageKey }
             channelOrder.markParted(ref.storageKey)
             _orderState.value = channelOrder.snapshot()
@@ -976,12 +1004,97 @@ public class LiveCoordinator(
         appendSystem(session, ref, if (reason == null) "← $nick left" else "← $nick left ($reason)", MessageKind.PART)
     }
 
+    private fun handleKick(session: Session, message: IrcMessage) {
+        if (message.parameters.size < 2) return
+        val channel = message.parameters[0]
+        if (channel.isEmpty() || channel[0] !in "#&") return
+        val kickedNick = message.parameters[1]
+        if (kickedNick.isEmpty()) return
+        val ref = ConversationRef.channel(session.config.id, channel, session.casemapping)
+        if (ref.storageKey !in _buffers.value) return
+        removeMember(session, kickedNick, ref.storageKey)
+        if (isOwnNick(session, kickedNick)) {
+            pendingNames.remove(ref.storageKey)
+            updateBufferKey(ref.storageKey) {
+                it.copy(
+                    members = emptyList(),
+                    memberPresence = emptyMap(),
+                    typingUsers = emptyMap(),
+                    joinState = JoinState.FAILED,
+                )
+            }
+        }
+        val actor = message.prefix?.nick ?: "server"
+        val reason = message.parameters.getOrNull(2)
+        appendSystem(
+            session,
+            ref,
+            "$kickedNick was kicked by $actor${reason?.let { " ($it)" }.orEmpty()}",
+            MessageKind.PART,
+        )
+    }
+
     private fun handleNickChange(session: Session, message: IrcMessage) {
         if (message.parameters.isEmpty()) return
+        val oldNick = message.prefix?.nick ?: return
         val newNick = message.parameters.last()
-        if (message.prefix?.nick == session.ownNick) {
+        renameMember(session, oldNick, newNick)
+        if (isOwnNick(session, oldNick)) {
             session.ownNick = newNick
             refreshNetworkStates()
+        }
+    }
+
+    private fun isOwnNick(session: Session, nick: String): Boolean =
+        session.casemapping.fold(nick) == session.casemapping.fold(session.ownNick)
+
+    private fun addMember(session: Session, ref: ConversationRef, nick: String) {
+        val folded = session.casemapping.fold(nick)
+        updateBuffer(ref) { buffer ->
+            if (buffer.members.any { session.casemapping.fold(it.nick) == folded }) buffer else
+                buffer.copy(members = (buffer.members + dev.brentdevs.yardhal.core.data.ChannelMember(nick))
+                    .sortedBy { it.nick.lowercase() })
+        }
+        pendingNames[ref.storageKey]?.add(dev.brentdevs.yardhal.core.data.ChannelMember(nick))
+    }
+
+    private fun removeMember(session: Session, nick: String, channelKey: String? = null) {
+        val folded = session.casemapping.fold(nick)
+        for ((key, buffer) in _buffers.value) {
+            if (buffer.ref.networkId != session.config.id || buffer.ref.kind != ConversationKind.CHANNEL) continue
+            if (channelKey != null && key != channelKey) continue
+            updateBufferKey(key) { current -> current.copy(
+                members = current.members.filterNot { session.casemapping.fold(it.nick) == folded },
+                memberPresence = current.memberPresence.filterKeys { session.casemapping.fold(it) != folded },
+            ) }
+            pendingNames[key]?.removeAll { session.casemapping.fold(it.nick) == folded }
+        }
+    }
+
+    private fun renameMember(session: Session, oldNick: String, newNick: String) {
+        val folded = session.casemapping.fold(oldNick)
+        for ((key, buffer) in _buffers.value) {
+            if (buffer.ref.networkId != session.config.id || buffer.ref.kind != ConversationKind.CHANNEL) continue
+            updateBufferKey(key) { current ->
+                val member = current.members.firstOrNull { session.casemapping.fold(it.nick) == folded }
+                    ?: return@updateBufferKey current
+                val presence = current.memberPresence.entries.firstOrNull {
+                    session.casemapping.fold(it.key) == folded
+                }?.value
+                current.copy(
+                    members = (current.members.filterNot { session.casemapping.fold(it.nick) == folded } +
+                        member.copy(nick = newNick)).sortedBy { it.nick.lowercase() },
+                    memberPresence = current.memberPresence.filterKeys { session.casemapping.fold(it) != folded } +
+                        if (presence == null) emptyMap() else mapOf(newNick to presence),
+                )
+            }
+            pendingNames[key]?.let { pending ->
+                val prior = pending.firstOrNull { session.casemapping.fold(it.nick) == folded }
+                if (prior != null) {
+                    pending.remove(prior)
+                    pending.add(prior.copy(nick = newNick))
+                }
+            }
         }
     }
 
@@ -1029,18 +1142,21 @@ public class LiveCoordinator(
         replyToMsgid: String? = null,
         playback: Boolean = false,
         attachmentUrl: String? = null,
+        pendingEcho: Boolean = false,
+        persist: Boolean = true,
+        reconcilePendingEcho: Boolean = false,
     ) {
-        persistAsync(session, ref, sender, kind, text, msgid, timestampMs, sentByUs)
+        if (persist) persistAsync(session, ref, sender, kind, text, msgid, timestampMs, sentByUs)
         val muted = mutes.isMuted(ref.storageKey)
         updateBuffer(ref) { buffer ->
-            if (sentByUs && msgid != null) {
-                val index = buffer.messages.indexOfLast {
-                    it.sentByUs && it.msgid == null && it.kind == kind && it.text == text
+            if (reconcilePendingEcho && !playback) {
+                val index = buffer.messages.indexOfFirst {
+                    it.pendingEcho && it.kind == kind && it.text == text
                 }
                 if (index >= 0) {
                     val messages = buffer.messages.toMutableList()
                     messages[index] = messages[index]
-                        .copy(msgid = msgid, timestampMs = timestampMs, attachmentUrl = attachmentUrl)
+                        .copy(msgid = msgid, timestampMs = timestampMs, attachmentUrl = attachmentUrl, pendingEcho = false)
                     return@updateBuffer buffer.copy(messages = messages)
                 }
             }
@@ -1057,6 +1173,7 @@ public class LiveCoordinator(
                 replyToMsgid = replyToMsgid,
                 attachmentUrl = attachmentUrl,
                 playback = playback,
+                pendingEcho = pendingEcho,
             )
             val countsAsUnread = entry.countsAsUnread && !muted && timestampMs > buffer.readAtMs
             val boundary = if (countsAsUnread) {
@@ -1380,6 +1497,8 @@ public class LiveCoordinator(
                 highlightsMe = false,
                 replyToMsgid = replyToMsgid,
                 attachmentUrl = attachmentUrl,
+                pendingEcho = "echo-message" in session.supportedCaps,
+                persist = "echo-message" !in session.supportedCaps,
             )
         }
         val tags = buildMap {

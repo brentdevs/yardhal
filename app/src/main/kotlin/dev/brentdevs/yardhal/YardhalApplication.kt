@@ -1,12 +1,21 @@
 package dev.brentdevs.yardhal
 
 import android.app.Application
+import dev.brentdevs.yardhal.coordinator.ConnectionFactory
+import dev.brentdevs.yardhal.coordinator.ConnectionStatus
+import dev.brentdevs.yardhal.coordinator.LiveCoordinator
+import dev.brentdevs.yardhal.core.client.IrcConnection
+import dev.brentdevs.yardhal.core.client.IrcConnectionConfig
+import dev.brentdevs.yardhal.core.data.ChannelOrderStore
 import dev.brentdevs.yardhal.core.data.CredentialVault
+import dev.brentdevs.yardhal.core.data.FileStsPolicyStore
 import dev.brentdevs.yardhal.core.data.MessageStore
 import dev.brentdevs.yardhal.core.data.MuteStore
 import dev.brentdevs.yardhal.core.data.NetworkStore
 import dev.brentdevs.yardhal.core.data.ReadMarkerStore
 import dev.brentdevs.yardhal.core.data.YardhalDatabase
+import dev.brentdevs.yardhal.service.ConnectionService
+import dev.brentdevs.yardhal.service.Notifications
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -28,6 +37,8 @@ class YardhalApplication : Application() {
         private set
     lateinit var vault: CredentialVault
         private set
+    lateinit var coordinator: LiveCoordinator
+        private set
 
     override fun onCreate() {
         super.onCreate()
@@ -38,6 +49,52 @@ class YardhalApplication : Application() {
         readMarkerStore = ReadMarkerStore(dir)
         muteStore = MuteStore(dir)
         vault = AndroidCredentialVault(this)
+        val stsPolicies = FileStsPolicyStore(dir)
+        Notifications.ensureChannels(this)
+        coordinator = LiveCoordinator(
+            scope = appScope,
+            networkStore = networkStore,
+            messageStore = messageStore,
+            readMarkers = readMarkerStore,
+            mutes = muteStore,
+            vault = vault,
+            channelOrder = ChannelOrderStore(dir),
+            connectionFactory = ConnectionFactory { config, onStsUpgrade ->
+                IrcConnection(
+                    config = IrcConnectionConfig(
+                        host = config.host,
+                        port = config.port,
+                        tls = config.tls,
+                        nick = config.nick,
+                        username = config.username,
+                        realName = config.realName,
+                        saslAuthcid = config.saslAuthcid,
+                        saslPassword = config.saslPassword,
+                        serverPassword = config.serverPasswordRef?.let { vault.readPassword(it) },
+                    ),
+                    rawTap = { outbound, line -> coordinator.ingestRaw(config.id, outbound, line) },
+                    stsPolicyStore = stsPolicies,
+                    onStsUpgrade = onStsUpgrade,
+                )
+            },
+            stsPolicies = stsPolicies,
+            notifier = LiveCoordinator.HighlightNotifier { networkName, sender, conversation, text ->
+                Notifications.highlight(this, networkName, sender, conversation, text)
+            },
+        )
+        coordinator.startAll()
+        appScope.launch {
+            coordinator.networks.collect { networks ->
+                if (networks.isEmpty()) {
+                    ConnectionService.stop(this@YardhalApplication)
+                } else {
+                    ConnectionService.start(
+                        this@YardhalApplication,
+                        networks.count { it.status == ConnectionStatus.REGISTERED },
+                    )
+                }
+            }
+        }
         backfillSearchIndex()
     }
 
