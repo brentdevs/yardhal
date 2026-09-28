@@ -32,6 +32,7 @@ class MainActivity : ComponentActivity() {
             ) {
                 YardhalAppRoot(
                     coordinator = coordinator,
+                    appearanceStore = app.chatAppearanceStore,
                     presets = NetworkPresets.ALL.map {
                         NetworkPresetUi(it.id, it.name, it.host, it.port, it.tls)
                     },

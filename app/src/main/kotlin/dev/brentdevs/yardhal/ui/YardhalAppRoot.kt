@@ -66,6 +66,7 @@ import dev.brentdevs.yardhal.ui.screens.WelcomeScreen
 @Composable
 public fun YardhalAppRoot(
     coordinator: LiveCoordinator,
+    appearanceStore: ChatAppearanceStore,
     presets: List<NetworkPresetUi>,
     onNetworkSaved: (NetworkDraft) -> Unit,
     sharedTextProvider: () -> String? = { null },
@@ -88,6 +89,7 @@ public fun YardhalAppRoot(
     var joinDialogVisible by remember { mutableStateOf(false) }
     var joinDraft by remember { mutableStateOf("") }
     var joinNetworkId by remember { mutableStateOf<String?>(null) }
+    var joinSendFailed by remember { mutableStateOf(false) }
     var searchVisible by remember { mutableStateOf(false) }
     var searchQuery by rememberSaveable { mutableStateOf("") }
     var searchNetworkScope by rememberSaveable { mutableStateOf<String?>(null) }
@@ -97,6 +99,7 @@ public fun YardhalAppRoot(
     var searching by remember { mutableStateOf(false) }
     var searchError by remember { mutableStateOf(false) }
     var searchRetry by remember { mutableStateOf(0) }
+    var retryImmediately by remember { mutableStateOf(false) }
     var searchResults by remember { mutableStateOf<List<dev.brentdevs.yardhal.core.data.FtsHit>>(emptyList()) }
     var bouncerVisible by remember { mutableStateOf(false) }
     var bouncerAddr by remember { mutableStateOf("ircs://") }
@@ -110,7 +113,6 @@ public fun YardhalAppRoot(
 
     val configuration = LocalConfiguration.current
     val context = LocalContext.current
-    val appearanceStore = remember(context) { ChatAppearanceStore(context.filesDir) }
     var appearance by remember { mutableStateOf(appearanceStore.snapshot()) }
     val wide = configuration.screenWidthDp >= 600
     val paneWidth = (configuration.screenWidthDp * 0.38f).coerceIn(280f, 360f).dp
@@ -120,7 +122,6 @@ public fun YardhalAppRoot(
             .filter { it.ref.kind != dev.brentdevs.yardhal.core.data.ConversationKind.SERVER }
             .minByOrNull { it.displayName.lowercase() }
         selectedKey = first?.key
-        onSharedConsumed()
     }
 
     val pickLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
@@ -173,6 +174,7 @@ public fun YardhalAppRoot(
             onAddNetwork = { addNetworkVisible = true },
             onJoinChannel = { networkId ->
                 joinNetworkId = networkId
+                joinSendFailed = false
                 joinDialogVisible = true
             },
             onRemoveNetwork = coordinator::removeNetwork,
@@ -181,7 +183,6 @@ public fun YardhalAppRoot(
             onJoinFromList = { networkId, channel ->
                 coordinator.sendText(networkId, ConversationRef.server(networkId).storageKey, "/join $channel")
             },
-            onOpenDebug = {},
             rawLogVersion = rawLogVersion,
             rawLogProvider = coordinator::rawLog,
             showBouncerButton = coordinator.hasBouncerSession(),
@@ -212,13 +213,17 @@ public fun YardhalAppRoot(
                             it.ref.kind == dev.brentdevs.yardhal.core.data.ConversationKind.CHANNEL
                     }.map { it.ref.rawTarget },
                     connected = connected,
+                    canSendOffline = { text -> coordinator.canSendOffline(networkId, key, text) },
                     onSend = { text ->
                         val sent = coordinator.sendText(networkId, key, text)
-                        if (sent) coordinator.sendTyping(networkId, key)
+                        if (sent && connected && !coordinator.canSendOffline(networkId, key, text)) {
+                            coordinator.sendTyping(networkId, key)
+                        }
                         sent
                     },
                     onOpenJoin = {
                         joinNetworkId = networkId
+                        joinSendFailed = false
                         joinDialogVisible = true
                     },
                     onLoadHistory = {
@@ -257,11 +262,14 @@ public fun YardhalAppRoot(
             searchResults = emptyList()
             searching = false
             searchError = false
+            retryImmediately = false
         } else {
             searching = true
             searchResults = emptyList()
             searchError = false
-            delay(250)
+            val skipDebounce = retryImmediately
+            retryImmediately = false
+            if (!skipDebounce) delay(250)
             try {
                 searchResults = coordinator.searchMessages(searchQuery, searchNetworkScope, searchConversationScope)
             } catch (cancelled: CancellationException) {
@@ -309,7 +317,12 @@ public fun YardhalAppRoot(
                     searchConversationScope = null
                 },
                 onConversationScopeChange = { searchConversationScope = it },
-                onRetry = { searchRetry += 1 },
+                onRetry = {
+                    searching = true
+                    searchError = false
+                    retryImmediately = true
+                    searchRetry += 1
+                },
                 onOpenHit = { hit ->
                     selectedKey = coordinator.openSearchHit(hit)
                     searchTargetRowId = hit.rowId
@@ -595,48 +608,69 @@ public fun YardhalAppRoot(
 
     if (joinDialogVisible) {
         val activeNetworkId = joinNetworkId ?: networks.singleOrNull()?.id
+        val networkReady = networks.any { it.id == activeNetworkId && it.status == ConnectionStatus.REGISTERED }
         AlertDialog(
             onDismissRequest = { joinDialogVisible = false },
             title = { Text("Join channel") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (networks.size > 1) {
-                    Text("Network", style = MaterialTheme.typography.labelMedium)
-                    Row(
-                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        networks.forEach { network ->
-                            FilterChip(
-                                selected = activeNetworkId == network.id,
-                                onClick = { joinNetworkId = network.id },
-                                label = { Text(network.name) },
-                            )
+                    if (networks.size > 1) {
+                        Text("Network", style = MaterialTheme.typography.labelMedium)
+                        Row(
+                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            networks.forEach { network ->
+                                FilterChip(
+                                    selected = activeNetworkId == network.id,
+                                    onClick = {
+                                        joinNetworkId = network.id
+                                        joinSendFailed = false
+                                    },
+                                    label = { Text(network.name) },
+                                )
+                            }
                         }
                     }
-                }
-                OutlinedTextField(
-                    value = joinDraft,
-                    onValueChange = { joinDraft = it },
-                    placeholder = { Text("#channel") },
-                    singleLine = true,
-                )
+                    OutlinedTextField(
+                        value = joinDraft,
+                        onValueChange = {
+                            joinDraft = it
+                            joinSendFailed = false
+                        },
+                        placeholder = { Text("#channel") },
+                        singleLine = true,
+                    )
+                    if (!networkReady || joinSendFailed) {
+                        Text(
+                            when {
+                                joinSendFailed -> "Could not send Join. Try again when connected."
+                                networks.size > 1 -> "Choose a connected network to join."
+                                else -> "Connect to this network to join."
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
             },
             confirmButton = {
                 Button(
-                    enabled = joinDraft.startsWith("#") && joinDraft.length > 1 && activeNetworkId != null,
+                    enabled = joinDraft.startsWith("#") && joinDraft.length > 1 && networkReady,
                     onClick = {
-                        val networkId = activeNetworkId
-                        if (networkId != null) {
+                        val sent = activeNetworkId?.let { networkId ->
                             coordinator.sendText(
                                 networkId,
                                 ConversationRef.server(networkId).storageKey,
                                 "/join $joinDraft",
                             )
+                        } == true
+                        if (sent) {
+                            joinDraft = ""
+                            joinDialogVisible = false
+                        } else {
+                            joinSendFailed = true
                         }
-                        joinDraft = ""
-                        joinDialogVisible = false
                     },
                 ) { Text("Join") }
             },

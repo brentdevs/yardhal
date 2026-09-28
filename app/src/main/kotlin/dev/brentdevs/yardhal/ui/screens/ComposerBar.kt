@@ -18,6 +18,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -36,17 +37,28 @@ private val COMMANDS = listOf(
 @Composable
 public fun ComposerBar(
     enabled: Boolean,
+    canSendOffline: (String) -> Boolean = { false },
     members: List<String>,
     channels: List<String> = emptyList(),
     onAttach: () -> Unit = {},
     initialDraft: String? = null,
+    onInitialDraftCaptured: () -> Unit = {},
     onSend: (String) -> Boolean,
     modifier: Modifier = Modifier,
 ) {
-    var draft by rememberSaveable(initialDraft, stateSaver = TextFieldValue.Saver) {
-        mutableStateOf(TextFieldValue(initialDraft.orEmpty()))
+    var draft by rememberSaveable(stateSaver = TextFieldValue.Saver) {
+        mutableStateOf(TextFieldValue(""))
     }
     var sendError by rememberSaveable { mutableStateOf(false) }
+
+    LaunchedEffect(initialDraft) {
+        if (initialDraft != null) {
+            val separator = if (draft.text.isBlank() || initialDraft.isBlank()) "" else "\n"
+            val updated = draft.text + separator + initialDraft
+            draft = TextFieldValue(updated, TextRange(updated.length))
+            onInitialDraftCaptured()
+        }
+    }
 
     fun tokenStart(): Int {
         val cursor = draft.selection.start.coerceIn(0, draft.text.length)
@@ -94,6 +106,7 @@ public fun ComposerBar(
     }
 
     Column(modifier = modifier.fillMaxWidth().navigationBarsPadding().imePadding()) {
+        val localCommandAvailable = !enabled && canSendOffline(draft.text)
         val candidates = suggestions()
         if (candidates.isNotEmpty()) {
             Row(
@@ -123,7 +136,15 @@ public fun ComposerBar(
                 modifier = Modifier.weight(1f),
                 placeholder = { Text("Message…") },
                 supportingText = if (enabled && !sendError) null else {
-                    { Text(if (sendError) "Could not send · draft retained" else "Offline · draft saved until reconnection") }
+                    {
+                        Text(
+                            when {
+                                sendError -> "Could not send · draft retained"
+                                localCommandAvailable -> "Offline · local command available"
+                                else -> "Offline · draft saved until reconnection"
+                            },
+                        )
+                    }
                 },
                 maxLines = 4,
             )
@@ -134,7 +155,7 @@ public fun ComposerBar(
                     tint = if (enabled) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.outline,
                 )
             }
-            IconButton(onClick = { submit() }, enabled = enabled && draft.text.isNotBlank()) {
+            IconButton(onClick = { submit() }, enabled = draft.text.isNotBlank() && (enabled || localCommandAvailable)) {
                 Icon(
                     imageVector = Icons.AutoMirrored.Filled.Send,
                     contentDescription = "Send",

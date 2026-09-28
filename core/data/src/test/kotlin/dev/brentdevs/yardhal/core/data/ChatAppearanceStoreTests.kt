@@ -18,4 +18,19 @@ class ChatAppearanceStoreTests {
             directory.deleteRecursively()
         }
     }
+
+    @Test
+    fun loadedPreferencesClampOutOfRangeTextScale() {
+        val directory = Files.createTempDirectory("yardhal-appearance-load").toFile()
+        try {
+            directory.resolve("chat-appearance.json").writeText("""{"compact":true,"textScale":9.0}""")
+
+            assertEquals(
+                ChatAppearancePreferences(compact = true, textScale = 1.25f),
+                ChatAppearanceStore(directory).snapshot(),
+            )
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
 }

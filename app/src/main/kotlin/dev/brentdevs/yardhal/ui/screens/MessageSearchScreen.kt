@@ -37,6 +37,7 @@ import androidx.compose.ui.unit.dp
 import dev.brentdevs.yardhal.coordinator.ConversationBuffer
 import dev.brentdevs.yardhal.coordinator.UiNetwork
 import dev.brentdevs.yardhal.core.data.FtsHit
+import dev.brentdevs.yardhal.core.data.ConversationKind
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -64,7 +65,9 @@ public fun MessageSearchScreen(
 ) {
     var conversationsExpanded by remember { mutableStateOf(false) }
     val matchingBuffers = buffers.filter { networkScope == null || it.ref.networkId == networkScope }
-        .distinctBy { it.ref.storageKey }
+        .distinctBy { it.ref.normalizedTarget }
+    fun scopeLabel(buffer: ConversationBuffer): String =
+        if (buffer.ref.kind == ConversationKind.SERVER) "Server messages" else buffer.displayName
 
     Scaffold(
         modifier = modifier.fillMaxSize(),
@@ -109,7 +112,7 @@ public fun MessageSearchScreen(
                 TextButton(onClick = { conversationsExpanded = true }) {
                     Text(
                         conversationScope?.let { scope ->
-                            matchingBuffers.firstOrNull { it.ref.normalizedTarget == scope }?.displayName
+                            matchingBuffers.firstOrNull { it.ref.normalizedTarget == scope }?.let(::scopeLabel)
                         } ?: "All conversations",
                     )
                 }
@@ -122,7 +125,7 @@ public fun MessageSearchScreen(
                         conversationsExpanded = false
                     })
                     matchingBuffers.forEach { buffer ->
-                        DropdownMenuItem(text = { Text(buffer.displayName) }, onClick = {
+                        DropdownMenuItem(text = { Text(scopeLabel(buffer)) }, onClick = {
                             onConversationScopeChange(buffer.ref.normalizedTarget)
                             conversationsExpanded = false
                         })

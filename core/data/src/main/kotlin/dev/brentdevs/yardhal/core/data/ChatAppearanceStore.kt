@@ -16,14 +16,17 @@ public class ChatAppearanceStore(directory: File) {
         serializer = ChatAppearancePreferences.serializer(),
     )
 
-    private var state = store.loadOrDefault(ChatAppearancePreferences())
+    private var state = store.loadOrDefault(ChatAppearancePreferences()).normalized()
 
     @Synchronized
     public fun snapshot(): ChatAppearancePreferences = state
 
     @Synchronized
     public fun update(preferences: ChatAppearancePreferences) {
-        state = preferences.copy(textScale = preferences.textScale.coerceIn(0.85f, 1.25f))
+        state = preferences.normalized()
         store.save(state)
     }
+
+    private fun ChatAppearancePreferences.normalized(): ChatAppearancePreferences =
+        copy(textScale = textScale.coerceIn(0.85f, 1.25f))
 }

@@ -4,7 +4,9 @@ import java.security.MessageDigest
 
 public class MessageStore(private val dao: MessageDao) {
 
-    public suspend fun record(message: StoredMessage): Boolean {
+    public suspend fun record(message: StoredMessage): Boolean = recordWithRowId(message) != null
+
+    public suspend fun recordWithRowId(message: StoredMessage): Long? {
         val hash = contentHash(message)
         val row = MessageRow(
             networkId = message.networkId,
@@ -22,12 +24,12 @@ public class MessageStore(private val dao: MessageDao) {
         if (row.msgid != null) {
             val inserted = dao.insert(row)
             if (inserted != -1L) indexForFts(inserted, row.senderNick, row.text)
-            return inserted != -1L
+            return inserted.takeIf { it != -1L }
         }
-        if (dao.existsByHash(message.networkId, row.conversation, hash)) return false
+        if (dao.existsByHash(message.networkId, row.conversation, hash)) return null
         val inserted = dao.insert(row)
         if (inserted != -1L) indexForFts(inserted, row.senderNick, row.text)
-        return inserted != -1L
+        return inserted.takeIf { it != -1L }
     }
 
     private suspend fun indexForFts(rowId: Long, sender: String, body: String) {

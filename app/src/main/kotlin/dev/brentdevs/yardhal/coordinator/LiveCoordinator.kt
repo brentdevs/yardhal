@@ -782,32 +782,7 @@ public class LiveCoordinator(
         scope.launch {
             val context = messageStore.around(ref, hit.rowId, hit.timestampMs)
             updateBufferKey(storageKey) { current ->
-                val merged = current.messages.toMutableList()
-                for (row in context) {
-                    val index = merged.indexOfFirst { message ->
-                        message.storedRowId == row.rowId ||
-                            (row.msgid != null && message.msgid == row.msgid) ||
-                            (message.sender == row.senderNick && message.timestampMs == row.timestampMs && message.text == row.text)
-                    }
-                    if (index >= 0) {
-                        merged[index] = merged[index].copy(storedRowId = row.rowId)
-                    } else {
-                        merged.add(
-                            ChatMessage(
-                                localId = idGenerator.getAndIncrement(),
-                                sender = row.senderNick,
-                                kind = row.kind,
-                                text = row.text,
-                                timestampMs = row.timestampMs,
-                                sentByUs = row.sentByUs,
-                                highlightsMe = false,
-                                msgid = row.msgid,
-                                storedRowId = row.rowId,
-                            ),
-                        )
-                    }
-                }
-                current.copy(messages = merged.sortedBy { it.timestampMs })
+                current.copy(messages = mergeSearchContext(current.messages, context, idGenerator::getAndIncrement))
             }
         }
         return storageKey
@@ -1190,7 +1165,7 @@ public class LiveCoordinator(
         persist: Boolean = true,
         reconcilePendingEcho: Boolean = false,
     ) {
-        if (persist) persistAsync(session, ref, sender, kind, text, msgid, timestampMs, sentByUs)
+        val newLocalId = idGenerator.getAndIncrement()
         val muted = mutes.isMuted(ref.storageKey)
         updateBuffer(ref) { buffer ->
             if (reconcilePendingEcho && !playback) {
@@ -1206,7 +1181,7 @@ public class LiveCoordinator(
             }
             if (msgid != null && buffer.messages.any { it.msgid == msgid }) return@updateBuffer buffer
             val entry = ChatMessage(
-                localId = idGenerator.getAndIncrement(),
+                localId = newLocalId,
                 sender = sender,
                 kind = kind,
                 text = text,
@@ -1232,6 +1207,14 @@ public class LiveCoordinator(
                 unreadFromTimestampMs = boundary,
             )
         }
+        if (persist) {
+            val localId = if (msgid == null) {
+                newLocalId
+            } else {
+                _buffers.value[ref.storageKey]?.messages?.firstOrNull { it.msgid == msgid }?.localId ?: newLocalId
+            }
+            persistAsync(session, ref, sender, kind, text, msgid, timestampMs, sentByUs, localId)
+        }
         if (highlightsMe && !sentByUs) {
             if (highlightsMe && !muted) {
                 notifier.onHighlight(session.config.name, sender, ConversationNames.forRef(ref), text)
@@ -1248,9 +1231,10 @@ public class LiveCoordinator(
         msgid: String?,
         timestampMs: Long,
         sentByUs: Boolean,
+        localId: Long,
     ) {
         scope.launch {
-            messageStore.record(
+            val rowId = messageStore.recordWithRowId(
                 StoredMessage(
                     networkId = session.config.id,
                     conversation = ref,
@@ -1263,7 +1247,15 @@ public class LiveCoordinator(
                     sentByUs = sentByUs,
                     timestampMs = timestampMs,
                 ),
-            )
+            ) ?: return@launch
+            updateBufferKey(ref.storageKey) { current ->
+                val index = current.messages.indexOfFirst { it.localId == localId }
+                if (index < 0) current else {
+                    val updated = current.messages.toMutableList()
+                    updated[index] = updated[index].copy(storedRowId = rowId)
+                    current.copy(messages = updated)
+                }
+            }
         }
     }
 
@@ -1390,17 +1382,27 @@ public class LiveCoordinator(
         session.reconnector?.sendLine(line)
     }
 
+    private fun SlashCommand.isLocal(): Boolean =
+        this is SlashCommand.Query || this is SlashCommand.IgnoreAdd ||
+            this is SlashCommand.IgnoreRemove || this is SlashCommand.Help
+
     public fun sendText(networkId: String, storageKey: String, input: String): Boolean {
         val session = sessions[networkId] ?: return false
-        if (session.statusFlow.value != ConnectionStatus.REGISTERED) return false
         val activeBuffer = _buffers.value[storageKey] ?: return false
         val command = SlashCommandParser.parse(input, activeBuffer.ref.rawTarget) ?: return false
+        if (session.statusFlow.value != ConnectionStatus.REGISTERED && !command.isLocal()) return false
         val replyTo = activeBuffer.replyDraft?.takeIf { command is SlashCommand.PlainMessage }
         if (replyTo != null) {
             updateBufferKey(storageKey) { it.copy(replyDraft = null) }
         }
         dispatchCommand(session, activeBuffer.ref, command, replyToMsgid = replyTo?.msgid)
         return true
+    }
+
+    public fun canSendOffline(networkId: String, storageKey: String, input: String): Boolean {
+        if (networkId !in sessions) return false
+        val activeBuffer = _buffers.value[storageKey] ?: return false
+        return SlashCommandParser.parse(input, activeBuffer.ref.rawTarget)?.isLocal() == true
     }
 
     private fun dispatchCommand(

@@ -133,6 +133,7 @@ public fun ConversationScreen(
     networkName: String,
     channels: List<String> = emptyList(),
     connected: Boolean,
+    canSendOffline: (String) -> Boolean = { false },
     onSend: (String) -> Boolean,
     onOpenJoin: () -> Unit,
     onLoadHistory: () -> Unit,
@@ -282,15 +283,13 @@ public fun ConversationScreen(
                 }
                 ComposerBar(
                     enabled = connected,
+                    canSendOffline = canSendOffline,
                     members = buffer.members.map { it.nick },
                     channels = channels,
                     onAttach = onPickFile,
                     initialDraft = sharedDraft,
-                    onSend = { text ->
-                        val sent = onSend(text)
-                        if (sent) onSharedConsumed()
-                        sent
-                    },
+                    onInitialDraftCaptured = onSharedConsumed,
+                    onSend = onSend,
                 )
             }
         },
@@ -622,8 +621,7 @@ public fun NetworkOverviewScreen(
     onRemoveNetwork: (String) -> Unit,
     onBrowseChannels: (String) -> Unit,
     channelList: List<dev.brentdevs.yardhal.coordinator.LiveCoordinator.ChannelListEntry>,
-    onJoinFromList: (String, String) -> Unit,
-    onOpenDebug: (String) -> Unit,
+    onJoinFromList: (String, String) -> Boolean,
     rawLogVersion: Int,
     rawLogProvider: (String) -> List<dev.brentdevs.yardhal.coordinator.LiveCoordinator.RawFrame>,
     showBouncerButton: Boolean = false,
@@ -640,6 +638,7 @@ public fun NetworkOverviewScreen(
 ) {
     var pendingRemoval by remember { mutableStateOf<String?>(null) }
     var browseVisible by remember { mutableStateOf(false) }
+    var browseJoinFailed by remember { mutableStateOf(false) }
     var debugVisible by remember { mutableStateOf(false) }
     var browseNetworkId by remember { mutableStateOf<String?>(null) }
     var browseQuery by remember { mutableStateOf("") }
@@ -679,6 +678,7 @@ public fun NetworkOverviewScreen(
     }
 
     if (browseVisible) {
+        val browseReady = networks.any { it.id == browseNetworkId && it.status == ConnectionStatus.REGISTERED }
         val filtered = channelList.filter { entry ->
             entry.name.contains(browseQuery, ignoreCase = true) || entry.topic.contains(browseQuery, ignoreCase = true)
         }
@@ -688,6 +688,14 @@ public fun NetworkOverviewScreen(
                     "${networks.firstOrNull { it.id == browseNetworkId }?.name.orEmpty()} channels · ${channelList.size}",
                     style = MaterialTheme.typography.titleLarge,
                 )
+                if (!browseReady || browseJoinFailed) {
+                    Text(
+                        if (browseJoinFailed) "Could not send Join. Try again when connected."
+                        else "Connect to this network to join a channel.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 OutlinedTextField(
                     value = browseQuery,
                     onValueChange = { browseQuery = it },
@@ -723,9 +731,12 @@ public fun NetworkOverviewScreen(
                                     }
                                 }
                                 Badge { Text("${entry.users}") }
-                                TextButton(onClick = {
-                                    browseNetworkId?.let { onJoinFromList(it, entry.name) }
-                                }) { Text("Join") }
+                                TextButton(
+                                    enabled = browseReady,
+                                    onClick = {
+                                        browseJoinFailed = browseNetworkId?.let { onJoinFromList(it, entry.name) } != true
+                                    },
+                                ) { Text("Join") }
                             }
                         }
                     }
@@ -829,6 +840,7 @@ public fun NetworkOverviewScreen(
                                     DropdownMenuItem(text = { Text("Browse channels") }, onClick = {
                                         networkMenuFor = null
                                         browseNetworkId = network.id
+                                        browseJoinFailed = false
                                         browseVisible = true
                                         onBrowseChannels(network.id)
                                     })
@@ -836,7 +848,6 @@ public fun NetworkOverviewScreen(
                                         networkMenuFor = null
                                         debugNetworkId = network.id
                                         debugVisible = true
-                                        onOpenDebug(network.id)
                                     })
                                     DropdownMenuItem(text = { Text("Remove network") }, onClick = {
                                         networkMenuFor = null
