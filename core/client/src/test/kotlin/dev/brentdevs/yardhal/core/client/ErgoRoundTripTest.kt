@@ -9,7 +9,6 @@ import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -140,8 +139,8 @@ class ErgoRoundTripTest {
                 capabilities = caps,
             )
             val connection = IrcConnection(config)
-            val seen = LinkedHashMap<String, IrcMessage>()
             val registered = kotlinx.coroutines.CompletableDeferred<IrcEvent.Registered>()
+            val isupport = kotlinx.coroutines.CompletableDeferred<Unit>()
             val joinEcho = kotlinx.coroutines.CompletableDeferred<IrcMessage>()
             val echoBack = kotlinx.coroutines.CompletableDeferred<IrcMessage>()
             scope.launch {
@@ -153,12 +152,12 @@ class ErgoRoundTripTest {
                                 IrcEvent.Registered(it.parameters.firstOrNull() ?: "", it.parameters.lastOrNull() ?: "")
                             },
                         )
+                        "005" -> isupport.complete(Unit)
                         "JOIN" -> if (!joinEcho.isCompleted) joinEcho.complete(event.message)
                         "PRIVMSG" -> if (event.message.parameters.lastOrNull()?.contains("roundtrip-payload") == true) {
                             echoBack.complete(event.message)
                         }
                     }
-                    seen[event.message.command] = event.message
                 }
             }
             connection.start()
@@ -166,7 +165,7 @@ class ErgoRoundTripTest {
             val welcome = withTimeout(15_000) { registered.await() }
             assertEquals("yardhal-it", welcome.nickname)
 
-            assertNotNull(seen["005"], "ISUPPORT numeric expected from real server")
+            withTimeout(10_000) { isupport.await() }
 
             connection.send(IrcMessage(command = "JOIN", parameters = listOf("#yardhal-roundtrip")))
             val joined = withTimeout(10_000) { joinEcho.await() }
