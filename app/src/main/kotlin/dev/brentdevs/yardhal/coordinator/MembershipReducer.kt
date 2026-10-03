@@ -134,6 +134,7 @@ internal fun Reduction.finalizeNames(message: IrcMessage) {
     val channel = channelOrCreate(ref)
     channel.members.clear()
     channel.members.putAll(pending)
+    for ((folded, member) in pending) state.users.getOrPut(folded) { UserState(member.nick) }
     publishMembers(channel)
     emit(InboundEffect.SetJoinState(ref, JoinState.JOINED))
 }

@@ -18,6 +18,9 @@ public class CapabilityNegotiator(
     public val acknowledged: MutableSet<String> = LinkedHashSet()
     public val declined: MutableSet<String> = LinkedHashSet()
 
+    private val values = LinkedHashMap<String, String>()
+    public val advertisedValues: Map<String, String> get() = values
+
     private var capEndSent: Boolean = false
 
     public fun begin() {
@@ -57,7 +60,7 @@ public class CapabilityNegotiator(
 
         when (verb) {
             "LS" -> {
-                available += splitAdvertisedNames(payload)
+                available += recordAdvertised(payload)
                 if (!multiline && phase == Phase.LISTING) completeListing()
             }
             "ACK" -> {
@@ -70,7 +73,7 @@ public class CapabilityNegotiator(
                 if (!multiline && phase == Phase.REQUESTING) completeRequest()
             }
             "NEW" -> {
-                val names = splitAdvertisedNames(payload)
+                val names = recordAdvertised(payload)
                 available += names
                 requestSubset(wanted intersect names)
             }
@@ -78,6 +81,7 @@ public class CapabilityNegotiator(
                 val names = splitNames(payload)
                 available -= names
                 acknowledged -= names
+                for (name in names) values.remove(name)
             }
         }
         return true
@@ -132,8 +136,15 @@ public class CapabilityNegotiator(
 
         internal fun splitNames(payload: String): Set<String> =
             payload.split(' ').filter { it.isNotEmpty() }.toSet()
+    }
 
-        internal fun splitAdvertisedNames(payload: String): Set<String> =
-            splitNames(payload).mapTo(LinkedHashSet()) { it.substringBefore('=') }
+    private fun recordAdvertised(payload: String): Set<String> {
+        val names = LinkedHashSet<String>()
+        for (token in splitNames(payload)) {
+            val name = token.substringBefore('=')
+            names += name
+            if ('=' in token) values[name] = token.substringAfter('=') else values.remove(name)
+        }
+        return names
     }
 }

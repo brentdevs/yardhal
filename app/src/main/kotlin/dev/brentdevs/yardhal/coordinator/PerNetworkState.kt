@@ -162,8 +162,16 @@ internal class Reduction(val state: PerNetworkState, val context: InboundContext
     }
 
     fun serverLine(message: IrcMessage, tag: String? = null) {
-        val payload = message.parameters.drop(1).joinToString(" ").ifEmpty { message.command }
+        val payload = if (message.numeric != null) {
+            message.parameters.drop(1).joinToString(" ").ifEmpty { message.command }
+        } else {
+            (listOf(message.command) + message.parameters).joinToString(" ")
+        }
         system(state.server, if (tag == null) payload else "[$tag] $payload")
+    }
+
+    fun standardReply(message: IrcMessage) {
+        system(state.server, "[${message.command.lowercase()}] ${message.parameters.joinToString(" ")}")
     }
 
     fun publishMembers(channel: ChannelState) {
@@ -191,8 +199,7 @@ internal fun Reduction.handleMessage(message: IrcMessage) {
         command == "KICK" -> handleKick(message)
         command == "TOPIC" -> handleTopicVerb(message)
         command == "NICK" -> handleNickChange(message)
-        command == "FAIL" || command == "WARN" -> serverLine(message, command.lowercase())
-        command == "NOTE" -> serverLine(message, "note")
+        command == "FAIL" || command == "WARN" || command == "NOTE" -> standardReply(message)
         numeric != null -> handleNumeric(numeric, message)
         else -> serverLine(message)
     }
