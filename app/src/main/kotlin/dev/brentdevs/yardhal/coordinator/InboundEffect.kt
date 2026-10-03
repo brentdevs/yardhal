@@ -8,6 +8,16 @@ import dev.brentdevs.yardhal.core.data.WhoisInfo
 public sealed interface InboundEffect {
     public data class SendRaw(public val line: String) : InboundEffect
 
+    public data class ScheduleRaw(
+        public val line: String,
+        public val delayMs: Long,
+        public val connectionEpoch: Int,
+    ) : InboundEffect
+
+    public data class ProfilesChanged(public val profiles: NetworkProfiles) : InboundEffect
+
+    public data class NetworkIconChanged(public val url: String?) : InboundEffect
+
     public data class StatusChanged(public val status: ConnectionStatus) : InboundEffect
 
     public data class OwnNickChanged(public val nick: String) : InboundEffect

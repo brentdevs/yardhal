@@ -28,6 +28,8 @@ public sealed interface SlashCommand {
     public data class IgnoreAdd(public val mask: String) : SlashCommand
     public data class IgnoreRemove(public val mask: String) : SlashCommand
     public data class Raw(public val line: String) : SlashCommand
+    public data class SetAvatar(public val url: String?) : SlashCommand
+    public data class SetDisplayName(public val name: String?) : SlashCommand
     public data object Help : SlashCommand
 }
 
@@ -78,6 +80,8 @@ public object SlashCommandParser {
             "unignore" -> tokensOf(rest).firstOrNull()?.let { SlashCommand.IgnoreRemove(it) }
             "register" -> parseRegister(rest)
             "verify" -> parseVerify(rest)
+            "setavatar" -> SlashCommand.SetAvatar(tokensOf(rest).firstOrNull())
+            "setdisplayname" -> SlashCommand.SetDisplayName(rest.trim().ifEmpty { null })
             "quote", "raw" -> rawLine(rest)
             else -> rawLine(body)
         }

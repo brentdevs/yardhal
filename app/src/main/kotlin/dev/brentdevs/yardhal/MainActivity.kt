@@ -6,11 +6,13 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Modifier
 import dev.brentdevs.yardhal.coordinator.LiveCoordinator
 import dev.brentdevs.yardhal.core.data.NetworkConfig
 import dev.brentdevs.yardhal.core.data.NetworkPresets
 import dev.brentdevs.yardhal.ui.YardhalAppRoot
+import dev.brentdevs.yardhal.ui.image.LocalRemoteImageLoader
 import dev.brentdevs.yardhal.ui.screens.NetworkDraft
 import dev.brentdevs.yardhal.ui.screens.NetworkPresetUi
 import dev.brentdevs.yardhal.ui.theme.YardhalTheme
@@ -30,17 +32,19 @@ class MainActivity : ComponentActivity() {
             YardhalTheme(
                 themeDefinition = if (isSystemInDarkTheme()) loadBundledTheme() else null,
             ) {
-                YardhalAppRoot(
-                    coordinator = coordinator,
-                    appearanceStore = app.chatAppearanceStore,
-                    presets = NetworkPresets.ALL.map {
-                        NetworkPresetUi(it.id, it.name, it.host, it.port, it.tls)
-                    },
-                    onNetworkSaved = { draft -> saveAndConnect(draft) },
-                    sharedTextProvider = { (application as YardhalApplication).sharedText },
-                    onSharedConsumed = { (application as YardhalApplication).sharedText = null },
-                    modifier = Modifier,
-                )
+                CompositionLocalProvider(LocalRemoteImageLoader provides app.remoteImages) {
+                    YardhalAppRoot(
+                        coordinator = coordinator,
+                        appearanceStore = app.chatAppearanceStore,
+                        presets = NetworkPresets.ALL.map {
+                            NetworkPresetUi(it.id, it.name, it.host, it.port, it.tls)
+                        },
+                        onNetworkSaved = { draft -> saveAndConnect(draft) },
+                        sharedTextProvider = { (application as YardhalApplication).sharedText },
+                        onSharedConsumed = { (application as YardhalApplication).sharedText = null },
+                        modifier = Modifier,
+                    )
+                }
             }
         }
 

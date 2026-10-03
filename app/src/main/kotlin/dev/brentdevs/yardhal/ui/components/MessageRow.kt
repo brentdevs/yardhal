@@ -27,6 +27,7 @@ import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import dev.brentdevs.yardhal.coordinator.ChatMessage
+import dev.brentdevs.yardhal.coordinator.UserProfile
 import dev.brentdevs.yardhal.core.data.ChatAppearancePreferences
 import dev.brentdevs.yardhal.core.data.MessageKind
 import dev.brentdevs.yardhal.ui.theme.nickColor
@@ -50,10 +51,11 @@ public fun MessageRow(
     onOpenAttachment: (String) -> Unit = {},
     onOpenChannel: (String) -> Unit = {},
     modifier: Modifier = Modifier,
+    profile: UserProfile? = null,
 ) {
     when (message.kind) {
         MessageKind.SYSTEM, MessageKind.JOIN, MessageKind.PART -> SystemLine(message, appearance, modifier)
-        else -> ChatLine(message, groupedWithPrevious, focused, appearance, reactions, quotedText, onLongPress, onToggleReaction, onOpenAttachment, onOpenChannel, modifier)
+        else -> ChatLine(message, profile, groupedWithPrevious, focused, appearance, reactions, quotedText, onLongPress, onToggleReaction, onOpenAttachment, onOpenChannel, modifier)
     }
 }
 
@@ -88,6 +90,7 @@ private fun SystemLine(message: ChatMessage, appearance: ChatAppearancePreferenc
 @Composable
 private fun ChatLine(
     message: ChatMessage,
+    profile: UserProfile?,
     groupedWithPrevious: Boolean,
     focused: Boolean,
     appearance: ChatAppearancePreferences,
@@ -121,7 +124,7 @@ private fun ChatLine(
             if (groupedWithPrevious) {
                 Spacer(modifier = Modifier.size(38.dp))
             } else {
-                NickAvatar(nick = message.sender)
+                NickAvatar(nick = message.sender, avatarUrl = profile?.avatarUrl)
             }
             Spacer(modifier = Modifier.width(10.dp))
             Column(modifier = Modifier.weight(1f)) {
@@ -130,8 +133,9 @@ private fun ChatLine(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
+                        val displayName = profile?.displayName
                         Text(
-                            text = message.sender,
+                            text = displayName ?: message.sender,
                             style = MaterialTheme.typography.bodyMedium,
                             fontWeight = FontWeight.SemiBold,
                             color = nickColor(message.sender),
@@ -141,6 +145,13 @@ private fun ChatLine(
                                 text = "✓",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.primary,
+                            )
+                        }
+                        if (displayName != null && displayName != message.sender) {
+                            Text(
+                                text = message.sender,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
                         Text(

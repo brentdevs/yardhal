@@ -62,11 +62,11 @@ Phase numbers refer to `docs/architecture.md`.
 - [x] invite-notify: INVITE system lines (own invites in server buffer, others in channel) + 341 confirmation (P5)
 - [x] bot-mode: BOT ISUPPORT letter, WHO/WHOX flag, 335 and `bot` tag drive member-sheet badge (P5)
 - [x] account-extban: ACCOUNTEXTBAN/EXTBAN "Ban account" member action (P6)
-- [ ] draft/metadata-2: METADATA GET/SET/SUB, avatars/display names (P5)
+- [x] draft/metadata-2: cap limits parsed; SUB avatar/display-name before autojoin; METADATA/761/766/770–774/FAIL handled; metadata batches; SYNC retry on 774; /setavatar /setdisplayname; HTTPS-only cached avatars + display names in rows/member sheet (P5; Ergo 2.14 lacks metadata, covered by reducer + loopback tests)
 - [x] soju.im/FILEHOST ISUPPORT: endpoint discovery, TLS-policy enforcement, authenticated POST with multipart fallback, attachment-tagged messages (P8)
 - [x] UTF8ONLY: always transmit UTF-8, skip legacy encoding heuristics (P5) — strict UTF-8 inbound decoding with U+FFFD replacement, codepoint-safe truncation, `ISupport.utf8Only`
 - [x] draft/extended-isupport: full ISUPPORT set pre-registration (P5) — `ISUPPORT` sent before CAP END when acknowledged; `draft/isupport` batches pass through, `-TOKEN` removals honoured by `ISupport.mergedWith`
-- [ ] draft/ICON: network icon ISUPPORT token fetch/cache (P6)
+- [x] draft/ICON: ISUPPORT token (with \xHH unescape, `{size}` template, `-draft/ICON`) shown on the network header via the HTTPS-only image cache (P6)
 - [x] draft/channel-rename: RENAME moves buffer, transcript rows (FTS-consistent), read marker, mute, pins/groups/parted, autojoin and member state; system line; selection follows rename (P5)
 - [ ] client-batch: infrastructure only; no production use until ratified
 - [ ] WebSocket transport: n/a (native TCP/TLS client)

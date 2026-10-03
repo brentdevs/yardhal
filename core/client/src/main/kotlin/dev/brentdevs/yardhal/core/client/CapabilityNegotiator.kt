@@ -151,5 +151,6 @@ public class CapabilityNegotiator(
 
         internal fun splitNames(payload: String): Set<String> =
             payload.split(' ').filter { it.isNotEmpty() }.toSet()
+
     }
 }

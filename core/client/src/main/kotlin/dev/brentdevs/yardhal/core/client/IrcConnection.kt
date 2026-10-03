@@ -75,6 +75,7 @@ public data class IrcConnectionConfig(
             PRE_AWAY_CAP,
             EXTENDED_ISUPPORT_CAP,
             dev.brentdevs.yardhal.core.protocol.AccountRegistrationPolicy.CAPABILITY,
+            "draft/metadata-2",
             dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.CAPABILITY,
             dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.NOTIFY_CAPABILITY,
         )

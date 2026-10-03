@@ -10,8 +10,9 @@ import dev.brentdevs.yardhal.core.protocol.IrcMessage
 
 private const val PLAYBACK_FALLBACK_SECONDS = 7L * 24 * 3600
 
-internal fun Reduction.handleCapabilities(capabilities: Set<String>) {
+internal fun Reduction.handleCapabilities(capabilities: Set<String>, values: Map<String, String> = emptyMap()) {
     state.supportedCaps = capabilities
+    applyMetadataCapability(capabilities, values)
     if ("znc.in/playback" in capabilities) {
         val since = context.latestReadMarkerMs()?.let { it / 1000 }
             ?: (context.nowMs / 1000 - PLAYBACK_FALLBACK_SECONDS)
@@ -25,8 +26,10 @@ internal fun Reduction.handleCapabilities(capabilities: Set<String>) {
 
 internal fun Reduction.handleRegistered(nickname: String) {
     state.ownNick = nickname
+    state.registered = true
     emit(InboundEffect.StatusChanged(ConnectionStatus.REGISTERED))
     emit(InboundEffect.OwnNickChanged(nickname))
+    subscribeMetadata()
     val channels = LinkedHashSet<String>()
     channels.addAll(state.autojoin)
     channels.addAll(context.openChannels())
@@ -59,6 +62,9 @@ internal fun Reduction.applyIsupportTokens(message: IrcMessage) {
             token == "WHOX" -> state.hasWhox = true
             token.startsWith("soju.im/FILEHOST=") ->
                 state.filehostEndpoint = token.removePrefix("soju.im/FILEHOST=")
+            token.startsWith(ISupport.NETWORK_ICON_TOKEN + "=") ->
+                setNetworkIcon(ISupport.unescapeValue(token.substringAfter('=')).takeIf { it.isNotEmpty() })
+            token == "-" + ISupport.NETWORK_ICON_TOKEN -> setNetworkIcon(null)
             token.startsWith(IrcBouncerNetworks.ISUPPORT_NET_ID_TOKEN + "=") -> {
                 state.bouncerStore.bind(token.substringAfter('='))
                 emit(InboundEffect.BouncerNetworksChanged)

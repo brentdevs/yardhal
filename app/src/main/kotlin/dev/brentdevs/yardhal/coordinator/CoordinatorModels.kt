@@ -14,6 +14,7 @@ public data class UiNetwork(
     public val ownNick: String,
     public val hasBotMode: Boolean = false,
     public val accountBanAvailable: Boolean = false,
+    public val iconUrl: String? = null,
 ) {
     public val storagePrefix: String get() = id
 }

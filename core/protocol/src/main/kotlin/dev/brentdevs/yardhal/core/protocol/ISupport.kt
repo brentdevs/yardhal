@@ -114,6 +114,9 @@ public class ISupport private constructor(
     public val extendedListFlags: String?
         get() = tokens["ELIST"]
 
+    public val networkIcon: String?
+        get() = tokens[NETWORK_ICON_TOKEN]?.let(::unescapeValue)?.takeIf { it.isNotEmpty() }
+
     public fun targMax(command: String): Int? =
         tokens["TARGMAX"]?.split(',')?.firstNotNullOfOrNull { entry ->
             val separator = entry.indexOf(':')
@@ -160,6 +163,33 @@ public class ISupport private constructor(
 
         public val EMPTY: ISupport = parse(emptyList())
 
+        public const val NETWORK_ICON_TOKEN: String = "draft/ICON"
+
+        public fun unescapeValue(value: String): String {
+            if ("\\x" !in value) return value
+            val bytes = java.io.ByteArrayOutputStream(value.length)
+            var index = 0
+            while (index < value.length) {
+                val escaped = if (value.startsWith("\\x", index) && index + 4 <= value.length) {
+                    val high = Character.digit(value[index + 2], HEX_RADIX)
+                    val low = Character.digit(value[index + 3], HEX_RADIX)
+                    if (high >= 0 && low >= 0) (high shl 4) or low else null
+                } else {
+                    null
+                }
+                if (escaped != null) {
+                    bytes.write(escaped)
+                    index += 4
+                } else {
+                    val codePoint = value.codePointAt(index)
+                    bytes.write(String(Character.toChars(codePoint)).toByteArray(Charsets.UTF_8))
+                    index += Character.charCount(codePoint)
+                }
+            }
+            return bytes.toString(Charsets.UTF_8.name())
+        }
+
+        private const val HEX_RADIX = 16
         private const val DEFAULT_CHANTYPES = "#&"
     }
 }
