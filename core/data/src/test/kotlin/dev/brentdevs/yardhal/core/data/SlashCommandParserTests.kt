@@ -77,6 +77,14 @@ class SlashCommandParserTests {
     }
 
     @Test
+    fun setnameTakesWholeRemainder() {
+        assertEquals(SlashCommand.SetName("Jane Q. Public"), parse("/setname Jane Q. Public"))
+        assertEquals(SlashCommand.SetName("solo"), parse("/SETNAME   solo"))
+        assertNull(parse("/setname"))
+        assertNull(parse("/setname   "))
+    }
+
+    @Test
     fun kickResolvesChannelFromContext() {
         assertEquals(SlashCommand.Kick("#yardhal", "spammer", "bye"), parse("/kick spammer bye"))
         assertEquals(SlashCommand.Kick("#other", "spammer", null), parse("/kick #other spammer"))
@@ -103,7 +111,7 @@ class SlashCommandParserTests {
 
     @Test
     fun unknownVerbPassesThroughRaw() {
-        assertEquals(SlashCommand.Raw("SETNAME Bob"), parse("/setname Bob"))
+        assertEquals(SlashCommand.Raw("KNOCK #c please"), parse("/knock #c please"))
         assertEquals(SlashCommand.Raw("CHATHISTORY LATEST #c * 10"), parse("/quote chathistory LATEST #c * 10"))
     }
 

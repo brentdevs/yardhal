@@ -134,6 +134,13 @@ private fun ChatLine(
                             fontWeight = FontWeight.SemiBold,
                             color = nickColor(message.sender),
                         )
+                        if (message.senderAccount != null) {
+                            Text(
+                                text = "✓",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary,
+                            )
+                        }
                         Text(
                             text = formatTime(message.timestampMs),
                             style = MaterialTheme.typography.labelSmall,

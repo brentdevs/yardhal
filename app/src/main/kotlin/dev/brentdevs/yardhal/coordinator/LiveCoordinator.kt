@@ -237,6 +237,7 @@ public class LiveCoordinator(
                 playback = effect.playback,
                 attachmentUrl = effect.attachmentUrl,
                 reconcilePendingEcho = effect.reconcilePendingEcho,
+                senderAccount = effect.senderAccount,
             )
             is InboundEffect.SetTopic -> updateBuffer(effect.ref) { it.copy(topic = effect.topic) }
             is InboundEffect.SetMembers -> updateBuffer(effect.ref) {
@@ -262,6 +263,7 @@ public class LiveCoordinator(
             is InboundEffect.ChannelListed -> _channelList.update { it + effect.entry }
             is InboundEffect.ChannelListFinished -> _channelList.update { list -> list.sortedByDescending { it.users } }
             is InboundEffect.BouncerNetworksChanged -> bumpBouncerVersion()
+            is InboundEffect.NetworkFeaturesChanged -> refreshNetworkStates()
         }
     }
 
@@ -411,9 +413,9 @@ public class LiveCoordinator(
         val buffer = _buffers.value[storageKey] ?: return
         if (buffer.ref.kind != ConversationKind.CHANNEL) return
         val needsMembers = buffer.members.isEmpty()
-        val needsPresence = buffer.memberPresence.size < buffer.members.size
+        val needsPresence = buffer.members.any { buffer.memberPresence[it.nick]?.away == null }
         if (!needsMembers && !needsPresence) return
-        val query = if (session.state.hasWhox) "%acfhn" else ""
+        val query = if (session.state.hasWhox) WHOX_QUERY else ""
         sendRaw(session, "WHO ${buffer.ref.rawTarget} $query".trimEnd())
     }
 
@@ -475,6 +477,13 @@ public class LiveCoordinator(
             dev.brentdevs.yardhal.ui.screens.MemberAction.WHOIS -> sendText(networkId, storageKey, "/whois $nick")
             dev.brentdevs.yardhal.ui.screens.MemberAction.KICK -> sendText(networkId, storageKey, "/kick $nick")
             dev.brentdevs.yardhal.ui.screens.MemberAction.BAN -> sendText(networkId, storageKey, "/ban ${nick}!*@*")
+            dev.brentdevs.yardhal.ui.screens.MemberAction.BAN_ACCOUNT -> {
+                val session = sessions[networkId] ?: return
+                val buffer = _buffers.value[storageKey] ?: return
+                if (buffer.ref.kind != ConversationKind.CHANNEL) return
+                val mask = synchronized(session.state) { session.state.accountBanMask(nick) } ?: return
+                sendRaw(session, "MODE ${buffer.ref.rawTarget} +b $mask")
+            }
             dev.brentdevs.yardhal.ui.screens.MemberAction.IGNORE -> {
                 ignoreStore?.add(nick)
                 sessions[networkId]?.let { session ->
@@ -641,6 +650,7 @@ public class LiveCoordinator(
         pendingEcho: Boolean = false,
         persist: Boolean = true,
         reconcilePendingEcho: Boolean = false,
+        senderAccount: String? = null,
     ) {
         val newLocalId = idGenerator.getAndIncrement()
         val muted = mutes.isMuted(ref.storageKey)
@@ -651,8 +661,13 @@ public class LiveCoordinator(
                 }
                 if (index >= 0) {
                     val messages = buffer.messages.toMutableList()
-                    messages[index] = messages[index]
-                        .copy(msgid = msgid, timestampMs = timestampMs, attachmentUrl = attachmentUrl, pendingEcho = false)
+                    messages[index] = messages[index].copy(
+                        msgid = msgid,
+                        timestampMs = timestampMs,
+                        attachmentUrl = attachmentUrl,
+                        pendingEcho = false,
+                        senderAccount = senderAccount,
+                    )
                     return@updateBuffer buffer.copy(messages = messages)
                 }
             }
@@ -670,6 +685,7 @@ public class LiveCoordinator(
                 attachmentUrl = attachmentUrl,
                 playback = playback,
                 pendingEcho = pendingEcho,
+                senderAccount = senderAccount,
             )
             val countsAsUnread = entry.countsAsUnread && !muted && timestampMs > buffer.readAtMs
             val boundary = if (countsAsUnread) {
@@ -843,6 +859,8 @@ public class LiveCoordinator(
                 host = session.config.host,
                 status = session.statusFlow.value,
                 ownNick = session.state.ownNick,
+                hasBotMode = session.state.botModeLetter != null,
+                accountBanAvailable = session.state.accountExtban != null,
             )
         }.sortedBy { it.name }
     }
@@ -917,6 +935,12 @@ public class LiveCoordinator(
                 val target = command.channel ?: active.rawTarget
                 sendRaw(session, "TOPIC $target")
             }
+            is SlashCommand.SetName ->
+                if ("setname" in session.state.supportedCaps) {
+                    sendRaw(session, "SETNAME :${sanitizeOutboundText(command.realName)}")
+                } else {
+                    appendSystem(session, active, "This server does not support changing your realname (setname)")
+                }
             is SlashCommand.Away ->
                 sendRaw(session, if (command.message == null) "AWAY" else "AWAY :${command.message}")
             is SlashCommand.Quit -> disconnect(session.config.id, sanitizeOutboundText(command.reason ?: ""))
@@ -959,11 +983,14 @@ public class LiveCoordinator(
                 sendRaw(session, "MODE $channel ${if (command.grant) "+v" else "-v"} ${command.nick}")
             }
             is SlashCommand.MonitorAdd -> sendRaw(session, "MONITOR + ${command.nick}")
-            is SlashCommand.MonitorRemove -> sendRaw(session, "MONITOR - ${command.nick}")
+            is SlashCommand.MonitorRemove -> {
+                synchronized(session.state) { session.state.forgetMonitored(command.nick.split(',')) }
+                sendRaw(session, "MONITOR - ${command.nick}")
+            }
             is SlashCommand.MonitorList -> sendRaw(session, "MONITOR L")
             is SlashCommand.WhoQuery -> sendRaw(
                 session,
-                if (command.useWhox && session.state.hasWhox) "WHO ${command.target} %acfhn" else "WHO ${command.target}",
+                if (command.useWhox && session.state.hasWhox) "WHO ${command.target} $WHOX_QUERY" else "WHO ${command.target}",
             )
             is SlashCommand.IgnoreAdd -> {
                 ignoreStore?.add(command.mask)
@@ -976,7 +1003,7 @@ public class LiveCoordinator(
             is SlashCommand.Help -> appendSystem(
                 session,
                 active,
-                "Commands: /me /msg /query /join /part /nick /topic /away /back /quit /whois /kick /ban /mode /ctcp /raw",
+                "Commands: /me /msg /query /join /part /nick /topic /away /back /setname /quit /whois /kick /ban /mode /ctcp /raw",
             )
             is SlashCommand.Raw -> sendRaw(session, command.line)
         }

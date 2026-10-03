@@ -66,6 +66,7 @@ internal fun Reduction.handleChatMessage(message: IrcMessage) {
             attachmentUrl = message.tag("+draft/attachment"),
             playback = playback,
             reconcilePendingEcho = fromUs,
+            senderAccount = accountValue(message.tag("account")),
         ),
     )
 }

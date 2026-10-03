@@ -15,18 +15,18 @@ Phase numbers refer to `docs/architecture.md`.
 
 - [x] sasl 3.1: AUTHENTICATE flow during negotiation (PLAIN) (P2)
 - [ ] sasl 3.2: mechanism list parsing, post-registration re-auth (P2+)
-- [ ] account-notify: ACCOUNT updates member account state (P5)
-- [ ] account-tag: verified-account badge input (P5)
-- [ ] extended-join: account + realname on JOIN (P5)
-- [ ] setname: inbound SETNAME + send own realname change (P5)
-- [ ] chghost: apply user/host updates silently (P5)
+- [x] account-notify: ACCOUNT updates member account state (P5)
+- [x] account-tag: verified-account badge input; `account` tag updates sender presence and ✓ on message rows/member sheet (P5)
+- [x] extended-join: account + realname on JOIN (P5)
+- [x] setname: inbound SETNAME + send own realname change via /setname (P5)
+- [x] chghost: apply user/host updates silently (P5)
 - [ ] draft/account-registration: REGISTER/VERIFY flows with standard-replies errors (P8)
 
 ## Presence
 
-- [ ] away-notify: live away/back transitions (P5)
+- [x] away-notify: live away/back transitions with away message (P5)
 - [x] MONITOR +/- verbs, 730/731 numerics surfaced (P5)
-- [ ] extended-monitor: monitored targets emit presence-class events (P5)
+- [x] extended-monitor: monitored targets (730/731/732) tracked so presence-class events update them (P5)
 - [ ] draft/pre-away: AWAY suppression during registration (P8)
 
 ## Messaging affordances
@@ -57,11 +57,11 @@ Phase numbers refer to `docs/architecture.md`.
 
 - [x] NAMES/353/366 member lists via multi-prefix-aware parser (P5); WHOX %fields pending
 - [x] multi-prefix: prefix symbols retained; member sheet sections by role (P5)
-- [ ] userhost-in-names: full nick!user@host in NAMES (P5)
+- [x] userhost-in-names: full nick!user@host in NAMES, user/host retained in presence (P5)
 - [x] no-implicit-names (equivalent): members fetched lazily via WHO on open (P5)
-- [ ] invite-notify: INVITE system lines for ops (P5)
-- [ ] bot-mode: BOT ISUPPORT letter + badge (P5)
-- [ ] account-extban: ban-account option in moderation menus (P6)
+- [x] invite-notify: INVITE system lines (own invites in server buffer, others in channel) + 341 confirmation (P5)
+- [x] bot-mode: BOT ISUPPORT letter, WHO/WHOX flag, 335 and `bot` tag drive member-sheet badge (P5)
+- [x] account-extban: ACCOUNTEXTBAN/EXTBAN "Ban account" member action (P6)
 - [ ] draft/metadata-2: METADATA GET/SET/SUB, avatars/display names (P5)
 - [x] soju.im/FILEHOST ISUPPORT: endpoint discovery, TLS-policy enforcement, authenticated POST with multipart fallback, attachment-tagged messages (P8)
 - [ ] UTF8ONLY: always transmit UTF-8, skip legacy encoding heuristics (P5)

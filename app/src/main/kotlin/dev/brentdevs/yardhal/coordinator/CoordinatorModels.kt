@@ -12,6 +12,8 @@ public data class UiNetwork(
     public val host: String,
     public val status: ConnectionStatus,
     public val ownNick: String,
+    public val hasBotMode: Boolean = false,
+    public val accountBanAvailable: Boolean = false,
 ) {
     public val storagePrefix: String get() = id
 }
@@ -36,6 +38,7 @@ public data class ChatMessage(
     public val playback: Boolean = false,
     public val pendingEcho: Boolean = false,
     public val storedRowId: Long? = null,
+    public val senderAccount: String? = null,
 ) {
     public val countsAsUnread: Boolean
         get() = !sentByUs && !playback &&
@@ -43,8 +46,13 @@ public data class ChatMessage(
 }
 
 public data class PresenceState(
-    public val away: Boolean,
+    public val away: Boolean? = null,
+    public val awayMessage: String? = null,
     public val account: String? = null,
+    public val user: String? = null,
+    public val host: String? = null,
+    public val realName: String? = null,
+    public val isBot: Boolean = false,
 )
 
 public enum class JoinState {

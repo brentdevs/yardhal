@@ -31,6 +31,17 @@ class NamesParserTests {
     }
 
     @Test
+    fun retainsUserAndHostFromUserhostInNames() {
+        assertEquals(
+            NamesEntry(ChannelMember("alice", '@'), user = "~al", host = "host.tld"),
+            NamesParser.parseEntry("@+alice!~al@host.tld", ChannelPrefixModes(listOf('o', 'v'), listOf('@', '+'))),
+        )
+        assertEquals(NamesEntry(ChannelMember("carol", null)), NamesParser.parseEntry("carol", prefixes))
+        val (_, entries) = NamesParser.parseNamesLine(listOf("me", "=", "#room", "@alice!a@h1 bob!b@h2"), prefixes)
+        assertEquals(listOf("a" to "h1", "b" to "h2"), entries.map { it.user to it.host })
+    }
+
+    @Test
     fun parsesChannelAndMembers() {
         val (channel, members) = NamesParser.parseNamesLine(
             listOf("me", "=", "#room", "@alice +bob carol dave"),
@@ -44,7 +55,7 @@ class NamesParserTests {
                 ChannelMember("carol", null),
                 ChannelMember("dave", null),
             ),
-            members,
+            members.map { it.member },
         )
     }
 

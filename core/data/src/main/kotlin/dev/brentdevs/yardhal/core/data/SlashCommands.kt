@@ -11,6 +11,7 @@ public sealed interface SlashCommand {
     public data class NickChange(public val newNick: String) : SlashCommand
     public data class TopicSet(public val channel: String, public val topic: String) : SlashCommand
     public data class TopicShow(public val channel: String?) : SlashCommand
+    public data class SetName(public val realName: String) : SlashCommand
     public data class Away(public val message: String?) : SlashCommand
     public data class Quit(public val reason: String?) : SlashCommand
     public data class Whois(public val target: String) : SlashCommand
@@ -56,6 +57,7 @@ public object SlashCommandParser {
             "nick" -> rest.split(' ').firstOrNull { it.isNotEmpty() }?.let { SlashCommand.NickChange(it) }
             "topic" -> parseTopic(rest, currentChannel)
             "away" -> SlashCommand.Away(rest.ifBlank { null })
+            "setname" -> rest.trim().takeIf { it.isNotEmpty() }?.let { SlashCommand.SetName(it) }
             "back" -> SlashCommand.Away(null)
             "quit" -> SlashCommand.Quit(rest.ifBlank { null })
             "whois" -> rest.split(' ').firstOrNull { it.isNotEmpty() }?.let { SlashCommand.Whois(it) }

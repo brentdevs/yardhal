@@ -204,6 +204,7 @@ public fun YardhalAppRoot(
     val conversationContent: @Composable (String, ConversationBuffer, String, Boolean, (() -> Unit)?) -> Unit =
         { key, buffer, networkName, connected, onOpenBuffers ->
             val networkId = key.substringBefore("|")
+            val networkFeatures = networks.firstOrNull { it.id == networkId }
             conversationStateHolder.SaveableStateProvider(key) {
                 ConversationScreen(
                     buffer = buffer,
@@ -249,6 +250,8 @@ public fun YardhalAppRoot(
                         searchTargetRowId = null
                         returnToSearch = false
                     },
+                    hasBotMode = networkFeatures?.hasBotMode == true,
+                    accountBanAvailable = networkFeatures?.accountBanAvailable == true,
                     sharedDraft = sharedDraft,
                     onSharedConsumed = onSharedConsumed,
                     onPickFile = { launchAttachmentPicker() },
@@ -597,6 +600,7 @@ public fun YardhalAppRoot(
                         Text("${info.user ?: "?"}@${info.host ?: "?"}", style = MaterialTheme.typography.bodySmall)
                     }
                     info.account?.let { Text("Account: $it", style = MaterialTheme.typography.bodySmall) }
+                    if (info.isBot) Text("Bot", style = MaterialTheme.typography.bodySmall)
                     info.server?.let { Text("Server: $it ${info.serverInfo.orEmpty()}", style = MaterialTheme.typography.bodySmall) }
                     info.idleSeconds?.let { Text("Idle: ${it / 60} min", style = MaterialTheme.typography.bodySmall) }
                     if (info.channels.isNotEmpty()) {

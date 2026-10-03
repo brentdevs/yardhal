@@ -29,6 +29,7 @@ public sealed interface InboundEffect {
         public val attachmentUrl: String? = null,
         public val playback: Boolean = false,
         public val reconcilePendingEcho: Boolean = false,
+        public val senderAccount: String? = null,
     ) : InboundEffect
 
     public data class SetTopic(public val ref: ConversationRef, public val topic: String?) : InboundEffect
@@ -68,4 +69,6 @@ public sealed interface InboundEffect {
     public data object ChannelListFinished : InboundEffect
 
     public data object BouncerNetworksChanged : InboundEffect
+
+    public data object NetworkFeaturesChanged : InboundEffect
 }

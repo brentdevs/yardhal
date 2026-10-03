@@ -8,8 +8,10 @@ import dev.brentdevs.yardhal.core.data.ConversationRef
 import dev.brentdevs.yardhal.core.data.MessageKind
 import dev.brentdevs.yardhal.core.data.NetsplitCollapser
 import dev.brentdevs.yardhal.core.data.WhoisAccumulator
+import dev.brentdevs.yardhal.core.protocol.AccountExtban
 import dev.brentdevs.yardhal.core.protocol.CaseMapping
 import dev.brentdevs.yardhal.core.protocol.ChannelPrefixModes
+import dev.brentdevs.yardhal.core.protocol.ISupport
 import dev.brentdevs.yardhal.core.protocol.IrcMessage
 
 public class InboundContext(
@@ -28,7 +30,7 @@ public data class OpenBatch(
 
 public data class UserState(
     public val nick: String,
-    public val presence: PresenceState? = null,
+    public val presence: PresenceState = PresenceState(),
 )
 
 public class ChannelState(public val ref: ConversationRef) {
@@ -58,6 +60,8 @@ public class PerNetworkState(
         internal set
     public var isBouncerDiscovery: Boolean = false
         internal set
+    public var isupport: ISupport = ISupport.EMPTY
+        internal set
     public var whoisExpected: Boolean = false
     public var listingChannels: Boolean = false
 
@@ -69,6 +73,11 @@ public class PerNetworkState(
     internal val pendingNames: LinkedHashMap<String, LinkedHashMap<String, ChannelMember>> = LinkedHashMap()
     internal val channels: LinkedHashMap<String, ChannelState> = LinkedHashMap()
     internal val users: LinkedHashMap<String, UserState> = LinkedHashMap()
+    internal val monitored: LinkedHashMap<String, String> = LinkedHashMap()
+
+    public val botModeLetter: Char? get() = isupport.botModeLetter
+
+    public val accountExtban: AccountExtban? get() = isupport.accountExtban
 
     public val server: ConversationRef get() = ConversationRef.server(networkId)
 
@@ -88,6 +97,26 @@ public class PerNetworkState(
     public fun channel(storageKey: String): ChannelState? = channels[storageKey]
 
     public fun user(nick: String): UserState? = users[fold(nick)]
+
+    public fun isMonitored(nick: String): Boolean = fold(nick) in monitored
+
+    public fun accountBanMask(nick: String): String? {
+        val account = user(nick)?.presence?.account ?: return null
+        return accountExtban?.mask(account)
+    }
+
+    public fun forgetMonitored(nicks: Collection<String>) {
+        for (nick in nicks) {
+            val folded = fold(nick)
+            monitored.remove(folded)
+            if (!isTracked(folded)) users.remove(folded)
+        }
+    }
+
+    internal fun isTracked(folded: String): Boolean =
+        folded in monitored ||
+            channels.values.any { folded in it.members } ||
+            pendingNames.values.any { folded in it }
 
     public fun forgetChannel(storageKey: String) {
         channels.remove(storageKey)
@@ -115,13 +144,15 @@ public class PerNetworkState(
         whois.reset()
         whoisExpected = false
         supportedCaps = emptySet()
+        isupport = ISupport.EMPTY
+        monitored.clear()
     }
 
     internal fun memberSnapshot(channel: ChannelState): InboundEffect.SetMembers {
         val members = channel.memberList()
         val presence = LinkedHashMap<String, PresenceState>()
         for (member in members) {
-            users[fold(member.nick)]?.presence?.let { presence[member.nick] = it }
+            users[fold(member.nick)]?.let { presence[member.nick] = it.presence }
         }
         return InboundEffect.SetMembers(channel.ref, members, presence)
     }
@@ -139,6 +170,9 @@ public class PerNetworkState(
         val oldUsers = users.values.toList()
         users.clear()
         for (user in oldUsers) users[fold(user.nick)] = user
+        val oldMonitored = monitored.values.toList()
+        monitored.clear()
+        for (nick in oldMonitored) monitored[fold(nick)] = nick
         val oldPending = pendingNames.toMap()
         pendingNames.clear()
         for ((key, members) in oldPending) {
@@ -152,6 +186,7 @@ public class PerNetworkState(
 
 internal class Reduction(val state: PerNetworkState, val context: InboundContext) {
     val effects: MutableList<InboundEffect> = ArrayList()
+    val changedUsers: LinkedHashSet<String> = LinkedHashSet()
 
     fun emit(effect: InboundEffect) {
         effects.add(effect)
@@ -172,11 +207,20 @@ internal class Reduction(val state: PerNetworkState, val context: InboundContext
 
     fun channelOrCreate(ref: ConversationRef): ChannelState =
         state.channels.getOrPut(ref.storageKey) { ChannelState(ref) }
+
+    fun publishChangedUsers() {
+        if (changedUsers.isEmpty()) return
+        for (channel in state.channels.values) {
+            if (changedUsers.any { it in channel.members }) publishMembers(channel)
+        }
+        changedUsers.clear()
+    }
 }
 
 internal fun Reduction.handleMessage(message: IrcMessage) {
     val command = message.command.uppercase()
     val numeric = message.numeric
+    if (command != "JOIN") observeSource(message)
     when {
         command == "CAP" || command == "PING" || command == "PONG" -> Unit
         command == "PRIVMSG" || command == "NOTICE" -> handleChatMessage(message)
@@ -191,9 +235,15 @@ internal fun Reduction.handleMessage(message: IrcMessage) {
         command == "KICK" -> handleKick(message)
         command == "TOPIC" -> handleTopicVerb(message)
         command == "NICK" -> handleNickChange(message)
+        command == "AWAY" -> handleAway(message)
+        command == "ACCOUNT" -> handleAccount(message)
+        command == "CHGHOST" -> handleChghost(message)
+        command == "SETNAME" -> handleSetname(message)
+        command == "INVITE" -> handleInvite(message)
         command == "FAIL" || command == "WARN" -> serverLine(message, command.lowercase())
         command == "NOTE" -> serverLine(message, "note")
         numeric != null -> handleNumeric(numeric, message)
         else -> serverLine(message)
     }
+    publishChangedUsers()
 }
