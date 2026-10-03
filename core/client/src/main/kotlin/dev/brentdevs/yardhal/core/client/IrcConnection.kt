@@ -33,6 +33,7 @@ public data class IrcConnectionConfig(
     public val saslPassword: String? = null,
     public val capabilities: Set<String> = DEFAULT_CAPABILITIES,
     public val connectTimeoutMillis: Int = 10_000,
+    public val initialAway: String? = null,
 ) {
     init {
         require(nick.isNotBlank()) { "nick must not be blank" }
@@ -40,9 +41,15 @@ public data class IrcConnectionConfig(
         require((saslAuthcid == null) == (saslPassword == null)) {
             "SASL requires both authcid and password"
         }
+        require(initialAway == null || (initialAway.isNotEmpty() && initialAway.none { it in "\r\n\u0000" })) {
+            "initialAway must be a non-empty single line"
+        }
     }
 
     public companion object {
+        public const val PRE_AWAY_CAP: String = "draft/pre-away"
+        public const val EXTENDED_ISUPPORT_CAP: String = "draft/extended-isupport"
+
         public val DEFAULT_CAPABILITIES: Set<String> = setOf(
             "server-time",
             "message-tags",
@@ -61,6 +68,9 @@ public data class IrcConnectionConfig(
             "sasl",
             "znc.in/playback",
             "draft/read-marker",
+            PRE_AWAY_CAP,
+            EXTENDED_ISUPPORT_CAP,
+            dev.brentdevs.yardhal.core.protocol.AccountRegistrationPolicy.CAPABILITY,
             dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.CAPABILITY,
             dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.NOTIFY_CAPABILITY,
         )
@@ -75,7 +85,10 @@ public data class KeepAliveConfig(
 
 public sealed interface IrcEvent {
     public data object ConnectionOpened : IrcEvent
-    public data class CapabilitiesNegotiated(public val capabilities: Set<String>) : IrcEvent
+    public data class CapabilitiesNegotiated(
+        public val capabilities: Set<String>,
+        public val values: Map<String, String> = emptyMap(),
+    ) : IrcEvent
     public data class SaslResult(public val outcome: SaslOutcome) : IrcEvent
     public data class Registered(public val nickname: String, public val welcomeText: String) : IrcEvent
     public data class MessageReceived(public val message: IrcMessage) : IrcEvent
@@ -115,13 +128,25 @@ public class IrcConnection(
         const val MAX_NICK_COLLISION_ATTEMPTS = 4
     }
 
+    private val stateLock = Any()
     private var nickUserSent: Boolean = false
     private var nickCollisionAttempts: Int = 0
     private var negotiator: CapabilityNegotiator? = null
-    private var saslHandler: SaslPlainHandler? = null
+    private var saslAuthenticator: SaslAuthenticator? = null
+    private var awaySent: Boolean = false
 
     public val isRegistered: Boolean
         get() = registeredNickname != null
+
+    public fun reauthenticate(): Boolean = synchronized(stateLock) {
+        val current = negotiator
+        val inProgress = saslAuthenticator?.isFinished == false
+        if (current == null || registeredNickname == null || inProgress || CapabilityNegotiator.SASL_CAP !in current.acknowledged) {
+            false
+        } else {
+            startSasl()
+        }
+    }
 
     internal fun start(socketOverride: Socket? = null): Job? {
         lastInboundMillis = nowMillis()
@@ -186,44 +211,67 @@ public class IrcConnection(
     }
 
     private fun beginRegistration() {
-        val wantsCaps = config.capabilities.isNotEmpty()
-        if (wantsCaps) {
+        synchronized(stateLock) {
+            if (config.capabilities.isEmpty()) {
+                sendNickUser()
+                return
+            }
             val effectiveWanted =
                 if (config.saslAuthcid != null) config.capabilities else config.capabilities - CapabilityNegotiator.SASL_CAP
-            negotiator = CapabilityNegotiator(
+            val created = CapabilityNegotiator(
                 wanted = effectiveWanted,
                 sendRaw = ::sendLine,
-                onSaslAcknowledged = {
-                    val authcid = config.saslAuthcid
-                    val password = config.saslPassword
-                    if (authcid == null || password == null) {
-                        negotiator?.saslAbandonedContinueWithout()
-                    } else {
-                        val handler = SaslPlainHandler(
-                            authcid = authcid,
-                            password = password,
-                            sendRaw = ::sendLine,
-                            onOutcome = { outcome ->
-                                emit(IrcEvent.SaslResult(outcome))
-                                when (outcome) {
-                                    is SaslOutcome.Success -> negotiator?.saslCompleted()
-                                    is SaslOutcome.Failure -> negotiator?.saslAbandonedContinueWithout()
-                                }
-                            },
-                        )
-                        saslHandler = handler
-                        handler.start()
-                    }
-                },
+                onSaslAcknowledged = { if (!startSasl()) negotiator?.saslFinished() },
                 onFinished = {
-                    emit(IrcEvent.CapabilitiesNegotiated(LinkedHashSet(negotiator?.acknowledged ?: emptySet())))
+                    val acknowledged = LinkedHashSet(negotiator?.acknowledged ?: emptySet())
+                    val values = negotiator?.advertisedValues?.filterKeys { it in acknowledged } ?: emptyMap()
+                    emit(IrcEvent.CapabilitiesNegotiated(acknowledged, values))
                     sendNickUser()
                 },
+                beforeCapEnd = ::sendPreRegistrationRequests,
+                onDeleted = ::handleCapabilitiesDeleted,
             )
-            negotiator?.begin()
-        } else {
-            sendNickUser()
+            negotiator = created
+            created.begin()
         }
+    }
+
+    private fun startSasl(): Boolean {
+        val authcid = config.saslAuthcid ?: return false
+        val password = config.saslPassword ?: return false
+        val authenticator = SaslAuthenticator(
+            authcid = authcid,
+            password = password,
+            advertisedMechanisms = SaslAuthenticator.parseMechanismList(
+                negotiator?.advertisedValues?.get(CapabilityNegotiator.SASL_CAP),
+            ),
+            sendRaw = ::sendLine,
+            onOutcome = { outcome ->
+                emit(IrcEvent.SaslResult(outcome))
+                negotiator?.saslFinished()
+            },
+        )
+        saslAuthenticator = authenticator
+        authenticator.start()
+        return true
+    }
+
+    private fun sendPreRegistrationRequests() {
+        val acknowledged = negotiator?.acknowledged ?: return
+        if (IrcConnectionConfig.EXTENDED_ISUPPORT_CAP in acknowledged) sendLine("ISUPPORT")
+        val away = config.initialAway
+        if (away != null && IrcConnectionConfig.PRE_AWAY_CAP in acknowledged) sendAway(away)
+    }
+
+    private fun sendAway(message: String) {
+        awaySent = true
+        sendLine("AWAY :$message")
+    }
+
+    private fun handleCapabilitiesDeleted(names: Set<String>) {
+        if (CapabilityNegotiator.SASL_CAP !in names) return
+        val active = saslAuthenticator ?: return
+        if (!active.isFinished) active.cancel("server withdrew the sasl capability")
     }
 
     private fun sendNickUser() {
@@ -239,18 +287,27 @@ public class IrcConnection(
         rawTap?.invoke(false, line)
         val message = IrcMessage.parse(line) ?: return
         if (handleStsAdvertisement(message)) return
+        synchronized(stateLock) { applyToSession(message) }
+        emit(IrcEvent.MessageReceived(message))
+    }
 
+    private fun applyToSession(message: IrcMessage) {
         val numeric = message.numeric
-        if (numeric != null) saslHandler?.handleNumeric(numeric, message)
-        saslHandler?.handleMessage(message)
+        saslAuthenticator?.let { authenticator ->
+            if (numeric != null) authenticator.handleNumeric(numeric, message)
+            authenticator.handleMessage(message)
+        }
         negotiator?.handle(message)
 
         when {
             message.command == "PING" && message.parameters.isNotEmpty() ->
                 sendLine("PONG :${message.parameters.last()}")
             numeric == 1 && registeredNickname == null -> {
-                registeredNickname = message.parameters.firstOrNull() ?: config.nick
-                emit(IrcEvent.Registered(registeredNickname!!, message.parameters.lastOrNull() ?: ""))
+                val nickname = message.parameters.firstOrNull() ?: config.nick
+                registeredNickname = nickname
+                emit(IrcEvent.Registered(nickname, message.parameters.lastOrNull() ?: ""))
+                val away = config.initialAway
+                if (away != null && !awaySent) sendAway(away)
             }
             (numeric == 432 || numeric == 433) &&
                 registeredNickname == null &&
@@ -260,7 +317,6 @@ public class IrcConnection(
                 sendLine("NICK $retryNick")
             }
         }
-        emit(IrcEvent.MessageReceived(message))
     }
 
     private fun handleStsAdvertisement(message: IrcMessage): Boolean {
@@ -379,12 +435,21 @@ public class IrcConnection(
     }
 }
 
+private val VISIBLE_AUTHENTICATE_ARGUMENTS: Set<String> =
+    SaslAuthenticator.PREFERRED_MECHANISMS.toSet() +
+        SaslAuthenticator.CONTINUATION_MARKER +
+        SaslAuthenticator.ABORT_MARKER
+
 internal fun redactSensitiveOutbound(line: String): String {
     val command = line.substringBefore(' ').uppercase()
     val argument = line.substringAfter(' ', "")
-    return when {
-        command == "PASS" -> "PASS <redacted>"
-        command == "AUTHENTICATE" && argument !in setOf("PLAIN", "+", "*") -> "AUTHENTICATE <redacted>"
+    return when (command) {
+        "PASS" -> "PASS <redacted>"
+        "AUTHENTICATE" -> if (argument in VISIBLE_AUTHENTICATE_ARGUMENTS) line else "AUTHENTICATE <redacted>"
+        "REGISTER" -> {
+            val fields = argument.split(' ', limit = 3)
+            if (fields.size < 3) "REGISTER <redacted>" else "REGISTER ${fields[0]} ${fields[1]} <redacted>"
+        }
         else -> line
     }
 }

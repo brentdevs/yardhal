@@ -14,20 +14,20 @@ Phase numbers refer to `docs/architecture.md`.
 ## Identity & access
 
 - [x] sasl 3.1: AUTHENTICATE flow during negotiation (PLAIN) (P2)
-- [ ] sasl 3.2: mechanism list parsing, post-registration re-auth (P2+)
+- [x] sasl 3.2: mechanism list parsing, post-registration re-auth (P2+) — SCRAM-SHA-256 preferred over PLAIN, 908 fallback, CAP NEW/DEL sasl, `IrcConnection.reauthenticate()`
 - [ ] account-notify: ACCOUNT updates member account state (P5)
 - [ ] account-tag: verified-account badge input (P5)
 - [ ] extended-join: account + realname on JOIN (P5)
 - [ ] setname: inbound SETNAME + send own realname change (P5)
 - [ ] chghost: apply user/host updates silently (P5)
-- [ ] draft/account-registration: REGISTER/VERIFY flows with standard-replies errors (P8)
+- [x] draft/account-registration: REGISTER/VERIFY flows with standard-replies errors (P8) — `/register [account] <email|*> <password>`, `/verify [account] <code>`, cap value via `AccountRegistrationPolicy`, password redacted in raw log; FAIL replies shown as server lines
 
 ## Presence
 
 - [ ] away-notify: live away/back transitions (P5)
 - [x] MONITOR +/- verbs, 730/731 numerics surfaced (P5)
 - [ ] extended-monitor: monitored targets emit presence-class events (P5)
-- [ ] draft/pre-away: AWAY suppression during registration (P8)
+- [x] draft/pre-away: AWAY suppression during registration (P8) — `IrcConnectionConfig.initialAway` sent before CAP END when acknowledged, after 001 otherwise
 
 ## Messaging affordances
 
@@ -64,8 +64,8 @@ Phase numbers refer to `docs/architecture.md`.
 - [ ] account-extban: ban-account option in moderation menus (P6)
 - [ ] draft/metadata-2: METADATA GET/SET/SUB, avatars/display names (P5)
 - [x] soju.im/FILEHOST ISUPPORT: endpoint discovery, TLS-policy enforcement, authenticated POST with multipart fallback, attachment-tagged messages (P8)
-- [ ] UTF8ONLY: always transmit UTF-8, skip legacy encoding heuristics (P5)
-- [ ] draft/extended-isupport: full ISUPPORT set pre-registration (P5)
+- [x] UTF8ONLY: always transmit UTF-8, skip legacy encoding heuristics (P5) — strict UTF-8 inbound decoding with U+FFFD replacement, codepoint-safe truncation, `ISupport.utf8Only`
+- [x] draft/extended-isupport: full ISUPPORT set pre-registration (P5) — `ISUPPORT` sent before CAP END when acknowledged; `draft/isupport` batches pass through, `-TOKEN` removals honoured by `ISupport.mergedWith`
 - [ ] draft/ICON: network icon ISUPPORT token fetch/cache (P6)
 - [ ] draft/channel-rename: RENAME moves buffer/transcript/unread state (P5)
 - [ ] client-batch: infrastructure only; no production use until ratified
