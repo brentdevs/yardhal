@@ -74,6 +74,8 @@ public object SlashCommandParser {
             }
             "ignore" -> tokensOf(rest).firstOrNull()?.let { SlashCommand.IgnoreAdd(it) }
             "unignore" -> tokensOf(rest).firstOrNull()?.let { SlashCommand.IgnoreRemove(it) }
+            "register" -> parseRegister(rest)
+            "verify" -> parseVerify(rest)
             "quote", "raw" -> rawLine(rest)
             else -> rawLine(body)
         }
@@ -86,6 +88,29 @@ public object SlashCommandParser {
             body.substring(0, spaceIndex).uppercase() + " " + body.substring(spaceIndex + 1),
         )
     }
+
+    private fun parseRegister(rest: String): SlashCommand? {
+        val tokens = tokensOf(rest)
+        val (account, email, password) = when (tokens.size) {
+            2 -> Triple("*", tokens[0], tokens[1])
+            3 -> Triple(tokens[0], tokens[1], tokens[2])
+            else -> return null
+        }
+        return SlashCommand.Raw("REGISTER $account $email ${trailingSafe(password)}")
+    }
+
+    private fun parseVerify(rest: String): SlashCommand? {
+        val tokens = tokensOf(rest)
+        val (account, code) = when (tokens.size) {
+            1 -> "*" to tokens[0]
+            2 -> tokens[0] to tokens[1]
+            else -> return null
+        }
+        return SlashCommand.Raw("VERIFY $account ${trailingSafe(code)}")
+    }
+
+    private fun trailingSafe(lastParameter: String): String =
+        if (lastParameter.startsWith(":")) ":$lastParameter" else lastParameter
 
     private fun parsePrivChange(
         rest: String,

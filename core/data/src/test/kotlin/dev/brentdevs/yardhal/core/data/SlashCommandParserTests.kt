@@ -108,6 +108,40 @@ class SlashCommandParserTests {
     }
 
     @Test
+    fun registerDefaultsAccountToCurrentNick() {
+        assertEquals(SlashCommand.Raw("REGISTER * me@example.org hunter2"), parse("/register me@example.org hunter2"))
+        assertEquals(SlashCommand.Raw("REGISTER * * hunter2"), parse("/register * hunter2"))
+    }
+
+    @Test
+    fun registerAcceptsCustomAccountName() {
+        assertEquals(
+            SlashCommand.Raw("REGISTER test tester@example.org hunter2"),
+            parse("/REGISTER  test tester@example.org hunter2"),
+        )
+    }
+
+    @Test
+    fun registerRejectsWrongArity() {
+        assertNull(parse("/register"))
+        assertNull(parse("/register hunter2"))
+        assertNull(parse("/register a b c d"))
+    }
+
+    @Test
+    fun registerPasswordStartingWithColonStaysOneParameter() {
+        assertEquals(SlashCommand.Raw("REGISTER * * ::secret"), parse("/register * :secret"))
+    }
+
+    @Test
+    fun verifyBuildsVerifyCommand() {
+        assertEquals(SlashCommand.Raw("VERIFY test 39gvcdg4myvnmdcfhvd6exsv4n"), parse("/verify test 39gvcdg4myvnmdcfhvd6exsv4n"))
+        assertEquals(SlashCommand.Raw("VERIFY * 1234"), parse("/verify 1234"))
+        assertNull(parse("/verify"))
+        assertNull(parse("/verify a b c"))
+    }
+
+    @Test
     fun quitTakesOptionalReason() {
         assertEquals(SlashCommand.Quit("brb"), parse("/quit brb"))
         assertEquals(SlashCommand.Quit(null), parse("/quit"))

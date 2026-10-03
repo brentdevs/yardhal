@@ -1,5 +1,6 @@
 package dev.brentdevs.yardhal.core.client
 
+import dev.brentdevs.yardhal.core.protocol.AccountRegistrationPolicy
 import dev.brentdevs.yardhal.core.protocol.IrcMessage
 import java.io.File
 import java.net.InetSocketAddress
@@ -183,6 +184,77 @@ class ErgoRoundTripTest {
             assertEquals("yardhal-it", echoed.prefix?.nick)
 
             connection.disconnect()
+        } finally {
+            scope.cancel()
+        }
+        Unit
+    }
+
+    @Test
+    fun registersAccountThenAuthenticatesWithScramAndPreAway() = runBlocking {
+        startErgo()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        try {
+            val password = "yardhal-correct-horse"
+            val registrar = IrcConnection(
+                IrcConnectionConfig(
+                    host = "127.0.0.1",
+                    port = port,
+                    tls = false,
+                    nick = "yardhalacct",
+                    capabilities = IrcConnectionConfig.DEFAULT_CAPABILITIES - CapabilityNegotiator.SASL_CAP,
+                ),
+            )
+            val registrarEvents = EventCollector(scope, registrar.events)
+            registrar.start()
+            val negotiated = registrarEvents.awaitInstance<IrcEvent.CapabilitiesNegotiated>()
+            val policy = AccountRegistrationPolicy.parse(negotiated.values[AccountRegistrationPolicy.CAPABILITY])
+            assertTrue(AccountRegistrationPolicy.CAPABILITY in negotiated.capabilities)
+            assertTrue(policy.beforeConnect)
+            withTimeout(15_000) { registrarEvents.awaitRegistered() }
+            registrar.sendLine("REGISTER * * $password")
+            withTimeout(10_000) {
+                while (true) {
+                    val message = registrarEvents.awaitInstance<IrcEvent.MessageReceived>().message
+                    if (message.command == "REGISTER" && message.parameters.firstOrNull() == "SUCCESS") break
+                }
+            }
+            registrar.disconnect()
+
+            val tapped = java.util.concurrent.CopyOnWriteArrayList<String>()
+            val authenticated = IrcConnection(
+                IrcConnectionConfig(
+                    host = "127.0.0.1",
+                    port = port,
+                    tls = false,
+                    nick = "yardhalscram",
+                    saslAuthcid = "yardhalacct",
+                    saslPassword = password,
+                    initialAway = "Connected by Yardhal",
+                ),
+                rawTap = { outbound, line -> if (outbound) tapped.add(line) },
+            )
+            val events = EventCollector(scope, authenticated.events)
+            authenticated.start()
+            val seen = withTimeout(15_000) { events.drainUntilRegistered() }
+            assertEquals(SaslOutcome.Success, seen.filterIsInstance<IrcEvent.SaslResult>().single().outcome)
+            val caps = seen.filterIsInstance<IrcEvent.CapabilitiesNegotiated>().single().capabilities
+            assertTrue(IrcConnectionConfig.PRE_AWAY_CAP in caps)
+            assertTrue(tapped.contains("AUTHENTICATE SCRAM-SHA-256"))
+            assertTrue(tapped.indexOf("AWAY :Connected by Yardhal") in 0 until tapped.indexOf("CAP END"))
+            val numerics = seen.filterIsInstance<IrcEvent.MessageReceived>().mapNotNull { it.message.numeric }
+            assertTrue(306 in numerics, "Ergo marks the connection away before 001")
+            val ownNick = seen.filterIsInstance<IrcEvent.Registered>().single().nickname
+            authenticated.sendLine("WHOIS $ownNick")
+            val whoisNumerics = withTimeout(10_000) {
+                val collected = ArrayList<Int>()
+                while (318 !in collected) {
+                    events.awaitInstance<IrcEvent.MessageReceived>().message.numeric?.let { collected += it }
+                }
+                collected
+            }
+            assertTrue(301 in whoisNumerics, "WHOIS $ownNick lacks RPL_AWAY: $whoisNumerics")
+            authenticated.disconnect()
         } finally {
             scope.cancel()
         }

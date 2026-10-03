@@ -113,7 +113,9 @@ public class ISupport private constructor(
 
     public fun mergedWith(later: ISupport): ISupport {
         val combined = LinkedHashMap(tokens)
-        combined.putAll(later.tokens)
+        for ((key, value) in later.tokens) {
+            if (key.startsWith('-')) combined.remove(key.substring(1)) else combined[key] = value
+        }
         return ISupport(combined)
     }
 
