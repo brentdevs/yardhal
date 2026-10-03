@@ -62,6 +62,13 @@ class PerNetworkStateTests {
     }
 
     @Test
+    fun inputTooLongSurfacesAsAnErrorLine() {
+        val line = state().feed(":srv 417 me :Input line was too long").appended().single()
+        assertEquals(ConversationKind.SERVER, line.ref.kind)
+        assertEquals("[error] Input line was too long", line.text)
+    }
+
+    @Test
     fun standardRepliesAreTaggedByVerb() {
         val state = state()
         assertEquals("[fail] CHATHISTORY INVALID_TARGET bad", state.feed(":srv FAIL CHATHISTORY INVALID_TARGET :bad").appended().single().text)
