@@ -1,4 +1,4 @@
-.PHONY: check build test clean sdk test-ircd emu emu-install emu-windowed play install devices
+.PHONY: check build lint test clean sdk test-ircd emu emu-install emu-windowed play install devices
 
 ANDROID_HOME ?= $(error ANDROID_HOME is not set; run inside `nix develop`)
 
@@ -15,7 +15,10 @@ build:
 test:
 	./gradlew $(GRADLE_FLAGS) test
 
-check: build test
+lint:
+	./gradlew $(GRADLE_FLAGS) :app:lintDebug
+
+check: build lint test
 
 test-ircd:
 	bash scripts/ensure-ergo.sh

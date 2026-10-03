@@ -29,7 +29,7 @@ architecture of the Halyard iOS client.
 
 ```sh
 nix develop            # JDK 21 + Android SDK (provisions a writable SDK clone)
-make check             # the quality gate: assembleDebug + all unit tests
+make check             # the quality gate: assembleDebug + Android lint + all unit tests
 ```
 
 The flake composes the Android SDK, emulator, and Gradle; the first
@@ -62,7 +62,8 @@ make play              # build + boot a windowed emulator + install + launch
 ## Test
 
 ```sh
-make check             # compile + unit tests (protocol, client, data, app)
+make check             # compile + Android lint + unit tests (protocol, client, data, app)
+make lint              # just Android lint, using the same checks as CI
 make test-ircd         # round-trip against a real Ergo ircd (make test-ircd first
                        # downloads a pinned binary into .tools/)
 ```

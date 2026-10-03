@@ -4,8 +4,10 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.LruCache
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
-import androidx.compose.runtime.produceState
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
@@ -164,12 +166,12 @@ public val LocalRemoteImageLoader: androidx.compose.runtime.ProvidableCompositio
 @Composable
 public fun rememberRemoteImage(loader: RemoteImageLoader?, rawUrl: String?, sizePx: Int): State<ImageBitmap?> {
     val url = ImageUrlPolicy.resolve(rawUrl, sizePx)
-    val initial = if (loader == null || url == null) null else loader.cached(url, sizePx)?.asImageBitmap()
-    return produceState(initialValue = initial, loader, url, sizePx) {
-        if (loader == null || url == null) {
-            value = null
-            return@produceState
-        }
-        value = loader.load(url, sizePx)?.asImageBitmap()
+    val image = remember {
+        val initial = if (loader == null || url == null) null else loader.cached(url, sizePx)?.asImageBitmap()
+        mutableStateOf(initial)
     }
+    LaunchedEffect(loader, url, sizePx) {
+        image.value = if (loader == null || url == null) null else loader.load(url, sizePx)?.asImageBitmap()
+    }
+    return image
 }
