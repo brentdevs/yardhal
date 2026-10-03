@@ -48,6 +48,7 @@ public data class IrcConnectionConfig(
             "message-tags",
             "echo-message",
             "batch",
+            "labeled-response",
             "extended-join",
             "away-notify",
             "account-notify",

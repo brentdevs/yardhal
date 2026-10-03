@@ -237,6 +237,7 @@ public class LiveCoordinator(
                 playback = effect.playback,
                 attachmentUrl = effect.attachmentUrl,
                 reconcilePendingEcho = effect.reconcilePendingEcho,
+                echoLabel = effect.echoLabel,
             )
             is InboundEffect.SetTopic -> updateBuffer(effect.ref) { it.copy(topic = effect.topic) }
             is InboundEffect.SetMembers -> updateBuffer(effect.ref) {
@@ -390,7 +391,7 @@ public class LiveCoordinator(
         for (session in sessions.values) {
             synchronized(session.state) { session.state.listingChannels = session.config.id == networkId }
         }
-        sessions[networkId]?.let { sendRaw(it, "LIST") }
+        sessions[networkId]?.let { sendLabeled(it, ConversationRef.server(networkId), LabeledCommand.LIST, "LIST") }
     }
 
     public fun deleteMessage(networkId: String, storageKey: String, msgid: String) {
@@ -641,20 +642,13 @@ public class LiveCoordinator(
         pendingEcho: Boolean = false,
         persist: Boolean = true,
         reconcilePendingEcho: Boolean = false,
+        echoLabel: String? = null,
     ) {
         val newLocalId = idGenerator.getAndIncrement()
         val muted = mutes.isMuted(ref.storageKey)
         updateBuffer(ref) { buffer ->
             if (reconcilePendingEcho && !playback) {
-                val index = buffer.messages.indexOfFirst {
-                    it.pendingEcho && it.kind == kind && it.text == text
-                }
-                if (index >= 0) {
-                    val messages = buffer.messages.toMutableList()
-                    messages[index] = messages[index]
-                        .copy(msgid = msgid, timestampMs = timestampMs, attachmentUrl = attachmentUrl, pendingEcho = false)
-                    return@updateBuffer buffer.copy(messages = messages)
-                }
+                reconcileEcho(buffer, kind, text, echoLabel, msgid, timestampMs, attachmentUrl)?.let { return@updateBuffer it }
             }
             if (msgid != null && buffer.messages.any { it.msgid == msgid }) return@updateBuffer buffer
             val entry = ChatMessage(
@@ -670,6 +664,7 @@ public class LiveCoordinator(
                 attachmentUrl = attachmentUrl,
                 playback = playback,
                 pendingEcho = pendingEcho,
+                echoLabel = echoLabel.takeIf { pendingEcho },
             )
             val countsAsUnread = entry.countsAsUnread && !muted && timestampMs > buffer.readAtMs
             val boundary = if (countsAsUnread) {
@@ -851,6 +846,11 @@ public class LiveCoordinator(
         session.reconnector?.sendLine(line)
     }
 
+    private fun sendLabeled(session: Session, origin: ConversationRef, command: LabeledCommand, line: String) {
+        val label = synchronized(session.state) { session.state.issueLabel(origin, command, clock()) }
+        sendRaw(session, if (label == null) line else labelLine(line, label))
+    }
+
     private fun SlashCommand.isLocal(): Boolean =
         this is SlashCommand.Query || this is SlashCommand.IgnoreAdd ||
             this is SlashCommand.IgnoreRemove || this is SlashCommand.Help
@@ -890,7 +890,12 @@ public class LiveCoordinator(
                 optimisticKind = MessageKind.ACTION,
                 optimisticText = command.description,
             )
-            is SlashCommand.Msg -> sendMessage(session, resolveTargetRef(session, command.target), sanitizeOutboundText(command.text))
+            is SlashCommand.Msg -> sendMessage(
+                session,
+                resolveTargetRef(session, command.target),
+                sanitizeOutboundText(command.text),
+                origin = active,
+            )
             is SlashCommand.Query -> buffer(resolveTargetRef(session, command.nick))
             is SlashCommand.Join -> {
                 if (command.channels.isEmpty()) return
@@ -915,14 +920,14 @@ public class LiveCoordinator(
             is SlashCommand.TopicSet -> sendRaw(session, "TOPIC ${command.channel} :${sanitizeOutboundText(command.topic)}")
             is SlashCommand.TopicShow -> {
                 val target = command.channel ?: active.rawTarget
-                sendRaw(session, "TOPIC $target")
+                sendLabeled(session, active, LabeledCommand.TOPIC, "TOPIC $target")
             }
             is SlashCommand.Away ->
                 sendRaw(session, if (command.message == null) "AWAY" else "AWAY :${command.message}")
             is SlashCommand.Quit -> disconnect(session.config.id, sanitizeOutboundText(command.reason ?: ""))
             is SlashCommand.Whois -> {
                 synchronized(session.state) { session.state.whoisExpected = true }
-                sendRaw(session, "WHOIS ${command.target} ${command.target}")
+                sendLabeled(session, active, LabeledCommand.WHOIS, "WHOIS ${command.target} ${command.target}")
             }
             is SlashCommand.Kick -> {
                 val channel = command.channel ?: active.rawTarget
@@ -935,12 +940,19 @@ public class LiveCoordinator(
             }
             is SlashCommand.Ban -> {
                 val channel = command.channel ?: active.rawTarget
-                sendRaw(session, if (command.mask == null) "MODE $channel +b" else "MODE $channel +b ${command.mask}")
+                sendLabeled(
+                    session,
+                    active,
+                    LabeledCommand.MODE,
+                    if (command.mask == null) "MODE $channel +b" else "MODE $channel +b ${command.mask}",
+                )
             }
             is SlashCommand.Mode -> {
                 val target = command.target ?: active.rawTarget
-                sendRaw(
+                sendLabeled(
                     session,
+                    active,
+                    LabeledCommand.MODE,
                     if (command.params.isEmpty()) "MODE $target" else "MODE $target ${command.params.joinToString(" ")}",
                 )
             }
@@ -949,20 +961,23 @@ public class LiveCoordinator(
                 resolveTargetRef(session, command.target),
                 IrcCtcp.encode(command.command, command.arguments),
                 suppressOptimistic = true,
+                origin = active,
             )
             is SlashCommand.Op -> {
                 val channel = command.channel ?: active.rawTarget
-                sendRaw(session, "MODE $channel ${if (command.grant) "+o" else "-o"} ${command.nick}")
+                sendLabeled(session, active, LabeledCommand.MODE, "MODE $channel ${if (command.grant) "+o" else "-o"} ${command.nick}")
             }
             is SlashCommand.Voice -> {
                 val channel = command.channel ?: active.rawTarget
-                sendRaw(session, "MODE $channel ${if (command.grant) "+v" else "-v"} ${command.nick}")
+                sendLabeled(session, active, LabeledCommand.MODE, "MODE $channel ${if (command.grant) "+v" else "-v"} ${command.nick}")
             }
-            is SlashCommand.MonitorAdd -> sendRaw(session, "MONITOR + ${command.nick}")
-            is SlashCommand.MonitorRemove -> sendRaw(session, "MONITOR - ${command.nick}")
-            is SlashCommand.MonitorList -> sendRaw(session, "MONITOR L")
-            is SlashCommand.WhoQuery -> sendRaw(
+            is SlashCommand.MonitorAdd -> sendLabeled(session, active, LabeledCommand.MONITOR, "MONITOR + ${command.nick}")
+            is SlashCommand.MonitorRemove -> sendLabeled(session, active, LabeledCommand.MONITOR, "MONITOR - ${command.nick}")
+            is SlashCommand.MonitorList -> sendLabeled(session, active, LabeledCommand.MONITOR, "MONITOR L")
+            is SlashCommand.WhoQuery -> sendLabeled(
                 session,
+                active,
+                LabeledCommand.WHO,
                 if (command.useWhox && session.state.hasWhox) "WHO ${command.target} %acfhn" else "WHO ${command.target}",
             )
             is SlashCommand.IgnoreAdd -> {
@@ -978,11 +993,20 @@ public class LiveCoordinator(
                 active,
                 "Commands: /me /msg /query /join /part /nick /topic /away /back /quit /whois /kick /ban /mode /ctcp /raw",
             )
-            is SlashCommand.Raw -> sendRaw(session, command.line)
+            is SlashCommand.Raw -> sendRawCommand(session, active, command.line)
         }
     }
 
     private fun resolveTargetRef(session: Session, target: String): ConversationRef = session.state.targetRef(target)
+
+    private fun sendRawCommand(session: Session, origin: ConversationRef, line: String) {
+        val parsed = IrcMessage.parse(line)
+        if (parsed == null || parsed.tags.containsKey("label")) {
+            sendRaw(session, line)
+        } else {
+            sendLabeled(session, origin, LabeledCommand.RAW, line)
+        }
+    }
 
     private fun sendMessage(
         session: Session,
@@ -993,8 +1017,11 @@ public class LiveCoordinator(
         suppressOptimistic: Boolean = false,
         replyToMsgid: String? = null,
         attachmentUrl: String? = null,
+        origin: ConversationRef = ref,
     ) {
         val safeWireText = sanitizeOutboundText(wireText)
+        val echoExpected = "echo-message" in session.state.supportedCaps
+        val label = synchronized(session.state) { session.state.issueLabel(origin, LabeledCommand.PRIVMSG, clock()) }
         if (!suppressOptimistic) {
             appendChat(
                 session = session,
@@ -1008,11 +1035,13 @@ public class LiveCoordinator(
                 highlightsMe = false,
                 replyToMsgid = replyToMsgid,
                 attachmentUrl = attachmentUrl,
-                pendingEcho = "echo-message" in session.state.supportedCaps,
-                persist = "echo-message" !in session.state.supportedCaps,
+                pendingEcho = echoExpected,
+                persist = !echoExpected,
+                echoLabel = label,
             )
         }
         val tags = buildMap {
+            if (label != null) put("label", label)
             if (replyToMsgid != null) put("+draft/reply", replyToMsgid)
             if (attachmentUrl != null) put("+draft/attachment", attachmentUrl)
         }

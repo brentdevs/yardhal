@@ -10,6 +10,33 @@ internal fun redactInBuffer(buffer: ConversationBuffer, msgid: String): Conversa
     return buffer.copy(messages = messages)
 }
 
+internal fun reconcileEcho(
+    buffer: ConversationBuffer,
+    kind: MessageKind,
+    text: String,
+    echoLabel: String?,
+    msgid: String?,
+    timestampMs: Long,
+    attachmentUrl: String?,
+): ConversationBuffer? {
+    val index = if (echoLabel != null) {
+        buffer.messages.indexOfFirst { it.pendingEcho && it.echoLabel == echoLabel }
+    } else {
+        buffer.messages.indexOfFirst { it.pendingEcho && it.kind == kind && it.text == text }
+    }
+    if (index < 0) return null
+    val messages = buffer.messages.toMutableList()
+    messages[index] = messages[index].copy(
+        text = text,
+        msgid = msgid,
+        timestampMs = timestampMs,
+        attachmentUrl = attachmentUrl,
+        pendingEcho = false,
+        echoLabel = null,
+    )
+    return buffer.copy(messages = messages)
+}
+
 internal fun applyReaction(
     reactions: Map<String, Map<String, Set<String>>>,
     effect: InboundEffect.ApplyReaction,

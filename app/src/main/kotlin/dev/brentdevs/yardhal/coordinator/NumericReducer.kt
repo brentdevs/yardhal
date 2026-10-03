@@ -46,7 +46,7 @@ internal fun Reduction.handleJoinFailure(message: IrcMessage) {
 }
 
 internal fun Reduction.handleWhoisNumeric(numeric: Int, message: IrcMessage) {
-    if (!state.whoisExpected) return
+    if (!state.whoisExpected && correlation?.command != LabeledCommand.WHOIS) return
     val complete = state.whois.handle(numeric, message.parameters) ?: return
     state.whoisExpected = false
     emit(InboundEffect.WhoisCompleted(complete))
