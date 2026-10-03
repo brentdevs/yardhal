@@ -188,4 +188,76 @@ class ErgoRoundTripTest {
         }
         Unit
     }
+
+    @Test
+    fun labeledResponsesCarryLabelsFromRealServer() = runBlocking {
+        startErgo()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        try {
+            val config = IrcConnectionConfig(
+                host = "127.0.0.1",
+                port = port,
+                tls = false,
+                nick = "yardhal-lr",
+                username = "labeled",
+                realName = "Yardhal Labeled Response",
+                capabilities = IrcConnectionConfig.DEFAULT_CAPABILITIES - CapabilityNegotiator.SASL_CAP,
+            )
+            val connection = IrcConnection(config)
+            val acked = kotlinx.coroutines.CompletableDeferred<Set<String>>()
+            val registered = kotlinx.coroutines.CompletableDeferred<Unit>()
+            val joined = kotlinx.coroutines.CompletableDeferred<Unit>()
+            val labelled = java.util.concurrent.ConcurrentHashMap<String, kotlinx.coroutines.CompletableDeferred<IrcMessage>>()
+            fun awaiting(label: String) = labelled.getOrPut(label) { kotlinx.coroutines.CompletableDeferred() }
+            scope.launch {
+                connection.events.collect { event ->
+                    when (event) {
+                        is IrcEvent.CapabilitiesNegotiated -> acked.complete(event.capabilities)
+                        is IrcEvent.MessageReceived -> {
+                            val message = event.message
+                            when (message.command.uppercase()) {
+                                "001" -> registered.complete(Unit)
+                                "JOIN" -> joined.complete(Unit)
+                            }
+                            message.tag("label")?.let { awaiting(it).complete(message) }
+                        }
+                        else -> Unit
+                    }
+                }
+            }
+            connection.start()
+
+            assertTrue("labeled-response" in withTimeout(15_000) { acked.await() }, "Ergo must ack labeled-response")
+            withTimeout(15_000) { registered.await() }
+            connection.send(IrcMessage(command = "JOIN", parameters = listOf("#yardhal-labeled")))
+            withTimeout(10_000) { joined.await() }
+
+            connection.send(
+                IrcMessage(
+                    tags = mapOf("label" to "yh1"),
+                    command = "PRIVMSG",
+                    parameters = listOf("#yardhal-labeled", "labelled payload"),
+                ),
+            )
+            val echo = withTimeout(10_000) { awaiting("yh1").await() }
+            assertEquals("PRIVMSG", echo.command)
+            assertEquals("labelled payload", echo.parameters.lastOrNull())
+            assertTrue(echo.tags.containsKey("msgid"), "labelled echo must carry msgid")
+
+            connection.send(IrcMessage(tags = mapOf("label" to "yh2"), command = "WHOIS", parameters = listOf("yardhal-lr")))
+            val batchStart = withTimeout(10_000) { awaiting("yh2").await() }
+            assertEquals("BATCH", batchStart.command)
+            assertTrue(batchStart.parameters.firstOrNull()?.startsWith("+") == true)
+            assertEquals("labeled-response", batchStart.parameters.getOrNull(1))
+
+            connection.send(IrcMessage(tags = mapOf("label" to "yh3"), command = "PONG", parameters = listOf("labelled")))
+            val ack = withTimeout(10_000) { awaiting("yh3").await() }
+            assertEquals("ACK", ack.command)
+
+            connection.disconnect()
+        } finally {
+            scope.cancel()
+        }
+        Unit
+    }
 }

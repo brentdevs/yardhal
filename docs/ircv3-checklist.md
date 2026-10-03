@@ -47,7 +47,7 @@ Phase numbers refer to `docs/architecture.md`.
 - [x] chathistory batch type: replay routed as history (no unread/notification noise) (P5)
 - [x] draft/chathistory: LATEST bootstrap on channel join when advertised (P5); full selectors pending
 - [x] netsplit/netjoin batches: collapse into one event (P5)
-- [ ] labeled-response: label outbound commands, correlate responses incl. ACK/batches (P5)
+- [x] labeled-response: /raw, /whois, /who, /mode family, /topic, /monitor, LIST and PRIVMSG sends labelled when acked; single replies, labelled batches and ACK correlated in the reducer; generic replies routed to the origin buffer; echoes reconciled by label (text match fallback) (P5)
 - [x] standard-replies: FAIL/WARN/NOTE → tagged system lines (P5; toast polish pending)
 - [x] sts: upgrade to TLS port, persist and enforce policy with expiry (P2; warning UI pending)
 - [x] SNI: hostname in ClientHello (platform TLS does this by default) (P2)

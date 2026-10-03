@@ -36,9 +36,9 @@ internal fun Reduction.handleChatMessage(message: IrcMessage) {
     if (!fromUs && context.isIgnored(senderNick)) return
     val ref = when {
         state.isChannelName(targetParam) -> state.channelRef(targetParam)
-        targetParam.startsWith("*") -> state.server
+        targetParam.startsWith("*") -> replyRef
         fromUs -> state.directRef(targetParam)
-        prefix.isServer -> state.server
+        prefix.isServer -> replyRef
         else -> state.directRef(senderNick)
     }
     val decoded = IrcCtcp.decode(rawText)
@@ -66,6 +66,7 @@ internal fun Reduction.handleChatMessage(message: IrcMessage) {
             attachmentUrl = message.tag("+draft/attachment"),
             playback = playback,
             reconcilePendingEcho = fromUs,
+            echoLabel = correlation?.takeIf { fromUs && it.command == LabeledCommand.PRIVMSG }?.label,
         ),
     )
 }
@@ -110,11 +111,11 @@ internal fun Reduction.handleBatchFrame(message: IrcMessage) {
         head.startsWith("+") -> {
             val type = message.parameters.getOrNull(1) ?: return
             val parameters = message.parameters.drop(2)
-            state.openBatches[reference] = OpenBatch(type, parameters, message.tag("batch"))
+            state.openBatches[reference] = OpenBatch(type, parameters, message.tag("batch"), message.tag("label"))
             state.netsplit.onStart(reference, type, parameters)
         }
         head.startsWith("-") -> {
-            state.openBatches.remove(reference)
+            state.openBatches.remove(reference)?.let { releaseBatchLabel(it) }
             val summary = state.netsplit.onEnd(reference) ?: return
             system(state.server, summary.toString())
         }

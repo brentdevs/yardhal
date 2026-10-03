@@ -24,6 +24,25 @@ public data class OpenBatch(
     public val type: String,
     public val parameters: List<String>,
     public val parent: String?,
+    public val label: String? = null,
+)
+
+public enum class LabeledCommand {
+    RAW,
+    WHOIS,
+    WHO,
+    MODE,
+    TOPIC,
+    MONITOR,
+    LIST,
+    PRIVMSG,
+}
+
+public data class PendingLabel(
+    public val label: String,
+    public val origin: ConversationRef,
+    public val command: LabeledCommand,
+    public val issuedAtMs: Long,
 )
 
 public data class UserState(
@@ -61,6 +80,8 @@ public class PerNetworkState(
     public var whoisExpected: Boolean = false
     public var listingChannels: Boolean = false
 
+    private var labelCounter: Long = 0L
+
     public val bouncerStore: BouncerNetworkStore = BouncerNetworkStore()
 
     internal val whois = WhoisAccumulator()
@@ -69,6 +90,7 @@ public class PerNetworkState(
     internal val pendingNames: LinkedHashMap<String, LinkedHashMap<String, ChannelMember>> = LinkedHashMap()
     internal val channels: LinkedHashMap<String, ChannelState> = LinkedHashMap()
     internal val users: LinkedHashMap<String, UserState> = LinkedHashMap()
+    internal val pendingLabels: LinkedHashMap<String, PendingLabel> = LinkedHashMap()
 
     public val server: ConversationRef get() = ConversationRef.server(networkId)
 
@@ -96,6 +118,19 @@ public class PerNetworkState(
 
     public fun batchType(reference: String?): String? = reference?.let { openBatches[it]?.type }
 
+    public val labeledResponseEnabled: Boolean get() = LABELED_RESPONSE_CAP in supportedCaps
+
+    public fun pendingLabel(label: String): PendingLabel? = pendingLabels[label]
+
+    public fun issueLabel(origin: ConversationRef, command: LabeledCommand, nowMs: Long): String? {
+        if (!labeledResponseEnabled) return null
+        pendingLabels.values.removeAll { nowMs - it.issuedAtMs > LABEL_TTL_MS }
+        labelCounter += 1
+        val label = "yh$labelCounter"
+        pendingLabels[label] = PendingLabel(label, origin, command, nowMs)
+        return label
+    }
+
     public fun apply(event: IrcEvent, context: InboundContext): List<InboundEffect> {
         val reduction = Reduction(this, context)
         when (event) {
@@ -115,6 +150,7 @@ public class PerNetworkState(
         whois.reset()
         whoisExpected = false
         supportedCaps = emptySet()
+        pendingLabels.clear()
     }
 
     internal fun memberSnapshot(channel: ChannelState): InboundEffect.SetMembers {
@@ -148,10 +184,19 @@ public class PerNetworkState(
             pendingNames[channelRef(rawTarget).storageKey] = rebuilt
         }
     }
+
+    public companion object {
+        public const val LABELED_RESPONSE_CAP: String = "labeled-response"
+        public const val LABEL_TTL_MS: Long = 120_000L
+    }
 }
 
 internal class Reduction(val state: PerNetworkState, val context: InboundContext) {
     val effects: MutableList<InboundEffect> = ArrayList()
+    var correlation: PendingLabel? = null
+
+    val replyRef: ConversationRef
+        get() = correlation?.origin?.takeIf { context.hasBuffer(it.storageKey) } ?: state.server
 
     fun emit(effect: InboundEffect) {
         effects.add(effect)
@@ -163,7 +208,7 @@ internal class Reduction(val state: PerNetworkState, val context: InboundContext
 
     fun serverLine(message: IrcMessage, tag: String? = null) {
         val payload = message.parameters.drop(1).joinToString(" ").ifEmpty { message.command }
-        system(state.server, if (tag == null) payload else "[$tag] $payload")
+        system(replyRef, if (tag == null) payload else "[$tag] $payload")
     }
 
     fun publishMembers(channel: ChannelState) {
@@ -177,8 +222,9 @@ internal class Reduction(val state: PerNetworkState, val context: InboundContext
 internal fun Reduction.handleMessage(message: IrcMessage) {
     val command = message.command.uppercase()
     val numeric = message.numeric
+    correlation = correlateLabel(message, command)
     when {
-        command == "CAP" || command == "PING" || command == "PONG" -> Unit
+        command == "CAP" || command == "PING" || command == "PONG" || command == "ACK" -> Unit
         command == "PRIVMSG" || command == "NOTICE" -> handleChatMessage(message)
         command == "BATCH" -> handleBatchFrame(message)
         command == "REDACT" -> handleRedact(message)
