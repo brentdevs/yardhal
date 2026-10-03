@@ -333,19 +333,22 @@ class PerNetworkStateTests {
         val end = state.feed(":srv 315 me #room :End of WHO")
         val members = end.only<InboundEffect.SetMembers>()
         assertEquals(listOf(ChannelMember("alice", '@'), ChannelMember("me")), members.members)
-        assertEquals(PresenceState(away = true), members.presence["alice"])
+        assertEquals(PresenceState(away = true, user = "~a", host = "host", realName = "Alice"), members.presence["alice"])
     }
 
     @Test
     fun whoxRepliesAddMembersWithAccountAndAway() {
         val state = state()
         state.joinChannelWith("#room", "me")
-        val effects = state.feed(":srv 354 me #room host alice G+ alice_acct")
+        val effects = state.feed(":srv 354 me #room ~a host alice G+ alice_acct :Alice A")
         val snapshot = effects.only<InboundEffect.SetMembers>()
         assertTrue(ChannelMember("alice", '+') in snapshot.members)
-        assertEquals(PresenceState(away = true, account = "alice_acct"), snapshot.presence["alice"])
-        val noAccount = state.feed(":srv 354 me #room host me H 0").only<InboundEffect.SetMembers>()
-        assertEquals(PresenceState(away = false, account = null), noAccount.presence["me"])
+        assertEquals(
+            PresenceState(away = true, account = "alice_acct", user = "~a", host = "host", realName = "Alice A"),
+            snapshot.presence["alice"],
+        )
+        val noAccount = state.feed(":srv 354 me #room ~m host me H 0 :Me").only<InboundEffect.SetMembers>()
+        assertEquals(PresenceState(away = false, account = null, user = "~m", host = "host", realName = "Me"), noAccount.presence["me"])
     }
 
     @Test

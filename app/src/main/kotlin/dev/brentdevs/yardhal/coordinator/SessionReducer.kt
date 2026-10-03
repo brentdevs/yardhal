@@ -4,6 +4,7 @@ import dev.brentdevs.yardhal.core.data.ConversationKind
 import dev.brentdevs.yardhal.core.data.ConversationRef
 import dev.brentdevs.yardhal.core.protocol.CaseMapping
 import dev.brentdevs.yardhal.core.protocol.ChannelPrefixModes
+import dev.brentdevs.yardhal.core.protocol.ISupport
 import dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks
 import dev.brentdevs.yardhal.core.protocol.IrcMessage
 
@@ -37,6 +38,12 @@ internal fun Reduction.handleRegistered(nickname: String) {
 
 internal fun Reduction.applyIsupportTokens(message: IrcMessage) {
     val tokens = message.parameters.drop(1).dropLast(1).filter { it.isNotEmpty() }
+    val previousBot = state.botModeLetter
+    val previousExtban = state.accountExtban
+    state.isupport = state.isupport.mergedWith(ISupport.parse(tokens))
+    if (state.botModeLetter != previousBot || state.accountExtban != previousExtban) {
+        emit(InboundEffect.NetworkFeaturesChanged)
+    }
     for (token in tokens) {
         when {
             token.startsWith("CASEMAPPING=") ->

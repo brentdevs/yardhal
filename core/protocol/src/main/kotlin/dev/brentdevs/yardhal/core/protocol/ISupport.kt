@@ -27,6 +27,13 @@ public data class ChannelModeLists(
     }
 }
 
+public data class AccountExtban(
+    public val prefix: String,
+    public val name: String,
+) {
+    public fun mask(account: String): String = "$prefix$name:$account"
+}
+
 public class ISupport private constructor(
     private val tokens: Map<String, String?>,
 ) {
@@ -93,6 +100,16 @@ public class ISupport private constructor(
 
     public val botModeLetter: Char?
         get() = tokens["BOT"]?.firstOrNull { it.isLetter() }
+
+    public val extbanPrefix: String?
+        get() = tokens["EXTBAN"]?.takeIf { it.contains(',') }?.substringBefore(',')
+
+    public val accountExtban: AccountExtban?
+        get() {
+            val prefix = extbanPrefix ?: return null
+            val name = tokens["ACCOUNTEXTBAN"]?.split(',')?.firstOrNull { it.isNotEmpty() } ?: return null
+            return AccountExtban(prefix, name)
+        }
 
     public val extendedListFlags: String?
         get() = tokens["ELIST"]

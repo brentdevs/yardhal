@@ -10,6 +10,7 @@ public data class WhoisInfo(
     public val account: String? = null,
     public val awayMessage: String? = null,
     public val isOper: Boolean = false,
+    public val isBot: Boolean = false,
     public val idleSeconds: Long? = null,
     public val signOnEpochSeconds: Long? = null,
     public val channels: List<String> = emptyList(),
@@ -36,6 +37,7 @@ public class WhoisAccumulator {
             )
             312 -> base.copy(server = params.getOrNull(2), serverInfo = params.getOrNull(3))
             313 -> base.copy(isOper = true)
+            335 -> base.copy(isBot = true)
             317 -> base.copy(
                 idleSeconds = params.getOrNull(2)?.toLongOrNull(),
                 signOnEpochSeconds = params.getOrNull(3)?.toLongOrNull(),

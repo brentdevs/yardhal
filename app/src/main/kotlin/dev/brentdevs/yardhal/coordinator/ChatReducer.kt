@@ -67,6 +67,7 @@ internal fun Reduction.handleChatMessage(message: IrcMessage) {
             playback = playback,
             reconcilePendingEcho = fromUs,
             echoLabel = correlation?.takeIf { fromUs && it.command == LabeledCommand.PRIVMSG }?.label,
+            senderAccount = accountValue(message.tag("account")),
         ),
     )
 }

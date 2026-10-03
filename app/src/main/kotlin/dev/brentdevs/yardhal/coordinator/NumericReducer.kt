@@ -4,7 +4,7 @@ import dev.brentdevs.yardhal.core.data.MessageKind
 import dev.brentdevs.yardhal.core.protocol.IrcMessage
 
 private val JOIN_FAILURE_NUMERICS = setOf(403, 405, 437, 471, 473, 474, 475)
-private val WHOIS_NUMERICS = (301..319).toSet() - setOf(305, 306) + 330
+private val WHOIS_NUMERICS = (301..319).toSet() - setOf(305, 306) + 330 + 335
 
 internal fun Reduction.handleNumeric(numeric: Int, message: IrcMessage) {
     when {
@@ -19,8 +19,13 @@ internal fun Reduction.handleNumeric(numeric: Int, message: IrcMessage) {
         numeric == 322 -> handleListEntry(message)
         numeric == 323 -> emit(InboundEffect.ChannelListFinished)
         numeric in JOIN_FAILURE_NUMERICS -> handleJoinFailure(message)
+        numeric == 335 -> {
+            handleWhoisBot(message)
+            handleWhoisNumeric(numeric, message)
+        }
         numeric in WHOIS_NUMERICS -> handleWhoisNumeric(numeric, message)
-        numeric == 730 || numeric == 731 -> serverLine(message, "monitor")
+        numeric == 341 -> handleInviting(message)
+        numeric in 730..732 -> handleMonitorStatus(numeric, message)
         numeric in 400..599 -> serverLine(message, "error")
         else -> serverLine(message)
     }

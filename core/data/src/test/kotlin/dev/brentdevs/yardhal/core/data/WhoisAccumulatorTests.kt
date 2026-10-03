@@ -39,6 +39,14 @@ class WhoisAccumulatorTests {
     }
 
     @Test
+    fun botNumericMarksWhoisAsBot() {
+        accumulator.handle(311, listOf("me", "robo", "u", "h", "*", "Robot"))
+        assertNull(accumulator.handle(335, listOf("me", "robo", "is a Bot")))
+        val complete = accumulator.handle(318, listOf("me", "robo", "end"))
+        assertTrue(complete?.isBot == true)
+    }
+
+    @Test
     fun resetClearsState() {
         accumulator.handle(311, listOf("me", "x", "u", "h", "*", "X"))
         accumulator.reset()

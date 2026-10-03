@@ -64,6 +64,8 @@ public data class IrcConnectionConfig(
             "userhost-in-names",
             "chghost",
             "setname",
+            "invite-notify",
+            "extended-monitor",
             "cap-notify",
             "sasl",
             "znc.in/playback",

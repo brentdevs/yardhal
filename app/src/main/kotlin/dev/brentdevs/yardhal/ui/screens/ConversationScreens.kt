@@ -69,7 +69,7 @@ private sealed interface TranscriptEntry {
     public data class Message(public val value: ChatMessage, public val groupedWithPrevious: Boolean) : TranscriptEntry
 }
 
-public enum class MemberAction { MESSAGE, WHOIS, KICK, BAN, IGNORE }
+public enum class MemberAction { MESSAGE, WHOIS, KICK, BAN, BAN_ACCOUNT, IGNORE }
 
 private fun buildTranscript(buffer: ConversationBuffer): List<TranscriptEntry> {
     val zone = ZoneId.systemDefault()
@@ -149,6 +149,8 @@ public fun ConversationScreen(
     onOpenAppearance: () -> Unit = {},
     onMemberAction: (MemberAction, String) -> Unit = { _, _ -> },
     onOpenDm: (String) -> Unit = {},
+    hasBotMode: Boolean = false,
+    accountBanAvailable: Boolean = false,
     sharedDraft: String? = null,
     onSharedConsumed: () -> Unit = {},
     onPickFile: () -> Unit = {},
@@ -427,8 +429,11 @@ public fun ConversationScreen(
     if (membersVisible) {
         val operators = buffer.members.filter { it.isOperator }
         val voices = buffer.members.filter { it.isVoice }
-        val bots = buffer.members.filter { it.looksLikeBot }
-        val plain = buffer.members.filter { member -> !member.isOperator && !member.isVoice && !member.looksLikeBot }
+        val isBot: (dev.brentdevs.yardhal.core.data.ChannelMember) -> Boolean = { member ->
+            buffer.memberPresence[member.nick]?.isBot == true || (!hasBotMode && member.looksLikeBot)
+        }
+        val bots = buffer.members.filter { isBot(it) }
+        val plain = buffer.members.filter { member -> !member.isOperator && !member.isVoice && !isBot(member) }
         ModalBottomSheet(onDismissRequest = { membersVisible = false }) {
             Text(
                 text = "Members · ${buffer.members.size}",
@@ -483,7 +488,7 @@ public fun ConversationScreen(
                             Text(member.nick, style = MaterialTheme.typography.bodyLarge)
                             presence?.account?.let { account ->
                                 Text(
-                                    text = account,
+                                    text = "✓ $account",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.padding(start = 8.dp),
@@ -516,6 +521,13 @@ public fun ConversationScreen(
                         }
                         TextButton(onClick = { onMemberAction(MemberAction.BAN, nick); memberTarget = null }) {
                             Text("Ban")
+                        }
+                        val account = buffer.memberPresence[nick]?.account
+                        TextButton(
+                            enabled = accountBanAvailable && account != null,
+                            onClick = { onMemberAction(MemberAction.BAN_ACCOUNT, nick); memberTarget = null },
+                        ) {
+                            Text(if (account != null) "Ban account ($account)" else "Ban account")
                         }
                     }
                     TextButton(onClick = { onMemberAction(MemberAction.IGNORE, nick); memberTarget = null }) {

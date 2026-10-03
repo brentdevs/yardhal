@@ -113,4 +113,30 @@ class ISupportTests {
         assertTrue(support.supports("SAFELIST"))
         assertFalse(support.supports("WALLCHOPS"))
     }
+
+    @Test
+    fun accountExtbanCombinesPrefixAndFirstName() {
+        val short = ISupport.parse(listOf("EXTBAN=$,ARar", "ACCOUNTEXTBAN=R"))
+        assertEquals(AccountExtban("$", "R"), short.accountExtban)
+        assertEquals("\$R:bob", short.accountExtban?.mask("bob"))
+        val long = ISupport.parse(listOf("EXTBAN=~,a", "ACCOUNTEXTBAN=account,a"))
+        assertEquals("~account:bob", long.accountExtban?.mask("bob"))
+        val unprefixed = ISupport.parse(listOf("EXTBAN=,ACNOR", "ACCOUNTEXTBAN=R"))
+        assertEquals("R:bob", unprefixed.accountExtban?.mask("bob"))
+    }
+
+    @Test
+    fun accountExtbanRequiresBothTokens() {
+        assertNull(ISupport.parse(listOf("EXTBAN=~,a")).accountExtban)
+        assertNull(ISupport.parse(listOf("ACCOUNTEXTBAN=a")).accountExtban)
+        assertNull(ISupport.parse(listOf("EXTBAN=a", "ACCOUNTEXTBAN=a")).accountExtban)
+        val merged = ISupport.parse(listOf("EXTBAN=~,a")).mergedWith(ISupport.parse(listOf("ACCOUNTEXTBAN=a")))
+        assertEquals("~a:bob", merged.accountExtban?.mask("bob"))
+    }
+
+    @Test
+    fun botModeLetterParsed() {
+        assertEquals('B', ISupport.parse(listOf("BOT=B")).botModeLetter)
+        assertNull(ISupport.EMPTY.botModeLetter)
+    }
 }

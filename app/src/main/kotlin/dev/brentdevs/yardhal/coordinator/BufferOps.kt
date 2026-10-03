@@ -18,6 +18,7 @@ internal fun reconcileEcho(
     msgid: String?,
     timestampMs: Long,
     attachmentUrl: String?,
+    senderAccount: String? = null,
 ): ConversationBuffer? {
     val index = if (echoLabel != null) {
         buffer.messages.indexOfFirst { it.pendingEcho && it.echoLabel == echoLabel }
@@ -33,6 +34,7 @@ internal fun reconcileEcho(
         attachmentUrl = attachmentUrl,
         pendingEcho = false,
         echoLabel = null,
+        senderAccount = senderAccount,
     )
     return buffer.copy(messages = messages)
 }

@@ -11,6 +11,7 @@ internal fun Reduction.handleJoin(message: IrcMessage) {
     val channelName = message.parameters.firstOrNull() ?: return
     val ref = state.channelRef(channelName)
     val fromUs = state.isOwnNick(nick)
+    recordJoinIdentity(nick, message)
     if (!fromUs) addMember(ref, ChannelMember(nick))
     if (!fromUs && state.netsplit.isSuppressing("JOIN")) {
         state.netsplit.recordSuppressed("JOIN")
@@ -110,10 +111,13 @@ internal fun Reduction.handleNoTopic(message: IrcMessage) {
 
 internal fun Reduction.accumulateNames(message: IrcMessage) {
     if (message.parameters.size < 2) return
-    val (channelName, members) = NamesParser.parseNamesLine(message.parameters.drop(1), state.prefixModes)
+    val (channelName, entries) = NamesParser.parseNamesLine(message.parameters.drop(1), state.prefixModes)
     val ref = state.channelRef(channelName ?: return)
     val pending = state.pendingNames.getOrPut(ref.storageKey) { LinkedHashMap() }
-    for (member in members) pending[state.fold(member.nick)] = member
+    for (entry in entries) {
+        pending[state.fold(entry.member.nick)] = entry.member
+        writeUser(entry.member.nick) { it.copy(user = entry.user ?: it.user, host = entry.host ?: it.host) }
+    }
 }
 
 internal fun Reduction.accumulateWhoLine(message: IrcMessage) {
@@ -123,7 +127,14 @@ internal fun Reduction.accumulateWhoLine(message: IrcMessage) {
     val flags = message.parameters[6]
     val symbol = state.prefixModes.symbols.firstOrNull { it in flags }
     state.pendingNames.getOrPut(ref.storageKey) { LinkedHashMap() }[state.fold(nick)] = ChannelMember(nick, symbol)
-    updatePresence(nick, away = flags.contains('G'), account = null, keepAccount = true)
+    val realName = message.parameters.getOrNull(7)?.substringAfter(' ', "")?.takeIf { it.isNotEmpty() }
+    writeUser(nick) { presence ->
+        whoFlags(presence, flags).copy(
+            user = message.parameters[2],
+            host = message.parameters[3],
+            realName = realName ?: presence.realName,
+        )
+    }
 }
 
 internal fun Reduction.finalizeNames(message: IrcMessage) {
@@ -140,13 +151,19 @@ internal fun Reduction.finalizeNames(message: IrcMessage) {
 }
 
 internal fun Reduction.handleWhoXLine(message: IrcMessage) {
-    if (message.parameters.size < 6) return
+    if (message.parameters.size < 8) return
     val fields = message.parameters.drop(1)
     val channelName = fields[0]
-    val nick = fields[2]
-    val flags = fields[3]
-    val account = fields[4].takeIf { it != "0" }
-    updatePresence(nick, away = flags.contains('G'), account = account, keepAccount = false)
+    val nick = fields[3]
+    val flags = fields[4]
+    writeUser(nick) { presence ->
+        whoFlags(presence, flags).copy(
+            user = fields[1],
+            host = fields[2],
+            account = fields[5].takeIf { it != "0" },
+            realName = fields[6],
+        )
+    }
     if (state.isChannelName(channelName)) {
         val ref = state.channelRef(channelName)
         val channel = channelOrCreate(ref)
@@ -159,11 +176,13 @@ internal fun Reduction.handleWhoXLine(message: IrcMessage) {
     publishChannelsContaining(nick, exceptRawTarget = channelName)
 }
 
-internal fun Reduction.updatePresence(nick: String, away: Boolean, account: String?, keepAccount: Boolean) {
-    val folded = state.fold(nick)
-    val existing = state.users[folded] ?: UserState(nick)
-    val resolvedAccount = if (keepAccount) existing.presence?.account else account
-    state.users[folded] = existing.copy(presence = PresenceState(away = away, account = resolvedAccount))
+internal fun Reduction.whoFlags(presence: PresenceState, flags: String): PresenceState {
+    val away = flags.contains('G')
+    return presence.copy(
+        away = away,
+        awayMessage = if (away) presence.awayMessage else null,
+        isBot = state.botModeLetter?.let { it in flags } ?: presence.isBot,
+    )
 }
 
 internal fun Reduction.publishChannelsContaining(nick: String, exceptRawTarget: String? = null) {
@@ -196,5 +215,5 @@ internal fun Reduction.removeMember(nick: String, storageKey: String?) {
         if (storageKey != null && key != storageKey) continue
         pending.remove(folded)
     }
-    if (state.channels.values.none { folded in it.members }) state.users.remove(folded)
+    if (!state.isTracked(folded)) state.users.remove(folded)
 }

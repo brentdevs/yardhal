@@ -144,6 +144,7 @@ class ErgoRoundTripTest {
             val isupport = kotlinx.coroutines.CompletableDeferred<Unit>()
             val joinEcho = kotlinx.coroutines.CompletableDeferred<IrcMessage>()
             val echoBack = kotlinx.coroutines.CompletableDeferred<IrcMessage>()
+            val setnameEcho = kotlinx.coroutines.CompletableDeferred<IrcMessage>()
             scope.launch {
                 connection.events.collect { event ->
                     if (event !is IrcEvent.MessageReceived) return@collect
@@ -158,6 +159,7 @@ class ErgoRoundTripTest {
                         "PRIVMSG" -> if (event.message.parameters.lastOrNull()?.contains("roundtrip-payload") == true) {
                             echoBack.complete(event.message)
                         }
+                        "SETNAME" -> setnameEcho.complete(event.message)
                     }
                 }
             }
@@ -171,6 +173,11 @@ class ErgoRoundTripTest {
             connection.send(IrcMessage(command = "JOIN", parameters = listOf("#yardhal-roundtrip")))
             val joined = withTimeout(10_000) { joinEcho.await() }
             assertEquals("#yardhal-roundtrip", joined.parameters.firstOrNull())
+            assertEquals(
+                listOf("#yardhal-roundtrip", "*", "Yardhal Ergo Round Trip"),
+                joined.parameters,
+                "extended-join must carry account placeholder and realname",
+            )
 
             connection.send(
                 IrcMessage(
@@ -182,6 +189,11 @@ class ErgoRoundTripTest {
             assertTrue(echoed.tags.containsKey("msgid"), "echo-message must carry msgid")
             assertTrue(echoed.tags.containsKey("time"), "server-time tag expected on echo")
             assertEquals("yardhal-it", echoed.prefix?.nick)
+
+            connection.send(IrcMessage(command = "SETNAME", parameters = listOf("Renamed Round Trip")))
+            val renamed = withTimeout(10_000) { setnameEcho.await() }
+            assertEquals("yardhal-it", renamed.prefix?.nick)
+            assertEquals(listOf("Renamed Round Trip"), renamed.parameters)
 
             connection.disconnect()
         } finally {
