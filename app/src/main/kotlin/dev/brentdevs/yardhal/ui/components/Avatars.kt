@@ -1,22 +1,29 @@
 package dev.brentdevs.yardhal.ui.components
 
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.brentdevs.yardhal.coordinator.ConnectionStatus
+import dev.brentdevs.yardhal.ui.image.LocalRemoteImageLoader
+import dev.brentdevs.yardhal.ui.image.rememberRemoteImage
 import dev.brentdevs.yardhal.ui.theme.nickColor
 
 @Composable
@@ -24,7 +31,21 @@ public fun NickAvatar(
     nick: String,
     modifier: Modifier = Modifier,
     size: Dp = 38.dp,
+    avatarUrl: String? = null,
 ) {
+    val image by rememberRemoteImage(LocalRemoteImageLoader.current, avatarUrl, size.roundToPxInt())
+    val loaded = image
+    if (loaded != null) {
+        Image(
+            bitmap = loaded,
+            contentDescription = null,
+            contentScale = ContentScale.Crop,
+            modifier = modifier
+                .size(size)
+                .clip(CircleShape),
+        )
+        return
+    }
     val color = nickColor(nick)
     val initial = nick.firstOrNull { it.isLetterOrDigit() }?.uppercase() ?: "?"
     Box(
@@ -42,6 +63,35 @@ public fun NickAvatar(
         )
     }
 }
+
+@Composable
+public fun NetworkBadge(
+    status: ConnectionStatus,
+    iconUrl: String?,
+    modifier: Modifier = Modifier,
+    size: Dp = 22.dp,
+) {
+    val image by rememberRemoteImage(LocalRemoteImageLoader.current, iconUrl, size.roundToPxInt())
+    val loaded = image
+    if (loaded == null) {
+        StatusDot(status, modifier)
+        return
+    }
+    Box(modifier = modifier.size(size)) {
+        Image(
+            bitmap = loaded,
+            contentDescription = null,
+            contentScale = ContentScale.Crop,
+            modifier = Modifier
+                .size(size)
+                .clip(RoundedCornerShape(size * 0.25f)),
+        )
+        StatusDot(status, Modifier.align(Alignment.BottomEnd), size = size * 0.4f)
+    }
+}
+
+@Composable
+private fun Dp.roundToPxInt(): Int = with(LocalDensity.current) { roundToPx() }
 
 @Composable
 public fun StatusDot(

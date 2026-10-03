@@ -2,9 +2,19 @@ package dev.brentdevs.yardhal.coordinator
 
 import dev.brentdevs.yardhal.core.data.MessageKind
 import dev.brentdevs.yardhal.core.protocol.IrcMessage
+import dev.brentdevs.yardhal.core.protocol.IrcMetadata
 
 private val JOIN_FAILURE_NUMERICS = setOf(403, 405, 437, 471, 473, 474, 475)
 private val WHOIS_NUMERICS = (301..319).toSet() - setOf(305, 306) + 330
+private val METADATA_NUMERICS = setOf(
+    IrcMetadata.RPL_WHOISKEYVALUE,
+    IrcMetadata.RPL_KEYVALUE,
+    IrcMetadata.RPL_KEYNOTSET,
+    IrcMetadata.RPL_METADATASUBOK,
+    IrcMetadata.RPL_METADATAUNSUBOK,
+    IrcMetadata.RPL_METADATASUBS,
+    IrcMetadata.RPL_METADATASYNCLATER,
+)
 
 internal fun Reduction.handleNumeric(numeric: Int, message: IrcMessage) {
     when {
@@ -21,6 +31,7 @@ internal fun Reduction.handleNumeric(numeric: Int, message: IrcMessage) {
         numeric in JOIN_FAILURE_NUMERICS -> handleJoinFailure(message)
         numeric in WHOIS_NUMERICS -> handleWhoisNumeric(numeric, message)
         numeric == 730 || numeric == 731 -> serverLine(message, "monitor")
+        numeric in METADATA_NUMERICS -> handleMetadataNumeric(numeric, message)
         numeric in 400..599 -> serverLine(message, "error")
         else -> serverLine(message)
     }

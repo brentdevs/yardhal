@@ -12,6 +12,7 @@ public data class UiNetwork(
     public val host: String,
     public val status: ConnectionStatus,
     public val ownNick: String,
+    public val iconUrl: String? = null,
 ) {
     public val storagePrefix: String get() = id
 }

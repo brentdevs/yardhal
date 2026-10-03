@@ -52,6 +52,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.brentdevs.yardhal.coordinator.ConnectionStatus
 import dev.brentdevs.yardhal.coordinator.ConversationBuffer
 import dev.brentdevs.yardhal.coordinator.LiveCoordinator
+import dev.brentdevs.yardhal.coordinator.NetworkProfiles
 import dev.brentdevs.yardhal.core.data.ConversationRef
 import dev.brentdevs.yardhal.core.data.ChatAppearanceStore
 import dev.brentdevs.yardhal.ui.screens.AddNetworkSheet
@@ -81,6 +82,7 @@ public fun YardhalAppRoot(
     val bouncerVersion by coordinator.bouncerVersion.collectAsStateWithLifecycle()
     val mutedKeys by coordinator.mutedState.collectAsStateWithLifecycle()
     val orderState by coordinator.orderState.collectAsStateWithLifecycle()
+    val profiles by coordinator.profiles.collectAsStateWithLifecycle()
 
     var addNetworkVisible by remember { mutableStateOf(false) }
     var pendingPreset by remember { mutableStateOf<NetworkPresetUi?>(null) }
@@ -251,6 +253,7 @@ public fun YardhalAppRoot(
                     },
                     sharedDraft = sharedDraft,
                     onSharedConsumed = onSharedConsumed,
+                    profiles = profiles[networkId] ?: NetworkProfiles.EMPTY,
                     onPickFile = { launchAttachmentPicker() },
                     modifier = Modifier.fillMaxSize(),
                 )

@@ -11,6 +11,8 @@ import dev.brentdevs.yardhal.core.data.WhoisAccumulator
 import dev.brentdevs.yardhal.core.protocol.CaseMapping
 import dev.brentdevs.yardhal.core.protocol.ChannelPrefixModes
 import dev.brentdevs.yardhal.core.protocol.IrcMessage
+import dev.brentdevs.yardhal.core.protocol.IrcMetadata
+import dev.brentdevs.yardhal.core.protocol.MetadataCapability
 
 public class InboundContext(
     public val nowMs: Long,
@@ -29,12 +31,19 @@ public data class OpenBatch(
 public data class UserState(
     public val nick: String,
     public val presence: PresenceState? = null,
-)
+    public val metadata: Map<String, String> = emptyMap(),
+) {
+    public val profile: UserProfile?
+        get() = UserProfile.from(metadata)
+}
 
 public class ChannelState(public val ref: ConversationRef) {
     internal val members: LinkedHashMap<String, ChannelMember> = LinkedHashMap()
+    internal val metadata: LinkedHashMap<String, String> = LinkedHashMap()
 
     public fun memberList(): List<ChannelMember> = members.values.sortedBy { it.nick.lowercase() }
+
+    public fun metadataValue(key: String): String? = metadata[key]
 }
 
 public class PerNetworkState(
@@ -60,6 +69,17 @@ public class PerNetworkState(
         internal set
     public var whoisExpected: Boolean = false
     public var listingChannels: Boolean = false
+    public var registered: Boolean = false
+        internal set
+    public var connectionEpoch: Int = 0
+        internal set
+    public var metadataCapability: MetadataCapability? = null
+        internal set
+    public var metadataSubscriptions: Set<String> = emptySet()
+        internal set
+    public var networkIconUrl: String? = null
+        internal set
+    private var publishedProfileVersion: Long = 0
 
     public val bouncerStore: BouncerNetworkStore = BouncerNetworkStore()
 
@@ -68,7 +88,7 @@ public class PerNetworkState(
     internal val openBatches: LinkedHashMap<String, OpenBatch> = LinkedHashMap()
     internal val pendingNames: LinkedHashMap<String, LinkedHashMap<String, ChannelMember>> = LinkedHashMap()
     internal val channels: LinkedHashMap<String, ChannelState> = LinkedHashMap()
-    internal val users: LinkedHashMap<String, UserState> = LinkedHashMap()
+    internal val users: UserTable = UserTable()
 
     public val server: ConversationRef get() = ConversationRef.server(networkId)
 
@@ -100,13 +120,21 @@ public class PerNetworkState(
         val reduction = Reduction(this, context)
         when (event) {
             is IrcEvent.ConnectionOpened -> resetConnectionScopedState()
-            is IrcEvent.CapabilitiesNegotiated -> reduction.handleCapabilities(event.capabilities)
+            is IrcEvent.CapabilitiesNegotiated -> reduction.handleCapabilities(event.capabilities, event.values)
             is IrcEvent.SaslResult -> Unit
             is IrcEvent.Registered -> reduction.handleRegistered(event.nickname)
             is IrcEvent.MessageReceived -> reduction.handleMessage(event.message)
             is IrcEvent.Disconnected -> reduction.emit(InboundEffect.StatusChanged(ConnectionStatus.CONNECTING))
         }
+        publishProfilesIfChanged(reduction)
         return reduction.effects
+    }
+
+    private fun publishProfilesIfChanged(reduction: Reduction) {
+        if (users.profileVersion == publishedProfileVersion) return
+        if (openBatches.values.any { it.type in PROFILE_DEFERRING_BATCHES }) return
+        publishedProfileVersion = users.profileVersion
+        reduction.emit(InboundEffect.ProfilesChanged(NetworkProfiles(casemapping, LinkedHashMap(users.profiles))))
     }
 
     private fun resetConnectionScopedState() {
@@ -115,6 +143,14 @@ public class PerNetworkState(
         whois.reset()
         whoisExpected = false
         supportedCaps = emptySet()
+        registered = false
+        connectionEpoch += 1
+        metadataCapability = null
+        metadataSubscriptions = emptySet()
+        for (channel in channels.values) channel.metadata.clear()
+        for ((key, user) in users.entries.toList()) {
+            if (user.metadata.isNotEmpty()) users[key] = user.copy(metadata = emptyMap())
+        }
     }
 
     internal fun memberSnapshot(channel: ChannelState): InboundEffect.SetMembers {
@@ -191,6 +227,8 @@ internal fun Reduction.handleMessage(message: IrcMessage) {
         command == "KICK" -> handleKick(message)
         command == "TOPIC" -> handleTopicVerb(message)
         command == "NICK" -> handleNickChange(message)
+        command == IrcMetadata.COMMAND -> handleMetadataMessage(message)
+        command == "FAIL" && message.parameters.firstOrNull() == IrcMetadata.COMMAND -> handleMetadataFail(message)
         command == "FAIL" || command == "WARN" -> serverLine(message, command.lowercase())
         command == "NOTE" -> serverLine(message, "note")
         numeric != null -> handleNumeric(numeric, message)

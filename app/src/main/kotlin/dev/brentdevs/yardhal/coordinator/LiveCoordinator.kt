@@ -23,10 +23,13 @@ import dev.brentdevs.yardhal.core.data.StoredMessage
 import dev.brentdevs.yardhal.core.protocol.CaseMapping
 import dev.brentdevs.yardhal.core.protocol.IrcCtcp
 import dev.brentdevs.yardhal.core.protocol.IrcMessage
+import dev.brentdevs.yardhal.core.protocol.IrcMetadata
+import dev.brentdevs.yardhal.ui.image.ImageUrlPolicy
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -61,6 +64,9 @@ public class LiveCoordinator(
 
     private val _buffers = MutableStateFlow<Map<String, ConversationBuffer>>(emptyMap())
     public val buffers: StateFlow<Map<String, ConversationBuffer>> = _buffers.asStateFlow()
+
+    private val _profiles = MutableStateFlow<Map<String, NetworkProfiles>>(emptyMap())
+    public val profiles: StateFlow<Map<String, NetworkProfiles>> = _profiles.asStateFlow()
 
     private val _whois = MutableStateFlow<dev.brentdevs.yardhal.core.data.WhoisInfo?>(null)
     public val whois: StateFlow<dev.brentdevs.yardhal.core.data.WhoisInfo?> = _whois.asStateFlow()
@@ -140,6 +146,7 @@ public class LiveCoordinator(
         networkStore.remove(networkId)
         scope.launch { messageStore.deleteNetwork(networkId) }
         _buffers.value = _buffers.value.filterValues { it.ref.networkId != networkId }
+        _profiles.update { it - networkId }
     }
 
     private fun launchSession(session: Session) {
@@ -211,6 +218,15 @@ public class LiveCoordinator(
     private fun processEffect(session: Session, effect: InboundEffect) {
         when (effect) {
             is InboundEffect.SendRaw -> sendRaw(session, effect.line)
+            is InboundEffect.ScheduleRaw -> scope.launch {
+                delay(effect.delayMs)
+                val epoch = synchronized(session.state) { session.state.connectionEpoch }
+                if (sessions[session.config.id] === session && epoch == effect.connectionEpoch) {
+                    sendRaw(session, effect.line)
+                }
+            }
+            is InboundEffect.ProfilesChanged -> _profiles.update { it + (session.config.id to effect.profiles) }
+            is InboundEffect.NetworkIconChanged -> refreshNetworkStates()
             is InboundEffect.StatusChanged -> {
                 if (effect.status != ConnectionStatus.REGISTERED && session.quitRequested) return
                 session.statusFlow.value = effect.status
@@ -843,6 +859,7 @@ public class LiveCoordinator(
                 host = session.config.host,
                 status = session.statusFlow.value,
                 ownNick = session.state.ownNick,
+                iconUrl = session.state.networkIconUrl,
             )
         }.sortedBy { it.name }
     }
@@ -976,10 +993,32 @@ public class LiveCoordinator(
             is SlashCommand.Help -> appendSystem(
                 session,
                 active,
-                "Commands: /me /msg /query /join /part /nick /topic /away /back /quit /whois /kick /ban /mode /ctcp /raw",
+                "Commands: /me /msg /query /join /part /nick /topic /away /back /quit /whois /kick /ban /mode /ctcp " +
+                    "/setavatar /setdisplayname /raw",
             )
             is SlashCommand.Raw -> sendRaw(session, command.line)
+            is SlashCommand.SetAvatar -> setOwnMetadata(session, active, IrcMetadata.KEY_AVATAR, command.url)
+            is SlashCommand.SetDisplayName ->
+                setOwnMetadata(session, active, IrcMetadata.KEY_DISPLAY_NAME, command.name)
         }
+    }
+
+    private fun setOwnMetadata(session: Session, active: ConversationRef, key: String, rawValue: String?) {
+        val capability = session.state.metadataCapability
+        if (capability == null) {
+            appendSystem(session, active, "This network does not support ${IrcMetadata.CAPABILITY}.")
+            return
+        }
+        val value = rawValue?.let(::sanitizeOutboundText)
+        if (key == IrcMetadata.KEY_AVATAR && value != null && !ImageUrlPolicy.isAllowed(value)) {
+            appendSystem(session, active, "Avatar URLs must use https://")
+            return
+        }
+        if (value != null && !capability.allowsValue(value)) {
+            appendSystem(session, active, "Value exceeds the server limit of ${capability.maxValueBytes} bytes.")
+            return
+        }
+        sendRaw(session, IrcMetadata.setCommand(key, value))
     }
 
     private fun resolveTargetRef(session: Session, target: String): ConversationRef = session.state.targetRef(target)

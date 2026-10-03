@@ -60,6 +60,7 @@ public data class IrcConnectionConfig(
             "sasl",
             "znc.in/playback",
             "draft/read-marker",
+            "draft/metadata-2",
             dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.CAPABILITY,
             dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.NOTIFY_CAPABILITY,
         )
@@ -74,7 +75,10 @@ public data class KeepAliveConfig(
 
 public sealed interface IrcEvent {
     public data object ConnectionOpened : IrcEvent
-    public data class CapabilitiesNegotiated(public val capabilities: Set<String>) : IrcEvent
+    public data class CapabilitiesNegotiated(
+        public val capabilities: Set<String>,
+        public val values: Map<String, String> = emptyMap(),
+    ) : IrcEvent
     public data class SaslResult(public val outcome: SaslOutcome) : IrcEvent
     public data class Registered(public val nickname: String, public val welcomeText: String) : IrcEvent
     public data class MessageReceived(public val message: IrcMessage) : IrcEvent
@@ -215,7 +219,9 @@ public class IrcConnection(
                     }
                 },
                 onFinished = {
-                    emit(IrcEvent.CapabilitiesNegotiated(LinkedHashSet(negotiator?.acknowledged ?: emptySet())))
+                    val acknowledged = LinkedHashSet(negotiator?.acknowledged ?: emptySet())
+                    val values = negotiator?.advertisedValues.orEmpty().filterKeys { it in acknowledged }
+                    emit(IrcEvent.CapabilitiesNegotiated(acknowledged, values))
                     sendNickUser()
                 },
             )

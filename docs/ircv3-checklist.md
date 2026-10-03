@@ -62,11 +62,11 @@ Phase numbers refer to `docs/architecture.md`.
 - [ ] invite-notify: INVITE system lines for ops (P5)
 - [ ] bot-mode: BOT ISUPPORT letter + badge (P5)
 - [ ] account-extban: ban-account option in moderation menus (P6)
-- [ ] draft/metadata-2: METADATA GET/SET/SUB, avatars/display names (P5)
+- [x] draft/metadata-2: cap limits parsed; SUB avatar/display-name before autojoin; METADATA/761/766/770–774/FAIL handled; metadata batches; SYNC retry on 774; /setavatar /setdisplayname; HTTPS-only cached avatars + display names in rows/member sheet (P5; Ergo 2.14 lacks metadata, covered by reducer + loopback tests)
 - [x] soju.im/FILEHOST ISUPPORT: endpoint discovery, TLS-policy enforcement, authenticated POST with multipart fallback, attachment-tagged messages (P8)
 - [ ] UTF8ONLY: always transmit UTF-8, skip legacy encoding heuristics (P5)
 - [ ] draft/extended-isupport: full ISUPPORT set pre-registration (P5)
-- [ ] draft/ICON: network icon ISUPPORT token fetch/cache (P6)
+- [x] draft/ICON: ISUPPORT token (with \xHH unescape, `{size}` template, `-draft/ICON`) shown on the network header via the HTTPS-only image cache (P6)
 - [ ] draft/channel-rename: RENAME moves buffer/transcript/unread state (P5)
 - [ ] client-batch: infrastructure only; no production use until ratified
 - [ ] WebSocket transport: n/a (native TCP/TLS client)

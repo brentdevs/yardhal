@@ -53,11 +53,13 @@ import dev.brentdevs.yardhal.coordinator.ChatMessage
 import dev.brentdevs.yardhal.coordinator.ConversationBuffer
 import dev.brentdevs.yardhal.coordinator.ConnectionStatus
 import dev.brentdevs.yardhal.coordinator.JoinState
+import dev.brentdevs.yardhal.coordinator.NetworkProfiles
 import dev.brentdevs.yardhal.core.data.ChatAppearancePreferences
 import dev.brentdevs.yardhal.ui.components.DayPill
 import dev.brentdevs.yardhal.ui.components.MessageRow
+import dev.brentdevs.yardhal.ui.components.NetworkBadge
 import dev.brentdevs.yardhal.ui.components.NewMessagesDivider
-import dev.brentdevs.yardhal.ui.components.StatusDot
+import dev.brentdevs.yardhal.ui.components.NickAvatar
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
@@ -151,6 +153,7 @@ public fun ConversationScreen(
     onOpenDm: (String) -> Unit = {},
     sharedDraft: String? = null,
     onSharedConsumed: () -> Unit = {},
+    profiles: NetworkProfiles = NetworkProfiles.EMPTY,
     onPickFile: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
@@ -371,6 +374,7 @@ public fun ConversationScreen(
                                         message.msgid?.let { msgid -> onReact(msgid, emoji) }
                                     },
                                     onOpenAttachment = ::openLink,
+                                    profile = message.sender.takeIf { it.isNotEmpty() }?.let(profiles::forNick),
                                 )
                             }
                         }
@@ -455,6 +459,7 @@ public fun ConversationScreen(
                     items(section.size, key = { index -> "member-${label}-${section[index].nick}" }) { index ->
                         val member = section[index]
                         val presence = buffer.memberPresence[member.nick]
+                        val memberProfile = profiles.forNick(member.nick)
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -472,6 +477,12 @@ public fun ConversationScreen(
                                 style = MaterialTheme.typography.labelSmall,
                                 modifier = Modifier.padding(end = 8.dp),
                             )
+                            NickAvatar(
+                                nick = member.nick,
+                                size = 28.dp,
+                                avatarUrl = memberProfile?.avatarUrl,
+                                modifier = Modifier.padding(end = 8.dp),
+                            )
                             if (member.symbol != null) {
                                 Text(
                                     text = member.symbol.toString(),
@@ -481,6 +492,15 @@ public fun ConversationScreen(
                                 )
                             }
                             Text(member.nick, style = MaterialTheme.typography.bodyLarge)
+                            memberProfile?.displayName?.let { displayName ->
+                                Text(
+                                    text = displayName,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    modifier = Modifier.padding(start = 8.dp),
+                                )
+                            }
                             presence?.account?.let { account ->
                                 Text(
                                     text = account,
@@ -810,7 +830,7 @@ public fun NetworkOverviewScreen(
                                 .padding(start = 16.dp, end = 12.dp, top = 14.dp, bottom = 4.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            StatusDot(network.status)
+                            NetworkBadge(network.status, network.iconUrl)
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
                                 text = network.name,
