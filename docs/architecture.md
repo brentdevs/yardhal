@@ -28,10 +28,10 @@ Each layer depends only on the ones below it.
   CTCP, batches, ISUPPORT, casemapping, numerics as sealed types. Pure
   Kotlin value types; no sockets, no coroutines, no Android.
 - **`core/client`** — `IrcConnection` (TLS socket via `javax.net.ssl`),
-  `LineFramer`, `BatchAssembler`, `CapabilityNegotiator` (CAP LS 302),
-  SASL handlers (PLAIN first; SCRAM-SHA-256 later), `Reconnector` with
-  backoff, STS policy handling. Exposes inbound events as a `Flow`.
-  One `IrcConnection` per network.
+  `LineFramer`, `CapabilityNegotiator` (CAP LS 302), SASL handlers,
+  `IrcReconnector` with backoff, STS policy handling, filehost uploads.
+  Exposes inbound events as a `Flow`. One `IrcConnection` per network.
+  IRCv3 batches are tracked by the app-layer reducer, not here.
 - **`core/data`** — Android library holding persistent stores:
   `NetworkStore` (kotlinx.serialization + file/DataStore),
   `MessageStore` (Room, dedup by `msgid` or content hash,
@@ -44,21 +44,40 @@ Each layer depends only on the ones below it.
 
 ## Data flow on an inbound message
 
-Actual shape (ported from Halyard):
+1. Bytes off the TLS socket → `LineFramer` splits on `\r\n` (`core/client`).
+2. Each line parses to an `IrcMessage` (`core/protocol`). `IrcConnection`
+   consumes connection-scoped traffic itself (PING, CAP, SASL, STS, nick
+   collisions during registration) and emits everything as `IrcEvent`s.
+3. `IrcReconnector` re-creates connections with backoff and republishes
+   their events as one `Flow` per network.
+4. `LiveCoordinator` collects that flow and, under a per-session lock, calls
+   `PerNetworkState.apply(event, InboundContext)`.
+5. `PerNetworkState` (`app/.../coordinator/PerNetworkState.kt`) is the pure
+   reducer. It owns per-network protocol state — casemapping, own nick,
+   negotiated caps, ISUPPORT-derived settings, open batches, NAMES/WHO
+   accumulation, channel membership, per-user presence, netsplit tracking,
+   WHOIS assembly — mutates it directly, and returns a `List<InboundEffect>`
+   for everything that crosses into UI state or the outside world. It never
+   writes to sockets, stores, coroutine scopes or StateFlows; read-only
+   queries it needs (clock, ignore list, which buffers exist, read markers)
+   arrive through `InboundContext`. Handlers are grouped by concern in
+   `SessionReducer.kt`, `MembershipReducer.kt`, `ChatReducer.kt` and
+   `NumericReducer.kt`.
+6. `LiveCoordinator.processEffect` executes each `InboundEffect`: append or
+   reconcile a message (and persist it to Room fire-and-forget), replace a
+   member snapshot, set topic/join state/typing/reactions, redact, apply a
+   read marker, send a raw line, publish WHOIS/LIST/bouncer updates. Pure
+   buffer transforms live in `BufferOps.kt`.
+7. Compose observes the coordinator's StateFlows.
 
-1. Bytes off the TLS socket → `LineFramer` splits on `\r\n`.
-2. Each line parses to an `IrcMessage` (`core/protocol`).
-3. `BatchAssembler` buffers IRCv3 BATCH members or delivers immediately.
-4. `LiveCoordinator`'s inbound reader consumes the connection's `Flow`.
-5. The message runs through `PerNetworkState.apply(...)` — a pure-function
-   reducer that mutates per-network state directly where it owns it and
-   returns `[InboundEffect]` for everything crossing into UI-visible state.
-6. `processEffect` translates effects into coordinator mutators
-   (append message, replace members, bump revision...).
-7. Compose observes StateFlows; Room persists fire-and-forget.
+Reducer behaviour is pinned by plain-JVM tests
+(`app/src/test/.../coordinator/*ReducerTests.kt`, `PerNetworkStateTests.kt`)
+that feed raw lines and assert on returned effects and state.
 
-Outbound mirrors it: composer line → `SlashCommand.parse` → verb handler →
-connection send.
+Outbound mirrors it: composer line → `SlashCommandParser.parse` →
+`LiveCoordinator.dispatchCommand` → connection send. Coordinator calls that
+change protocol state (WHOIS expectation, LIST browsing, leaving a channel)
+go through the same per-session lock.
 
 ## Conventions
 
