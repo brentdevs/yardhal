@@ -56,6 +56,8 @@ public data class IrcConnectionConfig(
             "userhost-in-names",
             "chghost",
             "setname",
+            "draft/multiline",
+            "draft/channel-rename",
             "cap-notify",
             "sasl",
             "znc.in/playback",

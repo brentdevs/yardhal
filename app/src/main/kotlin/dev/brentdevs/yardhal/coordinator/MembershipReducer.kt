@@ -93,6 +93,20 @@ internal fun Reduction.handleNickChange(message: IrcMessage) {
     }
 }
 
+internal fun Reduction.handleRename(message: IrcMessage) {
+    if (message.parameters.size < 2) return
+    val oldName = message.parameters[0]
+    val newName = message.parameters[1]
+    if (!state.isChannelName(oldName) || !state.isChannelName(newName)) return
+    val from = state.channelRef(oldName)
+    val to = state.channelRef(newName)
+    state.renameChannel(from, to)
+    emit(InboundEffect.RenameBuffer(from, to))
+    val actor = message.prefix?.nick?.let { " by $it" }.orEmpty()
+    val reason = message.parameters.getOrNull(2)?.takeIf { it.isNotEmpty() }?.let { " ($it)" }.orEmpty()
+    system(to, "Channel renamed from $oldName to $newName$actor$reason")
+}
+
 internal fun Reduction.handleTopicVerb(message: IrcMessage) {
     if (message.parameters.size < 2) return
     emit(InboundEffect.SetTopic(state.channelRef(message.parameters[0]), message.parameters.last()))

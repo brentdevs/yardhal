@@ -36,6 +36,7 @@ public data class ChatMessage(
     public val playback: Boolean = false,
     public val pendingEcho: Boolean = false,
     public val storedRowId: Long? = null,
+    public val channelContext: String? = null,
 ) {
     public val countsAsUnread: Boolean
         get() = !sentByUs && !playback &&

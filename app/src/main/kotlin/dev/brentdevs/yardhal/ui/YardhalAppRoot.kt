@@ -123,6 +123,10 @@ public fun YardhalAppRoot(
             .minByOrNull { it.displayName.lowercase() }
         selectedKey = first?.key
     }
+    val renamedSelection = selectedKey?.takeIf { it !in buffers }?.let(coordinator::renamedKey)
+    if (renamedSelection != null && renamedSelection in buffers) {
+        selectedKey = renamedSelection
+    }
 
     val pickLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.OpenDocument(),
@@ -246,6 +250,11 @@ public fun YardhalAppRoot(
                     onMemberAction = { action, nick -> coordinator.memberAction(networkId, key, action, nick) },
                     onOpenDm = { nick ->
                         selectedKey = coordinator.directMessageKey(networkId, key, nick)
+                        searchTargetRowId = null
+                        returnToSearch = false
+                    },
+                    onOpenChannel = { channel ->
+                        selectedKey = coordinator.ensureConversation(networkId, channel)
                         searchTargetRowId = null
                         returnToSearch = false
                     },

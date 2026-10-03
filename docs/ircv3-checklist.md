@@ -38,8 +38,8 @@ Phase numbers refer to `docs/architecture.md`.
 - [x] +typing: send rate-limited active TAGMSG; inbound indicators with expiry (P5)
 - [x] draft/message-redaction: REDACT handling + own redacts (P5)
 - [x] draft/read-marker: capability requested; MARKREAD sent on read and applied inbound (cross-device); unread divider + jump (P5)
-- [ ] draft/multiline: reassemble multiline batches honoring limits (P5)
-- [ ] +draft/channel-context: "re: #channel" chip on DMs (P8)
+- [x] draft/multiline: cap + max-bytes/max-lines parsed; inbound batches reassembled (concat, batch msgid, playback-aware, defensive limit flush); composer newlines sent as limit-respecting batches with concat splitting, echo reconciled; separate PRIVMSGs without the cap (P5)
+- [x] +draft/channel-context: `+channel-context`/`+draft/channel-context` on DMs stored per message; tappable "re: #channel" chip (P8)
 
 ## History & transport
 
@@ -67,7 +67,7 @@ Phase numbers refer to `docs/architecture.md`.
 - [ ] UTF8ONLY: always transmit UTF-8, skip legacy encoding heuristics (P5)
 - [ ] draft/extended-isupport: full ISUPPORT set pre-registration (P5)
 - [ ] draft/ICON: network icon ISUPPORT token fetch/cache (P6)
-- [ ] draft/channel-rename: RENAME moves buffer/transcript/unread state (P5)
+- [x] draft/channel-rename: RENAME moves buffer, transcript rows (FTS-consistent), read marker, mute, pins/groups/parted, autojoin and member state; system line; selection follows rename (P5)
 - [ ] client-batch: infrastructure only; no production use until ratified
 - [ ] WebSocket transport: n/a (native TCP/TLS client)
 - [ ] WEBIRC: server-only, n/a

@@ -11,6 +11,8 @@ import dev.brentdevs.yardhal.core.data.WhoisAccumulator
 import dev.brentdevs.yardhal.core.protocol.CaseMapping
 import dev.brentdevs.yardhal.core.protocol.ChannelPrefixModes
 import dev.brentdevs.yardhal.core.protocol.IrcMessage
+import dev.brentdevs.yardhal.core.protocol.IrcMultiline
+import dev.brentdevs.yardhal.core.protocol.MultilineLimits
 
 public class InboundContext(
     public val nowMs: Long,
@@ -24,7 +26,14 @@ public data class OpenBatch(
     public val type: String,
     public val parameters: List<String>,
     public val parent: String?,
+    public val multiline: MultilineBuffer? = null,
 )
+
+public class MultilineBuffer(public val opening: IrcMessage) {
+    internal val lines: MutableList<IrcMessage> = ArrayList()
+    internal var byteCount: Int = 0
+    internal var overflowed: Boolean = false
+}
 
 public data class UserState(
     public val nick: String,
@@ -40,8 +49,12 @@ public class ChannelState(public val ref: ConversationRef) {
 public class PerNetworkState(
     public val networkId: String,
     configuredNick: String,
-    public val autojoin: List<String> = emptyList(),
+    autojoin: List<String> = emptyList(),
 ) {
+    public var autojoin: List<String> = autojoin
+        internal set
+    public var multilineLimits: MultilineLimits? = null
+        internal set
     public var casemapping: CaseMapping = CaseMapping.RFC1459
         internal set
     public var ownNick: String = configuredNick
@@ -96,6 +109,19 @@ public class PerNetworkState(
 
     public fun batchType(reference: String?): String? = reference?.let { openBatches[it]?.type }
 
+    public fun outboundMultilineLimits(): MultilineLimits? =
+        multilineLimits?.takeIf { IrcMultiline.CAPABILITY in supportedCaps && "batch" in supportedCaps }
+
+    internal fun renameChannel(from: ConversationRef, to: ConversationRef) {
+        channels.remove(from.storageKey)?.let { existing ->
+            val moved = ChannelState(to)
+            moved.members.putAll(existing.members)
+            channels[to.storageKey] = moved
+        }
+        pendingNames.remove(from.storageKey)?.let { pendingNames[to.storageKey] = it }
+        autojoin = autojoin.map { if (fold(it) == from.normalizedTarget) to.rawTarget else it }
+    }
+
     public fun apply(event: IrcEvent, context: InboundContext): List<InboundEffect> {
         val reduction = Reduction(this, context)
         when (event) {
@@ -115,6 +141,7 @@ public class PerNetworkState(
         whois.reset()
         whoisExpected = false
         supportedCaps = emptySet()
+        multilineLimits = null
     }
 
     internal fun memberSnapshot(channel: ChannelState): InboundEffect.SetMembers {
@@ -178,8 +205,10 @@ internal fun Reduction.handleMessage(message: IrcMessage) {
     val command = message.command.uppercase()
     val numeric = message.numeric
     when {
-        command == "CAP" || command == "PING" || command == "PONG" -> Unit
+        command == "PING" || command == "PONG" -> Unit
+        command == "CAP" -> handleCapMessage(message)
         command == "PRIVMSG" || command == "NOTICE" -> handleChatMessage(message)
+        command == "RENAME" -> handleRename(message)
         command == "BATCH" -> handleBatchFrame(message)
         command == "REDACT" -> handleRedact(message)
         command == "TAGMSG" -> handleTagmsg(message)

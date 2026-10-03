@@ -1,6 +1,9 @@
 package dev.brentdevs.yardhal.core.client
 
 import dev.brentdevs.yardhal.core.protocol.IrcMessage
+import dev.brentdevs.yardhal.core.protocol.IrcMultiline
+import dev.brentdevs.yardhal.core.protocol.MultilineLimits
+import dev.brentdevs.yardhal.core.protocol.MultilineLine
 import java.io.File
 import java.net.InetSocketAddress
 import java.net.ServerSocket
@@ -181,6 +184,87 @@ class ErgoRoundTripTest {
             assertTrue(echoed.tags.containsKey("msgid"), "echo-message must carry msgid")
             assertTrue(echoed.tags.containsKey("time"), "server-time tag expected on echo")
             assertEquals("yardhal-it", echoed.prefix?.nick)
+
+            connection.disconnect()
+        } finally {
+            scope.cancel()
+        }
+        Unit
+    }
+
+    @Test
+    fun multilineEchoAndChannelRenameAgainstRealServer() = runBlocking {
+        startErgo()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        try {
+            val config = IrcConnectionConfig(
+                host = "127.0.0.1",
+                port = port,
+                tls = false,
+                nick = "yardhal-ml",
+                capabilities = IrcConnectionConfig.DEFAULT_CAPABILITIES - CapabilityNegotiator.SASL_CAP,
+            )
+            val connection = IrcConnection(config)
+            val negotiated = kotlinx.coroutines.CompletableDeferred<Set<String>>()
+            val registered = kotlinx.coroutines.CompletableDeferred<Unit>()
+            val joined = kotlinx.coroutines.CompletableDeferred<Unit>()
+            val echoedBatch = kotlinx.coroutines.CompletableDeferred<List<IrcMessage>>()
+            val renamed = kotlinx.coroutines.CompletableDeferred<IrcMessage>()
+            val batchFrames = ArrayList<IrcMessage>()
+            scope.launch {
+                connection.events.collect { event ->
+                    if (event is IrcEvent.CapabilitiesNegotiated) negotiated.complete(event.capabilities)
+                    if (event !is IrcEvent.MessageReceived) return@collect
+                    val message = event.message
+                    when (message.command.uppercase()) {
+                        "005" -> registered.complete(Unit)
+                        "JOIN" -> joined.complete(Unit)
+                        "RENAME" -> renamed.complete(message)
+                        "BATCH" -> {
+                            val head = message.parameters.firstOrNull().orEmpty()
+                            if (head.startsWith("+") && message.parameters.getOrNull(1) == IrcMultiline.BATCH_TYPE) {
+                                batchFrames.clear()
+                                batchFrames += message
+                            } else if (head.startsWith("-") && batchFrames.isNotEmpty()) {
+                                batchFrames += message
+                                echoedBatch.complete(batchFrames.toList())
+                            }
+                        }
+                        "PRIVMSG" -> if (batchFrames.isNotEmpty()) batchFrames += message
+                    }
+                }
+            }
+            connection.start()
+
+            val caps = withTimeout(15_000) { negotiated.await() }
+            assertTrue(IrcMultiline.CAPABILITY in caps, "Ergo should ack draft/multiline: $caps")
+            assertTrue("draft/channel-rename" in caps, "Ergo should ack draft/channel-rename: $caps")
+            withTimeout(15_000) { registered.await() }
+            connection.send(IrcMessage(command = "JOIN", parameters = listOf("#yardhal-ml")))
+            withTimeout(10_000) { joined.await() }
+
+            val original = "first line\n\n" + (1..60).joinToString(" ") { "word$it" }
+            val batches = IrcMultiline.split(original, MultilineLimits(4096, 100), 120)
+            assertEquals(1, batches.size)
+            IrcMultiline.frame("yml1", "PRIVMSG", "#yardhal-ml", batches.single()).forEach(connection::send)
+
+            val echoed = withTimeout(10_000) { echoedBatch.await() }
+            val opening = echoed.first()
+            assertTrue(opening.tags.containsKey("msgid"), "multiline echo must carry msgid on BATCH: $opening")
+            assertEquals("#yardhal-ml", opening.parameters.getOrNull(2))
+            val reference = opening.parameters.first().drop(1)
+            val lines = echoed.filter { it.command.equals("PRIVMSG", true) }
+            assertTrue(lines.all { it.tag("batch") == reference })
+            assertTrue(lines.any { it.tags.containsKey(IrcMultiline.CONCAT_TAG) })
+            val combined = IrcMultiline.combine(
+                lines.map { MultilineLine(it.parameters[1], it.tags.containsKey(IrcMultiline.CONCAT_TAG)) },
+            )
+            assertEquals(original, combined)
+
+            connection.send(IrcMessage(command = "RENAME", parameters = listOf("#yardhal-ml", "#yardhal-renamed", "round trip")))
+            val rename = withTimeout(10_000) { renamed.await() }
+            assertEquals(listOf("#yardhal-ml", "#yardhal-renamed", "round trip"), rename.parameters)
+            assertEquals("yardhal-ml", rename.prefix?.nick)
 
             connection.disconnect()
         } finally {

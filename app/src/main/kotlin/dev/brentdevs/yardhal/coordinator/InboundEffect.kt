@@ -16,6 +16,8 @@ public sealed interface InboundEffect {
 
     public data class RemoveBuffer(public val ref: ConversationRef) : InboundEffect
 
+    public data class RenameBuffer(public val from: ConversationRef, public val to: ConversationRef) : InboundEffect
+
     public data class AppendMessage(
         public val ref: ConversationRef,
         public val sender: String,
@@ -29,6 +31,7 @@ public sealed interface InboundEffect {
         public val attachmentUrl: String? = null,
         public val playback: Boolean = false,
         public val reconcilePendingEcho: Boolean = false,
+        public val channelContext: String? = null,
     ) : InboundEffect
 
     public data class SetTopic(public val ref: ConversationRef, public val topic: String?) : InboundEffect

@@ -78,6 +78,15 @@ public interface MessageDao {
     @Query("DELETE FROM messages WHERE networkId = :networkId")
     public suspend fun deleteNetwork(networkId: String)
 
+    @Query("UPDATE messages SET conversation = :to WHERE networkId = :networkId AND conversation = :from")
+    public suspend fun renameConversation(networkId: String, from: String, to: String): Int
+
+    @Query("SELECT * FROM messages WHERE networkId = :networkId AND conversation = :conversation")
+    public suspend fun allIn(networkId: String, conversation: String): List<MessageRow>
+
+    @Query("UPDATE messages SET contentHash = :hash WHERE rowId = :rowId")
+    public suspend fun updateContentHash(rowId: Long, hash: String)
+
     @Query("SELECT * FROM messages")
     public suspend fun allRows(): List<MessageRow>
 

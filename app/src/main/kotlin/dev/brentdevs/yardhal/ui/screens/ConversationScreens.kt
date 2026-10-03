@@ -149,6 +149,7 @@ public fun ConversationScreen(
     onOpenAppearance: () -> Unit = {},
     onMemberAction: (MemberAction, String) -> Unit = { _, _ -> },
     onOpenDm: (String) -> Unit = {},
+    onOpenChannel: (String) -> Unit = {},
     sharedDraft: String? = null,
     onSharedConsumed: () -> Unit = {},
     onPickFile: () -> Unit = {},
@@ -371,6 +372,7 @@ public fun ConversationScreen(
                                         message.msgid?.let { msgid -> onReact(msgid, emoji) }
                                     },
                                     onOpenAttachment = ::openLink,
+                                    onOpenChannel = onOpenChannel,
                                 )
                             }
                         }
