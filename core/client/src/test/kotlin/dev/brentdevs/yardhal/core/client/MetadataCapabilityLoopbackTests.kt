@@ -70,6 +70,46 @@ class MetadataCapabilityLoopbackTests {
     }
 
     @org.junit.jupiter.api.Test
+    fun runtimeCapabilityUpdatesPublishChangedValuesAndWithdrawnFeatures() = runBlocking {
+        LoopbackIrcServer().use { server ->
+            server.start()
+            server.lineListener = { line ->
+                when {
+                    line.startsWith("CAP LS") -> server.sendLine(
+                        ":srv CAP * LS :batch echo-message labeled-response draft/metadata-2=max-subs=2",
+                    )
+                    line.startsWith("CAP REQ :") ->
+                        server.sendLine(":srv CAP * ACK :${line.removePrefix("CAP REQ :")}")
+                    line.startsWith("USER") -> server.sendLine(":srv 001 tester :Welcome")
+                }
+            }
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            val connection = IrcConnection(
+                IrcConnectionConfig(host = "127.0.0.1", port = server.port, tls = false, nick = "tester"),
+            )
+            try {
+                val collector = EventCollector(scope, connection.events)
+                connection.start()
+                val initial = collector.drainUntilRegistered()
+                    .filterIsInstance<IrcEvent.CapabilitiesNegotiated>().single()
+                assertEquals("max-subs=2", initial.values["draft/metadata-2"])
+                server.sendLine(":srv CAP tester NEW :draft/metadata-2=max-subs=1")
+                val changed = collector.awaitInstance<IrcEvent.CapabilitiesNegotiated>()
+                assertEquals(initial.capabilities, changed.capabilities)
+                assertEquals("max-subs=1", changed.values["draft/metadata-2"])
+                server.sendLine(":srv CAP tester DEL :echo-message labeled-response draft/metadata-2")
+                val removed = collector.awaitInstance<IrcEvent.CapabilitiesNegotiated>()
+                assertEquals(setOf("batch"), removed.capabilities)
+                assertEquals(emptyMap(), removed.values)
+            } finally {
+                connection.disconnect()
+                scope.cancel()
+            }
+        }
+        Unit
+    }
+
+    @org.junit.jupiter.api.Test
     fun capDelForgetsAdvertisedValues() {
         val negotiator = CapabilityNegotiator(
             wanted = setOf("draft/metadata-2"),

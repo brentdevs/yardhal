@@ -57,6 +57,8 @@ internal fun Reduction.flushMultiline(batch: OpenBatch, buffer: MultilineBuffer)
     (first.tag("time") ?: buffer.opening.tag("time"))?.let { tags["time"] = it }
     buffer.lines.clear()
     buffer.byteCount = 0
+    val previousCorrelation = correlation
+    correlation = correlateLabel(buffer.opening, "BATCH") ?: previousCorrelation
     emitChat(
         prefix = buffer.opening.prefix ?: first.prefix,
         command = first.command,
@@ -65,4 +67,5 @@ internal fun Reduction.flushMultiline(batch: OpenBatch, buffer: MultilineBuffer)
         tags = tags,
         playback = isPlaybackBatch(batch.parent),
     )
+    correlation = previousCorrelation
 }

@@ -80,8 +80,10 @@ public class CapabilityNegotiator(
             }
             "NEW" -> {
                 val names = recordAdvertised(payload)
+                val updatesAcknowledged = names.any { it in acknowledged }
                 available += names
                 requestSubset((wanted intersect names) - acknowledged)
+                if (updatesAcknowledged) onFinished()
             }
             "DEL" -> {
                 val names = splitNames(payload)

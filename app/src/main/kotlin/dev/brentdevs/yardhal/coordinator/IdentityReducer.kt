@@ -30,7 +30,15 @@ internal fun Reduction.sourceIdentity(presence: PresenceState, prefix: IrcPrefix
     presence.copy(
         user = prefix.user ?: presence.user,
         host = prefix.host ?: presence.host,
-        account = if (ACCOUNT_TAG_CAP in state.supportedCaps) accountValue(message.tag("account")) else presence.account,
+        account = when {
+            message.tags.containsKey("account") -> accountValue(message.tag("account"))
+            ACCOUNT_TAG_CAP in state.supportedCaps && (
+                message.command.equals("PRIVMSG", ignoreCase = true) ||
+                    message.command.equals("NOTICE", ignoreCase = true) ||
+                    message.command.equals("TAGMSG", ignoreCase = true)
+                ) -> null
+            else -> presence.account
+        },
         isBot = presence.isBot || message.tags.containsKey("bot"),
     )
 

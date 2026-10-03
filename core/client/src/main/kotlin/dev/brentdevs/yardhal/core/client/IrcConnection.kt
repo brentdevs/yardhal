@@ -55,6 +55,9 @@ public data class IrcConnectionConfig(
             "message-tags",
             "echo-message",
             "batch",
+            "draft/chathistory",
+            "draft/message-redaction",
+            "no-implicit-names",
             "labeled-response",
             "extended-join",
             "away-notify",
@@ -228,9 +231,7 @@ public class IrcConnection(
                 sendRaw = ::sendLine,
                 onSaslAcknowledged = { if (!startSasl()) negotiator?.saslFinished() },
                 onFinished = {
-                    val acknowledged = LinkedHashSet(negotiator?.acknowledged ?: emptySet())
-                    val values = negotiator?.advertisedValues?.filterKeys { it in acknowledged } ?: emptyMap()
-                    emit(IrcEvent.CapabilitiesNegotiated(acknowledged, values))
+                    publishCapabilities()
                     sendNickUser()
                 },
                 beforeCapEnd = ::sendPreRegistrationRequests,
@@ -273,10 +274,17 @@ public class IrcConnection(
         sendLine("AWAY :$message")
     }
 
+    private fun publishCapabilities() {
+        val acknowledged = LinkedHashSet(negotiator?.acknowledged ?: emptySet())
+        val values = negotiator?.advertisedValues?.filterKeys { it in acknowledged } ?: emptyMap()
+        emit(IrcEvent.CapabilitiesNegotiated(acknowledged, values))
+    }
+
     private fun handleCapabilitiesDeleted(names: Set<String>) {
-        if (CapabilityNegotiator.SASL_CAP !in names) return
-        val active = saslAuthenticator ?: return
-        if (!active.isFinished) active.cancel("server withdrew the sasl capability")
+        if (CapabilityNegotiator.SASL_CAP in names) {
+            saslAuthenticator?.takeUnless { it.isFinished }?.cancel("server withdrew the sasl capability")
+        }
+        publishCapabilities()
     }
 
     private fun sendNickUser() {

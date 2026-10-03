@@ -98,9 +98,79 @@ class IdentityReducerTests {
     @Test
     fun accountTagAbsenceKeepsAccountWhenCapNotAcked() {
         val state = network(allCaps - "account-tag").joinRoom()
-        state.feed(":alice!a@host ACCOUNT alice-acct")
-        state.feed(":alice!a@host PRIVMSG #c :hi")
-        assertEquals("alice-acct", state.presenceOf("alice").account)
+        for (command in listOf("PRIVMSG #c :hi", "NOTICE #c :hi", "TAGMSG #c")) {
+            state.feed(":alice!a@host ACCOUNT alice-acct")
+            state.feed(":alice!a@host $command")
+            assertEquals("alice-acct", state.presenceOf("alice").account, command)
+        }
+    }
+
+    @Test
+    fun knownAccountsSurviveUntaggedIdentityNotificationsAndRemainAvailableForAccountBans() {
+        for (establishAccount in listOf(
+            ":alice!a@host ACCOUNT alice-acct",
+            ":alice!a@host JOIN #c alice-acct :Alice Real",
+        )) {
+            val state = network().joinRoom()
+            state.feed(":srv 005 me EXTBAN=~,a ACCOUNTEXTBAN=a :are supported")
+            state.feed(establishAccount)
+            for (command in listOf(
+                "AWAY :gone to lunch",
+                "CHGHOST changed changed.host",
+                "SETNAME :Alice New Name",
+                "BATCH +identity vendor.example/identity",
+                "BATCH -identity",
+            )) {
+                val effects = state.feed(":alice!a@host $command")
+                assertEquals("alice-acct", state.presenceOf("alice").account, "$establishAccount then $command")
+                assertEquals("~a:alice-acct", state.accountBanMask("alice"), command)
+                for (snapshot in effects.memberSnapshots()) {
+                    assertEquals("alice-acct", snapshot.presence["alice"]?.account, command)
+                }
+            }
+            val renamed = state.feed(":alice!a@host NICK :alicia")
+            assertNull(state.user("alice"))
+            assertEquals("alice-acct", state.presenceOf("alicia").account)
+            assertEquals("alice-acct", renamed.memberSnapshots().single().presence["alicia"]?.account)
+            assertEquals("~a:alice-acct", state.accountBanMask("alicia"))
+        }
+    }
+
+    @Test
+    fun untaggedChatClearsKnownAccountOnlyWhenAccountTagIsAcknowledged() {
+        val state = network().joinRoom()
+        for (command in listOf("PRIVMSG #c :logged out", "NOTICE #c :logged out", "TAGMSG #c")) {
+            state.feed(":alice!a@host ACCOUNT alice-acct")
+            val effects = state.feed(":alice!a@host $command")
+            assertNull(state.presenceOf("alice").account, command)
+            assertNull(effects.memberSnapshots().single().presence["alice"]?.account, command)
+            for (line in effects.lines()) assertNull(line.senderAccount, command)
+        }
+    }
+
+    @Test
+    fun explicitAccountTagsUpdateNonChatIdentityEvenWithoutAccountTagCapability() {
+        val state = network(allCaps - "account-tag").joinRoom()
+        for ((index, command) in listOf(
+            "AWAY :away",
+            "CHGHOST changed changed.host",
+            "SETNAME :Alice Real",
+            "BATCH +identity vendor.example/identity",
+            "BATCH -identity",
+        ).withIndex()) {
+            val account = "account-$index"
+            val effects = state.feed("@account=$account :alice!a@host $command")
+            assertEquals(account, state.presenceOf("alice").account, command)
+            assertEquals(account, effects.memberSnapshots().single().presence["alice"]?.account, command)
+        }
+        val renamed = state.feed("@account=renamed-account :alice!a@host NICK :alicia")
+        assertEquals("renamed-account", state.presenceOf("alicia").account)
+        assertTrue(renamed.memberSnapshots().all { it.presence["alicia"]?.account == "renamed-account" })
+        state.feed("@account=* :alicia!a@host AWAY")
+        assertNull(state.presenceOf("alicia").account)
+        state.feed("@account=restored :alicia!a@host SETNAME :Alice")
+        state.feed("@account :alicia!a@host AWAY :away")
+        assertNull(state.presenceOf("alicia").account)
     }
 
     @Test
@@ -268,6 +338,36 @@ class IdentityReducerTests {
         state.forgetMonitored(listOf("zed"))
         assertFalse(state.isMonitored("zed"))
         assertTrue(state.feed(":zed!z@zed.host AWAY :afk").isEmpty())
+    }
+
+    @Test
+    fun monitorListNumericEstablishesTargetsForSubsequentIdentityNotifications() {
+        val state = network()
+        val listed = state.feed(":srv 732 me :zed,alice")
+        assertEquals("zed,alice", listed.lines().single().text)
+        assertTrue(state.isMonitored("ZED"))
+        assertTrue(state.isMonitored("ALICE"))
+        assertNull(state.user("zed"))
+        assertNull(state.user("alice"))
+
+        assertTrue(state.feed(":zed!z@zed.host ACCOUNT zed-acct").isEmpty())
+        assertTrue(state.feed(":zed!z@zed.host AWAY :afk").isEmpty())
+        assertTrue(state.feed(":zed!z@zed.host CHGHOST z2 other.host").isEmpty())
+        assertTrue(state.feed(":zed!z2@other.host SETNAME :Zed Real").isEmpty())
+        assertEquals(
+            PresenceState(
+                away = true,
+                awayMessage = "afk",
+                account = "zed-acct",
+                user = "z2",
+                host = "other.host",
+                realName = "Zed Real",
+            ),
+            state.presenceOf("zed"),
+        )
+        assertTrue(state.feed(":alice!a@alice.host AWAY :brb").isEmpty())
+        assertEquals(true, state.presenceOf("alice").away)
+        assertNull(state.user("stranger"))
     }
 
     @Test

@@ -5,7 +5,7 @@ import dev.brentdevs.yardhal.core.protocol.IrcMessage
 import dev.brentdevs.yardhal.core.protocol.IrcMetadata
 
 private val JOIN_FAILURE_NUMERICS = setOf(403, 405, 437, 471, 473, 474, 475)
-private val WHOIS_NUMERICS = (301..319).toSet() - setOf(305, 306) + 330 + 335
+private val WHOIS_NUMERICS = setOf(301, 311, 312, 313, 317, 318, 319, 330, 335)
 private val METADATA_NUMERICS = setOf(
     IrcMetadata.RPL_WHOISKEYVALUE,
     IrcMetadata.RPL_KEYVALUE,

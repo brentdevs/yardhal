@@ -186,7 +186,9 @@ public class PerNetworkState(
 
     public fun issueLabel(origin: ConversationRef, command: LabeledCommand, nowMs: Long): String? {
         if (!labeledResponseEnabled) return null
-        pendingLabels.values.removeAll { nowMs - it.issuedAtMs > LABEL_TTL_MS }
+        pendingLabels.values.removeAll { pending ->
+            nowMs - pending.issuedAtMs > LABEL_TTL_MS && openBatches.values.none { it.label == pending.label }
+        }
         labelCounter += 1
         val label = "yh$labelCounter"
         pendingLabels[label] = PendingLabel(label, origin, command, nowMs)
@@ -200,9 +202,15 @@ public class PerNetworkState(
         channels.remove(from.storageKey)?.let { existing ->
             val moved = ChannelState(to)
             moved.members.putAll(existing.members)
+            moved.metadata.putAll(existing.metadata)
             channels[to.storageKey] = moved
         }
         pendingNames.remove(from.storageKey)?.let { pendingNames[to.storageKey] = it }
+        for ((label, pending) in pendingLabels) {
+            if (pending.origin.storageKey == from.storageKey) {
+                pendingLabels[label] = pending.copy(origin = to)
+            }
+        }
         autojoin = autojoin.map { if (fold(it) == from.normalizedTarget) to.rawTarget else it }
     }
 
@@ -235,6 +243,10 @@ public class PerNetworkState(
         supportedCaps = emptySet()
         pendingLabels.clear()
         isupport = ISupport.EMPTY
+        prefixModes = ChannelPrefixModes.DEFAULT
+        hasWhox = false
+        chathistoryLimit = 0
+        filehostEndpoint = null
         monitored.clear()
         multilineLimits = null
         registered = false
@@ -264,6 +276,7 @@ public class PerNetworkState(
             val ref = channelRef(old.ref.rawTarget)
             val fresh = ChannelState(ref)
             for (member in old.members.values) fresh.members[fold(member.nick)] = member
+            fresh.metadata.putAll(old.metadata)
             channels[ref.storageKey] = fresh
         }
         val oldUsers = users.values.toList()

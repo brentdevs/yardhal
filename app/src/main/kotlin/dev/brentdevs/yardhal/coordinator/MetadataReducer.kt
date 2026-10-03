@@ -16,6 +16,7 @@ internal fun Reduction.applyMetadataCapability(capabilities: Set<String>, values
     } else {
         null
     }
+    if (state.metadataCapability == null) state.metadataSubscriptions = emptySet()
     if (!wasEnabled && state.registered) subscribeMetadata()
 }
 

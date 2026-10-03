@@ -2,8 +2,6 @@ package dev.brentdevs.yardhal.coordinator
 
 import dev.brentdevs.yardhal.core.data.ConversationKind
 import dev.brentdevs.yardhal.core.data.ConversationRef
-import dev.brentdevs.yardhal.core.protocol.CaseMapping
-import dev.brentdevs.yardhal.core.protocol.ChannelPrefixModes
 import dev.brentdevs.yardhal.core.protocol.ISupport
 import dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks
 import dev.brentdevs.yardhal.core.protocol.IrcMessage
@@ -11,15 +9,17 @@ import dev.brentdevs.yardhal.core.protocol.IrcMessage
 private const val PLAYBACK_FALLBACK_SECONDS = 7L * 24 * 3600
 
 internal fun Reduction.handleCapabilities(capabilities: Set<String>, values: Map<String, String> = emptyMap()) {
+    val previous = state.supportedCaps
     state.supportedCaps = capabilities
     applyMetadataCapability(capabilities, values)
-    if ("znc.in/playback" in capabilities) {
+    if ("znc.in/playback" in capabilities && "znc.in/playback" !in previous) {
         val since = context.latestReadMarkerMs()?.let { it / 1000 }
             ?: (context.nowMs / 1000 - PLAYBACK_FALLBACK_SECONDS)
         emit(InboundEffect.SendRaw("PRIVMSG *playback :playback * start $since"))
     }
-    if (IrcBouncerNetworks.CAPABILITY in capabilities) {
-        state.isBouncerDiscovery = true
+    val discovery = IrcBouncerNetworks.CAPABILITY in capabilities
+    if (state.isBouncerDiscovery != discovery) {
+        state.isBouncerDiscovery = discovery
         emit(InboundEffect.BouncerNetworksChanged)
     }
 }
@@ -47,40 +47,22 @@ internal fun Reduction.applyIsupportTokens(message: IrcMessage) {
     if (state.botModeLetter != previousBot || state.accountExtban != previousExtban) {
         emit(InboundEffect.NetworkFeaturesChanged)
     }
+    val previousMapping = state.casemapping
+    state.casemapping = state.isupport.casemapping
+    state.rekey(previousMapping)
+    state.prefixModes = state.isupport.prefix
+    state.chathistoryLimit = state.isupport["CHATHISTORY"]?.toIntOrNull()?.coerceAtMost(200) ?: 0
+    state.hasWhox = state.isupport.whox
+    state.filehostEndpoint = state.isupport["soju.im/FILEHOST"]
+    setNetworkIcon(state.isupport.networkIcon)
     for (token in tokens) {
         when {
-            token.startsWith("CASEMAPPING=") ->
-                CaseMapping.fromWireName(token.removePrefix("CASEMAPPING="))?.let { mapping ->
-                    val previous = state.casemapping
-                    state.casemapping = mapping
-                    state.rekey(previous)
-                }
-            token.startsWith("PREFIX=") ->
-                parsePrefixToken(token.removePrefix("PREFIX="))?.let { state.prefixModes = it }
-            token.startsWith("CHATHISTORY=") ->
-                state.chathistoryLimit = token.substringAfter('=').toIntOrNull()?.coerceAtMost(200) ?: 0
-            token == "WHOX" -> state.hasWhox = true
-            token.startsWith("soju.im/FILEHOST=") ->
-                state.filehostEndpoint = token.removePrefix("soju.im/FILEHOST=")
-            token.startsWith(ISupport.NETWORK_ICON_TOKEN + "=") ->
-                setNetworkIcon(ISupport.unescapeValue(token.substringAfter('=')).takeIf { it.isNotEmpty() })
-            token == "-" + ISupport.NETWORK_ICON_TOKEN -> setNetworkIcon(null)
             token.startsWith(IrcBouncerNetworks.ISUPPORT_NET_ID_TOKEN + "=") -> {
                 state.bouncerStore.bind(token.substringAfter('='))
                 emit(InboundEffect.BouncerNetworksChanged)
             }
         }
     }
-}
-
-internal fun parsePrefixToken(raw: String): ChannelPrefixModes? {
-    if (!raw.startsWith('(')) return null
-    val close = raw.indexOf(')')
-    if (close < 0) return null
-    val modes = raw.substring(1, close)
-    val symbols = raw.substring(close + 1)
-    if (modes.length != symbols.length || modes.isEmpty()) return null
-    return ChannelPrefixModes(modes.toList(), symbols.toList())
 }
 
 internal fun Reduction.handleBouncerMessage(message: IrcMessage) {

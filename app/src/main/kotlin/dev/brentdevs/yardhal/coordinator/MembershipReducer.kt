@@ -20,6 +20,9 @@ internal fun Reduction.handleJoin(message: IrcMessage) {
     if (fromUs) {
         channelOrCreate(ref)
         emit(InboundEffect.EnsureBuffer(ref))
+        if ("no-implicit-names" in state.supportedCaps) {
+            emit(InboundEffect.SetJoinState(ref, JoinState.JOINED))
+        }
         emit(InboundEffect.SendRaw("TOPIC $channelName"))
         emit(InboundEffect.SendRaw("MODE $channelName"))
         requestChathistory(ref)

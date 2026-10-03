@@ -106,6 +106,7 @@ public class LiveCoordinator(
         if (sessions.containsKey(config.id)) return
         val session = Session(config)
         sessions[config.id] = session
+        _profiles.update { it - config.id }
         ensureBaseBuffers(session)
         restoreKnownConversations(session)
         refreshNetworkStates()
@@ -139,6 +140,7 @@ public class LiveCoordinator(
         session.reconnector?.stop()
         session.collectorJob?.cancel()
         sessions.remove(networkId)
+        _profiles.update { it - networkId }
         refreshNetworkStates()
     }
 
@@ -226,7 +228,13 @@ public class LiveCoordinator(
                     sendRaw(session, effect.line)
                 }
             }
-            is InboundEffect.ProfilesChanged -> _profiles.update { it + (session.config.id to effect.profiles) }
+            is InboundEffect.ProfilesChanged -> _profiles.update { profiles ->
+                if (sessions[session.config.id] === session) {
+                    profiles + (session.config.id to effect.profiles)
+                } else {
+                    profiles
+                }
+            }
             is InboundEffect.NetworkIconChanged -> refreshNetworkStates()
             is InboundEffect.StatusChanged -> {
                 if (effect.status != ConnectionStatus.REGISTERED && session.quitRequested) return
@@ -350,7 +358,7 @@ public class LiveCoordinator(
     private fun ensureBaseBuffers(session: Session) {
         buffer(ConversationRef.server(session.config.id))
         for (channel in session.config.autojoin) {
-            buffer(ConversationRef.channel(session.config.id, channel))
+            markJoining(ConversationRef.channel(session.config.id, channel))
         }
     }
 
@@ -1131,6 +1139,7 @@ public class LiveCoordinator(
         val budget = IrcMultiline.lineBudget(session.state.ownNick, ref.rawTarget)
         IrcMultiline.split(normalized, limits, budget).forEachIndexed { index, lines ->
             val reply = replyToMsgid.takeIf { index == 0 }
+            val label = synchronized(session.state) { session.state.issueLabel(ref, LabeledCommand.PRIVMSG, clock()) }
             appendChat(
                 session = session,
                 ref = ref,
@@ -1144,8 +1153,12 @@ public class LiveCoordinator(
                 replyToMsgid = reply,
                 pendingEcho = echoed,
                 persist = !echoed,
+                echoLabel = label,
             )
-            val batchTags = if (reply == null) emptyMap() else mapOf("+draft/reply" to reply)
+            val batchTags = buildMap {
+                if (label != null) put("label", label)
+                if (reply != null) put("+draft/reply", reply)
+            }
             val reference = "yml" + idGenerator.getAndIncrement()
             for (frame in IrcMultiline.frame(reference, "PRIVMSG", ref.rawTarget, lines, batchTags)) {
                 session.reconnector?.send(frame)

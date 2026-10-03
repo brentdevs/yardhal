@@ -220,6 +220,91 @@ class MessagingReducerTests {
     }
 
     @Test
+    fun channelMetadataSurvivesRenameAndCasemappingRekey() {
+        val state = PerNetworkState("net", "me")
+        state.feed(
+            ":me!u@h JOIN #old[room]",
+            ":srv METADATA #old[room] avatar * :https://example.org/channel.png",
+            ":op!u@h RENAME #old[room] #new[room] :rename",
+            ":srv 005 me CASEMAPPING=ascii :are supported",
+        )
+        val channel = state.channel(state.channelRef("#new[room]").storageKey)
+        assertEquals("https://example.org/channel.png", channel?.metadataValue("avatar"))
+        assertNull(state.channel(state.channelRef("#old[room]").storageKey))
+    }
+
+    @Test
+    fun outstandingLabeledReplyFollowsRenamedConversation() {
+        val state = PerNetworkState("net", "me")
+        state.apply(IrcEvent.CapabilitiesNegotiated(setOf("labeled-response")), context)
+        state.feed(":me!u@h JOIN #old")
+        val label = checkNotNull(state.issueLabel(state.channelRef("#old"), LabeledCommand.RAW, context.nowMs))
+        state.feed(":op!u@h RENAME #old #new :rename")
+        val replyContext = InboundContext(
+            nowMs = context.nowMs,
+            hasBuffer = { it == state.channelRef("#new").storageKey },
+        )
+        val reply = state.apply(
+            IrcEvent.MessageReceived(checkNotNull(IrcMessage.parse("@label=$label :srv 999 me :response"))),
+            replyContext,
+        ).appended().single()
+        assertEquals(state.channelRef("#new"), reply.ref)
+        assertNull(state.pendingLabel(label))
+    }
+
+    @Test
+    fun noImplicitNamesJoinCompletesWithoutWaitingForNames() {
+        val state = PerNetworkState("net", "me")
+        state.apply(IrcEvent.CapabilitiesNegotiated(setOf("no-implicit-names", "draft/chathistory")), context)
+        val effects = state.feed(":me!u@h JOIN #room")
+        assertTrue(InboundEffect.SetJoinState(state.channelRef("#room"), JoinState.JOINED) in effects)
+        assertTrue(state.channel(state.channelRef("#room").storageKey)?.memberList().orEmpty().isEmpty())
+        assertTrue(effects.filterIsInstance<InboundEffect.SendRaw>().any { it.line == "CHATHISTORY LATEST #room * 50" })
+    }
+
+    @Test
+    fun withdrawingCapabilitiesDisablesFeaturesAndResubscribesAfterReenable() {
+        val state = PerNetworkState("net", "me")
+        val caps = setOf("batch", "echo-message", "labeled-response", "draft/metadata-2", "znc.in/playback")
+        val values = mapOf("draft/metadata-2" to "max-subs=2")
+        state.apply(IrcEvent.CapabilitiesNegotiated(caps, values), context)
+        state.apply(IrcEvent.Registered("me", "welcome"), context)
+        state.feed(":srv 770 me avatar display-name")
+        assertTrue(state.metadataSubscriptions.isNotEmpty())
+        val updated = state.apply(IrcEvent.CapabilitiesNegotiated(caps, values), context)
+        assertFalse(updated.filterIsInstance<InboundEffect.SendRaw>().any { "*playback" in it.line })
+        state.apply(IrcEvent.CapabilitiesNegotiated(setOf("batch")), context)
+        assertNull(state.issueLabel(state.server, LabeledCommand.RAW, context.nowMs))
+        assertNull(state.metadataCapability)
+        assertTrue(state.metadataSubscriptions.isEmpty())
+        assertFalse("echo-message" in state.supportedCaps)
+        val reenabled = state.apply(IrcEvent.CapabilitiesNegotiated(caps, values), context)
+        assertTrue(reenabled.filterIsInstance<InboundEffect.SendRaw>().any { it.line == "METADATA * SUB avatar display-name" })
+    }
+
+    @Test
+    fun preregistrationIsupportBatchAndTokenRemovalUpdateDerivedState() {
+        val state = PerNetworkState("net", "me")
+        state.feed(
+            ":srv BATCH +support draft/isupport",
+            "@batch=support :srv 005 me CASEMAPPING=ascii PREFIX=(qov)~@+ WHOX CHATHISTORY=500 soju.im/FILEHOST=https://upload.example :are supported",
+            ":srv BATCH -support",
+        )
+        assertFalse(state.registered)
+        assertTrue(state.hasWhox)
+        assertEquals(listOf('~', '@', '+'), state.prefixModes.symbols)
+        assertEquals(200, state.chathistoryLimit)
+        state.feed(":srv 005 me -CASEMAPPING -PREFIX -WHOX -CHATHISTORY -soju.im/FILEHOST :are supported")
+        assertEquals(dev.brentdevs.yardhal.core.protocol.CaseMapping.RFC1459, state.casemapping)
+        assertEquals(dev.brentdevs.yardhal.core.protocol.ChannelPrefixModes.DEFAULT, state.prefixModes)
+        assertFalse(state.hasWhox)
+        assertEquals(0, state.chathistoryLimit)
+        assertNull(state.filehostEndpoint)
+        val joined = state.feed(":me!u@h JOIN #room")
+        assertFalse(joined.filterIsInstance<InboundEffect.SendRaw>().any { it.line.startsWith("CHATHISTORY") })
+    }
+
+    @Test
     fun renameIgnoresNonChannelTargets() {
         val state = PerNetworkState("net", "me")
         assertTrue(state.feed(":op!u@h RENAME alice bob :x").isEmpty())

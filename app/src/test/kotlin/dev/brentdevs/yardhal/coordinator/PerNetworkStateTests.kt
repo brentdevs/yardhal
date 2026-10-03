@@ -1,12 +1,15 @@
 package dev.brentdevs.yardhal.coordinator
 
 import dev.brentdevs.yardhal.core.client.IrcEvent
+import dev.brentdevs.yardhal.core.client.SaslOutcome
 import dev.brentdevs.yardhal.core.data.ChannelMember
 import dev.brentdevs.yardhal.core.data.ConversationKind
 import dev.brentdevs.yardhal.core.data.ConversationRef
 import dev.brentdevs.yardhal.core.data.MessageKind
+import dev.brentdevs.yardhal.core.data.WhoisInfo
 import dev.brentdevs.yardhal.core.protocol.CaseMapping
 import dev.brentdevs.yardhal.core.protocol.IrcMessage
+import dev.brentdevs.yardhal.core.protocol.MultilineLimits
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -385,6 +388,88 @@ class PerNetworkStateTests {
     }
 
     @Test
+    fun whoisAwayServerOperIdleAndBotNumericsReachTheCompletedResult() {
+        val state = state()
+        state.joinChannelWith("#room", "me", "alice")
+        state.whoisExpected = true
+        for (line in listOf(
+            ":srv 311 me alice ~a alice.host * :Alice A",
+            ":srv 301 me alice :gone to lunch",
+            ":srv 312 me alice irc.example :Example IRC server",
+            ":srv 313 me alice :is an IRC operator",
+            ":srv 317 me alice 42 1700000000 :seconds idle, signon time",
+        )) {
+            assertTrue(state.feed(line).isEmpty(), line)
+            assertTrue(state.whoisExpected, line)
+        }
+        val bot = state.feed(":srv 335 me alice :is a Bot on IRCv3")
+        assertEquals(true, bot.only<InboundEffect.SetMembers>().presence["alice"]?.isBot)
+        assertTrue(bot.filterIsInstance<InboundEffect.WhoisCompleted>().isEmpty())
+        assertTrue(state.whoisExpected)
+        val completed = state.feed(":srv 318 me alice :End of WHOIS").only<InboundEffect.WhoisCompleted>()
+        assertEquals(
+            WhoisInfo(
+                nick = "alice",
+                user = "~a",
+                host = "alice.host",
+                realName = "Alice A",
+                server = "irc.example",
+                serverInfo = "Example IRC server",
+                awayMessage = "gone to lunch",
+                isOper = true,
+                isBot = true,
+                idleSeconds = 42L,
+                signOnEpochSeconds = 1_700_000_000L,
+            ),
+            completed.info,
+        )
+        assertTrue(checkNotNull(state.user("alice")).presence.isBot)
+        assertFalse(state.whoisExpected)
+    }
+
+    @Test
+    fun unsolicitedWhoisFieldNumericsDoNotStartAssemblyOrChangePresence() {
+        val state = state()
+        state.joinChannelWith("#room", "me", "alice")
+        val presence = checkNotNull(state.user("alice")).presence
+        for (line in listOf(
+            ":srv 301 me alice :away",
+            ":srv 312 me alice irc.example :Example server",
+            ":srv 313 me alice :is an IRC operator",
+            ":srv 317 me alice 42 1700000000 :seconds idle, signon time",
+            ":srv 318 me alice :End of WHOIS",
+        )) {
+            assertTrue(state.feed(line).isEmpty(), line)
+            assertEquals(presence, checkNotNull(state.user("alice")).presence, line)
+            assertFalse(state.whoisExpected, line)
+        }
+    }
+
+    @Test
+    fun unassembledNumericsRemainVisibleAndDoNotSeedOrCompleteWhois() {
+        for (numeric in listOf(302, 303, 304, 307, 308, 309, 310, 314, 316)) {
+            for (requested in listOf(false, true)) {
+                val state = state()
+                state.whoisExpected = requested
+                val effects = state.feed(":srv $numeric me bob :numeric payload")
+                assertEquals(1, effects.size, "$numeric requested=$requested")
+                val line = effects.appended().single()
+                assertEquals(state.server, line.ref)
+                assertEquals("bob numeric payload", line.text)
+                assertEquals(requested, state.whoisExpected)
+                assertNull(state.user("bob"))
+                assertEquals("me", state.ownNick)
+
+                state.whoisExpected = true
+                assertTrue(state.feed(":srv 311 me alice ~a host * :Alice A").isEmpty())
+                val info = state.feed(":srv 318 me alice :End of WHOIS").only<InboundEffect.WhoisCompleted>().info
+                assertEquals(WhoisInfo(nick = "alice", user = "~a", host = "host", realName = "Alice A"), info)
+                assertFalse(state.whoisExpected)
+            }
+        }
+    }
+
+    @Test
     fun listRepliesOnlyFlowWhileListing() {
         val state = state()
         assertTrue(state.feed(":srv 322 me #room 12 :topic").isEmpty())
@@ -432,6 +517,42 @@ class PerNetworkStateTests {
         assertTrue(state.isBouncerDiscovery)
         val fallback = state().apply(IrcEvent.CapabilitiesNegotiated(setOf("znc.in/playback")), InboundContext(nowMs = now))
         assertEquals(listOf("PRIVMSG *playback :playback * start ${now / 1000 - 7 * 24 * 3600}"), fallback.sent())
+    }
+
+    @Test
+    fun capNewUpdatesAdvertisedMultilineLimitsWithoutAcknowledgingCapabilities() {
+        val state = state()
+        val context = InboundContext(nowMs = now)
+        assertTrue(state.feed(":srv CAP me NEW :draft/multiline=max-bytes=8192,max-lines=12").isEmpty())
+        assertEquals(MultilineLimits(8192, 12), state.multilineLimits)
+        assertTrue(state.supportedCaps.isEmpty())
+        assertNull(state.outboundMultilineLimits())
+
+        val caps = setOf("batch", "draft/multiline")
+        assertTrue(state.apply(IrcEvent.CapabilitiesNegotiated(caps), context).isEmpty())
+        assertEquals(MultilineLimits(8192, 12), state.outboundMultilineLimits())
+        assertTrue(state.feed(":srv CAP me NEW :server-time draft/multiline=max-bytes=4096,max-lines=6").isEmpty())
+        assertEquals(MultilineLimits(4096, 6), state.outboundMultilineLimits())
+        assertEquals(caps, state.supportedCaps)
+    }
+
+    @Test
+    fun saslResultsHaveNoReducerEffectsOrRegistrationStateChanges() {
+        val state = state(autojoin = listOf("#room"))
+        val context = InboundContext(nowMs = now)
+        val caps = setOf("batch", "sasl")
+        state.apply(IrcEvent.CapabilitiesNegotiated(caps), context)
+        state.feed(":srv BATCH +history chathistory #room")
+        state.whoisExpected = true
+        for (outcome in listOf(SaslOutcome.Success, SaslOutcome.Failure(904, "SASL authentication failed"))) {
+            assertTrue(state.apply(IrcEvent.SaslResult(outcome), context).isEmpty())
+            assertFalse(state.registered)
+            assertEquals("me", state.ownNick)
+            assertEquals(caps, state.supportedCaps)
+            assertEquals("chathistory", state.batchType("history"))
+            assertTrue(state.whoisExpected)
+            assertEquals(0, state.connectionEpoch)
+        }
     }
 
     @Test
