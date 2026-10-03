@@ -30,4 +30,11 @@ public class MuteStore(directory: File) {
         store.save(mutes.toSet())
         true
     }
+
+    public fun rename(fromKey: String, toKey: String): Boolean = synchronized(mutes) {
+        if (fromKey == toKey || !mutes.remove(fromKey)) return false
+        mutes.add(toKey)
+        store.save(mutes.toSet())
+        true
+    }
 }

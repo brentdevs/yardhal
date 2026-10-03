@@ -123,6 +123,10 @@ public fun YardhalAppRoot(
             .minByOrNull { it.displayName.lowercase() }
         selectedKey = first?.key
     }
+    val renamedSelection = selectedKey?.takeIf { it !in buffers }?.let(coordinator::renamedKey)
+    if (renamedSelection != null && renamedSelection in buffers) {
+        selectedKey = renamedSelection
+    }
 
     val pickLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.OpenDocument(),
@@ -252,6 +256,11 @@ public fun YardhalAppRoot(
                     },
                     hasBotMode = networkFeatures?.hasBotMode == true,
                     accountBanAvailable = networkFeatures?.accountBanAvailable == true,
+                    onOpenChannel = { channel ->
+                        selectedKey = coordinator.ensureConversation(networkId, channel)
+                        searchTargetRowId = null
+                        returnToSearch = false
+                    },
                     sharedDraft = sharedDraft,
                     onSharedConsumed = onSharedConsumed,
                     onPickFile = { launchAttachmentPicker() },

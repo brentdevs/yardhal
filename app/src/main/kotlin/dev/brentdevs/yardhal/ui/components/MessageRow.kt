@@ -48,11 +48,12 @@ public fun MessageRow(
     onLongPress: () -> Unit,
     onToggleReaction: (String) -> Unit,
     onOpenAttachment: (String) -> Unit = {},
+    onOpenChannel: (String) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     when (message.kind) {
         MessageKind.SYSTEM, MessageKind.JOIN, MessageKind.PART -> SystemLine(message, appearance, modifier)
-        else -> ChatLine(message, groupedWithPrevious, focused, appearance, reactions, quotedText, onLongPress, onToggleReaction, onOpenAttachment, modifier)
+        else -> ChatLine(message, groupedWithPrevious, focused, appearance, reactions, quotedText, onLongPress, onToggleReaction, onOpenAttachment, onOpenChannel, modifier)
     }
 }
 
@@ -95,6 +96,7 @@ private fun ChatLine(
     onLongPress: () -> Unit,
     onToggleReaction: (String) -> Unit,
     onOpenAttachment: (String) -> Unit,
+    onOpenChannel: (String) -> Unit,
     modifier: Modifier,
 ) {
     HighlightedSurface(
@@ -146,6 +148,21 @@ private fun ChatLine(
                             style = MaterialTheme.typography.labelSmall,
                             fontFamily = FontFamily.Monospace,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                message.channelContext?.let { channel ->
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.secondaryContainer,
+                        modifier = Modifier.padding(top = 2.dp),
+                        onClick = { onOpenChannel(channel) },
+                    ) {
+                        Text(
+                            text = "re: $channel",
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer,
                         )
                     }
                 }

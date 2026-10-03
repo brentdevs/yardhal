@@ -40,6 +40,7 @@ public data class ChatMessage(
     public val echoLabel: String? = null,
     public val storedRowId: Long? = null,
     public val senderAccount: String? = null,
+    public val channelContext: String? = null,
 ) {
     public val countsAsUnread: Boolean
         get() = !sentByUs && !playback &&

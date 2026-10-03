@@ -66,6 +66,8 @@ public data class IrcConnectionConfig(
             "setname",
             "invite-notify",
             "extended-monitor",
+            "draft/multiline",
+            "draft/channel-rename",
             "cap-notify",
             "sasl",
             "znc.in/playback",

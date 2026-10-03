@@ -1,9 +1,12 @@
 package dev.brentdevs.yardhal.coordinator
 
+import dev.brentdevs.yardhal.core.data.ConversationKind
 import dev.brentdevs.yardhal.core.data.MentionMatcher
 import dev.brentdevs.yardhal.core.data.MessageKind
 import dev.brentdevs.yardhal.core.protocol.IrcCtcp
 import dev.brentdevs.yardhal.core.protocol.IrcMessage
+import dev.brentdevs.yardhal.core.protocol.IrcMultiline
+import dev.brentdevs.yardhal.core.protocol.IrcPrefix
 import dev.brentdevs.yardhal.core.protocol.PrivmsgContent
 import java.time.Instant
 
@@ -16,8 +19,10 @@ internal fun parseServerTime(value: String?): Long? {
     return runCatching { Instant.parse(value).toEpochMilli() }.getOrNull()
 }
 
-internal fun Reduction.isPlayback(message: IrcMessage): Boolean {
-    var reference = message.tag("batch")
+internal fun Reduction.isPlayback(message: IrcMessage): Boolean = isPlaybackBatch(message.tag("batch"))
+
+internal fun Reduction.isPlaybackBatch(start: String?): Boolean {
+    var reference = start
     while (reference != null) {
         val batch = state.openBatches[reference] ?: return false
         if (batch.type in PLAYBACK_BATCH_TYPES) return true
@@ -28,9 +33,26 @@ internal fun Reduction.isPlayback(message: IrcMessage): Boolean {
 
 internal fun Reduction.handleChatMessage(message: IrcMessage) {
     if (message.parameters.size < 2) return
-    val targetParam = message.parameters[0]
-    val rawText = message.parameters[1]
-    val prefix = message.prefix ?: return
+    if (bufferMultilineLine(message)) return
+    emitChat(
+        prefix = message.prefix,
+        command = message.command,
+        targetParam = message.parameters[0],
+        rawText = message.parameters[1],
+        tags = message.tags,
+        playback = isPlayback(message),
+    )
+}
+
+internal fun Reduction.emitChat(
+    prefix: IrcPrefix?,
+    command: String,
+    targetParam: String,
+    rawText: String,
+    tags: Map<String, String?>,
+    playback: Boolean,
+) {
+    if (prefix == null) return
     val senderNick = prefix.nick
     val fromUs = state.isOwnNick(senderNick)
     if (!fromUs && context.isIgnored(senderNick)) return
@@ -45,29 +67,31 @@ internal fun Reduction.handleChatMessage(message: IrcMessage) {
     val ctcpAction = decoded.filterIsInstance<PrivmsgContent.Ctcp>().firstOrNull { it.message.command == IrcCtcp.ACTION }
     val kind = when {
         ctcpAction != null -> MessageKind.ACTION
-        message.command.equals("NOTICE", true) -> MessageKind.NOTICE
+        command.equals("NOTICE", true) -> MessageKind.NOTICE
         else -> MessageKind.PRIVMSG
     }
     val body = ctcpAction?.message?.arguments
         ?: decoded.filterIsInstance<PrivmsgContent.Plain>().firstOrNull()?.text
         ?: rawText
-    val playback = isPlayback(message)
+    val channelContext = (tags[CHANNEL_CONTEXT_TAG] ?: tags[DRAFT_CHANNEL_CONTEXT_TAG])
+        ?.takeIf { ref.kind == ConversationKind.DIRECT_MESSAGE && state.isChannelName(it) && ' ' !in it && ',' !in it }
     emit(
         InboundEffect.AppendMessage(
             ref = ref,
             sender = senderNick,
             kind = kind,
             text = body,
-            timestampMs = parseServerTime(message.tag("time")) ?: context.nowMs,
-            msgid = message.tag("msgid"),
+            timestampMs = parseServerTime(tags["time"]) ?: context.nowMs,
+            msgid = tags["msgid"],
             sentByUs = fromUs,
             highlightsMe = !fromUs && !playback && MentionMatcher.containsMessage(body, state.ownNick, state.casemapping),
-            replyToMsgid = message.tag("+draft/reply"),
-            attachmentUrl = message.tag("+draft/attachment"),
+            replyToMsgid = tags["+draft/reply"],
+            attachmentUrl = tags["+draft/attachment"],
             playback = playback,
             reconcilePendingEcho = fromUs,
             echoLabel = correlation?.takeIf { fromUs && it.command == LabeledCommand.PRIVMSG }?.label,
-            senderAccount = accountValue(message.tag("account")),
+            senderAccount = accountValue(tags["account"]),
+            channelContext = channelContext,
         ),
     )
 }
@@ -112,10 +136,13 @@ internal fun Reduction.handleBatchFrame(message: IrcMessage) {
         head.startsWith("+") -> {
             val type = message.parameters.getOrNull(1) ?: return
             val parameters = message.parameters.drop(2)
-            state.openBatches[reference] = OpenBatch(type, parameters, message.tag("batch"), message.tag("label"))
+            val multiline = if (type == IrcMultiline.BATCH_TYPE) MultilineBuffer(message) else null
+            state.openBatches[reference] = OpenBatch(type, parameters, message.tag("batch"), label = message.tag("label"), multiline = multiline)
             state.netsplit.onStart(reference, type, parameters)
         }
         head.startsWith("-") -> {
+            val closing = state.openBatches[reference]
+            closing?.multiline?.let { buffer -> if (!buffer.overflowed) flushMultiline(closing, buffer) }
             state.openBatches.remove(reference)?.let { releaseBatchLabel(it) }
             val summary = state.netsplit.onEnd(reference) ?: return
             system(state.server, summary.toString())

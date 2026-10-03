@@ -23,6 +23,7 @@ import dev.brentdevs.yardhal.core.data.StoredMessage
 import dev.brentdevs.yardhal.core.protocol.CaseMapping
 import dev.brentdevs.yardhal.core.protocol.IrcCtcp
 import dev.brentdevs.yardhal.core.protocol.IrcMessage
+import dev.brentdevs.yardhal.core.protocol.IrcMultiline
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineScope
@@ -82,7 +83,7 @@ public class LiveCoordinator(
         const val HISTORY_PAGE_SIZE = 200
     }
 
-    private inner class Session(val config: NetworkConfig) {
+    private inner class Session(var config: NetworkConfig) {
         val state = PerNetworkState(config.id, config.nick, config.autojoin)
         var statusFlow: MutableStateFlow<ConnectionStatus> = MutableStateFlow(ConnectionStatus.CONNECTING)
         var reconnector: IrcReconnector? = null
@@ -223,6 +224,7 @@ public class LiveCoordinator(
                 channelOrder.markParted(effect.ref.storageKey)
                 _orderState.value = channelOrder.snapshot()
             }
+            is InboundEffect.RenameBuffer -> renameConversation(session, effect.from, effect.to)
             is InboundEffect.AppendMessage -> appendChat(
                 session = session,
                 ref = effect.ref,
@@ -239,6 +241,7 @@ public class LiveCoordinator(
                 reconcilePendingEcho = effect.reconcilePendingEcho,
                 echoLabel = effect.echoLabel,
                 senderAccount = effect.senderAccount,
+                channelContext = effect.channelContext,
             )
             is InboundEffect.SetTopic -> updateBuffer(effect.ref) { it.copy(topic = effect.topic) }
             is InboundEffect.SetMembers -> updateBuffer(effect.ref) {
@@ -285,6 +288,46 @@ public class LiveCoordinator(
                     unreadFromTimestampMs = boundary,
                 ))
             }
+        }
+    }
+
+    private val renamedKeys = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    public fun renamedKey(storageKey: String): String? {
+        var current = renamedKeys[storageKey] ?: return null
+        val seen = HashSet<String>()
+        while (seen.add(current)) current = renamedKeys[current] ?: break
+        return current
+    }
+
+    private fun renameConversation(session: Session, from: ConversationRef, to: ConversationRef) {
+        val fromKey = from.storageKey
+        val toKey = to.storageKey
+        _buffers.update { current ->
+            val existing = current[fromKey] ?: return@update current
+            val moved = existing.copy(ref = to, displayName = ConversationNames.forRef(to))
+            val merged = current[toKey]?.takeIf { fromKey != toKey }?.let { occupant ->
+                moved.copy(
+                    messages = (occupant.messages + moved.messages).sortedBy { it.timestampMs },
+                    hasUnread = moved.hasUnread || occupant.hasUnread,
+                )
+            } ?: moved
+            current - fromKey + (toKey to merged)
+        }
+        if (fromKey != toKey) {
+            renamedKeys[fromKey] = toKey
+            renamedKeys.remove(toKey)
+            readMarkers.rename(fromKey, toKey)
+            if (mutes.rename(fromKey, toKey)) _mutedState.value = mutes.all()
+            channelOrder.rename(fromKey, toKey)
+            _orderState.value = channelOrder.snapshot()
+            if (fromKey in historyLoaded.value) historyLoaded.value = historyLoaded.value - fromKey + toKey
+            scope.launch { messageStore.renameConversation(from, to) }
+        }
+        val autojoin = session.state.autojoin
+        if (autojoin != session.config.autojoin) {
+            session.config = session.config.copy(autojoin = autojoin)
+            networkStore.update(session.config)
         }
     }
 
@@ -653,6 +696,7 @@ public class LiveCoordinator(
         reconcilePendingEcho: Boolean = false,
         echoLabel: String? = null,
         senderAccount: String? = null,
+        channelContext: String? = null,
     ) {
         val newLocalId = idGenerator.getAndIncrement()
         val muted = mutes.isMuted(ref.storageKey)
@@ -676,6 +720,7 @@ public class LiveCoordinator(
                 pendingEcho = pendingEcho,
                 echoLabel = echoLabel.takeIf { pendingEcho },
                 senderAccount = senderAccount,
+                channelContext = channelContext,
             )
             val countsAsUnread = entry.countsAsUnread && !muted && timestampMs > buffer.readAtMs
             val boundary = if (countsAsUnread) {
@@ -894,8 +939,8 @@ public class LiveCoordinator(
         replyToMsgid: String? = null,
     ) {
         when (command) {
-            is SlashCommand.PlainMessage -> sendMessage(session, active, command.text, replyToMsgid = replyToMsgid)
-            is SlashCommand.EscapedMessage -> sendMessage(session, active, "/" + command.text, replyToMsgid = replyToMsgid)
+            is SlashCommand.PlainMessage -> sendComposed(session, active, command.text, replyToMsgid)
+            is SlashCommand.EscapedMessage -> sendComposed(session, active, "/" + command.text, replyToMsgid)
             is SlashCommand.Action -> sendMessage(
                 session,
                 active,
@@ -1027,6 +1072,45 @@ public class LiveCoordinator(
             sendRaw(session, line)
         } else {
             sendLabeled(session, origin, LabeledCommand.RAW, line)
+        }
+    }
+
+    private fun sendComposed(session: Session, ref: ConversationRef, text: String, replyToMsgid: String?) {
+        val normalized = IrcMultiline.normalize(text)
+        if ('\n' !in normalized) {
+            sendMessage(session, ref, normalized, replyToMsgid = replyToMsgid)
+            return
+        }
+        val limits = session.state.outboundMultilineLimits()
+        if (limits == null) {
+            normalized.split('\n').filter { it.isNotBlank() }.forEachIndexed { index, line ->
+                sendMessage(session, ref, line, replyToMsgid = replyToMsgid.takeIf { index == 0 })
+            }
+            return
+        }
+        val echoed = "echo-message" in session.state.supportedCaps
+        val budget = IrcMultiline.lineBudget(session.state.ownNick, ref.rawTarget)
+        IrcMultiline.split(normalized, limits, budget).forEachIndexed { index, lines ->
+            val reply = replyToMsgid.takeIf { index == 0 }
+            appendChat(
+                session = session,
+                ref = ref,
+                sender = session.state.ownNick,
+                kind = MessageKind.PRIVMSG,
+                text = IrcMultiline.combine(lines),
+                msgid = null,
+                timestampMs = clock(),
+                sentByUs = true,
+                highlightsMe = false,
+                replyToMsgid = reply,
+                pendingEcho = echoed,
+                persist = !echoed,
+            )
+            val batchTags = if (reply == null) emptyMap() else mapOf("+draft/reply" to reply)
+            val reference = "yml" + idGenerator.getAndIncrement()
+            for (frame in IrcMultiline.frame(reference, "PRIVMSG", ref.rawTarget, lines, batchTags)) {
+                session.reconnector?.send(frame)
+            }
         }
     }
 
