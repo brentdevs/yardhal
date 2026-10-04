@@ -103,6 +103,33 @@ Outbound mirrors it: composer line → `SlashCommandParser.parse` →
 change protocol state (WHOIS expectation, LIST browsing, leaving a channel)
 go through the same per-session lock.
 
+## Network configuration
+
+Each network's overview menu exposes **Edit network**. The shared add/edit form
+prefills host, port, TLS, nickname, display name, autojoin channels and SASL
+account. Editing keeps the network ID and preserves unexposed configuration
+fields, transcripts, selection, read markers, pins, groups and mutes.
+
+`LiveCoordinator.updateNetwork` persists an existing ID through `NetworkStore`.
+A display-name-only or unchanged save updates the live name without reconnecting.
+Connection, identity, autojoin or credential changes replace the session once;
+the old session's child scope is canceled and stale events are rejected.
+Membership, presence, typing, topics and connection features reset before the
+updated connection starts. STS remains host-specific. Open channels continue to
+rejoin; removing an autojoin entry does not leave or delete its conversation.
+
+Passwords stay in the credential vault and are never prefilled. A blank edit
+password keeps the saved secret; a replacement updates it; **Clear saved SASL
+password** removes it. The SASL account is independent of nickname and can remain
+saved without a password, but the effective connection disables SASL until a
+password is configured. Nonsecret drafts survive rotation; plaintext password
+drafts do not. Cancel and Android Back discard edits.
+
+`NetworkEditLifecycleTests` covers persistence, cosmetic saves, endpoint and
+registration changes, conversation-state preservation, stale events, backoff
+cutover, credential replacement/removal, restart restoration and STS enforcement
+with Room and real loopback connections.
+
 ## Conventions
 
 See `AGENTS.md`. Short version: no comments in Kotlin sources, warnings are
@@ -176,7 +203,8 @@ Phases land in order; each phase ships with tests and updated docs.
   tree with pins/custom groups/swipe actions/last-message previews,
   role-sectioned member sheet with account and bot badges, account-extban
   moderation, network icons, join-state machine with retry, unread divider
-  with jump-to-unread, and Room-FTS message search with snippet results.
+  with jump-to-unread, Room-FTS message search with snippet results, and
+  identity-preserving network editing with credential-vault updates.
   Remaining: moderation surfaces beyond these actions and slash verbs,
   per-message link auto-open polish.
 - **Phase 7 — Bouncers**: ZNC `znc.in/playback` requested; playback

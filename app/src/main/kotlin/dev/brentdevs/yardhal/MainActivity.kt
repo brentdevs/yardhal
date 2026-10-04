@@ -39,7 +39,7 @@ class MainActivity : ComponentActivity() {
                         presets = NetworkPresets.ALL.map {
                             NetworkPresetUi(it.id, it.name, it.host, it.port, it.tls)
                         },
-                        onNetworkSaved = { draft -> saveAndConnect(draft) },
+                        onNetworkSaved = ::saveNetwork,
                         sharedTextProvider = { (application as YardhalApplication).sharedText },
                         onSharedConsumed = { (application as YardhalApplication).sharedText = null },
                         modifier = Modifier,
@@ -83,15 +83,35 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun saveAndConnect(draft: NetworkDraft) {
-        val id = UUID.randomUUID().toString()
+    private fun saveNetwork(draft: NetworkDraft) {
         val app = application as YardhalApplication
-        val passwordRef = draft.saslPassword?.let { password ->
-            val key = "sasl-$id"
-            app.vault.storePassword(key, password)
-            key
+        val existing = draft.networkId?.let { app.networkStore.byId(it) ?: return }
+        val id = existing?.id ?: UUID.randomUUID().toString()
+        val previousPasswordRef = existing?.saslPasswordRef
+        val replacementPassword = draft.saslPassword.takeUnless { draft.clearSaslPassword }
+        val passwordRef = when {
+            draft.clearSaslPassword -> null
+            replacementPassword != null -> {
+                if (previousPasswordRef != null && previousPasswordRef == existing?.serverPasswordRef) {
+                    "sasl-$id-${UUID.randomUUID()}"
+                } else {
+                    previousPasswordRef ?: "sasl-$id"
+                }
+            }
+            else -> previousPasswordRef
         }
-        val config = NetworkConfig(
+        val authcid = draft.saslAuthcid ?: passwordRef?.let { draft.nick }
+        val config = existing?.copy(
+            name = draft.displayName,
+            host = draft.host,
+            port = draft.port,
+            tls = draft.tls,
+            nick = draft.nick,
+            autojoin = draft.autojoin,
+            saslAuthcid = authcid,
+            saslPasswordRef = passwordRef,
+            saslPassword = null,
+        ) ?: NetworkConfig(
             id = id,
             name = draft.displayName,
             host = draft.host,
@@ -99,10 +119,22 @@ class MainActivity : ComponentActivity() {
             tls = draft.tls,
             nick = draft.nick,
             autojoin = draft.autojoin,
-            saslAuthcid = passwordRef?.let { draft.nick },
+            saslAuthcid = authcid,
             saslPasswordRef = passwordRef,
         )
-        app.networkStore.add(config)
-        coordinator.connect(config)
+        if (replacementPassword != null && passwordRef != null) {
+            app.vault.storePassword(passwordRef, replacementPassword)
+        }
+        if (existing == null) {
+            if (!app.networkStore.add(config)) return
+            coordinator.connect(config)
+        } else if (!coordinator.updateNetwork(config, credentialsChanged = replacementPassword != null)) {
+            return
+        }
+        if (previousPasswordRef != null && previousPasswordRef != passwordRef &&
+            previousPasswordRef != config.serverPasswordRef
+        ) {
+            app.vault.deletePassword(previousPasswordRef)
+        }
     }
 }

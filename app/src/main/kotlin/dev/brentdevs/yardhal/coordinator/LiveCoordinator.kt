@@ -28,9 +28,13 @@ import dev.brentdevs.yardhal.core.protocol.IrcMetadata
 import dev.brentdevs.yardhal.ui.image.ImageUrlPolicy
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -82,20 +86,30 @@ public class LiveCoordinator(
         ignoreStore = store
     }
 
-    private val sessions = LinkedHashMap<String, Session>()
+    private val sessions = ConcurrentHashMap<String, Session>()
+    private val sessionLifecycleLock = Any()
 
     private companion object {
         const val TYPING_SEND_INTERVAL_MS = 4_000L
         const val HISTORY_PAGE_SIZE = 200
     }
 
-    private inner class Session(var config: NetworkConfig) {
-        val state = PerNetworkState(config.id, config.nick, config.autojoin)
-        var statusFlow: MutableStateFlow<ConnectionStatus> = MutableStateFlow(ConnectionStatus.CONNECTING)
+    private inner class Session(@Volatile var config: NetworkConfig, casemapping: CaseMapping) {
+        val state = PerNetworkState(config.id, config.nick, config.autojoin).also { it.casemapping = casemapping }
+        val lifecycleJob = SupervisorJob(scope.coroutineContext[Job])
+        val lifecycleScope = CoroutineScope(scope.coroutineContext + lifecycleJob)
+        val statusFlow = MutableStateFlow(ConnectionStatus.CONNECTING)
         var reconnector: IrcReconnector? = null
-        var collectorJob: Job? = null
-        var quitRequested: Boolean = false
+        var connection: IrcConnection? = null
+        @Volatile var quitRequested: Boolean = false
         @Volatile var stsUpgradePort: Int? = null
+
+        init {
+            lifecycleJob.invokeOnCompletion {
+                reconnector?.stop()
+                connection?.disconnect()
+            }
+        }
     }
 
     public fun startAll() {
@@ -103,10 +117,61 @@ public class LiveCoordinator(
     }
 
     public fun connect(config: NetworkConfig) {
-        if (sessions.containsKey(config.id)) return
-        val session = Session(config)
+        synchronized(sessionLifecycleLock) {
+            if (sessions.containsKey(config.id)) return
+            startSession(config)
+        }
+    }
+
+    public fun updateNetwork(config: NetworkConfig, credentialsChanged: Boolean = false): Boolean =
+        synchronized(sessionLifecycleLock) update@{
+            val saved = networkStore.byId(config.id) ?: return@update false
+            val session = sessions[config.id]
+            if (session == null) {
+                if (!networkStore.update(config)) return@update false
+                if (credentialsChanged || !saved.connectionSettingsMatch(config)) startSession(config)
+            } else {
+                synchronized(session.state) {
+                    if (!networkStore.update(config)) return@update false
+                    if (!credentialsChanged && session.config.connectionSettingsMatch(config)) {
+                        session.config = config
+                        refreshNetworkStates()
+                    } else {
+                        stopSession(session, "Network settings changed")
+                        startSession(config, session.state.casemapping)
+                    }
+                }
+            }
+            true
+        }
+
+    private fun NetworkConfig.connectionSettingsMatch(other: NetworkConfig): Boolean =
+        id == other.id &&
+            host == other.host &&
+            port == other.port &&
+            tls == other.tls &&
+            nick == other.nick &&
+            username == other.username &&
+            realName == other.realName &&
+            autojoin == other.autojoin &&
+            saslAuthcid == other.saslAuthcid &&
+            saslPasswordRef == other.saslPasswordRef &&
+            serverPasswordRef == other.serverPasswordRef &&
+            saslPassword == other.saslPassword
+
+    private fun startSession(config: NetworkConfig, casemapping: CaseMapping = CaseMapping.RFC1459) {
+        val session = Session(config, casemapping)
         sessions[config.id] = session
         _profiles.update { it - config.id }
+        updateAllBuffersForNetwork(config.id) { buffer ->
+            buffer.copy(
+                topic = null,
+                members = emptyList(),
+                memberPresence = emptyMap(),
+                typingUsers = emptyMap(),
+                joinState = if (buffer.ref.kind == ConversationKind.CHANNEL) JoinState.JOINING else buffer.joinState,
+            )
+        }
         ensureBaseBuffers(session)
         restoreKnownConversations(session)
         refreshNetworkStates()
@@ -114,34 +179,49 @@ public class LiveCoordinator(
     }
 
     private fun restoreKnownConversations(session: Session) {
-        scope.launch {
+        session.lifecycleScope.launch {
             val known = runCatching {
                 messageStore.knownConversations(session.config.id, session.state.casemapping)
             }.getOrDefault(emptyList())
-            for (ref in known) {
-                val isAutojoined = ref.kind == ConversationKind.CHANNEL &&
-                    ref.rawTarget in session.config.autojoin
-                if (channelOrder.isParted(ref.storageKey)) continue
-                if (!isAutojoined) buffer(ref)
-                if (ref.kind == ConversationKind.CHANNEL &&
-                    ref.rawTarget !in session.config.autojoin &&
-                    session.statusFlow.value == ConnectionStatus.REGISTERED
-                ) {
-                    sendRaw(session, "JOIN ${ref.rawTarget}")
+            synchronized(session.state) {
+                if (sessions[session.config.id] !== session) return@launch
+                for (ref in known) {
+                    val isAutojoined = ref.kind == ConversationKind.CHANNEL &&
+                        ref.rawTarget in session.config.autojoin
+                    if (channelOrder.isParted(ref.storageKey)) continue
+                    val alreadyOpen = ref.storageKey in _buffers.value
+                    if (!isAutojoined && !alreadyOpen) {
+                        if (ref.kind == ConversationKind.CHANNEL) markJoining(ref) else buffer(ref)
+                    }
+                    if (ref.kind == ConversationKind.CHANNEL &&
+                        !isAutojoined && !alreadyOpen &&
+                        session.statusFlow.value == ConnectionStatus.REGISTERED
+                    ) {
+                        sendRaw(session, "JOIN ${ref.rawTarget}")
+                    }
                 }
             }
         }
     }
 
     public fun disconnect(networkId: String, quitReason: String = "Yardhal") {
-        val session = sessions[networkId] ?: return
+        synchronized(sessionLifecycleLock) {
+            val session = sessions[networkId] ?: return
+            synchronized(session.state) {
+                stopSession(session, quitReason)
+                _profiles.update { it - networkId }
+                refreshNetworkStates()
+            }
+        }
+    }
+
+    private fun stopSession(session: Session, quitReason: String) {
         session.quitRequested = true
         sendRaw(session, "QUIT :$quitReason")
+        sessions.remove(session.config.id, session)
         session.reconnector?.stop()
-        session.collectorJob?.cancel()
-        sessions.remove(networkId)
-        _profiles.update { it - networkId }
-        refreshNetworkStates()
+        session.connection?.disconnect()
+        session.lifecycleJob.cancel()
     }
 
     public fun removeNetwork(networkId: String) {
@@ -160,26 +240,33 @@ public class LiveCoordinator(
 
     private fun launchSession(session: Session) {
         val reconnector = IrcReconnector(
-            scope = scope,
+            scope = session.lifecycleScope,
             policy = ReconnectPolicy(initialDelayMillis = 1_000, maxDelayMillis = 30_000),
             connectionFactory = {
-                connectionFactory.create(effectiveConfig(session.config, session.stsUpgradePort)) { port ->
-                    session.stsUpgradePort = port
+                synchronized(session.state) {
+                    session.lifecycleJob.ensureActive()
+                    connectionFactory.create(effectiveConfig(session.config, session.stsUpgradePort)) { port ->
+                        synchronized(session.state) {
+                            if (sessions[session.config.id] === session) session.stsUpgradePort = port
+                        }
+                    }.also { session.connection = it }
                 }
             },
         )
         session.reconnector = reconnector
-        session.collectorJob = scope.launch {
+        session.lifecycleScope.launch(start = CoroutineStart.UNDISPATCHED) {
             reconnector.events.collect { event -> routeEvent(session, event) }
         }
-        scope.launch {
+        session.lifecycleScope.launch(start = CoroutineStart.UNDISPATCHED) {
             reconnector.state.collect { state ->
-                if (state is dev.brentdevs.yardhal.core.client.ReconnectState.Stopped &&
-                    sessions[session.config.id] === session &&
-                    !session.quitRequested
-                ) {
-                    session.statusFlow.value = ConnectionStatus.DISCONNECTED
-                    refreshNetworkStates()
+                synchronized(session.state) {
+                    if (state is dev.brentdevs.yardhal.core.client.ReconnectState.Stopped &&
+                        sessions[session.config.id] === session &&
+                        !session.quitRequested
+                    ) {
+                        session.statusFlow.value = ConnectionStatus.DISCONNECTED
+                        refreshNetworkStates()
+                    }
                 }
             }
         }
@@ -200,13 +287,17 @@ public class LiveCoordinator(
         return config.copy(
             port = securePort ?: config.port,
             tls = config.tls || securePort != null,
+            saslAuthcid = config.saslAuthcid.takeIf { config.saslPasswordRef != null },
             saslPassword = password,
         )
     }
 
     private fun routeEvent(session: Session, event: IrcEvent) {
-        val effects = synchronized(session.state) { session.state.apply(event, inboundContext(session)) }
-        for (effect in effects) processEffect(session, effect)
+        synchronized(session.state) {
+            if (sessions[session.config.id] !== session) return
+            val effects = session.state.apply(event, inboundContext(session))
+            for (effect in effects) processEffect(session, effect)
+        }
     }
 
     private fun inboundContext(session: Session): InboundContext {
@@ -227,11 +318,14 @@ public class LiveCoordinator(
     private fun processEffect(session: Session, effect: InboundEffect) {
         when (effect) {
             is InboundEffect.SendRaw -> sendRaw(session, effect.line)
-            is InboundEffect.ScheduleRaw -> scope.launch {
+            is InboundEffect.ScheduleRaw -> session.lifecycleScope.launch {
                 delay(effect.delayMs)
-                val epoch = synchronized(session.state) { session.state.connectionEpoch }
-                if (sessions[session.config.id] === session && epoch == effect.connectionEpoch) {
-                    sendRaw(session, effect.line)
+                synchronized(session.state) {
+                    if (sessions[session.config.id] === session &&
+                        session.state.connectionEpoch == effect.connectionEpoch
+                    ) {
+                        sendRaw(session, effect.line)
+                    }
                 }
             }
             is InboundEffect.ProfilesChanged -> _profiles.update { profiles ->
@@ -395,7 +489,7 @@ public class LiveCoordinator(
     private fun ensureBaseBuffers(session: Session) {
         buffer(ConversationRef.server(session.config.id))
         for (channel in session.config.autojoin) {
-            markJoining(ConversationRef.channel(session.config.id, channel))
+            markJoining(ConversationRef.channel(session.config.id, channel, session.state.casemapping))
         }
     }
 
@@ -507,8 +601,10 @@ public class LiveCoordinator(
     }
 
     private fun updateAllBuffersForNetwork(networkId: String, transform: (ConversationBuffer) -> ConversationBuffer) {
-        _buffers.value = _buffers.value.mapValues { (_, buffer) ->
-            if (buffer.ref.networkId == networkId) transform(buffer) else buffer
+        _buffers.update { current ->
+            current.mapValues { (_, buffer) ->
+                if (buffer.ref.networkId == networkId) transform(buffer) else buffer
+            }
         }
     }
 
@@ -955,22 +1051,24 @@ public class LiveCoordinator(
     }
 
     private fun refreshNetworkStates() {
-        _networkStates.value = sessions.values.map { session ->
-            UiNetwork(
-                id = session.config.id,
-                name = session.config.name,
-                host = session.config.host,
-                status = session.statusFlow.value,
-                ownNick = session.state.ownNick,
-                hasBotMode = session.state.botModeLetter != null,
-                accountBanAvailable = session.state.accountExtban != null,
-                iconUrl = session.state.networkIconUrl,
-            )
-        }.sortedBy { it.name }
+        _networkStates.update {
+            sessions.values.map { session ->
+                UiNetwork(
+                    id = session.config.id,
+                    name = session.config.name,
+                    host = session.config.host,
+                    status = session.statusFlow.value,
+                    ownNick = session.state.ownNick,
+                    hasBotMode = session.state.botModeLetter != null,
+                    accountBanAvailable = session.state.accountExtban != null,
+                    iconUrl = session.state.networkIconUrl,
+                )
+            }.sortedBy { it.name }
+        }
     }
 
     private fun sendRaw(session: Session, line: String) {
-        session.reconnector?.sendLine(line)
+        if (sessions[session.config.id] === session) session.reconnector?.sendLine(line)
     }
 
     private fun sendLabeled(session: Session, origin: ConversationRef, command: LabeledCommand, line: String) {
@@ -996,7 +1094,7 @@ public class LiveCoordinator(
     }
 
     public fun canSendOffline(networkId: String, storageKey: String, input: String): Boolean {
-        if (networkId !in sessions) return false
+        if (!sessions.containsKey(networkId)) return false
         val activeBuffer = _buffers.value[storageKey] ?: return false
         return SlashCommandParser.parse(input, activeBuffer.ref.rawTarget)?.isLocal() == true
     }
