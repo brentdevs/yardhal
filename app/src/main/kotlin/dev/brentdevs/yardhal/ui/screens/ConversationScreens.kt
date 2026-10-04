@@ -24,6 +24,8 @@ import androidx.compose.material.icons.filled.AlternateEmail
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Mail
@@ -36,6 +38,8 @@ import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.Tag
+import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
 import androidx.compose.material3.Card
@@ -983,6 +987,14 @@ private fun CollapsedEventsRow(entry: TranscriptEntry.CollapsedEvents) {
 private sealed interface OverviewEntry {
     public data class NetworkHeader(
         public val network: dev.brentdevs.yardhal.coordinator.UiNetwork,
+        public val isCollapsed: Boolean,
+        public val hasUnread: Boolean,
+        public val unreadCount: Int,
+    ) : OverviewEntry
+
+    public data class ServerRow(
+        public val networkId: String,
+        public val networkName: String,
     ) : OverviewEntry
 
     public data class SectionHeader(public val label: String) : OverviewEntry
@@ -1000,16 +1012,25 @@ private fun buildOverviewEntries(
     buffers: List<ConversationBuffer>,
     mutedKeys: Set<String>,
     order: dev.brentdevs.yardhal.core.data.ChannelOrderState,
+    collapsedNetworkIds: Set<String>,
 ): List<OverviewEntry> {
     val entries = ArrayList<OverviewEntry>()
     val comparison = compareByDescending<ConversationBuffer> { it.hasUnread }
         .thenBy { it.ref.kind != dev.brentdevs.yardhal.core.data.ConversationKind.CHANNEL }
         .thenBy { it.displayName.lowercase() }
     for (network in networks.sortedBy { it.name.lowercase() }) {
-        entries.add(OverviewEntry.NetworkHeader(network))
         val own = buffers.filter {
             it.ref.networkId == network.id && it.ref.kind != dev.brentdevs.yardhal.core.data.ConversationKind.SERVER
         }
+        val isCollapsed = network.id in collapsedNetworkIds
+        val netHasUnread = own.any { it.hasUnread }
+        val netUnreadCount = own.count { it.hasUnread }
+        entries.add(OverviewEntry.NetworkHeader(network, isCollapsed, netHasUnread, netUnreadCount))
+
+        if (isCollapsed) continue
+
+        entries.add(OverviewEntry.ServerRow(network.id, network.name))
+
         val channels = own.filter { it.ref.kind == dev.brentdevs.yardhal.core.data.ConversationKind.CHANNEL }
         val directs = own.filter { it.ref.kind == dev.brentdevs.yardhal.core.data.ConversationKind.DIRECT_MESSAGE }
 
@@ -1094,9 +1115,10 @@ public fun NetworkOverviewScreen(
     var pendingLeave by remember { mutableStateOf<ConversationBuffer?>(null) }
     var moveTarget by remember { mutableStateOf<String?>(null) }
     var newGroupName by remember { mutableStateOf("") }
+    var collapsedNetworkIds by rememberSaveable { mutableStateOf(emptySet<String>()) }
 
-    val entries = remember(networks, buffers, mutedKeys, orderState) {
-        buildOverviewEntries(networks, buffers, mutedKeys, orderState)
+    val entries = remember(networks, buffers, mutedKeys, orderState, collapsedNetworkIds) {
+        buildOverviewEntries(networks, buffers, mutedKeys, orderState, collapsedNetworkIds)
     }
 
     if (debugVisible) {
@@ -1240,6 +1262,7 @@ public fun NetworkOverviewScreen(
             items(entries.size, key = { index ->
                 when (val entry = entries[index]) {
                     is OverviewEntry.NetworkHeader -> "net-${entry.network.id}"
+                    is OverviewEntry.ServerRow -> "server-${entry.networkId}"
                     is OverviewEntry.SectionHeader -> "section-${entry.label}-$index"
                     is OverviewEntry.BufferRow -> "buf-${entry.buffer.key}"
                 }
@@ -1250,24 +1273,55 @@ public fun NetworkOverviewScreen(
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clickable { onSelectServer(network.id) }
+                                .clickable {
+                                    collapsedNetworkIds = if (entry.isCollapsed) {
+                                        collapsedNetworkIds - network.id
+                                    } else {
+                                        collapsedNetworkIds + network.id
+                                    }
+                                }
                                 .defaultMinSize(minHeight = 56.dp)
                                 .padding(start = 16.dp, end = 12.dp, top = 14.dp, bottom = 4.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             NetworkBadge(network.status, network.iconUrl)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = network.name,
-                                style = MaterialTheme.typography.titleSmall,
-                                fontWeight = FontWeight.SemiBold,
-                                modifier = Modifier.weight(1f),
-                            )
-                            if (network.status != ConnectionStatus.REGISTERED) {
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    if (network.status == ConnectionStatus.CONNECTING) "Connecting" else "Offline",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    text = network.name,
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold,
+                                )
+                                if (network.status != ConnectionStatus.REGISTERED) {
+                                    Text(
+                                        text = if (network.status == ConnectionStatus.CONNECTING) "Connecting…" else "Offline",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                            if (entry.isCollapsed && entry.hasUnread) {
+                                Badge(
+                                    containerColor = MaterialTheme.colorScheme.primary,
+                                    contentColor = MaterialTheme.colorScheme.onPrimary,
+                                ) {
+                                    Text(if (entry.unreadCount > 0) "${entry.unreadCount}" else "•")
+                                }
+                                Spacer(modifier = Modifier.width(4.dp))
+                            }
+                            IconButton(
+                                onClick = {
+                                    collapsedNetworkIds = if (entry.isCollapsed) {
+                                        collapsedNetworkIds - network.id
+                                    } else {
+                                        collapsedNetworkIds + network.id
+                                    }
+                                },
+                                modifier = Modifier.size(32.dp),
+                            ) {
+                                Icon(
+                                    imageVector = if (entry.isCollapsed) Icons.Filled.ExpandMore else Icons.Filled.ExpandLess,
+                                    contentDescription = if (entry.isCollapsed) "Expand ${network.name}" else "Collapse ${network.name}",
                                 )
                             }
                             Box {
@@ -1302,18 +1356,59 @@ public fun NetworkOverviewScreen(
                             }
                         }
                     }
+                    is OverviewEntry.ServerRow -> {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onSelectServer(entry.networkId) }
+                                .defaultMinSize(minHeight = 48.dp)
+                                .padding(start = 24.dp, end = 16.dp, top = 4.dp, bottom = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant,
+                                modifier = Modifier.size(32.dp),
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Terminal,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(18.dp),
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Server Console",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Medium,
+                                )
+                                Text(
+                                    text = "Status, raw log, system notices",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
                     is OverviewEntry.SectionHeader -> {
                         Text(
                             text = entry.label,
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(start = 42.dp, top = 10.dp, bottom = 2.dp),
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(start = 24.dp, top = 12.dp, bottom = 4.dp),
                         )
                     }
                     is OverviewEntry.BufferRow -> {
                         val buffer = entry.buffer
                         val last = buffer.messages.lastOrNull()
                         val isChannel = buffer.ref.kind == dev.brentdevs.yardhal.core.data.ConversationKind.CHANNEL
+                        val unreadCount = buffer.messages.count { it.countsAsUnread && (buffer.unreadFromTimestampMs == null || it.timestampMs >= buffer.unreadFromTimestampMs) }
+                        val hasMention = buffer.messages.any { it.highlightsMe && (buffer.unreadFromTimestampMs == null || it.timestampMs >= buffer.unreadFromTimestampMs) }
                         val dismissState = androidx.compose.material3.rememberSwipeToDismissBoxState(
                             confirmValueChange = { value ->
                                 when (value) {
@@ -1335,7 +1430,7 @@ public fun NetworkOverviewScreen(
                                     Box(
                                         modifier = Modifier
                                             .fillMaxSize()
-                                            .padding(horizontal = 44.dp, vertical = 4.dp),
+                                            .padding(horizontal = 24.dp, vertical = 4.dp),
                                         contentAlignment = if (dismissState.dismissDirection == androidx.compose.material3.SwipeToDismissBoxValue.EndToStart) {
                                             Alignment.CenterEnd
                                         } else {
@@ -1355,65 +1450,102 @@ public fun NetworkOverviewScreen(
                                 }
                             },
                         ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .combinedClickableCompat(
-                                    onClick = { onSelect(buffer.key) },
-                                    onLongClick = { rowMenuFor = buffer.key },
-                                )
-                                .defaultMinSize(minHeight = 56.dp)
-                                .padding(start = 42.dp, end = 16.dp, top = 6.dp, bottom = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Text(
-                                        text = buffer.displayName,
-                                        style = MaterialTheme.typography.bodyLarge,
-                                        fontWeight = if (buffer.hasUnread) FontWeight.SemiBold else FontWeight.Normal,
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .combinedClickableCompat(
+                                        onClick = { onSelect(buffer.key) },
+                                        onLongClick = { rowMenuFor = buffer.key },
                                     )
-                                    if (entry.muted) {
-                                        Text(
-                                            text = "  muted",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        )
+                                    .defaultMinSize(minHeight = 56.dp)
+                                    .padding(start = 24.dp, end = 16.dp, top = 6.dp, bottom = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                if (isChannel) {
+                                    Surface(
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = if (buffer.hasUnread) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                                        modifier = Modifier.size(32.dp),
+                                    ) {
+                                        Box(contentAlignment = Alignment.Center) {
+                                            Icon(
+                                                imageVector = Icons.Filled.Tag,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(18.dp),
+                                                tint = if (buffer.hasUnread) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+                                            )
+                                        }
                                     }
-                                    if (buffer.joinState == dev.brentdevs.yardhal.coordinator.JoinState.FAILED) {
-                                        Text(
-                                            text = "  ! failed",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.error,
-                                        )
-                                    } else if (buffer.joinState == dev.brentdevs.yardhal.coordinator.JoinState.JOINING) {
-                                        Text(
-                                            text = "  joining…",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        )
-                                    }
-                                }
-                                if (last != null) {
-                                    Text(
-                                        text = if (last.sentByUs) last.text else "${last.sender}: ${last.text}",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        maxLines = 1,
-                                    )
                                 } else {
-                                    Text(
-                                        text = "No messages yet",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        maxLines = 1,
+                                    NickAvatar(
+                                        nick = buffer.displayName,
+                                        size = 32.dp,
                                     )
                                 }
-                            }
-                            if (buffer.hasUnread) {
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Badge { Text("New") }
-                            }
+                                Spacer(modifier = Modifier.width(12.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            text = buffer.displayName,
+                                            style = MaterialTheme.typography.bodyLarge,
+                                            fontWeight = if (buffer.hasUnread) FontWeight.Bold else FontWeight.Normal,
+                                            maxLines = 1,
+                                        )
+                                        if (entry.muted) {
+                                            Text(
+                                                text = "  muted",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            )
+                                        }
+                                        if (buffer.joinState == dev.brentdevs.yardhal.coordinator.JoinState.FAILED) {
+                                            Text(
+                                                text = "  ! failed",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.error,
+                                            )
+                                        } else if (buffer.joinState == dev.brentdevs.yardhal.coordinator.JoinState.JOINING) {
+                                            Text(
+                                                text = "  joining…",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            )
+                                        }
+                                    }
+                                    if (last != null) {
+                                        Text(
+                                            text = if (last.sentByUs) last.text else "${last.sender}: ${last.text}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                        )
+                                    } else {
+                                        Text(
+                                            text = "No messages yet",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                        )
+                                    }
+                                }
+                                if (buffer.hasUnread) {
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    if (hasMention) {
+                                        Badge(
+                                            containerColor = MaterialTheme.colorScheme.error,
+                                            contentColor = MaterialTheme.colorScheme.onError,
+                                        ) {
+                                            Text(if (unreadCount > 0) "$unreadCount" else "!")
+                                        }
+                                    } else {
+                                        Badge(
+                                            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                                            contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        ) {
+                                            Text(if (unreadCount > 0) "$unreadCount" else "•")
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
