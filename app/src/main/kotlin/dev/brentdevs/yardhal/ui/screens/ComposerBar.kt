@@ -1,38 +1,109 @@
 package dev.brentdevs.yardhal.ui.screens
 
-import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Text
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.Code
+import androidx.compose.material.icons.filled.FormatBold
+import androidx.compose.material.icons.filled.FormatItalic
+import androidx.compose.material.icons.filled.FormatStrikethrough
+import androidx.compose.material.icons.filled.FormatUnderlined
+import androidx.compose.material.icons.filled.Tag
+import androidx.compose.material.icons.filled.TextFields
+import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
-import androidx.compose.runtime.saveable.rememberSaveable
+import dev.brentdevs.yardhal.ui.components.NickAvatar
+
+private const val BOLD_CHAR = '\u0002'
+private const val ITALIC_CHAR = '\u001D'
+private const val UNDERLINE_CHAR = '\u001F'
+private const val STRIKETHROUGH_CHAR = '\u001E'
+private const val MONOSPACE_CHAR = '\u0011'
+private const val RESET_CHAR = '\u000F'
+
+private data class CommandInfo(
+    val command: String,
+    val syntax: String,
+    val summary: String,
+)
 
 private val COMMANDS = listOf(
-    "/join", "/part", "/msg", "/query", "/me", "/nick", "/topic", "/whois", "/who",
-    "/away", "/back", "/monitor", "/ignore", "/unignore", "/mode", "/help",
+    CommandInfo("/join", "/join <#channel>", "Join channel"),
+    CommandInfo("/part", "/part [#channel] [reason]", "Leave channel"),
+    CommandInfo("/msg", "/msg <nick> <text>", "Private message"),
+    CommandInfo("/query", "/query <nick>", "Open direct message"),
+    CommandInfo("/me", "/me <action>", "Describe action"),
+    CommandInfo("/nick", "/nick <newnick>", "Change nickname"),
+    CommandInfo("/topic", "/topic [new topic]", "View or set topic"),
+    CommandInfo("/whois", "/whois <nick>", "User details"),
+    CommandInfo("/who", "/who <channel|mask>", "List channel users"),
+    CommandInfo("/away", "/away [message]", "Set away message"),
+    CommandInfo("/back", "/back", "Clear away status"),
+    CommandInfo("/quote", "/quote <raw>", "Send raw IRC line"),
+    CommandInfo("/monitor", "/monitor [+/-nick]", "Online monitor list"),
+    CommandInfo("/ignore", "/ignore <nick>", "Ignore user"),
+    CommandInfo("/unignore", "/unignore <nick>", "Unignore user"),
+    CommandInfo("/mode", "/mode [target] [modes]", "Channel or user modes"),
+    CommandInfo("/clear", "/clear", "Clear scrollback"),
+    CommandInfo("/help", "/help [command]", "Show command help"),
 )
+
+private sealed interface SuggestionItem {
+    val completionText: String
+    val isChannel: Boolean get() = false
+    val isNick: Boolean get() = false
+    val isCommand: Boolean get() = false
+
+    data class Command(val info: CommandInfo) : SuggestionItem {
+        override val completionText: String get() = info.command
+        override val isCommand: Boolean get() = true
+    }
+
+    data class Nick(val nick: String) : SuggestionItem {
+        override val completionText: String get() = nick
+        override val isNick: Boolean get() = true
+    }
+
+    data class Channel(val channel: String) : SuggestionItem {
+        override val completionText: String get() = channel
+        override val isChannel: Boolean get() = true
+    }
+}
 
 @Composable
 public fun ComposerBar(
@@ -50,6 +121,7 @@ public fun ComposerBar(
         mutableStateOf(TextFieldValue(""))
     }
     var sendError by rememberSaveable { mutableStateOf(false) }
+    var showFormattingBar by rememberSaveable { mutableStateOf(false) }
 
     LaunchedEffect(initialDraft) {
         if (initialDraft != null) {
@@ -65,33 +137,67 @@ public fun ComposerBar(
         return draft.text.lastIndexOfAny(charArrayOf(' ', '\n', '\t'), cursor - 1) + 1
     }
 
-    fun suggestions(): List<String> {
+    fun suggestions(): List<SuggestionItem> {
         val cursor = draft.selection.start.coerceIn(0, draft.text.length)
         val start = tokenStart()
         val raw = draft.text.substring(start, cursor)
         if (raw.isEmpty()) return emptyList()
-        val nickCompletion = !(start == 0 && raw.startsWith("/")) && !raw.startsWith("#") && !raw.startsWith("&")
-        val candidates = when {
-            start == 0 && raw.startsWith("/") -> COMMANDS
-            raw.startsWith("#") || raw.startsWith("&") -> channels
-            else -> members
+        val isSlashCommand = start == 0 && raw.startsWith("/")
+        val isChannel = raw.startsWith("#") || raw.startsWith("&")
+        return when {
+            isSlashCommand -> {
+                val token = raw.lowercase()
+                COMMANDS.filter { it.command.startsWith(token) && !it.command.equals(token, ignoreCase = true) }
+                    .take(6)
+                    .map { SuggestionItem.Command(it) }
+            }
+            isChannel -> {
+                channels.filter { it.startsWith(raw, ignoreCase = true) && !it.equals(raw, ignoreCase = true) }
+                    .take(5)
+                    .map { SuggestionItem.Channel(it) }
+            }
+            else -> {
+                val token = raw.removePrefix("@")
+                if (token.isEmpty()) return emptyList()
+                members.filter { it.startsWith(token, ignoreCase = true) && !it.equals(token, ignoreCase = true) }
+                    .take(5)
+                    .map { SuggestionItem.Nick(it) }
+            }
         }
-        val token = if (nickCompletion) raw.removePrefix("@") else raw
-        if (token.isEmpty()) return emptyList()
-        return candidates.filter { it.startsWith(token, ignoreCase = true) && !it.equals(token, ignoreCase = true) }
-            .take(3)
     }
 
-    fun complete(candidate: String) {
+    fun complete(candidate: SuggestionItem) {
         val start = tokenStart()
         val cursor = draft.selection.start.coerceIn(start, draft.text.length)
         val end = draft.text.indexOfAny(charArrayOf(' ', '\n', '\t'), cursor).let {
             if (it < 0) draft.text.length else it
         }
-        val suffix = if (start == 0 && !candidate.startsWith("/") && !candidate.startsWith("#") && !candidate.startsWith("&")) ": " else " "
-        val replacement = candidate + suffix
+        val rawText = candidate.completionText
+        val suffix = when {
+            candidate.isCommand -> " "
+            candidate.isChannel -> " "
+            candidate.isNick && start == 0 -> ": "
+            else -> " "
+        }
+        val replacement = rawText + suffix
         val updated = draft.text.replaceRange(start, end, replacement)
         draft = TextFieldValue(updated, TextRange(start + replacement.length))
+    }
+
+    fun applyFormatting(code: Char) {
+        val selectedText = if (draft.selection.collapsed) "" else draft.text.substring(draft.selection.min, draft.selection.max)
+        if (selectedText.isNotEmpty()) {
+            val start = draft.selection.min
+            val end = draft.selection.max
+            val wrapped = "$code$selectedText$code"
+            val updated = draft.text.replaceRange(start, end, wrapped)
+            draft = TextFieldValue(updated, TextRange(start + wrapped.length))
+        } else {
+            val cursor = draft.selection.start.coerceIn(0, draft.text.length)
+            val codeStr = "$code"
+            val updated = draft.text.replaceRange(cursor, cursor, codeStr)
+            draft = TextFieldValue(updated, TextRange(cursor + 1))
+        }
     }
 
     fun submit() {
@@ -108,26 +214,226 @@ public fun ComposerBar(
     Column(modifier = modifier.fillMaxWidth().navigationBarsPadding().imePadding()) {
         val localCommandAvailable = !enabled && canSendOffline(draft.text)
         val candidates = suggestions()
-        if (candidates.isNotEmpty()) {
+
+        AnimatedVisibility(
+            visible = candidates.isNotEmpty(),
+            enter = fadeIn(),
+            exit = fadeOut(),
+        ) {
             Row(
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                modifier = Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 12.dp, vertical = 4.dp),
             ) {
                 candidates.forEach { candidate ->
-                    androidx.compose.material3.TextButton(onClick = { complete(candidate) }) {
-                        Text(candidate, style = MaterialTheme.typography.labelMedium)
+                    when (candidate) {
+                        is SuggestionItem.Command -> {
+                            Surface(
+                                onClick = { complete(candidate) },
+                                shape = RoundedCornerShape(12.dp),
+                                color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                                tonalElevation = 1.dp,
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                ) {
+                                    Text(
+                                        text = candidate.info.command,
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.primary,
+                                    )
+                                    Text(
+                                        text = candidate.info.syntax.removePrefix(candidate.info.command),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                        }
+                        is SuggestionItem.Nick -> {
+                            Surface(
+                                onClick = { complete(candidate) },
+                                shape = RoundedCornerShape(12.dp),
+                                color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                                tonalElevation = 1.dp,
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                ) {
+                                    NickAvatar(nick = candidate.nick, size = 20.dp)
+                                    Text(
+                                        text = candidate.nick,
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                    )
+                                }
+                            }
+                        }
+                        is SuggestionItem.Channel -> {
+                            Surface(
+                                onClick = { complete(candidate) },
+                                shape = RoundedCornerShape(12.dp),
+                                color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                                tonalElevation = 1.dp,
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Tag,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp),
+                                        tint = MaterialTheme.colorScheme.primary,
+                                    )
+                                    Text(
+                                        text = candidate.channel.removePrefix("#"),
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
+
+        AnimatedVisibility(
+            visible = showFormattingBar,
+            enter = fadeIn(),
+            exit = fadeOut(),
+        ) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 12.dp, vertical = 4.dp),
+            ) {
+                Surface(
+                    onClick = { applyFormatting(BOLD_CHAR) },
+                    shape = RoundedCornerShape(8.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                ) {
+                    Box(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                        Icon(
+                            imageVector = Icons.Filled.FormatBold,
+                            contentDescription = "Bold",
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+                }
+                Surface(
+                    onClick = { applyFormatting(ITALIC_CHAR) },
+                    shape = RoundedCornerShape(8.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                ) {
+                    Box(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                        Icon(
+                            imageVector = Icons.Filled.FormatItalic,
+                            contentDescription = "Italic",
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+                }
+                Surface(
+                    onClick = { applyFormatting(UNDERLINE_CHAR) },
+                    shape = RoundedCornerShape(8.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                ) {
+                    Box(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                        Icon(
+                            imageVector = Icons.Filled.FormatUnderlined,
+                            contentDescription = "Underline",
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+                }
+                Surface(
+                    onClick = { applyFormatting(STRIKETHROUGH_CHAR) },
+                    shape = RoundedCornerShape(8.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                ) {
+                    Box(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                        Icon(
+                            imageVector = Icons.Filled.FormatStrikethrough,
+                            contentDescription = "Strikethrough",
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+                }
+                Surface(
+                    onClick = { applyFormatting(MONOSPACE_CHAR) },
+                    shape = RoundedCornerShape(8.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                ) {
+                    Box(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                        Icon(
+                            imageVector = Icons.Filled.Code,
+                            contentDescription = "Monospace",
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+                }
+                Surface(
+                    onClick = { applyFormatting(RESET_CHAR) },
+                    shape = RoundedCornerShape(8.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                ) {
+                    Text(
+                        text = "Reset",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                    )
+                }
+            }
+        }
+
+        if (!enabled || sendError) {
+            Text(
+                text = when {
+                    sendError -> "Could not send · draft retained"
+                    localCommandAvailable -> "Offline · local command available"
+                    else -> "Offline · draft saved until reconnection"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = if (sendError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
+            )
+        }
+
         Row(
-            modifier = modifier
+            modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 8.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            OutlinedTextField(
+            IconButton(
+                onClick = onAttach,
+                enabled = enabled,
+                modifier = Modifier.size(40.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.AttachFile,
+                    contentDescription = "Attach file",
+                    tint = if (enabled) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.outline,
+                )
+            }
+            TextField(
                 value = draft,
                 onValueChange = {
                     draft = it
@@ -135,31 +441,46 @@ public fun ComposerBar(
                 },
                 modifier = Modifier.weight(1f),
                 placeholder = { Text("Message…") },
-                supportingText = if (enabled && !sendError) null else {
-                    {
-                        Text(
-                            when {
-                                sendError -> "Could not send · draft retained"
-                                localCommandAvailable -> "Offline · local command available"
-                                else -> "Offline · draft saved until reconnection"
-                            },
+                trailingIcon = {
+                    IconButton(
+                        onClick = { showFormattingBar = !showFormattingBar },
+                        modifier = Modifier.size(32.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.TextFields,
+                            contentDescription = "Format text",
+                            tint = if (showFormattingBar) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(20.dp),
                         )
                     }
                 },
-                maxLines = 4,
+                shape = RoundedCornerShape(24.dp),
+                colors = TextFieldDefaults.colors(
+                    focusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    disabledContainerColor = MaterialTheme.colorScheme.surfaceContainerLow,
+                    focusedIndicatorColor = Color.Transparent,
+                    unfocusedIndicatorColor = Color.Transparent,
+                    disabledIndicatorColor = Color.Transparent,
+                ),
+                maxLines = 5,
             )
-            IconButton(onClick = onAttach, enabled = enabled) {
-                Icon(
-                    imageVector = Icons.Filled.AttachFile,
-                    contentDescription = "Attach file",
-                    tint = if (enabled) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.outline,
-                )
-            }
-            IconButton(onClick = { submit() }, enabled = draft.text.isNotBlank() && (enabled || localCommandAvailable)) {
+            val canSend = draft.text.isNotBlank() && (enabled || localCommandAvailable)
+            FilledIconButton(
+                onClick = { submit() },
+                enabled = canSend,
+                modifier = Modifier.size(44.dp),
+                colors = IconButtonDefaults.filledIconButtonColors(
+                    containerColor = MaterialTheme.colorScheme.primary,
+                    contentColor = MaterialTheme.colorScheme.onPrimary,
+                    disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                    disabledContentColor = MaterialTheme.colorScheme.outline,
+                ),
+            ) {
                 Icon(
                     imageVector = Icons.AutoMirrored.Filled.Send,
                     contentDescription = "Send",
-                    tint = if (enabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(20.dp),
                 )
             }
         }
