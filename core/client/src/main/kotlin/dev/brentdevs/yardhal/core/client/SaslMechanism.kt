@@ -87,6 +87,7 @@ internal class ScramSha256Mechanism(
         val iterations = attributes["i"]?.toIntOrNull()
             ?: throw SaslMechanismException("SCRAM server-first lacks iteration count")
         if (iterations < MIN_ITERATIONS) throw SaslMechanismException("SCRAM iteration count $iterations is too low")
+        if (iterations > MAX_ITERATIONS) throw SaslMechanismException("SCRAM iteration count $iterations is too high")
 
         val saltedPassword = hi(passwordBytes, salt, iterations)
         val clientKey = hmac(saltedPassword, "Client Key".toByteArray(Charsets.UTF_8))
@@ -118,6 +119,7 @@ internal class ScramSha256Mechanism(
         private const val HMAC_SHA256 = "HmacSHA256"
         private const val NONCE_BYTES = 18
         const val MIN_ITERATIONS: Int = 4096
+        const val MAX_ITERATIONS: Int = 1_000_000
 
         private val random = SecureRandom()
 

@@ -79,6 +79,28 @@ class ScramSha256MechanismTests {
     }
 
     @Test
+    fun excessiveIterationCountsAreRejected() {
+        for (iterations in listOf(1_000_001, Int.MAX_VALUE)) {
+            val mechanism = rfcMechanism()
+            mechanism.step("")
+            assertFailsWith<SaslMechanismException> {
+                mechanism.step("r=${rfcClientNonce}xyz,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=$iterations")
+            }
+        }
+    }
+
+    @Test
+    fun maximumIterationCountAuthenticatesAgainstIndependentPbkdf2Server() {
+        val server = ScramServerFixture(password = "pencil", iterations = 1_000_000)
+        val mechanism = rfcMechanism()
+        val serverFirst = server.serverFirst(mechanism.step(""))
+        val serverFinal = server.serverFinal(mechanism.step(serverFirst))
+        assertTrue(server.clientProofValid)
+        mechanism.step(serverFinal)
+        assertTrue(mechanism.serverVerified)
+    }
+
+    @Test
     fun usernameIsEscapedAndPrepared() {
         val mechanism = ScramSha256Mechanism("a=b,c\u00A0d", "pw", clientNonce = "nonce")
         assertEquals("n,,n=a=3Db=2Cc d,r=nonce", mechanism.step(""))

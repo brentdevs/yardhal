@@ -81,9 +81,10 @@ visible conversation requests members only after its CHANNEL/JOINED transition;
 the coordinator additionally requires registration. Persisted-history loading
 is separate, and hidden channels are not eagerly queried.
 
-Room schema 2 stores nullable channel context through the entire transcript
-path. Its explicit 1→2 migration only adds the column; existing row IDs,
-deduplication hashes and the FTS index survive. There is no destructive fallback.
+Room schema 2 stores nullable channel context through live transcripts, history
+reloads and search-hit context restoration. Its explicit 1→2 migration only adds
+the column; existing row IDs, deduplication hashes and the FTS index survive.
+There is no destructive fallback.
 Rename-following retains only the active selected key and one pending destination,
 retargeted across rapid renames before buffer publication. Consuming a redirect,
 changing selection, reusing its source or removing its destination/network clears
@@ -121,6 +122,9 @@ NFKC normalization, prohibited-character checks, bidi restrictions, and the
 query/stored unassigned-character distinction. Usernames use QUERY and passwords
 use STORED. Empty prepared credentials fail at mechanism construction. Preparation
 failure emits one SASL failure without sending credentials or downgrading.
+Server iteration counts must be within 4,096–1,000,000 inclusive. The upper bound
+is a client resource policy, not a protocol requirement; out-of-range challenges
+abort authentication before password derivation without clamping or downgrading.
 
 `scripts/generate-saslprep-tables.py` reproduces the frozen encoded initializer
 from CPython's RFC 3454 `stringprep` predicates and `unicodedata.ucd_3_2_0`, without
