@@ -34,6 +34,7 @@ internal fun Reduction.handleRegistered(nickname: String) {
     channels.addAll(state.autojoin)
     channels.addAll(context.openChannels())
     for (channel in channels) {
+        if (context.isParted(channel)) continue
         emit(InboundEffect.SetJoinState(state.channelRef(channel), JoinState.JOINING))
         emit(InboundEffect.SendRaw("JOIN $channel"))
     }

@@ -129,9 +129,21 @@ public class ChannelOrderStore(directory: File) {
     public fun rename(fromKey: String, toKey: String) {
         if (fromKey == toKey) return
         fun List<String>.renamed(): List<String> = map { if (it == fromKey) toKey else it }.distinct()
+        var assigned = false
         state = state.copy(
             pinnedKeys = state.pinnedKeys.renamed(),
-            groups = state.groups.map { it.copy(memberKeys = it.memberKeys.renamed()) },
+            groups = state.groups.map { group ->
+                group.copy(memberKeys = group.memberKeys.renamed().filter { key ->
+                    if (key != toKey) {
+                        true
+                    } else if (assigned) {
+                        false
+                    } else {
+                        assigned = true
+                        true
+                    }
+                })
+            },
             partedKeys = state.partedKeys.renamed(),
         )
         persist()

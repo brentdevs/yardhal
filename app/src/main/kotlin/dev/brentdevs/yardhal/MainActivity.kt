@@ -9,14 +9,11 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Modifier
 import dev.brentdevs.yardhal.coordinator.LiveCoordinator
-import dev.brentdevs.yardhal.core.data.NetworkConfig
 import dev.brentdevs.yardhal.core.data.NetworkPresets
 import dev.brentdevs.yardhal.ui.YardhalAppRoot
 import dev.brentdevs.yardhal.ui.image.LocalRemoteImageLoader
-import dev.brentdevs.yardhal.ui.screens.NetworkDraft
 import dev.brentdevs.yardhal.ui.screens.NetworkPresetUi
 import dev.brentdevs.yardhal.ui.theme.YardhalTheme
-import java.util.UUID
 
 class MainActivity : ComponentActivity() {
 
@@ -27,6 +24,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         val app = application as YardhalApplication
         coordinator = app.coordinator
+        val networkSaver = NetworkSaver(coordinator, app.vault)
 
         setContent {
             YardhalTheme(
@@ -39,7 +37,7 @@ class MainActivity : ComponentActivity() {
                         presets = NetworkPresets.ALL.map {
                             NetworkPresetUi(it.id, it.name, it.host, it.port, it.tls)
                         },
-                        onNetworkSaved = { draft -> saveAndConnect(draft) },
+                        onNetworkSaved = networkSaver::save,
                         sharedTextProvider = { (application as YardhalApplication).sharedText },
                         onSharedConsumed = { (application as YardhalApplication).sharedText = null },
                         modifier = Modifier,
@@ -83,26 +81,4 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun saveAndConnect(draft: NetworkDraft) {
-        val id = UUID.randomUUID().toString()
-        val app = application as YardhalApplication
-        val passwordRef = draft.saslPassword?.let { password ->
-            val key = "sasl-$id"
-            app.vault.storePassword(key, password)
-            key
-        }
-        val config = NetworkConfig(
-            id = id,
-            name = draft.displayName,
-            host = draft.host,
-            port = draft.port,
-            tls = draft.tls,
-            nick = draft.nick,
-            autojoin = draft.autojoin,
-            saslAuthcid = passwordRef?.let { draft.nick },
-            saslPasswordRef = passwordRef,
-        )
-        app.networkStore.add(config)
-        coordinator.connect(config)
-    }
 }

@@ -55,7 +55,7 @@ import dev.brentdevs.yardhal.coordinator.LiveCoordinator
 import dev.brentdevs.yardhal.coordinator.NetworkProfiles
 import dev.brentdevs.yardhal.core.data.ConversationRef
 import dev.brentdevs.yardhal.core.data.ChatAppearanceStore
-import dev.brentdevs.yardhal.ui.screens.AddNetworkSheet
+import dev.brentdevs.yardhal.ui.screens.NetworkEditorSheet
 import dev.brentdevs.yardhal.ui.screens.ConversationScreen
 import dev.brentdevs.yardhal.ui.screens.MessageSearchScreen
 import dev.brentdevs.yardhal.ui.screens.NetworkDraft
@@ -69,7 +69,7 @@ public fun YardhalAppRoot(
     coordinator: LiveCoordinator,
     appearanceStore: ChatAppearanceStore,
     presets: List<NetworkPresetUi>,
-    onNetworkSaved: (NetworkDraft) -> Unit,
+    onNetworkSaved: (NetworkDraft) -> Boolean,
     sharedTextProvider: () -> String? = { null },
     onSharedConsumed: () -> Unit = {},
     modifier: Modifier = Modifier,
@@ -84,8 +84,19 @@ public fun YardhalAppRoot(
     val orderState by coordinator.orderState.collectAsStateWithLifecycle()
     val profiles by coordinator.profiles.collectAsStateWithLifecycle()
 
-    var addNetworkVisible by remember { mutableStateOf(false) }
-    var pendingPreset by remember { mutableStateOf<NetworkPresetUi?>(null) }
+    var networkEditorVisible by rememberSaveable { mutableStateOf(false) }
+    var editingNetworkId by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingPresetId by rememberSaveable { mutableStateOf<String?>(null) }
+    fun openNetworkEditor(networkId: String? = null, preset: NetworkPresetUi? = null) {
+        editingNetworkId = networkId
+        pendingPresetId = preset?.id
+        networkEditorVisible = true
+    }
+    fun dismissNetworkEditor() {
+        networkEditorVisible = false
+        editingNetworkId = null
+        pendingPresetId = null
+    }
     var selectedKey by rememberSaveable { mutableStateOf<String?>(null) }
     fun selectConversation(key: String?) {
         coordinator.trackSelection(key)
@@ -181,7 +192,10 @@ public fun YardhalAppRoot(
                 returnToSearch = false
                 onSelected()
             },
-            onAddNetwork = { addNetworkVisible = true },
+            onAddNetwork = { openNetworkEditor() },
+            onEditNetwork = { networkId ->
+                if (coordinator.networkStore.byId(networkId) != null) openNetworkEditor(networkId = networkId)
+            },
             onJoinChannel = { networkId ->
                 joinNetworkId = networkId
                 joinSendFailed = false
@@ -303,20 +317,24 @@ public fun YardhalAppRoot(
         returnToSearch = false
     }
 
+    val initialNetworkConfig = if (networkEditorVisible) editingNetworkId?.let(coordinator.networkStore::byId) else null
+    val missingEditTarget = networkEditorVisible && editingNetworkId != null && initialNetworkConfig == null
+    if (missingEditTarget) {
+        LaunchedEffect(editingNetworkId) { dismissNetworkEditor() }
+    }
+
     Surface(modifier = modifier.fillMaxSize()) {
-        if (addNetworkVisible) {
-            AddNetworkSheet(
+        if (networkEditorVisible && !missingEditTarget) {
+            NetworkEditorSheet(
                 presets = presets,
-                initialPreset = pendingPreset,
+                initialPreset = presets.firstOrNull { it.id == pendingPresetId },
+                initialConfig = initialNetworkConfig,
                 onSave = {
-                    onNetworkSaved(it)
-                    addNetworkVisible = false
-                    pendingPreset = null
+                    val saved = onNetworkSaved(it)
+                    if (saved) dismissNetworkEditor()
+                    saved
                 },
-                onDismiss = {
-                    addNetworkVisible = false
-                    pendingPreset = null
-                },
+                onDismiss = ::dismissNetworkEditor,
             )
         } else if (searchVisible) {
             val searchScreen: @Composable (Modifier) -> Unit = { searchModifier -> MessageSearchScreen(
@@ -423,15 +441,9 @@ public fun YardhalAppRoot(
                 else -> {
                     if (networks.isEmpty()) {
                         WelcomeScreen(
-                            onAddNetwork = {
-                                pendingPreset = null
-                                addNetworkVisible = true
-                            },
+                            onAddNetwork = { openNetworkEditor() },
                             presets = presets,
-                            onPickPreset = { picked ->
-                                pendingPreset = picked
-                                addNetworkVisible = true
-                            },
+                            onPickPreset = { picked -> openNetworkEditor(preset = picked) },
                         )
                     } else {
                         overviewScreen(Modifier.fillMaxSize()) {}
