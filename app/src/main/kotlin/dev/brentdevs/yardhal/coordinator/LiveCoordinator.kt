@@ -148,7 +148,13 @@ public class LiveCoordinator(
         disconnect(networkId)
         networkStore.remove(networkId)
         scope.launch { messageStore.deleteNetwork(networkId) }
-        _buffers.value = _buffers.value.filterValues { it.ref.networkId != networkId }
+        synchronized(selectionLock) {
+            if (selectedStorageKey?.substringBefore("|") == networkId) {
+                selectedStorageKey = null
+                pendingRenamedKey = null
+            }
+            _buffers.update { buffers -> buffers.filterValues { it.ref.networkId != networkId } }
+        }
         _profiles.update { it - networkId }
     }
 
@@ -244,7 +250,7 @@ public class LiveCoordinator(
             is InboundEffect.OwnNickChanged -> refreshNetworkStates()
             is InboundEffect.EnsureBuffer -> buffer(effect.ref)
             is InboundEffect.RemoveBuffer -> {
-                _buffers.update { it - effect.ref.storageKey }
+                removeBuffer(effect.ref.storageKey)
                 channelOrder.markParted(effect.ref.storageKey)
                 _orderState.value = channelOrder.snapshot()
             }
@@ -315,32 +321,63 @@ public class LiveCoordinator(
         }
     }
 
-    private val renamedKeys = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val selectionLock = Any()
+    private var selectedStorageKey: String? = null
+    private var pendingRenamedKey: String? = null
 
-    public fun renamedKey(storageKey: String): String? {
-        var current = renamedKeys[storageKey] ?: return null
-        val seen = HashSet<String>()
-        while (seen.add(current)) current = renamedKeys[current] ?: break
-        return current
+    public fun trackSelection(storageKey: String?) {
+        synchronized(selectionLock) {
+            if (selectedStorageKey != storageKey) {
+                selectedStorageKey = storageKey
+                pendingRenamedKey = null
+            }
+        }
+    }
+
+    public fun followRenamedSelection(storageKey: String?, bufferKeys: Set<String>): String? =
+        synchronized(selectionLock) {
+            if (selectedStorageKey != storageKey) {
+                selectedStorageKey = storageKey
+                pendingRenamedKey = null
+            }
+            val renamed = pendingRenamedKey
+            if (renamed == null || (storageKey != null && storageKey in bufferKeys) || renamed !in bufferKeys) {
+                return@synchronized null
+            }
+            selectedStorageKey = renamed
+            pendingRenamedKey = null
+            renamed
+        }
+
+    private fun removeBuffer(storageKey: String) {
+        synchronized(selectionLock) {
+            if (selectedStorageKey == storageKey || pendingRenamedKey == storageKey) pendingRenamedKey = null
+            _buffers.update { it - storageKey }
+        }
     }
 
     private fun renameConversation(session: Session, from: ConversationRef, to: ConversationRef) {
         val fromKey = from.storageKey
         val toKey = to.storageKey
-        _buffers.update { current ->
-            val existing = current[fromKey] ?: return@update current
-            val moved = existing.copy(ref = to, displayName = ConversationNames.forRef(to))
-            val merged = current[toKey]?.takeIf { fromKey != toKey }?.let { occupant ->
-                moved.copy(
-                    messages = (occupant.messages + moved.messages).sortedBy { it.timestampMs },
-                    hasUnread = moved.hasUnread || occupant.hasUnread,
-                )
-            } ?: moved
-            current - fromKey + (toKey to merged)
+        synchronized(selectionLock) {
+            if (fromKey != toKey && fromKey in _buffers.value &&
+                (selectedStorageKey == fromKey || pendingRenamedKey == fromKey)
+            ) {
+                pendingRenamedKey = toKey
+            }
+            _buffers.update { current ->
+                val existing = current[fromKey] ?: return@update current
+                val moved = existing.copy(ref = to, displayName = ConversationNames.forRef(to))
+                val merged = current[toKey]?.takeIf { fromKey != toKey }?.let { occupant ->
+                    moved.copy(
+                        messages = (occupant.messages + moved.messages).sortedBy { it.timestampMs },
+                        hasUnread = moved.hasUnread || occupant.hasUnread,
+                    )
+                } ?: moved
+                current - fromKey + (toKey to merged)
+            }
         }
         if (fromKey != toKey) {
-            renamedKeys[fromKey] = toKey
-            renamedKeys.remove(toKey)
             readMarkers.rename(fromKey, toKey)
             if (mutes.rename(fromKey, toKey)) _mutedState.value = mutes.all()
             channelOrder.rename(fromKey, toKey)
@@ -361,7 +398,6 @@ public class LiveCoordinator(
             markJoining(ConversationRef.channel(session.config.id, channel))
         }
     }
-
 
     public data class BouncerEntry(
         public val networkId: String,
@@ -479,11 +515,14 @@ public class LiveCoordinator(
     public fun ensureMembers(networkId: String, storageKey: String) {
         val session = sessions[networkId] ?: return
         val buffer = _buffers.value[storageKey] ?: return
-        if (buffer.ref.kind != ConversationKind.CHANNEL) return
+        if (buffer.ref.kind != ConversationKind.CHANNEL || buffer.joinState != JoinState.JOINED) return
         val needsMembers = buffer.members.isEmpty()
         val needsPresence = buffer.members.any { buffer.memberPresence[it.nick]?.away == null }
         if (!needsMembers && !needsPresence) return
-        val query = if (session.state.hasWhox) WHOX_QUERY else ""
+        val query = synchronized(session.state) {
+            if (!session.state.registered) return
+            if (session.state.hasWhox) WHOX_QUERY else ""
+        }
         sendRaw(session, "WHO ${buffer.ref.rawTarget} $query".trimEnd())
     }
 
@@ -646,7 +685,7 @@ public class LiveCoordinator(
         if (buffer.ref.kind == ConversationKind.CHANNEL) {
             sendText(networkId, storageKey, "/part ${buffer.ref.rawTarget}")
         }
-        _buffers.update { it - storageKey }
+        removeBuffer(storageKey)
         sessions[networkId]?.let { session -> synchronized(session.state) { session.state.forgetChannel(storageKey) } }
         channelOrder.markParted(storageKey)
         _orderState.value = channelOrder.snapshot()
@@ -765,12 +804,10 @@ public class LiveCoordinator(
             } else {
                 _buffers.value[ref.storageKey]?.messages?.firstOrNull { it.msgid == msgid }?.localId ?: newLocalId
             }
-            persistAsync(session, ref, sender, kind, text, msgid, timestampMs, sentByUs, localId)
+            persistAsync(session, ref, sender, kind, text, msgid, timestampMs, sentByUs, localId, channelContext)
         }
-        if (highlightsMe && !sentByUs) {
-            if (highlightsMe && !muted) {
-                notifier.onHighlight(session.config.name, sender, ConversationNames.forRef(ref), text)
-            }
+        if (highlightsMe && !sentByUs && !muted) {
+            notifier.onHighlight(session.config.name, sender, ConversationNames.forRef(ref), text)
         }
     }
 
@@ -784,6 +821,7 @@ public class LiveCoordinator(
         timestampMs: Long,
         sentByUs: Boolean,
         localId: Long,
+        channelContext: String?,
     ) {
         scope.launch {
             val rowId = messageStore.recordWithRowId(
@@ -798,6 +836,7 @@ public class LiveCoordinator(
                     text = text,
                     sentByUs = sentByUs,
                     timestampMs = timestampMs,
+                    channelContext = channelContext,
                 ),
             ) ?: return@launch
             updateBufferKey(ref.storageKey) { current ->
@@ -812,18 +851,22 @@ public class LiveCoordinator(
     }
 
     private fun updateBuffer(ref: ConversationRef, transform: (ConversationBuffer) -> ConversationBuffer) {
-        _buffers.update { current ->
-            val existing = current[ref.storageKey]
-                ?: ConversationBuffer(ref = ref, displayName = ConversationNames.forRef(ref))
-            current + (ref.storageKey to transform(existing))
+        synchronized(selectionLock) {
+            if (ref.storageKey !in _buffers.value && ref.storageKey == selectedStorageKey) pendingRenamedKey = null
+            _buffers.update { current ->
+                val existing = current[ref.storageKey]
+                    ?: ConversationBuffer(ref = ref, displayName = ConversationNames.forRef(ref))
+                current + (ref.storageKey to transform(existing))
+            }
         }
     }
 
-    private fun buffer(ref: ConversationRef): ConversationBuffer {
-        _buffers.value[ref.storageKey]?.let { return it }
+    private fun buffer(ref: ConversationRef): ConversationBuffer = synchronized(selectionLock) {
+        _buffers.value[ref.storageKey]?.let { return@synchronized it }
+        if (ref.storageKey == selectedStorageKey) pendingRenamedKey = null
         val created = ConversationBuffer(ref = ref, displayName = ConversationNames.forRef(ref))
         _buffers.update { it + (ref.storageKey to created) }
-        return created
+        created
     }
 
     public fun markRead(storageKey: String) {
@@ -873,6 +916,7 @@ public class LiveCoordinator(
                             highlightsMe = false,
                             msgid = row.msgid,
                             storedRowId = row.rowId,
+                            channelContext = row.channelContext,
                         )
                     }
                 val messages = restored + current.messages
@@ -1212,7 +1256,6 @@ public class LiveCoordinator(
         }
     }
 }
-
 
 internal fun sanitizeOutboundText(raw: String): String =
     raw.replace("\r", " ").replace("\n", " ")

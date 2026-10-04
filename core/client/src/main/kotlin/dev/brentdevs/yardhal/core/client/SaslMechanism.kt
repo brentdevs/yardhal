@@ -2,12 +2,24 @@ package dev.brentdevs.yardhal.core.client
 
 import java.security.MessageDigest
 import java.security.SecureRandom
-import java.text.Normalizer
 import java.util.Base64
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
-internal class SaslMechanismException(message: String) : Exception(message)
+internal enum class SaslMechanismFailure {
+    PROTOCOL_ERROR,
+    PROHIBITED_CHARACTER,
+    UNASSIGNED_CHARACTER,
+    BIDIRECTIONAL_STRING,
+    EMPTY_USERNAME,
+    EMPTY_PASSWORD,
+}
+
+internal class SaslMechanismException(
+    message: String,
+    val failure: SaslMechanismFailure = SaslMechanismFailure.PROTOCOL_ERROR,
+    val codePoint: Int? = null,
+) : Exception(message)
 
 internal interface SaslMechanism {
     val name: String
@@ -41,8 +53,8 @@ internal class ScramSha256Mechanism(
 ) : SaslMechanism {
     private enum class Step { CLIENT_FIRST, CLIENT_FINAL, VERIFY_SERVER, DONE }
 
-    private val clientFirstBare = "n=${escapeUsername(saslPrep(username))},r=$clientNonce"
-    private val passwordBytes = saslPrep(password).toByteArray(Charsets.UTF_8)
+    private val clientFirstBare = "n=${escapeUsername(prepareUsername(username))},r=$clientNonce"
+    private val passwordBytes = preparePassword(password).toByteArray(Charsets.UTF_8)
     private var step = Step.CLIENT_FIRST
     private var expectedServerSignature = ByteArray(0)
 
@@ -75,7 +87,6 @@ internal class ScramSha256Mechanism(
         val iterations = attributes["i"]?.toIntOrNull()
             ?: throw SaslMechanismException("SCRAM server-first lacks iteration count")
         if (iterations < MIN_ITERATIONS) throw SaslMechanismException("SCRAM iteration count $iterations is too low")
-        if (passwordBytes.isEmpty()) throw SaslMechanismException("SCRAM requires a non-empty password")
 
         val saltedPassword = hi(passwordBytes, salt, iterations)
         val clientKey = hmac(saltedPassword, "Client Key".toByteArray(Charsets.UTF_8))
@@ -108,14 +119,6 @@ internal class ScramSha256Mechanism(
         private const val NONCE_BYTES = 18
         const val MIN_ITERATIONS: Int = 4096
 
-        private val NON_ASCII_SPACES = setOf(
-            '\u00A0', '\u1680', '\u2000', '\u2001', '\u2002', '\u2003', '\u2004', '\u2005', '\u2006',
-            '\u2007', '\u2008', '\u2009', '\u200A', '\u200B', '\u202F', '\u205F', '\u3000',
-        )
-        private val MAPPED_TO_NOTHING = setOf(
-            '\u00AD', '\u034F', '\u1806', '\u180B', '\u180C', '\u180D', '\u200C', '\u200D', '\u2060', '\uFEFF',
-        ) + ('\uFE00'..'\uFE0F')
-
         private val random = SecureRandom()
 
         fun randomNonce(): String {
@@ -124,17 +127,20 @@ internal class ScramSha256Mechanism(
             return base64(bytes)
         }
 
-        fun saslPrep(value: String): String {
-            if (value.all { it.code in 0x20..0x7E }) return value
-            val mapped = StringBuilder(value.length)
-            for (ch in value) {
-                when (ch) {
-                    in NON_ASCII_SPACES -> mapped.append(' ')
-                    in MAPPED_TO_NOTHING -> Unit
-                    else -> mapped.append(ch)
-                }
+        private fun prepareUsername(value: String): String {
+            val prepared = SaslPrep.prepare(value, SaslPrep.Policy.QUERY)
+            if (prepared.isEmpty()) {
+                throw SaslMechanismException("SCRAM requires a non-empty username", SaslMechanismFailure.EMPTY_USERNAME)
             }
-            return Normalizer.normalize(mapped, Normalizer.Form.NFKC)
+            return prepared
+        }
+
+        private fun preparePassword(value: String): String {
+            val prepared = SaslPrep.prepare(value, SaslPrep.Policy.STORED)
+            if (prepared.isEmpty()) {
+                throw SaslMechanismException("SCRAM requires a non-empty password", SaslMechanismFailure.EMPTY_PASSWORD)
+            }
+            return prepared
         }
 
         fun escapeUsername(username: String): String =

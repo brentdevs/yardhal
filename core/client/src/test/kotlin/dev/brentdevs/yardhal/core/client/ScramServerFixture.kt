@@ -16,11 +16,16 @@ internal class ScramServerFixture(
     private var clientFirstBare: String = ""
     private var serverFirst: String = ""
 
+    var clientUsername: String = ""
+        private set
+
     var clientProofValid: Boolean = false
         private set
 
     fun serverFirst(clientFirst: String): String {
         clientFirstBare = clientFirst.removePrefix("n,,")
+        clientUsername = clientFirstBare.substringAfter("n=").substringBefore(",r=")
+            .replace("=2C", ",").replace("=3D", "=")
         val clientNonce = clientFirstBare.substringAfter(",r=")
         serverFirst = "r=$clientNonce$serverNonceSuffix,s=${encode(salt)},i=$iterations"
         return serverFirst

@@ -166,7 +166,7 @@ public val LocalRemoteImageLoader: androidx.compose.runtime.ProvidableCompositio
 @Composable
 public fun rememberRemoteImage(loader: RemoteImageLoader?, rawUrl: String?, sizePx: Int): State<ImageBitmap?> {
     val url = ImageUrlPolicy.resolve(rawUrl, sizePx)
-    val image = remember {
+    val image = remember(loader, url, sizePx) {
         val initial = if (loader == null || url == null) null else loader.cached(url, sizePx)?.asImageBitmap()
         mutableStateOf(initial)
     }

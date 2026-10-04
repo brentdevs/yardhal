@@ -29,6 +29,7 @@ internal class SaslAuthenticator(
         get() = mechanism?.name
 
     fun start() {
+        if (isFinished) return
         if (!startNextMechanism()) fail(0, "server offers no supported SASL mechanism")
     }
 
@@ -36,36 +37,36 @@ internal class SaslAuthenticator(
         fail(0, description)
     }
 
-    fun handleMessage(message: IrcMessage): Boolean {
-        if (!message.command.equals(AUTHENTICATE_COMMAND, ignoreCase = true)) return false
-        if (isFinished) return true
-        val current = mechanism ?: return true
-        val chunk = message.parameters.firstOrNull() ?: return true
+    fun handleMessage(message: IrcMessage) {
+        if (!message.command.equals(AUTHENTICATE_COMMAND, ignoreCase = true)) return
+        if (isFinished) return
+        val current = mechanism ?: return
+        val chunk = message.parameters.firstOrNull() ?: return
         if (chunk != CONTINUATION_MARKER) inbound.append(chunk)
         if (inbound.length > MAX_CHALLENGE_LENGTH) {
             abort("SASL challenge exceeds $MAX_CHALLENGE_LENGTH bytes")
-            return true
+            return
         }
-        if (chunk.length == CHUNK_LENGTH) return true
+        if (chunk.length == CHUNK_LENGTH) return
         val encoded = inbound.toString()
         inbound.setLength(0)
         val challenge = try {
             Base64.getDecoder().decode(encoded)
         } catch (_: IllegalArgumentException) {
             abort("malformed base64 in AUTHENTICATE payload")
-            return true
+            return
         }
         val response = try {
             current.respond(challenge)
         } catch (error: SaslMechanismException) {
             abort(error.message ?: "SASL mechanism failure")
-            return true
+            return
         }
         sendPayload(response)
-        return true
     }
 
-    fun handleNumeric(numeric: Int, message: IrcMessage): Boolean {
+    fun handleNumeric(numeric: Int, message: IrcMessage) {
+        if (isFinished) return
         val description = message.parameters.lastOrNull() ?: "authentication failed"
         when (numeric) {
             RPL_SASLMECHS -> serverMechanisms = parseMechanismList(message.parameters.getOrNull(1))
@@ -75,11 +76,10 @@ internal class SaslAuthenticator(
                 } else {
                     fail(numeric, "server reported success without proving its identity")
                 }
-            ERR_SASLFAIL -> if (isFinished || !fallBackToOfferedMechanism()) fail(numeric, description)
+            ERR_SASLFAIL -> if (!fallBackToOfferedMechanism()) fail(numeric, description)
             ERR_NICKLOCKED, ERR_SASLTOOLONG, ERR_SASLABORTED, ERR_SASLALREADY -> fail(numeric, description)
-            else -> return false
+            else -> Unit
         }
-        return true
     }
 
     private fun fallBackToOfferedMechanism(): Boolean {
@@ -93,7 +93,12 @@ internal class SaslAuthenticator(
     private fun startNextMechanism(): Boolean {
         val next = candidates.firstOrNull { it !in attempted } ?: return false
         attempted += next
-        mechanism = createMechanism(next)
+        mechanism = try {
+            createMechanism(next)
+        } catch (error: SaslMechanismException) {
+            fail(0, error.message ?: "SASL mechanism failure")
+            return false
+        }
         serverMechanisms = null
         inbound.setLength(0)
         sendRaw("$AUTHENTICATE_COMMAND $next")

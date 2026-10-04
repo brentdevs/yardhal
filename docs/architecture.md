@@ -75,6 +75,24 @@ Each layer depends only on the ones below it.
    HTTP image fetching, bounded decoding and caching live in `ui/image`.
 7. Compose observes the coordinator's StateFlows.
 
+Reconnect clears connection-scoped members, presence and metadata, publishes
+empty member snapshots, and marks existing/restored channels JOINING. The
+visible conversation requests members only after its CHANNEL/JOINED transition;
+the coordinator additionally requires registration. Persisted-history loading
+is separate, and hidden channels are not eagerly queried.
+
+Room schema 2 stores nullable channel context through the entire transcript
+path. Its explicit 1→2 migration only adds the column; existing row IDs,
+deduplication hashes and the FTS index survive. There is no destructive fallback.
+Rename-following retains only the active selected key and one pending destination,
+retargeted across rapid renames before buffer publication. Consuming a redirect,
+changing selection, reusing its source or removing its destination/network clears
+the pending state; no historical alias map is retained.
+
+Remote image state is remembered by loader, resolved URL and requested size.
+A changed identity starts with its matching cached image or a placeholder, never
+the previous identity's bitmap; keyed loading retains cancellation behavior.
+
 Reducer behaviour is pinned by plain-JVM tests
 (`app/src/test/.../coordinator/*ReducerTests.kt`, `PerNetworkStateTests.kt`)
 that feed raw lines and assert on returned effects and state.
@@ -97,6 +115,31 @@ explain why.
 3. Real-server round-trip against a pinned Ergo binary (downloaded on
    demand, self-skipping when absent) — connect → CAP → register → JOIN →
    PRIVMSG echo.
+
+SCRAM uses the complete RFC 4013 Unicode 3.2 SASLprep profile: mapping, frozen
+NFKC normalization, prohibited-character checks, bidi restrictions, and the
+query/stored unassigned-character distinction. Usernames use QUERY and passwords
+use STORED. Empty prepared credentials fail at mechanism construction. Preparation
+failure emits one SASL failure without sending credentials or downgrading.
+
+`scripts/generate-saslprep-tables.py` reproduces the frozen encoded initializer
+from CPython's RFC 3454 `stringprep` predicates and `unicodedata.ucd_3_2_0`, without
+runtime dependencies or dependence on Android/JVM Unicode versions:
+
+```sh
+nix develop --command python3 scripts/generate-saslprep-tables.py
+```
+
+The compressed payload contains ten big-endian, length-prefixed uint32 arrays:
+B.1, C.1.2, prohibited, A.1, D.1 and D.2 ranges; combining-class pairs;
+expanded NFKD code-point/offset/length triples; decomposition values; and canonical
+composition triples. Hangul normalization is algorithmic. Its uncompressed SHA256
+is `42a08a6261c74bc6e3ee56b62b408ae7af3fdf6f6512432ceacc6f910cc43761`.
+
+The prepared loopback fixture covers normalization-changing Unicode credentials.
+The live Ergo scenario covers a normalized username and NFKC-stable Unicode
+password: [Ergo 2.14.0 stores SCRAM keys without password preparation](https://github.com/ergochat/ergo/blob/v2.14.0/irc/accounts.go#L2286-L2299).
+No server-specific preparation fallback is introduced.
 
 ## Roadmap
 

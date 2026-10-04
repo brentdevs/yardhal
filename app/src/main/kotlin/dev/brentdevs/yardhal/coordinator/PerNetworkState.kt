@@ -217,7 +217,7 @@ public class PerNetworkState(
     public fun apply(event: IrcEvent, context: InboundContext): List<InboundEffect> {
         val reduction = Reduction(this, context)
         when (event) {
-            is IrcEvent.ConnectionOpened -> resetConnectionScopedState()
+            is IrcEvent.ConnectionOpened -> resetConnectionScopedState(reduction)
             is IrcEvent.CapabilitiesNegotiated -> reduction.handleCapabilities(event.capabilities, event.values)
             is IrcEvent.SaslResult -> Unit
             is IrcEvent.Registered -> reduction.handleRegistered(event.nickname)
@@ -235,7 +235,7 @@ public class PerNetworkState(
         reduction.emit(InboundEffect.ProfilesChanged(NetworkProfiles(casemapping, LinkedHashMap(users.profiles))))
     }
 
-    private fun resetConnectionScopedState() {
+    private fun resetConnectionScopedState(reduction: Reduction) {
         openBatches.clear()
         pendingNames.clear()
         whois.reset()
@@ -253,9 +253,13 @@ public class PerNetworkState(
         connectionEpoch += 1
         metadataCapability = null
         metadataSubscriptions = emptySet()
-        for (channel in channels.values) channel.metadata.clear()
-        for ((key, user) in users.entries.toList()) {
-            if (user.metadata.isNotEmpty()) users[key] = user.copy(metadata = emptyMap())
+        users.clear()
+        for (channelName in reduction.context.openChannels()) reduction.channelOrCreate(channelRef(channelName))
+        for (channel in channels.values) {
+            channel.members.clear()
+            channel.metadata.clear()
+            reduction.publishMembers(channel)
+            reduction.emit(InboundEffect.SetJoinState(channel.ref, JoinState.JOINING))
         }
     }
 

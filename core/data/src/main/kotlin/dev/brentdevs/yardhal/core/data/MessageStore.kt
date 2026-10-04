@@ -20,6 +20,7 @@ public class MessageStore(private val dao: MessageDao) {
             text = message.text,
             sentByUs = message.sentByUs,
             timestampMs = message.timestampMs,
+            channelContext = message.channelContext,
         )
         if (row.msgid != null) {
             val inserted = dao.insert(row)
@@ -195,6 +196,7 @@ public class MessageStore(private val dao: MessageDao) {
             text = text,
             sentByUs = sentByUs,
             timestampMs = timestampMs,
+            channelContext = channelContext,
         )
     }
 }

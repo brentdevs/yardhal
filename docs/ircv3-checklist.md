@@ -14,7 +14,7 @@ Phase numbers refer to `docs/architecture.md`.
 ## Identity & access
 
 - [x] sasl 3.1: AUTHENTICATE flow during negotiation (PLAIN) (P2)
-- [x] sasl 3.2: mechanism list parsing, post-registration re-auth (P2+) — SCRAM-SHA-256 preferred over PLAIN, 908 fallback, CAP NEW/DEL sasl, `IrcConnection.reauthenticate()`
+- [x] sasl 3.2: mechanism list parsing and server-driven post-registration re-auth (P2+) — SCRAM-SHA-256 preferred over PLAIN, 908 fallback, CAP NEW/DEL sasl. Manual `IrcConnection.reauthenticate()` is a connection-layer API only, not an app command; REGISTER SUCCESS and VERIFY SUCCESS already authenticate the account without a second SASL exchange.
 - [x] account-notify: ACCOUNT updates member account state (P5)
 - [x] account-tag: verified-account badge input; `account` tag updates sender presence and ✓ on message rows/member sheet (P5)
 - [x] extended-join: account + realname on JOIN (P5)
@@ -91,7 +91,7 @@ Ergo and runs all real-server tests without skips.
 | message-tags | `IrcTagsTests.serializeSectionRoundTrip`; `PerNetworkStateTests.inputTooLongSurfacesAsAnErrorLine` |
 | server-time | `PerNetworkStateTests.channelPrivmsgBecomesAChannelMessageWithServerTimeAndTags` |
 | sasl 3.1 | `IrcConnectionIntegrationTests.negotiatesCapabilitiesWithSaslPlainThenRegisters` |
-| sasl 3.2 / SCRAM | `ScramSha256MechanismTests.rfc7677TestVectorRoundTrip`; `IrcConnectionIntegrationTests.reauthenticatesAfterRegistrationAndOnCapNew` |
+| sasl 3.2 / SCRAM | `ScramSha256MechanismTests.rfc7677TestVectorRoundTrip`; `SaslPrepTests.rfc4013Examples`; `SaslPrepTests.queryCombiningClassesRemainFrozenForCharactersAssignedAfterUnicode32`; `IrcConnectionIntegrationTests.reauthenticatesAfterRegistrationAndOnCapNew`; `IrcConnectionIntegrationTests.unicodeScramCredentialsAuthenticateAgainstPreparedLoopbackKeys`; `IrcConnectionIntegrationTests.saslPreparationFailureSurfacesAndRegistrationContinues`; `ErgoRoundTripTest.registersAccountThenAuthenticatesWithScramAndPreAway` |
 | account-notify | `IdentityReducerTests.accountNotifyUpdatesAccount` |
 | account-tag | `IdentityReducerTests.accountTagFeedsSenderAccountAndPresence`; `IdentityReducerTests.knownAccountsSurviveUntaggedIdentityNotificationsAndRemainAvailableForAccountBans` |
 | extended-join | `IdentityReducerTests.extendedJoinCapturesAccountAndRealname` |
@@ -110,7 +110,7 @@ Ergo and runs all real-server tests without skips.
 | draft/message-redaction | `PerNetworkStateTests.redactEmitsRedactionByMsgid`; `PerNetworkStateTests.redactionReplacesOnlyTheMatchingMessage` |
 | draft/read-marker | `PerNetworkStateTests.markreadAppliesTimestampToTheTargetAndIgnoresStarTargets` |
 | draft/multiline | `IrcMultilineTests.splitsLongLinesBetweenWordsWithConcatTagAndRoundTrips`; `MessagingReducerTests.multilineNestedInChathistoryIsPlayback`; `MessagingCoordinatorTests.multilineComposerTextIsBatchedAndReconciledAgainstTheEchoedBatch`; `ErgoRoundTripTest.multilineEchoAndChannelRenameAgainstRealServer` |
-| +draft/channel-context | `MessagingReducerTests.channelContextTagStoredOnDirectMessages`; `MessagingReducerTests.channelContextOnMultilineBatchOpeningApplies` |
+| +draft/channel-context | `MessagingReducerTests.channelContextTagStoredOnDirectMessages`; `MessagingReducerTests.channelContextOnMultilineBatchOpeningApplies`; `MessagingCoordinatorTests.channelContextSurvivesCoordinatorHistoryReload`; `MessageStoreTests.channelContextRoundTripsThroughRecentAndHistory`; `YardhalDatabaseMigrationTests.versionOneUpgradePreservesTranscriptHashesRowIdsAndSearch` |
 | batch | `PerNetworkStateTests.playbackBatchesIncludingNestedOnesSuppressHighlights`; `PerNetworkStateTests.disconnectReportsConnectingAndReconnectResetsConnectionState` |
 | chathistory batch type | `MessagingReducerTests.multilineNestedInChathistoryIsPlayback` |
 | draft/chathistory | `PerNetworkStateTests.ownJoinOpensBufferAndRequestsTopicModeAndHistory`; `MessagingReducerTests.noImplicitNamesJoinCompletesWithoutWaitingForNames` |

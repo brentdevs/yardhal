@@ -418,6 +418,9 @@ class IrcConnectionIntegrationTests {
         ) { _, collector, server ->
             val events = collector.drainUntilRegistered()
             assertEquals(SaslOutcome.Success, events.filterIsInstance<IrcEvent.SaslResult>().single().outcome)
+            val inbound = events.filterIsInstance<IrcEvent.MessageReceived>().map { it.message }
+            assertTrue(inbound.any { it.command == "AUTHENTICATE" })
+            assertTrue(inbound.any { it.numeric == 903 })
             assertTrue(fixture.clientProofValid)
             val lines = server.receivedLines.toList()
             assertTrue(lines.indexOf("AUTHENTICATE SCRAM-SHA-256") < lines.indexOf("CAP END"))
@@ -427,6 +430,44 @@ class IrcConnectionIntegrationTests {
             assertTrue(tapped.contains("AUTHENTICATE SCRAM-SHA-256"))
             assertTrue(tapped.contains("AUTHENTICATE <redacted>"))
             assertFalse(tapped.any { it.startsWith("AUTHENTICATE ") && it.length > 40 })
+        }
+    }
+
+    @org.junit.jupiter.api.Test
+    fun unicodeScramCredentialsAuthenticateAgainstPreparedLoopbackKeys() {
+        val fixture = ScramServerFixture(password = "p\u00E9ncil")
+        withLoopback(
+            config = {
+                saslConfig(it).copy(
+                    saslAuthcid = "\u2168\u00AD\uFF1D\uFF0C\uD835\uDC00",
+                    saslPassword = "pe\u0301ncil\u00AD",
+                )
+            },
+            respond = scramResponder(fixture, tamperSignature = false),
+        ) { _, collector, server ->
+            val events = collector.drainUntilRegistered()
+            assertEquals(SaslOutcome.Success, events.filterIsInstance<IrcEvent.SaslResult>().single().outcome)
+            assertEquals("IX=,A", fixture.clientUsername)
+            assertTrue(fixture.clientProofValid)
+            assertFalse("AUTHENTICATE PLAIN" in server.receivedLines)
+            val inbound = events.filterIsInstance<IrcEvent.MessageReceived>().map { it.message }
+            assertTrue(inbound.any { it.command == "AUTHENTICATE" })
+            assertTrue(inbound.any { it.numeric == 903 })
+        }
+    }
+
+    @org.junit.jupiter.api.Test
+    fun saslPreparationFailureSurfacesAndRegistrationContinues() {
+        withLoopback(
+            config = { saslConfig(it).copy(saslPassword = "password\uD83D\uDE00") },
+            respond = { line -> handleCapBasics(line, "sasl=PLAIN,SCRAM-SHA-256 cap-notify") },
+        ) { _, collector, server ->
+            val events = collector.drainUntilRegistered()
+            val failure = events.filterIsInstance<IrcEvent.SaslResult>().single().outcome
+            assertTrue(failure is SaslOutcome.Failure && failure.description.contains("unassigned"))
+            assertTrue(events.any { it is IrcEvent.Registered })
+            assertTrue("CAP END" in server.receivedLines)
+            assertFalse(server.receivedLines.any { it.startsWith("AUTHENTICATE ") })
         }
     }
 

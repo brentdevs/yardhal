@@ -355,6 +355,56 @@ class PerNetworkStateTests {
     }
 
     @Test
+    fun reconnectClearsRostersAndPresenceBeforeWhoxRebuildsJoinedChannel() {
+        val state = state()
+        val context = InboundContext(nowMs = now, openChannels = { listOf("#room", "#hidden", "#restored") })
+        val caps = setOf("away-notify", "no-implicit-names")
+        state.apply(IrcEvent.CapabilitiesNegotiated(caps), context)
+        state.feed(":me!old@old.host JOIN #room me_account :Old Me")
+        state.feed(":srv 354 me #room ~a alice.host Alice G@ alice_account :Alice A")
+        state.feed(":srv 354 me #room old old.host me G me_account :Old Me")
+        state.feed(":me!old@old.host AWAY :Old away message")
+        state.feed(":me!old@old.host JOIN #hidden")
+        state.feed(":srv 354 me #hidden ~c carol.host Carol H 0 :Carol C")
+        assertEquals(true, state.user("me")?.presence?.away)
+        assertEquals("me_account", state.user("me")?.presence?.account)
+
+        val reopened = state.apply(IrcEvent.ConnectionOpened, context)
+        val cleared = reopened.filterIsInstance<InboundEffect.SetMembers>()
+        assertEquals(setOf(channel("#room"), channel("#hidden"), channel("#restored")), cleared.map { it.ref }.toSet())
+        assertEquals(3, cleared.size)
+        assertTrue(cleared.all { it.members.isEmpty() && it.presence.isEmpty() })
+        assertTrue(state.channel(channel("#room").storageKey)?.memberList()?.isEmpty() == true)
+        assertTrue(state.channel(channel("#hidden").storageKey)?.memberList()?.isEmpty() == true)
+        assertNull(state.user("Alice"))
+        assertNull(state.user("Carol"))
+        assertNull(state.user("me"))
+        assertEquals("me", state.ownNick)
+        assertTrue(InboundEffect.SetJoinState(channel("#room"), JoinState.JOINING) in reopened)
+        assertTrue(InboundEffect.SetJoinState(channel("#hidden"), JoinState.JOINING) in reopened)
+        assertTrue(InboundEffect.SetJoinState(channel("#restored"), JoinState.JOINING) in reopened)
+        assertTrue(reopened.sent().isEmpty())
+
+        state.apply(IrcEvent.CapabilitiesNegotiated(caps), context)
+        val registered = state.apply(IrcEvent.Registered("me", "Welcome"), context)
+        assertEquals(listOf("JOIN #room", "JOIN #hidden", "JOIN #restored"), registered.sent())
+        val joined = state.feed(":me!fresh@fresh.host JOIN #room")
+        assertTrue(InboundEffect.SetJoinState(channel("#room"), JoinState.JOINED) in joined)
+        assertTrue(joined.sent().none { it.startsWith("WHO ") })
+        assertEquals(PresenceState(away = false, user = "fresh", host = "fresh.host"), state.user("me")?.presence)
+
+        val refreshed = state.feed(":srv 354 me #room ~b bob.host Bob H+ bob_account :Bob B")
+            .only<InboundEffect.SetMembers>()
+        assertEquals(listOf(ChannelMember("Bob", '+')), refreshed.members)
+        assertEquals(
+            mapOf("Bob" to PresenceState(away = false, account = "bob_account", user = "~b", host = "bob.host", realName = "Bob B")),
+            refreshed.presence,
+        )
+        assertNull(state.user("Alice"))
+        assertTrue(state.channel(channel("#hidden").storageKey)?.memberList()?.isEmpty() == true)
+    }
+
+    @Test
     fun banListEntriesGoToTheChannel() {
         val line = state().feed(":srv 367 me #room *!*@bad op 1700000000").appended().single()
         assertEquals(channel("#room"), line.ref)

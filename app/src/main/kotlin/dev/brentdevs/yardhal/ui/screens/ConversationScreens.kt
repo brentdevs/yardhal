@@ -55,6 +55,7 @@ import dev.brentdevs.yardhal.coordinator.ConnectionStatus
 import dev.brentdevs.yardhal.coordinator.JoinState
 import dev.brentdevs.yardhal.coordinator.NetworkProfiles
 import dev.brentdevs.yardhal.core.data.ChatAppearancePreferences
+import dev.brentdevs.yardhal.core.data.ConversationKind
 import dev.brentdevs.yardhal.ui.components.DayPill
 import dev.brentdevs.yardhal.ui.components.MessageRow
 import dev.brentdevs.yardhal.ui.components.NetworkBadge
@@ -139,6 +140,7 @@ public fun ConversationScreen(
     onSend: (String) -> Boolean,
     onOpenJoin: () -> Unit,
     onLoadHistory: () -> Unit,
+    onLoadMembers: () -> Unit,
     onReact: (String, String) -> Unit,
     onSetReplyDraft: (ChatMessage?) -> Unit,
     onDelete: (String) -> Unit,
@@ -177,6 +179,12 @@ public fun ConversationScreen(
     val unreadIndex = entries.indexOfFirst { it is TranscriptEntry.UnreadDivider }
     val coroutineScope = androidx.compose.runtime.rememberCoroutineScope()
     var focusedRowId by remember { mutableStateOf<Long?>(null) }
+
+    androidx.compose.runtime.LaunchedEffect(buffer.key, buffer.joinState) {
+        if (buffer.ref.kind == ConversationKind.CHANNEL && buffer.joinState == JoinState.JOINED) {
+            onLoadMembers()
+        }
+    }
 
     androidx.compose.runtime.LaunchedEffect(searchTargetRowId, entries) {
         if (searchTargetRowId != null) {

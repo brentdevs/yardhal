@@ -50,6 +50,7 @@ class MessagingCoordinatorTests {
         @Volatile private var socket: Socket? = null
         val received: MutableList<String> = CopyOnWriteArrayList()
         val noImplicitNames: Boolean = "no-implicit-names" in advertised.split(' ')
+        @Volatile var holdJoins: Boolean = false
 
         val port: Int get() = listener.localPort
 
@@ -71,7 +72,7 @@ class MessagingCoordinatorTests {
                             send(":srv 001 tester :Welcome")
                             if (noImplicitNames) send(":srv 005 tester WHOX :are supported")
                         }
-                        line == "JOIN #room" -> {
+                        line == "JOIN #room" && !holdJoins -> {
                             send(":tester!u@h JOIN #room")
                             if (!noImplicitNames) {
                                 send(":srv 353 tester = #room :@tester alice")
@@ -278,6 +279,15 @@ class MessagingCoordinatorTests {
             assertEquals(JoinState.JOINED, joined.joinState)
             assertTrue(joined.members.isEmpty())
             assertTrue(server.received.none { IrcMessage.parse(it)?.command == "WHO" })
+            server.holdJoins = true
+            coordinator.retryJoin(harness.config.id, ref.storageKey)
+            coordinator.ensureMembers(harness.config.id, ref.storageKey)
+            assertTrue(coordinator.sendText(harness.config.id, ref.storageKey, "/quote PING :joining-guard"))
+            await { "PING :joining-guard" in server.received }
+            assertEquals(JoinState.JOINING, coordinator.buffers.value.getValue(ref.storageKey).joinState)
+            assertTrue(server.received.none { IrcMessage.parse(it)?.command == "WHO" })
+            server.send(":tester!u@h JOIN #room")
+            await { coordinator.buffers.value[ref.storageKey]?.joinState == JoinState.JOINED }
 
             coordinator.ensureMembers(harness.config.id, ref.storageKey)
             val queried = withTimeoutOrNull(5_000) {
@@ -324,6 +334,7 @@ class MessagingCoordinatorTests {
             val coordinator = harness.coordinator
             val old = ConversationRef.channel(harness.config.id, "#room")
             val renamed = ConversationRef.channel(harness.config.id, "#lounge")
+            coordinator.trackSelection(old.storageKey)
             server.send("@msgid=a1;time=2024-01-01T00:00:00.000Z :alice!u@h PRIVMSG #room :before rename")
             await { harness.messages.recent(old, 10).any { it.msgid == "a1" } }
             coordinator.markRead(old.storageKey)
@@ -344,7 +355,10 @@ class MessagingCoordinatorTests {
             assertEquals("#lounge", buffer.displayName)
             assertTrue(buffer.messages.any { it.msgid == "a1" })
             assertTrue(buffer.members.any { it.nick == "alice" })
-            assertEquals(renamed.storageKey, coordinator.renamedKey(old.storageKey))
+            assertEquals(
+                renamed.storageKey,
+                coordinator.followRenamedSelection(old.storageKey, coordinator.buffers.value.keys),
+            )
             assertTrue(harness.mutes.isMuted(renamed.storageKey))
             assertFalse(harness.mutes.isMuted(old.storageKey))
             assertTrue(renamed.storageKey in coordinator.mutedState.value)
@@ -354,6 +368,83 @@ class MessagingCoordinatorTests {
             assertEquals(listOf("#lounge"), harness.networks.byId(harness.config.id)?.autojoin)
             await { harness.messages.recent(renamed, 10).any { it.msgid == "a1" } }
             assertTrue(harness.messages.recent(old, 10).isEmpty())
+        }
+
+    @Test
+    fun rapidRenamesFollowActiveSelectionOnceAndIgnoreRecreatedSourceAndRemovedDestination() =
+        withHarness("echo-message server-time batch draft/channel-rename") { server, harness ->
+            val coordinator = harness.coordinator
+            val original = ConversationRef.channel(harness.config.id, "#room").storageKey
+            val middle = ConversationRef.channel(harness.config.id, "#middle").storageKey
+            val final = ConversationRef.channel(harness.config.id, "#final").storageKey
+            coordinator.trackSelection(original)
+            server.send(":alice!u@h RENAME #room #middle :first")
+            server.send(":alice!u@h RENAME #middle #final :second")
+            await { final in coordinator.buffers.value && middle !in coordinator.buffers.value }
+            assertEquals(null, coordinator.followRenamedSelection(original, setOf(original)))
+            assertEquals(final, coordinator.followRenamedSelection(original, coordinator.buffers.value.keys))
+            assertEquals(null, coordinator.followRenamedSelection(final, coordinator.buffers.value.keys))
+            assertEquals(null, coordinator.followRenamedSelection(original, coordinator.buffers.value.keys))
+
+            server.send(":tester!u@h JOIN #room")
+            await { original in coordinator.buffers.value }
+            coordinator.trackSelection(original)
+            server.send(":alice!u@h RENAME #room #middle :reused")
+            await { middle in coordinator.buffers.value && original !in coordinator.buffers.value }
+            server.send(":tester!u@h JOIN #room")
+            await { original in coordinator.buffers.value }
+            assertEquals(null, coordinator.followRenamedSelection(original, coordinator.buffers.value.keys))
+            coordinator.leaveConversation(harness.config.id, original)
+            assertEquals(null, coordinator.followRenamedSelection(original, coordinator.buffers.value.keys))
+
+            coordinator.trackSelection(middle)
+            val removed = ConversationRef.channel(harness.config.id, "#removed").storageKey
+            server.send(":alice!u@h RENAME #middle #removed :last")
+            await { removed in coordinator.buffers.value && middle !in coordinator.buffers.value }
+            coordinator.leaveConversation(harness.config.id, removed)
+            assertEquals(null, coordinator.followRenamedSelection(middle, coordinator.buffers.value.keys))
+
+            coordinator.trackSelection(final)
+            val discarded = ConversationRef.channel(harness.config.id, "#discarded").storageKey
+            server.send(":alice!u@h RENAME #final #discarded :network removal")
+            await { discarded in coordinator.buffers.value }
+            coordinator.removeNetwork(harness.config.id)
+            assertEquals(null, coordinator.followRenamedSelection(final, setOf(discarded)))
+        }
+
+    @Test
+    fun channelContextSurvivesCoordinatorHistoryReload() =
+        withHarness("echo-message server-time batch") { server, harness ->
+            val ref = ConversationRef.directMessage(harness.config.id, "alice")
+            server.send("@+draft/channel-context=#room;msgid=context-1 :alice!u@h NOTICE tester :contextual help")
+            await { harness.messages.recent(ref, 10).any { it.msgid == "context-1" } }
+            assertEquals(
+                "#room",
+                harness.coordinator.buffers.value.getValue(ref.storageKey).messages.single { it.msgid == "context-1" }.channelContext,
+            )
+            val restored = LiveCoordinator(
+                scope = harness.scope,
+                networkStore = harness.networks,
+                messageStore = harness.messages,
+                readMarkers = harness.readMarkers,
+                mutes = harness.mutes,
+                vault = InMemoryCredentialVault(),
+                channelOrder = harness.channelOrder,
+                connectionFactory = ConnectionFactory { config, onStsUpgrade ->
+                    IrcConnection(
+                        IrcConnectionConfig(host = config.host, port = config.port, tls = config.tls, nick = config.nick),
+                        onStsUpgrade = onStsUpgrade,
+                    )
+                },
+                stsPolicies = InMemoryStsPolicyStore(),
+            )
+            assertEquals(ref.storageKey, restored.ensureConversation(harness.config.id, "alice"))
+            assertTrue(restored.loadPersistedHistory(ref.storageKey))
+            await { restored.buffers.value[ref.storageKey]?.messages?.any { it.msgid == "context-1" } == true }
+            val entry = restored.buffers.value.getValue(ref.storageKey).messages.single { it.msgid == "context-1" }
+            assertEquals("#room", entry.channelContext)
+            assertEquals("contextual help", entry.text)
+            assertEquals(dev.brentdevs.yardhal.core.data.MessageKind.NOTICE, entry.kind)
         }
 
     private suspend fun await(condition: suspend () -> Boolean) {

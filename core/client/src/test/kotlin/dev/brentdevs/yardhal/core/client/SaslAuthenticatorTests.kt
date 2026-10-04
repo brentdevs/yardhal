@@ -103,12 +103,18 @@ class SaslAuthenticatorTests {
     }
 
     @Test
-    fun nonSaslMessagesPassThrough() {
+    fun unrelatedMessagesDoNotAdvanceOrFinishAuthentication() {
         val harness = Harness(advertised = null)
-        val privmsg = IrcMessage.parse("PRIVMSG #a :x") ?: error("unparseable")
-        val welcome = IrcMessage.parse("001 nick :Welcome") ?: error("unparseable")
-        assertFalse(harness.authenticator.handleMessage(privmsg))
-        assertFalse(harness.authenticator.handleNumeric(1, welcome))
+        harness.authenticator.start()
+        harness.server("PRIVMSG #a :x")
+        harness.server("001 nick :Welcome")
+        assertEquals(listOf("AUTHENTICATE PLAIN"), harness.sent)
+        assertTrue(harness.outcomes.isEmpty())
+        assertFalse(harness.authenticator.isFinished)
+        assertEquals(SaslAuthenticator.PLAIN, harness.authenticator.currentMechanism)
+        harness.server("AUTHENTICATE +")
+        harness.server(":srv 903 * :SASL authentication successful")
+        assertEquals(listOf<SaslOutcome>(SaslOutcome.Success), harness.outcomes)
     }
 
     @Test
@@ -242,5 +248,71 @@ class SaslAuthenticatorTests {
         harness.authenticator.cancel("withdrawn")
         harness.server(":srv 903 * :SASL authentication successful")
         assertEquals(SaslOutcome.Failure(0, "withdrawn"), harness.outcomes.single())
+    }
+
+    @Test
+    fun invalidCredentialsReportFailureWithoutSendingOrDowngrading() {
+        val credentials = listOf(
+            "\u0007user" to "password",
+            "\u0627user" to "password",
+            "\uD800" to "password",
+            "\u00AD" to "password",
+            "user" to "\u00AD",
+            "user" to "password\u0000",
+            "user" to "password\uD83D\uDE00",
+        )
+        for ((username, password) in credentials) {
+            val harness = Harness(
+                advertised = setOf("SCRAM-SHA-256", "PLAIN"),
+                authcid = username,
+                password = password,
+            )
+            harness.authenticator.start()
+            val failure = assertIs<SaslOutcome.Failure>(harness.outcomes.single())
+            assertEquals(0, failure.numeric)
+            assertTrue(failure.description.isNotEmpty())
+            assertTrue(harness.authenticator.isFinished)
+            assertTrue(harness.sent.isEmpty())
+            harness.authenticator.start()
+            harness.server("AUTHENTICATE +")
+            harness.server(":srv 903 * :SASL authentication successful")
+            assertEquals(listOf<SaslOutcome>(failure), harness.outcomes)
+            assertTrue(harness.sent.isEmpty())
+        }
+    }
+
+    @Test
+    fun fallbackMechanismConstructionFailureReportsOneOutcome() {
+        val harness = Harness(advertised = setOf("SCRAM-SHA-256", "PLAIN"), createMechanism = { name ->
+            if (name == SaslAuthenticator.PLAIN) throw SaslMechanismException("credentials are invalid")
+            ScramSha256Mechanism("user", "password")
+        })
+        harness.authenticator.start()
+        harness.server(":srv 908 user PLAIN :are available SASL mechanisms")
+        harness.server(":srv 904 user :SASL authentication failed")
+        assertEquals(SaslOutcome.Failure(0, "credentials are invalid"), harness.outcomes.single())
+        assertEquals(listOf("AUTHENTICATE SCRAM-SHA-256"), harness.sent)
+        assertTrue(harness.authenticator.isFinished)
+    }
+
+    @Test
+    fun unicodeScramExchangeUsesPreparedCredentials() {
+        val server = ScramServerFixture(password = "p\u00E9ncil")
+        val harness = Harness(
+            advertised = setOf("SCRAM-SHA-256", "PLAIN"),
+            authcid = "\u2168\u00AD\uFF1D\uFF0C\uD835\uDC00",
+            password = "pe\u0301ncil",
+        )
+        harness.authenticator.start()
+        harness.server("AUTHENTICATE +")
+        val clientFirst = ScramServerFixture.decode(harness.sent.last().removePrefix("AUTHENTICATE "))
+        assertTrue(clientFirst.startsWith("n,,n=IX=3D=2CA,r="))
+        harness.server("AUTHENTICATE ${ScramServerFixture.encode(server.serverFirst(clientFirst))}")
+        val clientFinal = ScramServerFixture.decode(harness.sent.last().removePrefix("AUTHENTICATE "))
+        harness.server("AUTHENTICATE ${ScramServerFixture.encode(server.serverFinal(clientFinal))}")
+        harness.server(":srv 903 * :SASL authentication successful")
+        assertTrue(server.clientProofValid)
+        assertEquals(listOf<SaslOutcome>(SaslOutcome.Success), harness.outcomes)
+        assertFalse("AUTHENTICATE PLAIN" in harness.sent)
     }
 }

@@ -282,7 +282,7 @@ class ErgoRoundTripTest {
         startErgo()
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         try {
-            val password = "yardhal-correct-horse"
+            val password = "yardhal-caf\u00E9-\u65E5\u672C"
             val registrar = IrcConnection(
                 IrcConnectionConfig(
                     host = "127.0.0.1",
@@ -315,7 +315,7 @@ class ErgoRoundTripTest {
                     port = port,
                     tls = false,
                     nick = "yardhalscram",
-                    saslAuthcid = "yardhalacct",
+                    saslAuthcid = "\uFF59\uFF41rdhalacct",
                     saslPassword = password,
                     initialAway = "Connected by Yardhal",
                 ),
