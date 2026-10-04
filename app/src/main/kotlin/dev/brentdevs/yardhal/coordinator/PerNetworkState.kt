@@ -24,6 +24,7 @@ public class InboundContext(
     public val hasBuffer: (String) -> Boolean = { true },
     public val openChannels: () -> List<String> = { emptyList() },
     public val latestReadMarkerMs: () -> Long? = { null },
+    public val isParted: (String) -> Boolean = { false },
 )
 
 public data class OpenBatch(
@@ -168,6 +169,16 @@ public class PerNetworkState(
         }
     }
 
+    internal fun clearMonitored(): InboundEffect.ProfilesChanged? {
+        val targets = monitored.keys.iterator()
+        while (targets.hasNext()) {
+            val folded = targets.next()
+            targets.remove()
+            if (!isTracked(folded)) users.remove(folded)
+        }
+        return profileUpdate()
+    }
+
     internal fun isTracked(folded: String): Boolean =
         folded in monitored ||
             channels.values.any { folded in it.members } ||
@@ -224,15 +235,15 @@ public class PerNetworkState(
             is IrcEvent.MessageReceived -> reduction.handleMessage(event.message)
             is IrcEvent.Disconnected -> reduction.emit(InboundEffect.StatusChanged(ConnectionStatus.CONNECTING))
         }
-        publishProfilesIfChanged(reduction)
+        profileUpdate()?.let(reduction::emit)
         return reduction.effects
     }
 
-    private fun publishProfilesIfChanged(reduction: Reduction) {
-        if (users.profileVersion == publishedProfileVersion) return
-        if (openBatches.values.any { it.type in PROFILE_DEFERRING_BATCHES }) return
+    private fun profileUpdate(): InboundEffect.ProfilesChanged? {
+        if (users.profileVersion == publishedProfileVersion) return null
+        if (openBatches.values.any { it.type in PROFILE_DEFERRING_BATCHES }) return null
         publishedProfileVersion = users.profileVersion
-        reduction.emit(InboundEffect.ProfilesChanged(NetworkProfiles(casemapping, LinkedHashMap(users.profiles))))
+        return InboundEffect.ProfilesChanged(NetworkProfiles(casemapping, LinkedHashMap(users.profiles)))
     }
 
     private fun resetConnectionScopedState(reduction: Reduction) {
@@ -278,10 +289,9 @@ public class PerNetworkState(
         channels.clear()
         for (old in oldChannels) {
             val ref = channelRef(old.ref.rawTarget)
-            val fresh = ChannelState(ref)
+            val fresh = channels.getOrPut(ref.storageKey) { ChannelState(ref) }
             for (member in old.members.values) fresh.members[fold(member.nick)] = member
             fresh.metadata.putAll(old.metadata)
-            channels[ref.storageKey] = fresh
         }
         val oldUsers = users.values.toList()
         users.clear()
@@ -293,9 +303,13 @@ public class PerNetworkState(
         pendingNames.clear()
         for ((key, members) in oldPending) {
             val rawTarget = oldChannels.firstOrNull { it.ref.storageKey == key }?.ref?.rawTarget ?: continue
-            val rebuilt = LinkedHashMap<String, ChannelMember>()
+            val rebuilt = pendingNames.getOrPut(channelRef(rawTarget).storageKey) { LinkedHashMap() }
             for (member in members.values) rebuilt[fold(member.nick)] = member
-            pendingNames[channelRef(rawTarget).storageKey] = rebuilt
+        }
+        for ((label, pending) in pendingLabels.toMap()) {
+            pendingLabels[label] = pending.copy(
+                origin = pending.origin.copy(normalizedTarget = fold(pending.origin.rawTarget)),
+            )
         }
     }
 

@@ -81,6 +81,12 @@ visible conversation requests members only after its CHANNEL/JOINED transition;
 the coordinator additionally requires registration. Persisted-history loading
 is separate, and hidden channels are not eagerly queried.
 
+`/monitor c` clears the session's local MONITOR targets before sending `MONITOR C`,
+without waiting for a server acknowledgement. Users shared with joined channels
+or pending NAMES replies remain tracked; unshared users and profiles are pruned.
+Profile removals publish immediately unless an open metadata/join batch defers
+publication until its close.
+
 Room schema 2 stores nullable channel context through live transcripts, history
 reloads and search-hit context restoration. Its explicit 1→2 migration only adds
 the column; existing row IDs, deduplication hashes and the FTS index survive.
@@ -119,6 +125,57 @@ Outbound mirrors it: composer line → `SlashCommandParser.parse` →
 change protocol state (WHOIS expectation, LIST browsing, leaving a channel)
 go through the same per-session lock.
 
+## Network configuration
+
+Each network's overview menu exposes **Edit network**. The shared add/edit form
+prefills host, port, TLS, nickname, display name, autojoin channels and SASL
+account. Editing keeps the network ID and preserves unexposed configuration
+fields, transcripts, selection, read markers, pins, groups and mutes.
+
+`LiveCoordinator.updateNetwork` persists an existing ID through `NetworkStore`.
+A display-name-only or unchanged save updates the live name without reconnecting.
+Connection, identity, autojoin or credential changes replace the session once;
+the old session's child scope is canceled and stale events are rejected.
+Membership, presence, typing, topics and connection features reset before the
+updated connection starts. STS remains host-specific. Open, unparted channels
+continue to rejoin; removing an autojoin entry does not leave or delete its
+conversation. Explicit PART intent is recorded before the server reply and
+survives edits and reconnects. An explicit join or newly added autojoin entry
+clears that intent.
+
+Advertised CASEMAPPING changes rekey retained conversations, selection, history
+reservations and persistent metadata. Colliding conversations merge transcripts;
+pins, read markers, mutes and group definitions survive, with one group membership
+per merged conversation. Room writes, key migrations and history reads are
+ordered, and queued restoration retains the original live target spelling.
+Initial bootstrap casemapping is not evidence of how existing database keys were
+normalized; persisted keys are left intact until the prior mapping is known.
+Closed legacy history stores only normalized names: unavailable original
+spellings cannot be reverse-expanded safely when a server uses a less permissive
+mapping.
+
+Passwords stay in the credential vault and are never prefilled. An empty edit
+password keeps the saved secret; any nonempty replacement, including only spaces,
+uses a fresh vault key. `NetworkSaver` deletes that staged key on a rejected add
+or update and reports failure to the editor, which shows an error and retains the
+draft. The previous SASL key is deleted only after a successful save and only
+when it is not also the configured server-password key. **Clear saved SASL
+password** removes the SASL reference without deleting a shared server secret.
+The SASL account is independent of nickname and can remain saved without a
+password, but the effective connection disables SASL until a password is
+configured. Nonsecret drafts survive rotation; plaintext password drafts do not.
+Cancel and Android Back discard edits. A restored, missing edit target falls
+through to normal content while its stale editor state is dismissed.
+
+`NetworkSaverTests` exercises production credential saves, shared-key handling
+and rejected-save rollback with real stores and loopback authentication.
+`NetworkEditLifecycleTests` covers cosmetic saves, endpoint and registration
+changes, conversation-state preservation, stale events, virtual-time backoff
+cutover, restart restoration, STS enforcement, CASEMAPPING collisions and queued
+history restoration with Room and real loopback connections. Editor prefill,
+rotation, cancellation and rejected-save presentation are verified on Android;
+there is no Compose test suite.
+
 ## Conventions
 
 See `AGENTS.md`. Short version: no comments in Kotlin sources, warnings are
@@ -132,6 +189,11 @@ explain why.
 3. Real-server round-trip against a pinned Ergo binary (downloaded on
    demand, self-skipping when absent) — connect → CAP → register → JOIN →
    PRIVMSG echo.
+
+CI runs debug assembly, lint and the full test suite as separate ten-minute
+phases, matching the `make check` ordering within the existing thirty-minute
+job limit. Test start/end logging identifies a stalled case; a phase timeout
+leaves time for failure-report upload instead of exhausting the whole job.
 
 SCRAM uses the complete RFC 4013 Unicode 3.2 SASLprep profile: mapping, frozen
 NFKC normalization, prohibited-character checks, bidi restrictions, and the
@@ -192,7 +254,8 @@ Phases land in order; each phase ships with tests and updated docs.
   tree with pins/custom groups/swipe actions/last-message previews,
   role-sectioned member sheet with account and bot badges, account-extban
   moderation, network icons, join-state machine with retry, unread divider
-  with jump-to-unread, and Room-FTS message search with snippet results.
+  with jump-to-unread, Room-FTS message search with snippet results, and
+  identity-preserving network editing with credential-vault updates.
   Remaining: moderation surfaces beyond these actions and slash verbs,
   per-message link auto-open polish.
 - **Phase 7 — Bouncers**: ZNC `znc.in/playback` requested; playback

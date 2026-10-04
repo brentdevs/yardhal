@@ -341,6 +341,27 @@ class IdentityReducerTests {
     }
 
     @Test
+    fun monitorClearForgetsAllTargetsButRetainsSharedAndPendingMembers() {
+        val state = network().joinRoom()
+        state.feed(":srv 353 me = #pending :pending")
+        state.feed(":srv 730 me :zed!z@zed.host,alice!a@alice.host,pending!p@pending.host")
+        state.clearMonitored()
+
+        for (nick in listOf("ZED", "ALICE", "PENDING")) {
+            assertFalse(state.isMonitored(nick))
+        }
+        assertNull(state.user("zed"))
+        assertEquals("alice.host", state.presenceOf("alice").host)
+        assertEquals("pending.host", state.presenceOf("pending").host)
+        state.feed(":zed!z@new.host ACCOUNT stale-acct")
+        assertNull(state.user("zed"))
+        state.feed(":alice!a@alice.host AWAY :still tracked")
+        assertEquals("still tracked", state.presenceOf("alice").awayMessage)
+        state.feed(":pending!p@pending.host ACCOUNT pending-acct")
+        assertEquals("pending-acct", state.presenceOf("pending").account)
+    }
+
+    @Test
     fun monitorListNumericEstablishesTargetsForSubsequentIdentityNotifications() {
         val state = network()
         val listed = state.feed(":srv 732 me :zed,alice")

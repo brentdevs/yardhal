@@ -1147,6 +1147,7 @@ public fun NetworkOverviewScreen(
     onSelect: (String) -> Unit,
     onSelectServer: (String) -> Unit,
     onAddNetwork: () -> Unit,
+    onEditNetwork: (String) -> Unit,
     onJoinChannel: (String?) -> Unit,
     onRemoveNetwork: (String) -> Unit,
     onBrowseChannels: (String) -> Unit,
@@ -1384,6 +1385,10 @@ public fun NetworkOverviewScreen(
                                     expanded = networkMenuFor == network.id,
                                     onDismissRequest = { networkMenuFor = null },
                                 ) {
+                                    DropdownMenuItem(text = { Text("Edit network") }, onClick = {
+                                        networkMenuFor = null
+                                        onEditNetwork(network.id)
+                                    })
                                     DropdownMenuItem(text = { Text("Join channel") }, onClick = {
                                         networkMenuFor = null
                                         onJoinChannel(network.id)

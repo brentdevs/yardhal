@@ -64,33 +64,41 @@ public class MessageStore(private val dao: MessageDao) {
     public suspend fun latestTimestamp(conversation: ConversationRef): Long? =
         dao.latestTimestamp(conversation.networkId, conversation.normalizedTarget)
 
-    public suspend fun knownConversations(
-        networkId: String,
-        casemapping: dev.brentdevs.yardhal.core.protocol.CaseMapping = dev.brentdevs.yardhal.core.protocol.CaseMapping.RFC1459,
-    ): List<ConversationRef> =
-        dao.conversations(networkId).mapNotNull { target ->
-            val leader = target.firstOrNull()
-            when {
-                target == ConversationRef.SERVER_TARGET -> ConversationRef.server(networkId)
-                leader != null && leader in "#&" -> ConversationRef.channel(networkId, target, casemapping)
-                else -> ConversationRef.directMessage(networkId, target, casemapping)
+    public suspend fun knownConversations(networkId: String): List<ConversationRef> =
+        dao.conversations(networkId).map { target ->
+            val kind = when {
+                target == ConversationRef.SERVER_TARGET -> ConversationKind.SERVER
+                target.firstOrNull()?.let { it in "#&" } == true -> ConversationKind.CHANNEL
+                else -> ConversationKind.DIRECT_MESSAGE
             }
+            ConversationRef(networkId, kind, target, target)
         }
 
     public suspend fun trimTo(conversation: ConversationRef, keep: Int) {
         dao.trim(conversation.networkId, conversation.normalizedTarget, keep)
     }
 
-    public suspend fun renameConversation(from: ConversationRef, to: ConversationRef): Int {
+    public suspend fun renameConversation(
+        from: ConversationRef,
+        to: ConversationRef,
+        onRowMerged: (Long, Long) -> Unit = { _, _ -> },
+    ): Int {
         if (from.networkId != to.networkId || from.normalizedTarget == to.normalizedTarget) return 0
         val moving = dao.allIn(from.networkId, from.normalizedTarget)
         if (moving.isEmpty()) return 0
         val renamed = dao.renameConversation(from.networkId, from.normalizedTarget, to.normalizedTarget)
         for (row in moving) {
-            dao.updateContentHash(
-                row.rowId,
-                hashOf(row.networkId, to.normalizedTarget, row.senderNick, row.kind, row.text, row.timestampMs),
-            )
+            val hash = hashOf(row.networkId, to.normalizedTarget, row.senderNick, row.kind, row.text, row.timestampMs)
+            val duplicate = if (row.msgid == null) dao.rowIdByHash(row.networkId, to.normalizedTarget, hash) else null
+            if (duplicate != null) {
+                dao.deleteFtsForNetworkRaw(
+                    androidx.sqlite.db.SimpleSQLiteQuery("DELETE FROM message_fts WHERE rowid = ?", arrayOf<Any>(row.rowId)),
+                )
+                dao.deleteRow(row.rowId)
+                onRowMerged(row.rowId, duplicate)
+            } else {
+                dao.updateContentHash(row.rowId, hash)
+            }
         }
         return renamed
     }
