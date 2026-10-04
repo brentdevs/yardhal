@@ -26,4 +26,5 @@ public data class MessageRow(
     @ColumnInfo(name = "text") public val text: String,
     @ColumnInfo(name = "sentByUs") public val sentByUs: Boolean,
     @ColumnInfo(name = "timestampMs") public val timestampMs: Long,
+    @ColumnInfo(name = "channelContext") public val channelContext: String? = null,
 )

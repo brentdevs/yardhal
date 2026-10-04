@@ -8,26 +8,26 @@ Phase numbers refer to `docs/architecture.md`.
 
 - [x] Modern IRC baseline: message grammar, numerics, ISUPPORT/CASEMAPPING handling (P1)
 - [x] capability-negotiation 302: CAP LS 302, REQ/ACK, CAP NEW/DEL at runtime (P2)
-- [x] message-tags: parse/escape tags, enlarged limits, request cap (P1/P2; 417 surfacing pending)
+- [x] message-tags: parse/escape tags, enlarged limits, request cap; 417 surfaced as an error (P1/P2)
 - [x] server-time: use time tag as authoritative timestamp, especially in playback (P5)
 
 ## Identity & access
 
 - [x] sasl 3.1: AUTHENTICATE flow during negotiation (PLAIN) (P2)
-- [ ] sasl 3.2: mechanism list parsing, post-registration re-auth (P2+)
-- [ ] account-notify: ACCOUNT updates member account state (P5)
-- [ ] account-tag: verified-account badge input (P5)
-- [ ] extended-join: account + realname on JOIN (P5)
-- [ ] setname: inbound SETNAME + send own realname change (P5)
-- [ ] chghost: apply user/host updates silently (P5)
-- [ ] draft/account-registration: REGISTER/VERIFY flows with standard-replies errors (P8)
+- [x] sasl 3.2: mechanism list parsing and server-driven post-registration re-auth (P2+) — SCRAM-SHA-256 preferred over PLAIN, 908 fallback, CAP NEW/DEL sasl. Manual `IrcConnection.reauthenticate()` is a connection-layer API only, not an app command; REGISTER SUCCESS and VERIFY SUCCESS already authenticate the account without a second SASL exchange.
+- [x] account-notify: ACCOUNT updates member account state (P5)
+- [x] account-tag: verified-account badge input; `account` tag updates sender presence and ✓ on message rows/member sheet (P5)
+- [x] extended-join: account + realname on JOIN (P5)
+- [x] setname: inbound SETNAME + send own realname change via /setname (P5)
+- [x] chghost: apply user/host updates silently (P5)
+- [x] draft/account-registration: REGISTER/VERIFY flows with standard-replies errors (P8) — `/register [account] <email|*> <password>`, `/verify [account] <code>`, cap value via `AccountRegistrationPolicy`, password redacted in raw log; FAIL replies shown as server lines
 
 ## Presence
 
-- [ ] away-notify: live away/back transitions (P5)
+- [x] away-notify: live away/back transitions with away message (P5)
 - [x] MONITOR +/- verbs, 730/731 numerics surfaced (P5)
-- [ ] extended-monitor: monitored targets emit presence-class events (P5)
-- [ ] draft/pre-away: AWAY suppression during registration (P8)
+- [x] extended-monitor: monitored targets (730/731/732) tracked so presence-class events update them (P5)
+- [x] draft/pre-away: AWAY suppression during registration (P8) — `IrcConnectionConfig.initialAway` sent before CAP END when acknowledged, after 001 otherwise
 
 ## Messaging affordances
 
@@ -38,41 +38,104 @@ Phase numbers refer to `docs/architecture.md`.
 - [x] +typing: send rate-limited active TAGMSG; inbound indicators with expiry (P5)
 - [x] draft/message-redaction: REDACT handling + own redacts (P5)
 - [x] draft/read-marker: capability requested; MARKREAD sent on read and applied inbound (cross-device); unread divider + jump (P5)
-- [ ] draft/multiline: reassemble multiline batches honoring limits (P5)
-- [ ] +draft/channel-context: "re: #channel" chip on DMs (P8)
+- [x] draft/multiline: cap + max-bytes/max-lines parsed; inbound batches reassembled (concat, batch msgid, playback-aware, defensive limit flush); composer newlines sent as limit-respecting batches with concat splitting, echo reconciled; separate PRIVMSGs without the cap (P5)
+- [x] +draft/channel-context: `+channel-context`/`+draft/channel-context` on DMs stored per message; tappable "re: #channel" chip (P8)
 
 ## History & transport
 
 - [x] batch: BATCH +/- frames tracked per session; netsplit/netjoin collapse; playback classified as history (P5)
 - [x] chathistory batch type: replay routed as history (no unread/notification noise) (P5)
-- [x] draft/chathistory: LATEST bootstrap on channel join when advertised (P5); full selectors pending
+- [x] draft/chathistory: negotiated capability or CHATHISTORY ISUPPORT enables LATEST bootstrap on channel join; playback batches suppress live-message effects (P5)
 - [x] netsplit/netjoin batches: collapse into one event (P5)
-- [ ] labeled-response: label outbound commands, correlate responses incl. ACK/batches (P5)
-- [x] standard-replies: FAIL/WARN/NOTE → tagged system lines (P5; toast polish pending)
-- [x] sts: upgrade to TLS port, persist and enforce policy with expiry (P2; warning UI pending)
-- [x] SNI: hostname in ClientHello (platform TLS does this by default) (P2)
-- [ ] STARTTLS: NOT implemented (deprecated); direct TLS only
+- [x] labeled-response: /raw, /whois, /who, /mode family, /topic, /monitor, LIST and PRIVMSG sends labelled when acked; single replies, labelled batches and ACK correlated in the reducer; generic replies routed to the origin buffer; echoes reconciled by label (text match fallback) (P5)
+- [x] standard-replies: FAIL/WARN/NOTE → tagged system lines (P5)
+- [x] sts: upgrade to TLS port, persist and enforce policy with expiry; no insecure bypass of active policy (P2)
+- [x] SNI: configured hostname verified in captured ClientHello (P2)
+- n/a — STARTTLS: deprecated; use direct TLS and STS upgrade instead
 
 ## Metadata & misc
 
-- [x] NAMES/353/366 member lists via multi-prefix-aware parser (P5); WHOX %fields pending
-- [x] multi-prefix: prefix symbols retained; member sheet sections by role (P5)
-- [ ] userhost-in-names: full nick!user@host in NAMES (P5)
-- [x] no-implicit-names (equivalent): members fetched lazily via WHO on open (P5)
-- [ ] invite-notify: INVITE system lines for ops (P5)
-- [ ] bot-mode: BOT ISUPPORT letter + badge (P5)
-- [ ] account-extban: ban-account option in moderation menus (P6)
-- [ ] draft/metadata-2: METADATA GET/SET/SUB, avatars/display names (P5)
+- [x] NAMES/353/366 member lists via multi-prefix-aware parser; WHOX `%cuhnfar` retains user/host/nick/flags/account/realname (P5)
+- [x] multi-prefix: consume stacked symbols and retain the highest role for member-sheet sections (P5)
+- [x] userhost-in-names: full nick!user@host in NAMES, user/host retained in presence (P5)
+- [x] no-implicit-names: negotiate suppression of join-time NAMES; own JOIN completes membership-independent join state; fetch members lazily via WHO/WHOX on open (P5)
+- [x] invite-notify: INVITE system lines (own invites in server buffer, others in channel) + 341 confirmation (P5)
+- [x] bot-mode: BOT ISUPPORT letter, WHO/WHOX flag, 335 and `bot` tag drive member-sheet badge (P5)
+- [x] account-extban: ACCOUNTEXTBAN/EXTBAN "Ban account" member action (P6)
+- [x] draft/metadata-2: cap limits parsed; SUB avatar/display-name before autojoin; METADATA and 760/761/766/770/771/772/774/FAIL handled; metadata batches; SYNC retry on 774; /setavatar /setdisplayname; HTTPS-only cached avatars + display names in rows/member sheet (P5; Ergo 2.14 lacks metadata, covered by reducer + loopback tests)
 - [x] soju.im/FILEHOST ISUPPORT: endpoint discovery, TLS-policy enforcement, authenticated POST with multipart fallback, attachment-tagged messages (P8)
-- [ ] UTF8ONLY: always transmit UTF-8, skip legacy encoding heuristics (P5)
-- [ ] draft/extended-isupport: full ISUPPORT set pre-registration (P5)
-- [ ] draft/ICON: network icon ISUPPORT token fetch/cache (P6)
-- [ ] draft/channel-rename: RENAME moves buffer/transcript/unread state (P5)
-- [ ] client-batch: infrastructure only; no production use until ratified
-- [ ] WebSocket transport: n/a (native TCP/TLS client)
-- [ ] WEBIRC: server-only, n/a
+- [x] UTF8ONLY: always transmit UTF-8, skip legacy encoding heuristics (P5) — strict UTF-8 inbound decoding with U+FFFD replacement, codepoint-safe truncation, `ISupport.utf8Only`
+- [x] draft/extended-isupport: full ISUPPORT set pre-registration (P5) — `ISUPPORT` sent before CAP END when acknowledged; `draft/isupport` batches pass through, `-TOKEN` removals honoured by `ISupport.mergedWith`
+- [x] draft/ICON: ISUPPORT token (with \xHH unescape, `{size}` template, `-draft/ICON`) shown on the network header via the HTTPS-only image cache (P6)
+- [x] draft/channel-rename: RENAME moves buffer, transcript rows (FTS-consistent), read marker, mute, pins/groups/parted, autojoin and member state; system line; selection follows rename (P5)
+- n/a — client-batch: no production use until ratified; multiline uses its own defined client batch frames
+- n/a — WebSocket transport: native TCP/TLS client
+- n/a — WEBIRC: server/gateway obligation, not an end-user client command
 
 ## Bouncer extensions (soju)
 
 - [x] soju.im/bouncer-networks: capability + notify requested, BOUNCER NETWORK upsert/delete parsing with escaped attributes, ADDNETWORK/DELNETWORK, CONNECT/DISCONNECTNETWORK, BouncerServ service commands, draft diffing (P7)
 - [x] znc.in/playback: playback start request + batch classification (P7)
+
+## Coverage audit
+
+Test classes below live in their feature module's `src/test`; coordinator
+reducer tests run on the plain JVM. Coordinator/store integration tests use
+Robolectric only for Android persistence. `make test-ircd` provisions pinned
+Ergo and runs all real-server tests without skips.
+
+| Inventory item | Covering test |
+| --- | --- |
+| Modern IRC baseline | `IrcMessageTests.parsesSimplePrivmsg`; `PerNetworkStateTests.casemappingChangeRekeysTrackedChannels` |
+| capability-negotiation 302 | `CapabilityNegotiatorTests.fullListingThenRequestThenAckWithSasl`; `MetadataCapabilityLoopbackTests.runtimeCapabilityUpdatesPublishChangedValuesAndWithdrawnFeatures` |
+| message-tags | `IrcTagsTests.serializeSectionRoundTrip`; `PerNetworkStateTests.inputTooLongSurfacesAsAnErrorLine` |
+| server-time | `PerNetworkStateTests.channelPrivmsgBecomesAChannelMessageWithServerTimeAndTags` |
+| sasl 3.1 | `IrcConnectionIntegrationTests.negotiatesCapabilitiesWithSaslPlainThenRegisters` |
+| sasl 3.2 / SCRAM | `ScramSha256MechanismTests.rfc7677TestVectorRoundTrip`; `ScramSha256MechanismTests.excessiveIterationCountsAreRejected`; `ScramSha256MechanismTests.maximumIterationCountAuthenticatesAgainstIndependentPbkdf2Server`; `SaslPrepTests.rfc4013Examples`; `SaslPrepTests.queryCombiningClassesRemainFrozenForCharactersAssignedAfterUnicode32`; `IrcConnectionIntegrationTests.reauthenticatesAfterRegistrationAndOnCapNew`; `IrcConnectionIntegrationTests.unicodeScramCredentialsAuthenticateAgainstPreparedLoopbackKeys`; `IrcConnectionIntegrationTests.saslPreparationFailureSurfacesAndRegistrationContinues`; `ErgoRoundTripTest.registersAccountThenAuthenticatesWithScramAndPreAway` |
+| account-notify | `IdentityReducerTests.accountNotifyUpdatesAccount` |
+| account-tag | `IdentityReducerTests.accountTagFeedsSenderAccountAndPresence`; `IdentityReducerTests.knownAccountsSurviveUntaggedIdentityNotificationsAndRemainAvailableForAccountBans` |
+| extended-join | `IdentityReducerTests.extendedJoinCapturesAccountAndRealname` |
+| setname | `IdentityReducerTests.setnameUpdatesRealnameSilentlyForOthers`; `ErgoRoundTripTest.fullRoundTripAgainstRealServer` |
+| chghost | `IdentityReducerTests.chghostUpdatesUserAndHostWithoutTranscriptLine` |
+| draft/account-registration | `AccountRegistrationPolicyTests.parsesKnownFlags`; `SlashCommandParserTests.verifyBuildsVerifyCommand`; `ErgoRoundTripTest.registersAccountThenAuthenticatesWithScramAndPreAway` |
+| away-notify | `IdentityReducerTests.awayNotifyTracksAwayAndBackAndRepublishesMembers` |
+| MONITOR | `PerNetworkStateTests.monitorNumericsAreTaggedAsMonitorLines` |
+| extended-monitor | `IdentityReducerTests.extendedMonitorTracksMonitoredNicksOutsideChannels`; `IdentityReducerTests.monitorListNumericEstablishesTargetsForSubsequentIdentityNotifications` |
+| draft/pre-away | `IrcConnectionIntegrationTests.preAwaySendsAwayBeforeCapEnd`; `IrcConnectionIntegrationTests.initialAwayWithoutPreAwayIsSentAfterWelcome` |
+| message-ids | `MessageStoreTests.recordDeduplicatesByMsgid`; `LiveCoordinatorIntegrationTests.echoesKeepMessageIdsOrderedAndMembershipTracksKickAndNickChanges` |
+| echo-message | `LabeledResponseReducerTests.labelledEchoReconcilesPendingMessageEvenWhenTextDiffers`; `LiveCoordinatorIntegrationTests.echoesKeepMessageIdsOrderedAndMembershipTracksKickAndNickChanges` |
+| +draft/reply | `PerNetworkStateTests.channelPrivmsgBecomesAChannelMessageWithServerTimeAndTags`; `IrcMultilineTests.framesBatchWithTargetReferenceAndClientTagsOnOpening` |
+| +draft/react / +draft/unreact | `PerNetworkStateTests.tagmsgReactionsAndTypingBecomeEffects`; `PerNetworkStateTests.reactionFoldAddsAndRemovesPerSender` |
+| +typing | `PerNetworkStateTests.tagmsgReactionsAndTypingBecomeEffects` |
+| draft/message-redaction | `PerNetworkStateTests.redactEmitsRedactionByMsgid`; `PerNetworkStateTests.redactionReplacesOnlyTheMatchingMessage` |
+| draft/read-marker | `PerNetworkStateTests.markreadAppliesTimestampToTheTargetAndIgnoresStarTargets` |
+| draft/multiline | `IrcMultilineTests.splitsLongLinesBetweenWordsWithConcatTagAndRoundTrips`; `MessagingReducerTests.multilineNestedInChathistoryIsPlayback`; `MessagingCoordinatorTests.multilineComposerTextIsBatchedAndReconciledAgainstTheEchoedBatch`; `ErgoRoundTripTest.multilineEchoAndChannelRenameAgainstRealServer` |
+| +draft/channel-context | `MessagingReducerTests.channelContextTagStoredOnDirectMessages`; `MessagingReducerTests.channelContextOnMultilineBatchOpeningApplies`; `MessagingCoordinatorTests.channelContextSurvivesCoordinatorHistoryReload`; `LiveCoordinatorIntegrationTests.openingPersistedSearchHitRestoresChannelContextIntoAnAbsentConversation`; `MessageStoreTests.channelContextRoundTripsThroughRecentAndHistory`; `YardhalDatabaseMigrationTests.versionOneUpgradePreservesTranscriptHashesRowIdsAndSearch` |
+| batch | `PerNetworkStateTests.playbackBatchesIncludingNestedOnesSuppressHighlights`; `PerNetworkStateTests.disconnectReportsConnectingAndReconnectResetsConnectionState` |
+| chathistory batch type | `MessagingReducerTests.multilineNestedInChathistoryIsPlayback` |
+| draft/chathistory | `PerNetworkStateTests.ownJoinOpensBufferAndRequestsTopicModeAndHistory`; `MessagingReducerTests.noImplicitNamesJoinCompletesWithoutWaitingForNames` |
+| netsplit/netjoin | `PerNetworkStateTests.netsplitBatchCollapsesQuitsIntoOneSummaryLine`; `PerNetworkStateTests.netjoinBatchSuppressesJoinLinesButTracksMembers` |
+| labeled-response | `LabeledResponseReducerTests.labelledBatchIsRoutedToOriginAndClearedAtBatchEnd`; `LabeledResponseReducerTests.ackClearsPendingLabelWithoutOutput`; `ErgoRoundTripTest.labeledResponsesCarryLabelsFromRealServer` |
+| standard-replies | `PerNetworkStateTests.standardRepliesAreTaggedByVerb` |
+| sts | `StsTests.plainConnectionUpgradesUnderActivePolicy`; `StsTests.expiredPolicyDeletedAndIgnored`; `FileStsPolicyStoreTests.policySurvivesStoreRecreation` |
+| SNI | `TlsServerNameIndicationTests.clientHelloNamesTheConfiguredHost` |
+| NAMES/353/366 | `PerNetworkStateTests.namesAccumulateUntilEndAndMarkJoined` |
+| multi-prefix | `NamesParserTests.keepsHighestRoleWhenMultiPrefixStacksPrefixes` |
+| userhost-in-names | `IdentityReducerTests.userhostInNamesCapturesUserAndHost` |
+| no-implicit-names | `MessagingReducerTests.noImplicitNamesJoinCompletesWithoutWaitingForNames`; `MessagingCoordinatorTests.noImplicitNamesJoinsBeforeLazyWhoxLoadsMembersOnlyOnce` |
+| invite-notify | `IdentityReducerTests.inviteNotifyForOthersLandsInChannelBuffer`; `IdentityReducerTests.invitingNumericConfirmsInChannel` |
+| bot-mode | `IdentityReducerTests.botModeTokenAndWhoFlagsMarkBots`; `PerNetworkStateTests.whoisAwayServerOperIdleAndBotNumericsReachTheCompletedResult` |
+| account-extban | `IdentityReducerTests.accountExtbanBuildsBanMaskFromKnownAccount` |
+| draft/metadata-2 | `MetadataReducerTests.metadataBatchPublishesProfilesOnceAtBatchEnd`; `MetadataReducerTests.subscriptionNumericsTrackKeys`; `MetadataCoordinatorLoopbackTests.metadataFlowsFromWireToProfilesAndBack` |
+| soju.im/FILEHOST | `FilehostUploaderTests.rawPostSendsHeadersAndResolvesRelativeLocation`; `FilehostUploaderTests.bodyFormatRejectionRetriesMultipartThenSucceeds`; `FilehostUploaderTests.plainHttpBlockedWhenIrcConnectionUsesTls` |
+| UTF8ONLY | `LineFramerTests.malformedUtf8IsReplacedNotDecodedAsLatin1`; `LineFramerTests.truncationNeverSplitsACodepoint` |
+| draft/extended-isupport | `IrcConnectionIntegrationTests.extendedIsupportRequestsIsupportBeforeCapEnd`; `ISupportTests.negatedTokensRemoveEarlierValues` |
+| draft/ICON | `MetadataReducerTests.iconIsupportTokenSetsAndClearsNetworkIcon`; `ImageUrlPolicyTests.sizeTemplateIsExpanded` |
+| draft/channel-rename | `MessagingCoordinatorTests.renameMovesBufferTranscriptMarkersMutesPinsAndAutojoin`; `MessageStoreRenameTests.renamedRowsStaySearchableUnderTheNewConversation`; `MessagingReducerTests.outstandingLabeledReplyFollowsRenamedConversation` |
+| soju.im/bouncer-networks | `IrcBouncerNetworksTests.commandBuilders`; `BouncerNetworkDraftTests.diffContainsOnlyChangedKeys`; `PerNetworkStateTests.bouncerNetIdBindsAndNetworkUpdatesBumpVersion` |
+| znc.in/playback | `PerNetworkStateTests.capabilitiesRequestPlaybackSinceLatestReadMarkerInSeconds` |
+
+Emulator smoke (`make play`) exercises rendered network icons, avatars,
+display names, verified-account/away/bot member rows, account-ban wire syntax,
+multiline send/echo, selected channel rename, channel-context navigation and
+the traffic console. Protocol-only tests above do not claim UI rendering proof.

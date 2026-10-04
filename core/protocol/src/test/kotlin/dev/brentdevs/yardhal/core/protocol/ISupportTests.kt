@@ -77,6 +77,24 @@ class ISupportTests {
     }
 
     @Test
+    fun negatedTokensRemoveEarlierValues() {
+        val first = ISupport.parse(listOf("UTF8ONLY", "NICKLEN=30", "FOO=bar"))
+        val update = ISupport.parse(listOf("NICKLEN=42", "-FOO", "-UTF8ONLY"))
+        val merged = first.mergedWith(update)
+        assertEquals(42, merged.nickLengthLimit)
+        assertFalse(merged.supports("FOO"))
+        assertFalse(merged.supports("-FOO"))
+        assertFalse(merged.utf8Only)
+    }
+
+    @Test
+    fun utf8OnlyAbsentByDefaultAndSurvivesMerge() {
+        assertFalse(ISupport.EMPTY.utf8Only)
+        val merged = ISupport.parse(listOf("UTF8ONLY")).mergedWith(ISupport.parse(listOf("NICKLEN=9")))
+        assertTrue(merged.utf8Only)
+    }
+
+    @Test
     fun flagDetectionAndLimits() {
         val support = ISupport.parse(
             listOf("UTF8ONLY", "BOT=b", "MONITOR=100", "ELIST=CTU", "NICKLEN=0", "MAXTARGETS=-2"),
@@ -94,5 +112,31 @@ class ISupportTests {
         val support = ISupport.parse(listOf("SAFELIST", "CALLERID"))
         assertTrue(support.supports("SAFELIST"))
         assertFalse(support.supports("WALLCHOPS"))
+    }
+
+    @Test
+    fun accountExtbanCombinesPrefixAndFirstName() {
+        val short = ISupport.parse(listOf("EXTBAN=$,ARar", "ACCOUNTEXTBAN=R"))
+        assertEquals(AccountExtban("$", "R"), short.accountExtban)
+        assertEquals("\$R:bob", short.accountExtban?.mask("bob"))
+        val long = ISupport.parse(listOf("EXTBAN=~,a", "ACCOUNTEXTBAN=account,a"))
+        assertEquals("~account:bob", long.accountExtban?.mask("bob"))
+        val unprefixed = ISupport.parse(listOf("EXTBAN=,ACNOR", "ACCOUNTEXTBAN=R"))
+        assertEquals("R:bob", unprefixed.accountExtban?.mask("bob"))
+    }
+
+    @Test
+    fun accountExtbanRequiresBothTokens() {
+        assertNull(ISupport.parse(listOf("EXTBAN=~,a")).accountExtban)
+        assertNull(ISupport.parse(listOf("ACCOUNTEXTBAN=a")).accountExtban)
+        assertNull(ISupport.parse(listOf("EXTBAN=a", "ACCOUNTEXTBAN=a")).accountExtban)
+        val merged = ISupport.parse(listOf("EXTBAN=~,a")).mergedWith(ISupport.parse(listOf("ACCOUNTEXTBAN=a")))
+        assertEquals("~a:bob", merged.accountExtban?.mask("bob"))
+    }
+
+    @Test
+    fun botModeLetterParsed() {
+        assertEquals('B', ISupport.parse(listOf("BOT=B")).botModeLetter)
+        assertNull(ISupport.EMPTY.botModeLetter)
     }
 }

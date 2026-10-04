@@ -11,6 +11,7 @@ public sealed interface SlashCommand {
     public data class NickChange(public val newNick: String) : SlashCommand
     public data class TopicSet(public val channel: String, public val topic: String) : SlashCommand
     public data class TopicShow(public val channel: String?) : SlashCommand
+    public data class SetName(public val realName: String) : SlashCommand
     public data class Away(public val message: String?) : SlashCommand
     public data class Quit(public val reason: String?) : SlashCommand
     public data class Whois(public val target: String) : SlashCommand
@@ -27,6 +28,8 @@ public sealed interface SlashCommand {
     public data class IgnoreAdd(public val mask: String) : SlashCommand
     public data class IgnoreRemove(public val mask: String) : SlashCommand
     public data class Raw(public val line: String) : SlashCommand
+    public data class SetAvatar(public val url: String?) : SlashCommand
+    public data class SetDisplayName(public val name: String?) : SlashCommand
     public data object Help : SlashCommand
 }
 
@@ -56,6 +59,7 @@ public object SlashCommandParser {
             "nick" -> rest.split(' ').firstOrNull { it.isNotEmpty() }?.let { SlashCommand.NickChange(it) }
             "topic" -> parseTopic(rest, currentChannel)
             "away" -> SlashCommand.Away(rest.ifBlank { null })
+            "setname" -> rest.trim().takeIf { it.isNotEmpty() }?.let { SlashCommand.SetName(it) }
             "back" -> SlashCommand.Away(null)
             "quit" -> SlashCommand.Quit(rest.ifBlank { null })
             "whois" -> rest.split(' ').firstOrNull { it.isNotEmpty() }?.let { SlashCommand.Whois(it) }
@@ -74,6 +78,10 @@ public object SlashCommandParser {
             }
             "ignore" -> tokensOf(rest).firstOrNull()?.let { SlashCommand.IgnoreAdd(it) }
             "unignore" -> tokensOf(rest).firstOrNull()?.let { SlashCommand.IgnoreRemove(it) }
+            "register" -> parseRegister(rest)
+            "verify" -> parseVerify(rest)
+            "setavatar" -> SlashCommand.SetAvatar(tokensOf(rest).firstOrNull())
+            "setdisplayname" -> SlashCommand.SetDisplayName(rest.trim().ifEmpty { null })
             "quote", "raw" -> rawLine(rest)
             else -> rawLine(body)
         }
@@ -86,6 +94,29 @@ public object SlashCommandParser {
             body.substring(0, spaceIndex).uppercase() + " " + body.substring(spaceIndex + 1),
         )
     }
+
+    private fun parseRegister(rest: String): SlashCommand? {
+        val tokens = tokensOf(rest)
+        val (account, email, password) = when (tokens.size) {
+            2 -> Triple("*", tokens[0], tokens[1])
+            3 -> Triple(tokens[0], tokens[1], tokens[2])
+            else -> return null
+        }
+        return SlashCommand.Raw("REGISTER $account $email ${trailingSafe(password)}")
+    }
+
+    private fun parseVerify(rest: String): SlashCommand? {
+        val tokens = tokensOf(rest)
+        val (account, code) = when (tokens.size) {
+            1 -> "*" to tokens[0]
+            2 -> tokens[0] to tokens[1]
+            else -> return null
+        }
+        return SlashCommand.Raw("VERIFY $account ${trailingSafe(code)}")
+    }
+
+    private fun trailingSafe(lastParameter: String): String =
+        if (lastParameter.startsWith(":")) ":$lastParameter" else lastParameter
 
     private fun parsePrivChange(
         rest: String,

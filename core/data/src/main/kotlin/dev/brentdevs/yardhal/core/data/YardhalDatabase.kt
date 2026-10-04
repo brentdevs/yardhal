@@ -4,14 +4,21 @@ import android.content.Context
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
-@Database(entities = [MessageRow::class], version = 1, exportSchema = true)
+@Database(entities = [MessageRow::class], version = 2, exportSchema = true)
 public abstract class YardhalDatabase : RoomDatabase() {
 
     public abstract fun messageDao(): MessageDao
 
     public companion object {
+        private val migration1To2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE messages ADD COLUMN channelContext TEXT")
+            }
+        }
+
         private fun ensureFts(db: SupportSQLiteDatabase) {
             db.execSQL("CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts4(sender, body, tokenize=unicode61)")
         }
@@ -25,7 +32,7 @@ public abstract class YardhalDatabase : RoomDatabase() {
         public fun build(context: Context, name: String = "yardhal.db"): YardhalDatabase =
             Room.databaseBuilder(context, YardhalDatabase::class.java, name)
                 .addCallback(callback)
-                .fallbackToDestructiveMigration()
+                .addMigrations(migration1To2)
                 .build()
 
         public fun inMemory(context: Context): YardhalDatabase =

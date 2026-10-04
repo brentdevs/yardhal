@@ -27,6 +27,7 @@ import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import dev.brentdevs.yardhal.coordinator.ChatMessage
+import dev.brentdevs.yardhal.coordinator.UserProfile
 import dev.brentdevs.yardhal.core.data.ChatAppearancePreferences
 import dev.brentdevs.yardhal.core.data.MessageKind
 import dev.brentdevs.yardhal.ui.theme.nickColor
@@ -48,11 +49,13 @@ public fun MessageRow(
     onLongPress: () -> Unit,
     onToggleReaction: (String) -> Unit,
     onOpenAttachment: (String) -> Unit = {},
+    onOpenChannel: (String) -> Unit = {},
     modifier: Modifier = Modifier,
+    profile: UserProfile? = null,
 ) {
     when (message.kind) {
         MessageKind.SYSTEM, MessageKind.JOIN, MessageKind.PART -> SystemLine(message, appearance, modifier)
-        else -> ChatLine(message, groupedWithPrevious, focused, appearance, reactions, quotedText, onLongPress, onToggleReaction, onOpenAttachment, modifier)
+        else -> ChatLine(message, profile, groupedWithPrevious, focused, appearance, reactions, quotedText, onLongPress, onToggleReaction, onOpenAttachment, onOpenChannel, modifier)
     }
 }
 
@@ -87,6 +90,7 @@ private fun SystemLine(message: ChatMessage, appearance: ChatAppearancePreferenc
 @Composable
 private fun ChatLine(
     message: ChatMessage,
+    profile: UserProfile?,
     groupedWithPrevious: Boolean,
     focused: Boolean,
     appearance: ChatAppearancePreferences,
@@ -95,6 +99,7 @@ private fun ChatLine(
     onLongPress: () -> Unit,
     onToggleReaction: (String) -> Unit,
     onOpenAttachment: (String) -> Unit,
+    onOpenChannel: (String) -> Unit,
     modifier: Modifier,
 ) {
     HighlightedSurface(
@@ -119,7 +124,7 @@ private fun ChatLine(
             if (groupedWithPrevious) {
                 Spacer(modifier = Modifier.size(38.dp))
             } else {
-                NickAvatar(nick = message.sender)
+                NickAvatar(nick = message.sender, avatarUrl = profile?.avatarUrl)
             }
             Spacer(modifier = Modifier.width(10.dp))
             Column(modifier = Modifier.weight(1f)) {
@@ -128,17 +133,47 @@ private fun ChatLine(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
+                        val displayName = profile?.displayName
                         Text(
-                            text = message.sender,
+                            text = displayName ?: message.sender,
                             style = MaterialTheme.typography.bodyMedium,
                             fontWeight = FontWeight.SemiBold,
                             color = nickColor(message.sender),
                         )
+                        if (message.senderAccount != null) {
+                            Text(
+                                text = "✓",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary,
+                            )
+                        }
+                        if (displayName != null && displayName != message.sender) {
+                            Text(
+                                text = message.sender,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
                         Text(
                             text = formatTime(message.timestampMs),
                             style = MaterialTheme.typography.labelSmall,
                             fontFamily = FontFamily.Monospace,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                message.channelContext?.let { channel ->
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.secondaryContainer,
+                        modifier = Modifier.padding(top = 2.dp),
+                        onClick = { onOpenChannel(channel) },
+                    ) {
+                        Text(
+                            text = "re: $channel",
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer,
                         )
                     }
                 }

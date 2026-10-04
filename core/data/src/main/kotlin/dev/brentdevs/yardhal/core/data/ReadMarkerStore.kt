@@ -25,6 +25,14 @@ public class ReadMarkerStore(directory: File) {
         true
     }
 
+    public fun rename(fromKey: String, toKey: String): Boolean = synchronized(markers) {
+        if (fromKey == toKey) return false
+        val moved = markers.remove(fromKey) ?: return false
+        markers[toKey] = maxOf(moved, markers[toKey] ?: 0L)
+        store.save(markers.toMap())
+        true
+    }
+
     public fun hasUnread(storageKey: String, latestTimestampMs: Long): Boolean =
         latestTimestampMs > marker(storageKey)
 

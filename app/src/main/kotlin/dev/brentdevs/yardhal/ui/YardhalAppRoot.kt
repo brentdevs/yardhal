@@ -52,6 +52,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.brentdevs.yardhal.coordinator.ConnectionStatus
 import dev.brentdevs.yardhal.coordinator.ConversationBuffer
 import dev.brentdevs.yardhal.coordinator.LiveCoordinator
+import dev.brentdevs.yardhal.coordinator.NetworkProfiles
 import dev.brentdevs.yardhal.core.data.ConversationRef
 import dev.brentdevs.yardhal.core.data.ChatAppearanceStore
 import dev.brentdevs.yardhal.ui.screens.AddNetworkSheet
@@ -81,10 +82,15 @@ public fun YardhalAppRoot(
     val bouncerVersion by coordinator.bouncerVersion.collectAsStateWithLifecycle()
     val mutedKeys by coordinator.mutedState.collectAsStateWithLifecycle()
     val orderState by coordinator.orderState.collectAsStateWithLifecycle()
+    val profiles by coordinator.profiles.collectAsStateWithLifecycle()
 
     var addNetworkVisible by remember { mutableStateOf(false) }
     var pendingPreset by remember { mutableStateOf<NetworkPresetUi?>(null) }
     var selectedKey by rememberSaveable { mutableStateOf<String?>(null) }
+    fun selectConversation(key: String?) {
+        coordinator.trackSelection(key)
+        selectedKey = key
+    }
     val conversationStateHolder = rememberSaveableStateHolder()
     var joinDialogVisible by remember { mutableStateOf(false) }
     var joinDraft by remember { mutableStateOf("") }
@@ -121,7 +127,11 @@ public fun YardhalAppRoot(
         val first = buffers.values
             .filter { it.ref.kind != dev.brentdevs.yardhal.core.data.ConversationKind.SERVER }
             .minByOrNull { it.displayName.lowercase() }
-        selectedKey = first?.key
+        selectConversation(first?.key)
+    }
+    val renamedSelection = coordinator.followRenamedSelection(selectedKey, buffers.keys)
+    if (renamedSelection != null) {
+        selectConversation(renamedSelection)
     }
 
     val pickLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
@@ -158,7 +168,7 @@ public fun YardhalAppRoot(
             orderState = orderState,
             onSelect = { key ->
                 coordinator.markRead(key)
-                selectedKey = key
+                selectConversation(key)
                 searchTargetRowId = null
                 returnToSearch = false
                 onSelected()
@@ -166,7 +176,7 @@ public fun YardhalAppRoot(
             onSelectServer = { networkId ->
                 val key = ConversationRef.server(networkId).storageKey
                 coordinator.markRead(key)
-                selectedKey = key
+                selectConversation(key)
                 searchTargetRowId = null
                 returnToSearch = false
                 onSelected()
@@ -204,6 +214,7 @@ public fun YardhalAppRoot(
     val conversationContent: @Composable (String, ConversationBuffer, String, Boolean, (() -> Unit)?) -> Unit =
         { key, buffer, networkName, connected, onOpenBuffers ->
             val networkId = key.substringBefore("|")
+            val networkFeatures = networks.firstOrNull { it.id == networkId }
             conversationStateHolder.SaveableStateProvider(key) {
                 ConversationScreen(
                     buffer = buffer,
@@ -226,10 +237,8 @@ public fun YardhalAppRoot(
                         joinSendFailed = false
                         joinDialogVisible = true
                     },
-                    onLoadHistory = {
-                        coordinator.loadPersistedHistory(key)
-                        coordinator.ensureMembers(networkId, key)
-                    },
+                    onLoadHistory = { coordinator.loadPersistedHistory(key) },
+                    onLoadMembers = { coordinator.ensureMembers(networkId, key) },
                     onReact = { msgid, emoji -> coordinator.react(networkId, key, msgid, emoji) },
                     onSetReplyDraft = { message -> coordinator.setReplyDraft(networkId, key, message) },
                     onDelete = { msgid -> coordinator.deleteMessage(networkId, key, msgid) },
@@ -245,12 +254,20 @@ public fun YardhalAppRoot(
                     },
                     onMemberAction = { action, nick -> coordinator.memberAction(networkId, key, action, nick) },
                     onOpenDm = { nick ->
-                        selectedKey = coordinator.directMessageKey(networkId, key, nick)
+                        selectConversation(coordinator.directMessageKey(networkId, key, nick))
+                        searchTargetRowId = null
+                        returnToSearch = false
+                    },
+                    hasBotMode = networkFeatures?.hasBotMode == true,
+                    accountBanAvailable = networkFeatures?.accountBanAvailable == true,
+                    onOpenChannel = { channel ->
+                        selectConversation(coordinator.ensureConversation(networkId, channel))
                         searchTargetRowId = null
                         returnToSearch = false
                     },
                     sharedDraft = sharedDraft,
                     onSharedConsumed = onSharedConsumed,
+                    profiles = profiles[networkId] ?: NetworkProfiles.EMPTY,
                     onPickFile = { launchAttachmentPicker() },
                     modifier = Modifier.fillMaxSize(),
                 )
@@ -324,7 +341,7 @@ public fun YardhalAppRoot(
                     searchRetry += 1
                 },
                 onOpenHit = { hit ->
-                    selectedKey = coordinator.openSearchHit(hit)
+                    selectConversation(coordinator.openSearchHit(hit))
                     searchTargetRowId = hit.rowId
                     returnToSearch = true
                     searchVisible = false
@@ -376,14 +393,14 @@ public fun YardhalAppRoot(
                     val networkId = key.substringBefore("|")
                     val network = networks.firstOrNull { it.id == networkId }
                     if (buffer == null || network == null) {
-                        selectedKey = null
+                        selectConversation(null)
                     } else {
                         BackHandler(enabled = drawerState.currentValue == DrawerValue.Closed) {
                             if (returnToSearch) {
                                 searchVisible = true
                                 returnToSearch = false
                             } else {
-                                selectedKey = null
+                                selectConversation(null)
                             }
                         }
                         ModalNavigationDrawer(
@@ -597,6 +614,7 @@ public fun YardhalAppRoot(
                         Text("${info.user ?: "?"}@${info.host ?: "?"}", style = MaterialTheme.typography.bodySmall)
                     }
                     info.account?.let { Text("Account: $it", style = MaterialTheme.typography.bodySmall) }
+                    if (info.isBot) Text("Bot", style = MaterialTheme.typography.bodySmall)
                     info.server?.let { Text("Server: $it ${info.serverInfo.orEmpty()}", style = MaterialTheme.typography.bodySmall) }
                     info.idleSeconds?.let { Text("Idle: ${it / 60} min", style = MaterialTheme.typography.bodySmall) }
                     if (info.channels.isNotEmpty()) {

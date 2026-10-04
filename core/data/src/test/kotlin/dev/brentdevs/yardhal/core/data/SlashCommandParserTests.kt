@@ -77,6 +77,14 @@ class SlashCommandParserTests {
     }
 
     @Test
+    fun setnameTakesWholeRemainder() {
+        assertEquals(SlashCommand.SetName("Jane Q. Public"), parse("/setname Jane Q. Public"))
+        assertEquals(SlashCommand.SetName("solo"), parse("/SETNAME   solo"))
+        assertNull(parse("/setname"))
+        assertNull(parse("/setname   "))
+    }
+
+    @Test
     fun kickResolvesChannelFromContext() {
         assertEquals(SlashCommand.Kick("#yardhal", "spammer", "bye"), parse("/kick spammer bye"))
         assertEquals(SlashCommand.Kick("#other", "spammer", null), parse("/kick #other spammer"))
@@ -103,8 +111,42 @@ class SlashCommandParserTests {
 
     @Test
     fun unknownVerbPassesThroughRaw() {
-        assertEquals(SlashCommand.Raw("SETNAME Bob"), parse("/setname Bob"))
+        assertEquals(SlashCommand.Raw("KNOCK #c please"), parse("/knock #c please"))
         assertEquals(SlashCommand.Raw("CHATHISTORY LATEST #c * 10"), parse("/quote chathistory LATEST #c * 10"))
+    }
+
+    @Test
+    fun registerDefaultsAccountToCurrentNick() {
+        assertEquals(SlashCommand.Raw("REGISTER * me@example.org hunter2"), parse("/register me@example.org hunter2"))
+        assertEquals(SlashCommand.Raw("REGISTER * * hunter2"), parse("/register * hunter2"))
+    }
+
+    @Test
+    fun registerAcceptsCustomAccountName() {
+        assertEquals(
+            SlashCommand.Raw("REGISTER test tester@example.org hunter2"),
+            parse("/REGISTER  test tester@example.org hunter2"),
+        )
+    }
+
+    @Test
+    fun registerRejectsWrongArity() {
+        assertNull(parse("/register"))
+        assertNull(parse("/register hunter2"))
+        assertNull(parse("/register a b c d"))
+    }
+
+    @Test
+    fun registerPasswordStartingWithColonStaysOneParameter() {
+        assertEquals(SlashCommand.Raw("REGISTER * * ::secret"), parse("/register * :secret"))
+    }
+
+    @Test
+    fun verifyBuildsVerifyCommand() {
+        assertEquals(SlashCommand.Raw("VERIFY test 39gvcdg4myvnmdcfhvd6exsv4n"), parse("/verify test 39gvcdg4myvnmdcfhvd6exsv4n"))
+        assertEquals(SlashCommand.Raw("VERIFY * 1234"), parse("/verify 1234"))
+        assertNull(parse("/verify"))
+        assertNull(parse("/verify a b c"))
     }
 
     @Test

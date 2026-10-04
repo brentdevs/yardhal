@@ -21,6 +21,7 @@ import dev.brentdevs.yardhal.core.data.ReadMarkerStore
 import dev.brentdevs.yardhal.core.data.YardhalDatabase
 import dev.brentdevs.yardhal.service.ConnectionService
 import dev.brentdevs.yardhal.service.Notifications
+import dev.brentdevs.yardhal.ui.image.RemoteImageLoader
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -46,6 +47,8 @@ class YardhalApplication : Application() {
         private set
     lateinit var chatAppearanceStore: ChatAppearanceStore
         private set
+
+    val remoteImages: RemoteImageLoader by lazy { RemoteImageLoader(cacheDir) }
 
     override fun onCreate() {
         super.onCreate()

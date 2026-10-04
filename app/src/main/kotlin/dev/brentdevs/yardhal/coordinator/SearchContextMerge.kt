@@ -27,6 +27,7 @@ internal fun mergeSearchContext(
                     highlightsMe = false,
                     msgid = row.msgid,
                     storedRowId = row.rowId,
+                    channelContext = row.channelContext,
                 ),
             )
         }

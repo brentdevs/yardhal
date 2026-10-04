@@ -9,11 +9,13 @@ import dev.brentdevs.yardhal.core.data.ChannelOrderStore
 import dev.brentdevs.yardhal.core.data.ConversationRef
 import dev.brentdevs.yardhal.core.data.InMemoryCredentialVault
 import dev.brentdevs.yardhal.core.data.IgnoreStore
+import dev.brentdevs.yardhal.core.data.MessageKind
 import dev.brentdevs.yardhal.core.data.MessageStore
 import dev.brentdevs.yardhal.core.data.MuteStore
 import dev.brentdevs.yardhal.core.data.NetworkConfig
 import dev.brentdevs.yardhal.core.data.NetworkStore
 import dev.brentdevs.yardhal.core.data.ReadMarkerStore
+import dev.brentdevs.yardhal.core.data.StoredMessage
 import dev.brentdevs.yardhal.core.data.YardhalDatabase
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -230,6 +232,58 @@ class LiveCoordinatorIntegrationTests {
                 database.close()
                 directory.deleteRecursively()
             }
+        }
+    }
+
+    @Test
+    fun openingPersistedSearchHitRestoresChannelContextIntoAnAbsentConversation() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val directory = Files.createTempDirectory("yardhal-search-context").toFile()
+        val database = YardhalDatabase.inMemory(context)
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        try {
+            val messages = MessageStore(database.messageDao())
+            val ref = ConversationRef.directMessage("network", "alice")
+            messages.record(
+                StoredMessage(
+                    networkId = ref.networkId,
+                    conversation = ref,
+                    msgid = "search-context",
+                    senderNick = "alice",
+                    senderUser = "u",
+                    senderHost = "h",
+                    kind = MessageKind.PRIVMSG,
+                    text = "searchcontext",
+                    sentByUs = false,
+                    timestampMs = 1_000,
+                    channelContext = "#room",
+                ),
+            )
+            val coordinator = LiveCoordinator(
+                scope = scope,
+                networkStore = NetworkStore(directory),
+                messageStore = messages,
+                readMarkers = ReadMarkerStore(directory),
+                mutes = MuteStore(directory),
+                vault = InMemoryCredentialVault(),
+                channelOrder = ChannelOrderStore(directory),
+                connectionFactory = ConnectionFactory { config, onStsUpgrade ->
+                    IrcConnection(
+                        IrcConnectionConfig(host = config.host, port = config.port, tls = config.tls, nick = config.nick),
+                        onStsUpgrade = onStsUpgrade,
+                    )
+                },
+                stsPolicies = InMemoryStsPolicyStore(),
+            )
+            val hit = coordinator.searchMessages("searchcontext").single()
+            assertFalse(coordinator.buffers.value.containsKey(ref.storageKey))
+            val key = coordinator.openSearchHit(hit)
+            await { coordinator.buffers.value[key]?.messages?.any { it.storedRowId == hit.rowId } == true }
+            assertEquals("#room", coordinator.buffers.value[key]?.messages?.single()?.channelContext)
+        } finally {
+            scope.cancel()
+            database.close()
+            directory.deleteRecursively()
         }
     }
 

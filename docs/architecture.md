@@ -28,10 +28,10 @@ Each layer depends only on the ones below it.
   CTCP, batches, ISUPPORT, casemapping, numerics as sealed types. Pure
   Kotlin value types; no sockets, no coroutines, no Android.
 - **`core/client`** — `IrcConnection` (TLS socket via `javax.net.ssl`),
-  `LineFramer`, `BatchAssembler`, `CapabilityNegotiator` (CAP LS 302),
-  SASL handlers (PLAIN first; SCRAM-SHA-256 later), `Reconnector` with
-  backoff, STS policy handling. Exposes inbound events as a `Flow`.
-  One `IrcConnection` per network.
+  `LineFramer`, `CapabilityNegotiator` (CAP LS 302), SASL handlers,
+  `IrcReconnector` with backoff, STS policy handling, filehost uploads.
+  Exposes inbound events as a `Flow`. One `IrcConnection` per network.
+  IRCv3 batches are tracked by the app-layer reducer, not here.
 - **`core/data`** — Android library holding persistent stores:
   `NetworkStore` (kotlinx.serialization + file/DataStore),
   `MessageStore` (Room, dedup by `msgid` or content hash,
@@ -44,21 +44,64 @@ Each layer depends only on the ones below it.
 
 ## Data flow on an inbound message
 
-Actual shape (ported from Halyard):
+1. Bytes off the TLS socket → `LineFramer` splits on `\r\n` (`core/client`).
+2. Each line parses to an `IrcMessage` (`core/protocol`). `IrcConnection`
+   consumes connection-scoped traffic itself (PING, CAP, SASL, STS, nick
+   collisions during registration) and emits everything as `IrcEvent`s.
+3. `IrcReconnector` re-creates connections with backoff and republishes
+   their events as one `Flow` per network.
+4. `LiveCoordinator` collects that flow and, under a per-session lock, calls
+   `PerNetworkState.apply(event, InboundContext)`.
+5. `PerNetworkState` (`app/.../coordinator/PerNetworkState.kt`) is the pure
+   reducer. It owns per-network protocol state — casemapping, own nick,
+   negotiated caps and values, ISUPPORT-derived settings, open batches,
+   NAMES/WHO accumulation, channel membership, per-user presence and metadata,
+   netsplit tracking, labeled replies and WHOIS assembly — mutates it directly,
+   and returns a `List<InboundEffect>`
+   for everything that crosses into UI state or the outside world. It never
+   writes to sockets, stores, coroutine scopes or StateFlows; read-only
+   queries it needs (clock, ignore list, which buffers exist, read markers)
+   arrive through `InboundContext`. Handlers are grouped by concern in
+   `SessionReducer.kt`, `MembershipReducer.kt`, `IdentityReducer.kt`,
+   `ChatReducer.kt`, `MultilineReducer.kt`, `LabelReducer.kt`,
+   `MetadataReducer.kt` and `NumericReducer.kt`. `UserProfiles.kt` tracks
+   profile changes and publishes snapshots after metadata/join batches close.
+6. `LiveCoordinator.processEffect` executes each `InboundEffect`: append or
+   reconcile a message (and persist it to Room fire-and-forget), replace a
+   member snapshot, set topic/join state/typing/reactions, redact, apply a
+   read marker, rename a conversation and its persistent keys, send a raw line,
+   schedule epoch-guarded metadata sync, publish profiles and network icons,
+   WHOIS/LIST/bouncer updates. Pure buffer transforms live in `BufferOps.kt`;
+   HTTP image fetching, bounded decoding and caching live in `ui/image`.
+7. Compose observes the coordinator's StateFlows.
 
-1. Bytes off the TLS socket → `LineFramer` splits on `\r\n`.
-2. Each line parses to an `IrcMessage` (`core/protocol`).
-3. `BatchAssembler` buffers IRCv3 BATCH members or delivers immediately.
-4. `LiveCoordinator`'s inbound reader consumes the connection's `Flow`.
-5. The message runs through `PerNetworkState.apply(...)` — a pure-function
-   reducer that mutates per-network state directly where it owns it and
-   returns `[InboundEffect]` for everything crossing into UI-visible state.
-6. `processEffect` translates effects into coordinator mutators
-   (append message, replace members, bump revision...).
-7. Compose observes StateFlows; Room persists fire-and-forget.
+Reconnect clears connection-scoped members, presence and metadata, publishes
+empty member snapshots, and marks existing/restored channels JOINING. The
+visible conversation requests members only after its CHANNEL/JOINED transition;
+the coordinator additionally requires registration. Persisted-history loading
+is separate, and hidden channels are not eagerly queried.
 
-Outbound mirrors it: composer line → `SlashCommand.parse` → verb handler →
-connection send.
+Room schema 2 stores nullable channel context through live transcripts, history
+reloads and search-hit context restoration. Its explicit 1→2 migration only adds
+the column; existing row IDs, deduplication hashes and the FTS index survive.
+There is no destructive fallback.
+Rename-following retains only the active selected key and one pending destination,
+retargeted across rapid renames before buffer publication. Consuming a redirect,
+changing selection, reusing its source or removing its destination/network clears
+the pending state; no historical alias map is retained.
+
+Remote image state is remembered by loader, resolved URL and requested size.
+A changed identity starts with its matching cached image or a placeholder, never
+the previous identity's bitmap; keyed loading retains cancellation behavior.
+
+Reducer behaviour is pinned by plain-JVM tests
+(`app/src/test/.../coordinator/*ReducerTests.kt`, `PerNetworkStateTests.kt`)
+that feed raw lines and assert on returned effects and state.
+
+Outbound mirrors it: composer line → `SlashCommandParser.parse` →
+`LiveCoordinator.dispatchCommand` → connection send. Coordinator calls that
+change protocol state (WHOIS expectation, LIST browsing, leaving a channel)
+go through the same per-session lock.
 
 ## Conventions
 
@@ -74,6 +117,34 @@ explain why.
    demand, self-skipping when absent) — connect → CAP → register → JOIN →
    PRIVMSG echo.
 
+SCRAM uses the complete RFC 4013 Unicode 3.2 SASLprep profile: mapping, frozen
+NFKC normalization, prohibited-character checks, bidi restrictions, and the
+query/stored unassigned-character distinction. Usernames use QUERY and passwords
+use STORED. Empty prepared credentials fail at mechanism construction. Preparation
+failure emits one SASL failure without sending credentials or downgrading.
+Server iteration counts must be within 4,096–1,000,000 inclusive. The upper bound
+is a client resource policy, not a protocol requirement; out-of-range challenges
+abort authentication before password derivation without clamping or downgrading.
+
+`scripts/generate-saslprep-tables.py` reproduces the frozen encoded initializer
+from CPython's RFC 3454 `stringprep` predicates and `unicodedata.ucd_3_2_0`, without
+runtime dependencies or dependence on Android/JVM Unicode versions:
+
+```sh
+nix develop --command python3 scripts/generate-saslprep-tables.py
+```
+
+The compressed payload contains ten big-endian, length-prefixed uint32 arrays:
+B.1, C.1.2, prohibited, A.1, D.1 and D.2 ranges; combining-class pairs;
+expanded NFKD code-point/offset/length triples; decomposition values; and canonical
+composition triples. Hangul normalization is algorithmic. Its uncompressed SHA256
+is `42a08a6261c74bc6e3ee56b62b408ae7af3fdf6f6512432ceacc6f910cc43761`.
+
+The prepared loopback fixture covers normalization-changing Unicode credentials.
+The live Ergo scenario covers a normalized username and NFKC-stable Unicode
+password: [Ergo 2.14.0 stores SCRAM keys without password preparation](https://github.com/ergochat/ergo/blob/v2.14.0/irc/accounts.go#L2286-L2299).
+No server-specific preparation fallback is introduced.
+
 ## Roadmap
 
 Phases land in order; each phase ships with tests and updated docs.
@@ -82,28 +153,32 @@ Phases land in order; each phase ships with tests and updated docs.
   Compose shell app, quality gate, CI. ✅
 - **Phase 1 — Protocol core**: wire grammar, tags escaping, prefixes,
   numerics, CTCP, ISUPPORT, casemapping, mIRC formatting parse. ✅
-- **Phase 2 — Connection**: TLS, CAP LS 302, SASL PLAIN, registration,
+- **Phase 2 — Connection**: TLS, CAP LS 302, SASL PLAIN and SCRAM-SHA-256,
+  post-registration authentication, pre-away and extended ISUPPORT,
   ping keepalive, reconnect/backoff, STS persist + upgrade; loopback +
   Ergo harness green. ✅
-- **Phase 3 — Data + brain**: stores, reducer-style coordinator routing,
+- **Phase 3 — Data + brain**: stores, pure per-network inbound reducer,
   slash commands, credential vault, network presets. ✅
 - **Phase 4 — MVP UI**: network/channel lists, transcript, composer with
   nick completion, join sheet, foreground service + notifications,
   settings. ✅ (settings screen minimal)
-- **Phase 5 — IRCv3 breadth**: landed so far — server-time everywhere,
-  chathistory LATEST bootstrap, gap-free history seeding from the store,
+- **Phase 5 — IRCv3 breadth**: server-time everywhere, chathistory LATEST
+  bootstrap, gap-free history seeding from the store, labeled replies,
   echo-message reconciliation, msgid-gated reactions/replies/redaction,
-  typing both ways, presence via NAMES + PREFIX and WHOX (354 away/account),
-  MONITOR verbs with status lines, standard-replies lines, MARKREAD
-  mirroring, netsplit/netjoin collapse. Remaining: multiline batches
-  (spec wip), metadata avatars.
+  typing both ways, NAMES + PREFIX and WHOX presence, account/away/host/realname
+  notifications, extended MONITOR, standard replies, MARKREAD mirroring,
+  netsplit/netjoin collapse, limit-aware multiline composition and reassembly,
+  metadata subscriptions, avatars and display names. Draft features use the
+  advertised capability values; metadata is exercised against loopback servers
+  because pinned Ergo 2.14 does not implement it.
 - **Phase 6 — Polish**: ✅ whois panel, ignore list, LIST browser, two-pane
   tablet layout, traffic console, TOML theme engine, per-network channel
   tree with pins/custom groups/swipe actions/last-message previews,
-  role-sectioned member sheet with moderation actions, join-state machine
-  with retry, unread divider with jump-to-unread, and Room-FTS message
-  search with snippet results. Remaining: moderation surfaces beyond slash
-  verbs, per-message link auto-open polish.
+  role-sectioned member sheet with account and bot badges, account-extban
+  moderation, network icons, join-state machine with retry, unread divider
+  with jump-to-unread, and Room-FTS message search with snippet results.
+  Remaining: moderation surfaces beyond these actions and slash verbs,
+  per-message link auto-open polish.
 - **Phase 7 — Bouncers**: ZNC `znc.in/playback` requested; playback
   batches classified as history (no unread/highlight noise);
   `*status`/`*playback` routed to the server buffer. soju
@@ -123,9 +198,10 @@ Phases land in order; each phase ships with tests and updated docs.
   work — Android has no FoundationModels equivalent, so that feature needs a
   bundled model decision first.
 
-Deferred by design: multiline batches (spec WIP), metadata-2 avatars,
-link auto-open, catch-up digest, widgets. Each is tracked in
-`docs/ircv3-checklist.md` or above.
+Deferred by design: link auto-open, catch-up digest and widgets.
+WebSocket transport and WEBIRC do not apply to this native TCP/TLS client;
+deprecated STARTTLS is replaced by direct TLS, and client-batch production
+use waits for ratification. See `docs/ircv3-checklist.md`.
 
 The authoritative IRCv3 obligation inventory lives in
 `docs/ircv3-checklist.md`; check items off as they land.

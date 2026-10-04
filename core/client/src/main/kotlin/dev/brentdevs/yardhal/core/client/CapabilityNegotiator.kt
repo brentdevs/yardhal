@@ -7,6 +7,8 @@ public class CapabilityNegotiator(
     private val sendRaw: (String) -> Unit,
     private val onSaslAcknowledged: () -> Unit,
     private val onFinished: () -> Unit,
+    private val beforeCapEnd: () -> Unit = {},
+    private val onDeleted: (Set<String>) -> Unit = {},
     private val registrationHandshake: Boolean = true,
 ) {
     public enum class Phase { IDLE, LISTING, REQUESTING, AUTHENTICATING, FINISHED }
@@ -17,6 +19,12 @@ public class CapabilityNegotiator(
     public val available: MutableSet<String> = LinkedHashSet()
     public val acknowledged: MutableSet<String> = LinkedHashSet()
     public val declined: MutableSet<String> = LinkedHashSet()
+
+    private val values = LinkedHashMap<String, String>()
+    private val acknowledgedThisRound = LinkedHashSet<String>()
+
+    public val advertisedValues: Map<String, String>
+        get() = values
 
     private var capEndSent: Boolean = false
 
@@ -57,12 +65,13 @@ public class CapabilityNegotiator(
 
         when (verb) {
             "LS" -> {
-                available += splitAdvertisedNames(payload)
+                available += recordAdvertised(payload)
                 if (!multiline && phase == Phase.LISTING) completeListing()
             }
             "ACK" -> {
                 val names = splitNames(payload)
                 acknowledged += names
+                acknowledgedThisRound += names
                 if (!multiline && phase == Phase.REQUESTING) completeRequest()
             }
             "NAK" -> {
@@ -70,26 +79,36 @@ public class CapabilityNegotiator(
                 if (!multiline && phase == Phase.REQUESTING) completeRequest()
             }
             "NEW" -> {
-                val names = splitAdvertisedNames(payload)
+                val names = recordAdvertised(payload)
+                val updatesAcknowledged = names.any { it in acknowledged }
                 available += names
-                requestSubset(wanted intersect names)
+                requestSubset((wanted intersect names) - acknowledged)
+                if (updatesAcknowledged) onFinished()
             }
             "DEL" -> {
                 val names = splitNames(payload)
                 available -= names
                 acknowledged -= names
+                for (name in names) values.remove(name)
+                if (names.isNotEmpty()) onDeleted(names)
             }
         }
         return true
     }
 
-    public fun saslCompleted() {
+    public fun saslFinished() {
         if (phase == Phase.AUTHENTICATING) finish()
     }
 
-    public fun saslAbandonedContinueWithout() {
-        acknowledged.remove(SASL_CAP)
-        if (phase == Phase.AUTHENTICATING) finish()
+    private fun recordAdvertised(payload: String): Set<String> {
+        val names = LinkedHashSet<String>()
+        for (token in splitNames(payload)) {
+            val separator = token.indexOf('=')
+            val name = if (separator < 0) token else token.substring(0, separator)
+            if (separator < 0) values.remove(name) else values[name] = token.substring(separator + 1)
+            names += name
+        }
+        return names
     }
 
     private fun completeListing() {
@@ -102,12 +121,13 @@ public class CapabilityNegotiator(
             return
         }
         phase = Phase.REQUESTING
+        acknowledgedThisRound.clear()
         sendRaw("CAP REQ :${subset.sorted().joinToString(" ")}")
     }
 
     private fun completeRequest() {
         if (phase != Phase.REQUESTING) return
-        if (SASL_CAP in acknowledged) {
+        if (SASL_CAP in acknowledgedThisRound) {
             phase = Phase.AUTHENTICATING
             onSaslAcknowledged()
         } else {
@@ -119,6 +139,7 @@ public class CapabilityNegotiator(
         val alreadyDone = phase == Phase.FINISHED
         phase = Phase.FINISHED
         if (registrationHandshake && !alreadyDone && !capEndSent) {
+            beforeCapEnd()
             capEndSent = true
             sendRaw("CAP END")
         }
@@ -133,7 +154,5 @@ public class CapabilityNegotiator(
         internal fun splitNames(payload: String): Set<String> =
             payload.split(' ').filter { it.isNotEmpty() }.toSet()
 
-        internal fun splitAdvertisedNames(payload: String): Set<String> =
-            splitNames(payload).mapTo(LinkedHashSet()) { it.substringBefore('=') }
     }
 }

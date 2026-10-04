@@ -57,4 +57,5 @@ public data class StoredMessage(
     public val text: String,
     public val sentByUs: Boolean,
     public val timestampMs: Long,
+    public val channelContext: String? = null,
 )

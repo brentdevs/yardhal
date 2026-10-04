@@ -5,6 +5,7 @@ import androidx.test.core.app.ApplicationProvider
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.runBlocking
@@ -54,6 +55,7 @@ class MessageStoreTests {
         assertTrue(store.record(message(conversation = ref, msgid = null)))
         assertTrue(store.record(message(conversation = ref, msgid = null, timestampMs = 9999)))
         assertFalse(store.record(message(conversation = ref, msgid = null)))
+        assertFalse(store.record(message(conversation = ref, msgid = null).copy(channelContext = "#room")))
         assertTrue(store.record(message(conversation = ref, msgid = null, text = "different", timestampMs = 9999)))
         assertEquals(3, store.recent(ref, 10).size)
     }
@@ -90,6 +92,32 @@ class MessageStoreTests {
     }
 
     @Test
+    fun channelContextRoundTripsThroughRecentAndHistory() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = YardhalDatabase.inMemory(context)
+        try {
+            val store = MessageStore(db.messageDao())
+            val ref = ConversationRef.server("n1")
+            val contexts = listOf(null, "#room", "#Other")
+            val expected = contexts.mapIndexed { index, channelContext ->
+                val stored = message(
+                    conversation = ref,
+                    msgid = "context-$index",
+                    timestampMs = (index + 1) * 100L,
+                ).copy(kind = MessageKind.NOTICE, channelContext = channelContext)
+                stored.copy(rowId = assertNotNull(store.recordWithRowId(stored)))
+            }
+
+            assertEquals(expected, store.recent(ref, 10))
+            assertEquals(expected, store.after(ref, 0))
+            assertEquals(expected, store.before(ref, 400, 10))
+            assertEquals(expected, store.around(ref, expected[1].rowId, expected[1].timestampMs))
+        } finally {
+            db.close()
+        }
+    }
+
+    @Test
     fun trimKeepsNewest() = runBlocking {
         val store = newStore()
         val ref = ConversationRef.channel("n1", "#room")
@@ -109,14 +137,5 @@ class MessageStoreTests {
 
         assertTrue(store.recent(ConversationRef.channel("n1", "#a"), 5).isEmpty())
         assertEquals(1, store.recent(ConversationRef.channel("n2", "#a"), 5).size)
-    }
-
-    @Test
-    fun contentHashIsStableAndDistinct() {
-        val base = message()
-        val same = message()
-        val other = message(text = "other")
-        assertEquals(MessageStore.contentHash(base), MessageStore.contentHash(same))
-        assertFalse(MessageStore.contentHash(base) == MessageStore.contentHash(other))
     }
 }

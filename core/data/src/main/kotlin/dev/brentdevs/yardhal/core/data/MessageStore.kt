@@ -20,6 +20,7 @@ public class MessageStore(private val dao: MessageDao) {
             text = message.text,
             sentByUs = message.sentByUs,
             timestampMs = message.timestampMs,
+            channelContext = message.channelContext,
         )
         if (row.msgid != null) {
             val inserted = dao.insert(row)
@@ -78,6 +79,20 @@ public class MessageStore(private val dao: MessageDao) {
 
     public suspend fun trimTo(conversation: ConversationRef, keep: Int) {
         dao.trim(conversation.networkId, conversation.normalizedTarget, keep)
+    }
+
+    public suspend fun renameConversation(from: ConversationRef, to: ConversationRef): Int {
+        if (from.networkId != to.networkId || from.normalizedTarget == to.normalizedTarget) return 0
+        val moving = dao.allIn(from.networkId, from.normalizedTarget)
+        if (moving.isEmpty()) return 0
+        val renamed = dao.renameConversation(from.networkId, from.normalizedTarget, to.normalizedTarget)
+        for (row in moving) {
+            dao.updateContentHash(
+                row.rowId,
+                hashOf(row.networkId, to.normalizedTarget, row.senderNick, row.kind, row.text, row.timestampMs),
+            )
+        }
+        return renamed
     }
 
     public suspend fun reindexAll() {
@@ -140,15 +155,31 @@ public class MessageStore(private val dao: MessageDao) {
 
     public companion object {
 
-        public fun contentHash(message: StoredMessage): String {
+        public fun contentHash(message: StoredMessage): String = hashOf(
+            message.networkId,
+            message.conversation.normalizedTarget,
+            message.senderNick,
+            message.kind.name,
+            message.text,
+            message.timestampMs,
+        )
+
+        private fun hashOf(
+            networkId: String,
+            conversation: String,
+            senderNick: String,
+            kind: String,
+            text: String,
+            timestampMs: Long,
+        ): String {
             val digest = MessageDigest.getInstance("SHA-256")
             val payload = buildString {
-                append(message.networkId).append('\u0000')
-                append(message.conversation.normalizedTarget).append('\u0000')
-                append(message.senderNick).append('\u0000')
-                append(message.kind.name).append('\u0000')
-                append(message.text).append('\u0000')
-                append(message.timestampMs)
+                append(networkId).append('\u0000')
+                append(conversation).append('\u0000')
+                append(senderNick).append('\u0000')
+                append(kind).append('\u0000')
+                append(text).append('\u0000')
+                append(timestampMs)
             }
             return digest.digest(payload.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
         }
@@ -165,6 +196,7 @@ public class MessageStore(private val dao: MessageDao) {
             text = text,
             sentByUs = sentByUs,
             timestampMs = timestampMs,
+            channelContext = channelContext,
         )
     }
 }
