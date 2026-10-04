@@ -34,6 +34,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -42,11 +43,14 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import dev.brentdevs.yardhal.coordinator.ChatMessage
@@ -69,6 +73,7 @@ import java.time.format.DateTimeFormatter
 private sealed interface TranscriptEntry {
     public data class DayHeader(public val label: String) : TranscriptEntry
     public data class UnreadDivider(public val label: String) : TranscriptEntry
+    public data class CollapsedEvents(public val events: List<ChatMessage>, public val id: String) : TranscriptEntry
     public data class Message(public val value: ChatMessage, public val groupedWithPrevious: Boolean) : TranscriptEntry
 }
 
@@ -95,22 +100,49 @@ private fun buildTranscript(buffer: ConversationBuffer): List<TranscriptEntry> {
     var lastDate: LocalDate? = null
     var previousTimestamp = Long.MAX_VALUE
     var renderedUnreadDivider = false
+
+    val pendingEvents = ArrayList<ChatMessage>()
+    fun flushEvents() {
+        if (pendingEvents.isEmpty()) return
+        if (pendingEvents.size == 1) {
+            val single = pendingEvents[0]
+            val origIndex = ordered.indexOf(single)
+            val isGrouped = if (origIndex >= 0) grouped[origIndex].groupedWithPrevious else false
+            entries.add(TranscriptEntry.Message(single, isGrouped))
+        } else {
+            entries.add(TranscriptEntry.CollapsedEvents(pendingEvents.toList(), "collapsed-${pendingEvents.first().localId}"))
+        }
+        pendingEvents.clear()
+    }
+
     for (index in ordered.indices) {
         val message = ordered[index]
         val timestamp = message.timestampMs
         val date = Instant.ofEpochMilli(timestamp).atZone(zone).toLocalDate()
         if (date != lastDate) {
+            flushEvents()
             entries.add(TranscriptEntry.DayHeader(formatDayLabel(date)))
             lastDate = date
             previousTimestamp = Long.MAX_VALUE
         }
         if (unreadFrom != null && timestamp < unreadFrom && previousTimestamp >= unreadFrom) {
+            flushEvents()
             entries.add(TranscriptEntry.UnreadDivider("New messages"))
             renderedUnreadDivider = true
         }
-        entries.add(TranscriptEntry.Message(message, grouped[index].groupedWithPrevious))
+
+        val isEvent = message.kind == dev.brentdevs.yardhal.core.data.MessageKind.JOIN ||
+            message.kind == dev.brentdevs.yardhal.core.data.MessageKind.PART
+        if (isEvent) {
+            pendingEvents.add(message)
+        } else {
+            flushEvents()
+            entries.add(TranscriptEntry.Message(message, grouped[index].groupedWithPrevious))
+        }
         previousTimestamp = timestamp
     }
+    flushEvents()
+
     if (unreadFrom != null && !renderedUnreadDivider) {
         entries.add(TranscriptEntry.UnreadDivider("New messages"))
     }
@@ -189,7 +221,11 @@ public fun ConversationScreen(
     androidx.compose.runtime.LaunchedEffect(searchTargetRowId, entries) {
         if (searchTargetRowId != null) {
             val index = entries.indexOfFirst { entry ->
-                entry is TranscriptEntry.Message && entry.value.storedRowId == searchTargetRowId
+                when (entry) {
+                    is TranscriptEntry.Message -> entry.value.storedRowId == searchTargetRowId
+                    is TranscriptEntry.CollapsedEvents -> entry.events.any { it.storedRowId == searchTargetRowId }
+                    else -> false
+                }
             }
             if (index >= 0) {
                 listState.scrollToItem(index)
@@ -360,12 +396,14 @@ public fun ConversationScreen(
                         when (val entry = entries[index]) {
                             is TranscriptEntry.DayHeader -> "header-${entry.label}-$index"
                             is TranscriptEntry.UnreadDivider -> "unread-$index"
+                            is TranscriptEntry.CollapsedEvents -> entry.id
                             is TranscriptEntry.Message -> "msg-${entry.value.localId}"
                         }
                     }) { index ->
                         when (val entry = entries[index]) {
                             is TranscriptEntry.DayHeader -> DayPill(entry.label)
                             is TranscriptEntry.UnreadDivider -> NewMessagesDivider(entry.label)
+                            is TranscriptEntry.CollapsedEvents -> CollapsedEventsRow(entry)
                             is TranscriptEntry.Message -> {
                                 val message = entry.value
                                 MessageRow(
@@ -386,6 +424,7 @@ public fun ConversationScreen(
                                     },
                                     onOpenAttachment = ::openLink,
                                     onOpenChannel = onOpenChannel,
+                                    onOpenNick = onOpenDm,
                                     profile = message.sender.takeIf { it.isNotEmpty() }?.let(profiles::forNick),
                                 )
                             }
@@ -575,6 +614,64 @@ public fun ConversationScreen(
 @Composable
 private fun LaunchedEffectOnce(key: Any?, effect: () -> Unit) {
     androidx.compose.runtime.LaunchedEffect(key) { effect() }
+}
+
+@Composable
+private fun CollapsedEventsRow(entry: TranscriptEntry.CollapsedEvents) {
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 2.dp),
+    ) {
+        Surface(
+            shape = RoundedCornerShape(12.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+            modifier = Modifier.clickable { expanded = !expanded },
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text(
+                    text = if (expanded) "▾" else "▸",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    text = "${entry.events.size} user events",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        if (expanded) {
+            Column(modifier = Modifier.padding(start = 12.dp, top = 2.dp)) {
+                for (event in entry.events) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 1.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "·",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.width(14.dp),
+                        )
+                        Text(
+                            text = event.text,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontStyle = FontStyle.Italic,
+                        )
+                    }
+                }
+            }
+        }
+    }
 }
 
 private sealed interface OverviewEntry {

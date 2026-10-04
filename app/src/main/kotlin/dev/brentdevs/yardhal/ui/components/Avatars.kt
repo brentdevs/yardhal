@@ -14,6 +14,10 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
@@ -118,19 +122,26 @@ public fun HighlightedSurface(
     modifier: Modifier = Modifier,
     content: @Composable () -> Unit,
 ) {
-    val background =
-        if (highlighted) MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.5f) else Color.Transparent
-    val border =
-        if (highlighted) {
-            androidx.compose.foundation.BorderStroke(1.5.dp, MaterialTheme.colorScheme.tertiary.copy(alpha = 0.7f))
-        } else {
-            null
+    if (!highlighted) {
+        Box(modifier = modifier) {
+            content()
         }
-    Surface(
-        modifier = modifier,
-        shape = MaterialTheme.shapes.medium,
-        color = background,
-        border = border,
+        return
+    }
+    val accent = MaterialTheme.colorScheme.primary
+    val tint = accent.copy(alpha = 0.08f)
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(tint)
+            .drawBehind {
+                drawRoundRect(
+                    color = accent,
+                    topLeft = Offset.Zero,
+                    size = Size(3.5.dp.toPx(), size.height),
+                    cornerRadius = CornerRadius(2.dp.toPx(), 2.dp.toPx()),
+                )
+            },
     ) {
         content()
     }
