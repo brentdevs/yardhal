@@ -191,6 +191,28 @@ class MetadataCoordinatorLoopbackTests {
     }
 
     @Test
+    fun monitorClearDropsUnsharedProfilesWithoutWaitingForServerReplies() = withHarness { server, harness ->
+        val coordinator = harness.coordinator
+        val networkId = harness.config.id
+        val room = ConversationRef.channel(networkId, "#room")
+        assertTrue(coordinator.sendText(networkId, room.storageKey, "/monitor + zed,alice"))
+        await { "MONITOR + zed,alice" in server.received }
+        server.send(":srv 730 tester :zed!z@zed.host,alice!a@alice.host")
+        server.send(":srv METADATA zed display-name * :Zed Monitored")
+        await { coordinator.profiles.value[networkId]?.forNick("zed")?.displayName == "Zed Monitored" }
+
+        assertTrue(coordinator.sendText(networkId, room.storageKey, "/monitor c"))
+        assertEquals(null, coordinator.profiles.value[networkId]?.forNick("zed"))
+        assertEquals("Alice Liddell", coordinator.profiles.value[networkId]?.forNick("alice")?.displayName)
+        await { "MONITOR C" in server.received }
+
+        server.send(":zed!z@zed.host ACCOUNT stale-acct")
+        server.send(":srv METADATA alice display-name * :Alice Still Shared")
+        await { coordinator.profiles.value[networkId]?.forNick("alice")?.displayName == "Alice Still Shared" }
+        assertEquals(null, coordinator.profiles.value[networkId]?.forNick("zed"))
+    }
+
+    @Test
     fun disconnectClearsProfilesUntilReplacementSessionPublishesFreshMetadata() = withHarness { _, harness ->
         val coordinator = harness.coordinator
         val networkId = harness.config.id

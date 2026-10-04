@@ -835,6 +835,17 @@ public class LiveCoordinator(
         return ref.storageKey
     }
 
+    public fun openChannel(networkId: String, channel: String): String? {
+        val session = sessions[networkId] ?: return null
+        val ref = ConversationRef.channel(networkId, channel, session.state.casemapping)
+        val joinState = _buffers.value[ref.storageKey]?.joinState
+        if (joinState != JoinState.JOINED && joinState != JoinState.JOINING) {
+            val serverKey = ConversationRef.server(networkId).storageKey
+            if (!sendText(networkId, serverKey, "/join $channel")) return null
+        }
+        return ref.storageKey
+    }
+
     public fun memberAction(networkId: String, storageKey: String, action: dev.brentdevs.yardhal.ui.screens.MemberAction, nick: String) {
         when (action) {
             dev.brentdevs.yardhal.ui.screens.MemberAction.WHOIS -> sendText(networkId, storageKey, "/whois $nick")
@@ -1386,6 +1397,11 @@ public class LiveCoordinator(
                 sendLabeled(session, active, LabeledCommand.MONITOR, "MONITOR - ${command.nick}")
             }
             is SlashCommand.MonitorList -> sendLabeled(session, active, LabeledCommand.MONITOR, "MONITOR L")
+            is SlashCommand.MonitorClear -> synchronized(session.state) {
+                session.state.clearMonitored()?.let { processEffect(session, it) }
+                sendLabeled(session, active, LabeledCommand.MONITOR, "MONITOR C")
+            }
+            is SlashCommand.MonitorStatus -> sendLabeled(session, active, LabeledCommand.MONITOR, "MONITOR S")
             is SlashCommand.WhoQuery -> sendLabeled(
                 session,
                 active,

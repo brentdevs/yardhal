@@ -169,6 +169,16 @@ public class PerNetworkState(
         }
     }
 
+    internal fun clearMonitored(): InboundEffect.ProfilesChanged? {
+        val targets = monitored.keys.iterator()
+        while (targets.hasNext()) {
+            val folded = targets.next()
+            targets.remove()
+            if (!isTracked(folded)) users.remove(folded)
+        }
+        return profileUpdate()
+    }
+
     internal fun isTracked(folded: String): Boolean =
         folded in monitored ||
             channels.values.any { folded in it.members } ||
@@ -225,15 +235,15 @@ public class PerNetworkState(
             is IrcEvent.MessageReceived -> reduction.handleMessage(event.message)
             is IrcEvent.Disconnected -> reduction.emit(InboundEffect.StatusChanged(ConnectionStatus.CONNECTING))
         }
-        publishProfilesIfChanged(reduction)
+        profileUpdate()?.let(reduction::emit)
         return reduction.effects
     }
 
-    private fun publishProfilesIfChanged(reduction: Reduction) {
-        if (users.profileVersion == publishedProfileVersion) return
-        if (openBatches.values.any { it.type in PROFILE_DEFERRING_BATCHES }) return
+    private fun profileUpdate(): InboundEffect.ProfilesChanged? {
+        if (users.profileVersion == publishedProfileVersion) return null
+        if (openBatches.values.any { it.type in PROFILE_DEFERRING_BATCHES }) return null
         publishedProfileVersion = users.profileVersion
-        reduction.emit(InboundEffect.ProfilesChanged(NetworkProfiles(casemapping, LinkedHashMap(users.profiles))))
+        return InboundEffect.ProfilesChanged(NetworkProfiles(casemapping, LinkedHashMap(users.profiles)))
     }
 
     private fun resetConnectionScopedState(reduction: Reduction) {

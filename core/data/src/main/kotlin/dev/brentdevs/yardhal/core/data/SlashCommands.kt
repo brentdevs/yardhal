@@ -24,6 +24,8 @@ public sealed interface SlashCommand {
     public data class MonitorAdd(public val nick: String) : SlashCommand
     public data class MonitorRemove(public val nick: String) : SlashCommand
     public data object MonitorList : SlashCommand
+    public data object MonitorClear : SlashCommand
+    public data object MonitorStatus : SlashCommand
     public data class WhoQuery(public val target: String, public val useWhox: Boolean) : SlashCommand
     public data class IgnoreAdd(public val mask: String) : SlashCommand
     public data class IgnoreRemove(public val mask: String) : SlashCommand
@@ -136,17 +138,39 @@ public object SlashCommandParser {
         }
     }
 
-    private fun parseMonitor(rest: String): SlashCommand {
+    private fun parseMonitor(rest: String): SlashCommand? {
         val trimmed = rest.trim()
         val parts = tokensOf(trimmed)
-        val sub = parts.firstOrNull()?.lowercase()
-        val target = parts.getOrNull(1)
+        if (parts.isEmpty()) return SlashCommand.MonitorList
+        val first = parts[0]
+        val sub = first.lowercase()
         return when {
-            sub == "+" && target != null -> SlashCommand.MonitorAdd(target)
-            sub == "-" && target != null -> SlashCommand.MonitorRemove(target)
-            sub == "l" || sub == "ls" || trimmed.isEmpty() -> SlashCommand.MonitorList
-            target == null -> SlashCommand.MonitorAdd(sub ?: return SlashCommand.MonitorList)
-            else -> SlashCommand.MonitorAdd(trimmed)
+            sub == "c" || sub == "clear" -> SlashCommand.MonitorClear
+            sub == "s" || sub == "status" -> SlashCommand.MonitorStatus
+            sub == "l" || sub == "ls" || sub == "list" -> SlashCommand.MonitorList
+            sub == "+" -> {
+                val targets = parts.drop(1)
+                if (targets.isEmpty()) null
+                else SlashCommand.MonitorAdd(targets.joinToString(","))
+            }
+            sub == "-" -> {
+                val targets = parts.drop(1)
+                if (targets.isEmpty()) null
+                else SlashCommand.MonitorRemove(targets.joinToString(","))
+            }
+            first.startsWith("+") -> {
+                val inline = first.substring(1)
+                val all = (if (inline.isNotEmpty()) listOf(inline) else emptyList()) + parts.drop(1)
+                if (all.isEmpty()) null
+                else SlashCommand.MonitorAdd(all.joinToString(","))
+            }
+            first.startsWith("-") -> {
+                val inline = first.substring(1)
+                val all = (if (inline.isNotEmpty()) listOf(inline) else emptyList()) + parts.drop(1)
+                if (all.isEmpty()) null
+                else SlashCommand.MonitorRemove(all.joinToString(","))
+            }
+            else -> SlashCommand.MonitorAdd(parts.joinToString(","))
         }
     }
 

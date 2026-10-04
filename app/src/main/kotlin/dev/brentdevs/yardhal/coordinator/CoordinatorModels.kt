@@ -45,7 +45,7 @@ public data class ChatMessage(
 ) {
     public val countsAsUnread: Boolean
         get() = !sentByUs && !playback &&
-            kind in setOf(MessageKind.PRIVMSG, MessageKind.NOTICE, MessageKind.ACTION)
+            (kind == MessageKind.PRIVMSG || kind == MessageKind.NOTICE || kind == MessageKind.ACTION)
 }
 
 public data class PresenceState(

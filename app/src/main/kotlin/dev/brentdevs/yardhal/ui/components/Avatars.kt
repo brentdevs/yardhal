@@ -14,6 +14,10 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
@@ -23,6 +27,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.brentdevs.yardhal.coordinator.ConnectionStatus
 import dev.brentdevs.yardhal.ui.image.LocalRemoteImageLoader
+import dev.brentdevs.yardhal.ui.image.RemoteImageState
 import dev.brentdevs.yardhal.ui.image.rememberRemoteImage
 import dev.brentdevs.yardhal.ui.theme.nickColor
 
@@ -34,7 +39,7 @@ public fun NickAvatar(
     avatarUrl: String? = null,
 ) {
     val image by rememberRemoteImage(LocalRemoteImageLoader.current, avatarUrl, size.roundToPxInt())
-    val loaded = image
+    val loaded = (image as? RemoteImageState.Success)?.bitmap
     if (loaded != null) {
         Image(
             bitmap = loaded,
@@ -72,7 +77,7 @@ public fun NetworkBadge(
     size: Dp = 22.dp,
 ) {
     val image by rememberRemoteImage(LocalRemoteImageLoader.current, iconUrl, size.roundToPxInt())
-    val loaded = image
+    val loaded = (image as? RemoteImageState.Success)?.bitmap
     if (loaded == null) {
         StatusDot(status, modifier)
         return
@@ -118,20 +123,26 @@ public fun HighlightedSurface(
     modifier: Modifier = Modifier,
     content: @Composable () -> Unit,
 ) {
-    val background =
-        if (highlighted) MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.5f) else Color.Transparent
-    val border =
-        if (highlighted) {
-            androidx.compose.foundation.BorderStroke(1.5.dp, MaterialTheme.colorScheme.tertiary.copy(alpha = 0.7f))
-        } else {
-            null
-        }
-    Surface(
-        modifier = modifier,
-        shape = MaterialTheme.shapes.medium,
-        color = background,
-        border = border,
-    ) {
+    val accent = MaterialTheme.colorScheme.primary
+    val tint = accent.copy(alpha = 0.08f)
+    val highlightModifier = if (highlighted) {
+        Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(tint)
+            .drawBehind {
+                val barWidth = 3.5.dp.toPx()
+                val x = if (layoutDirection == androidx.compose.ui.unit.LayoutDirection.Rtl) size.width - barWidth else 0f
+                drawRoundRect(
+                    color = accent,
+                    topLeft = Offset(x, 0f),
+                    size = Size(barWidth, size.height),
+                    cornerRadius = CornerRadius(2.dp.toPx(), 2.dp.toPx()),
+                )
+            }
+    } else {
+        Modifier
+    }
+    Box(modifier = modifier.then(highlightModifier)) {
         content()
     }
 }

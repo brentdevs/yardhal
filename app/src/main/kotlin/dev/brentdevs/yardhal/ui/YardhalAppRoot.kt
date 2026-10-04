@@ -1,9 +1,13 @@
 package dev.brentdevs.yardhal.ui
 
+import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.semantics.Role
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
@@ -37,6 +41,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.material3.rememberDrawerState
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
@@ -53,8 +58,9 @@ import dev.brentdevs.yardhal.coordinator.ConnectionStatus
 import dev.brentdevs.yardhal.coordinator.ConversationBuffer
 import dev.brentdevs.yardhal.coordinator.LiveCoordinator
 import dev.brentdevs.yardhal.coordinator.NetworkProfiles
-import dev.brentdevs.yardhal.core.data.ConversationRef
+import dev.brentdevs.yardhal.core.data.ChatAppearancePreferences
 import dev.brentdevs.yardhal.core.data.ChatAppearanceStore
+import dev.brentdevs.yardhal.core.data.ConversationRef
 import dev.brentdevs.yardhal.ui.screens.NetworkEditorSheet
 import dev.brentdevs.yardhal.ui.screens.ConversationScreen
 import dev.brentdevs.yardhal.ui.screens.MessageSearchScreen
@@ -62,6 +68,11 @@ import dev.brentdevs.yardhal.ui.screens.NetworkDraft
 import dev.brentdevs.yardhal.ui.screens.NetworkOverviewScreen
 import dev.brentdevs.yardhal.ui.screens.NetworkPresetUi
 import dev.brentdevs.yardhal.ui.screens.WelcomeScreen
+
+private val NETWORK_ID_SET_SAVER = listSaver<Set<String>, String>(
+    save = { it.toList() },
+    restore = { it.toSet() },
+)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -72,6 +83,7 @@ public fun YardhalAppRoot(
     onNetworkSaved: (NetworkDraft) -> Boolean,
     sharedTextProvider: () -> String? = { null },
     onSharedConsumed: () -> Unit = {},
+    onAppearanceChanged: (ChatAppearancePreferences) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val networks by coordinator.networks.collectAsStateWithLifecycle()
@@ -98,6 +110,9 @@ public fun YardhalAppRoot(
         pendingPresetId = null
     }
     var selectedKey by rememberSaveable { mutableStateOf<String?>(null) }
+    var collapsedNetworkIds by rememberSaveable(stateSaver = NETWORK_ID_SET_SAVER) {
+        mutableStateOf(emptySet<String>())
+    }
     fun selectConversation(key: String?) {
         coordinator.trackSelection(key)
         selectedKey = key
@@ -177,6 +192,14 @@ public fun YardhalAppRoot(
             networks = networks,
             mutedKeys = mutedKeys,
             orderState = orderState,
+            collapsedNetworkIds = collapsedNetworkIds,
+            onToggleNetwork = { networkId ->
+                collapsedNetworkIds = if (networkId in collapsedNetworkIds) {
+                    collapsedNetworkIds - networkId
+                } else {
+                    collapsedNetworkIds + networkId
+                }
+            },
             onSelect = { key ->
                 coordinator.markRead(key)
                 selectConversation(key)
@@ -275,9 +298,17 @@ public fun YardhalAppRoot(
                     hasBotMode = networkFeatures?.hasBotMode == true,
                     accountBanAvailable = networkFeatures?.accountBanAvailable == true,
                     onOpenChannel = { channel ->
-                        selectConversation(coordinator.ensureConversation(networkId, channel))
-                        searchTargetRowId = null
-                        returnToSearch = false
+                        val channelKey = coordinator.openChannel(networkId, channel)
+                        if (channelKey != null) {
+                            selectConversation(channelKey)
+                            searchTargetRowId = null
+                            returnToSearch = false
+                        } else {
+                            joinNetworkId = networkId
+                            joinDraft = channel
+                            joinSendFailed = true
+                            joinDialogVisible = true
+                        }
                     },
                     sharedDraft = sharedDraft,
                     onSharedConsumed = onSharedConsumed,
@@ -454,33 +485,120 @@ public fun YardhalAppRoot(
     }
 
     if (appearanceVisible) {
+        val updateAppearance: (ChatAppearancePreferences) -> Unit = { updated ->
+            appearance = updated
+            appearanceStore.update(updated)
+            onAppearanceChanged(updated)
+        }
         ModalBottomSheet(onDismissRequest = { appearanceVisible = false }) {
             Column(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 24.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
                 Text("Chat appearance", style = MaterialTheme.typography.titleLarge)
-                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                    Text("Compact message spacing", modifier = Modifier.weight(1f))
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .defaultMinSize(minHeight = 48.dp)
+                        .toggleable(
+                            value = appearance.compact,
+                            role = Role.Switch,
+                            onValueChange = { updateAppearance(appearance.copy(compact = it)) },
+                        ),
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Compact spacing", style = MaterialTheme.typography.bodyLarge)
+                        Text("Reduce padding between messages", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                     Switch(
                         checked = appearance.compact,
-                        onCheckedChange = { compact ->
-                            appearance = appearance.copy(compact = compact)
-                            appearanceStore.update(appearance)
-                        },
+                        onCheckedChange = null,
                     )
                 }
-                Text("Message text size", style = MaterialTheme.typography.titleSmall)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("Small" to 0.9f, "Default" to 1f, "Large" to 1.15f).forEach { (label, scale) ->
-                        FilterChip(
-                            selected = appearance.textScale == scale,
-                            onClick = {
-                                appearance = appearance.copy(textScale = scale)
-                                appearanceStore.update(appearance)
-                            },
-                            label = { Text(label) },
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .defaultMinSize(minHeight = 48.dp)
+                        .toggleable(
+                            value = appearance.monospaceFont,
+                            role = Role.Switch,
+                            onValueChange = { updateAppearance(appearance.copy(monospaceFont = it)) },
+                        ),
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Monospace font", style = MaterialTheme.typography.bodyLarge)
+                        Text("Render messages in fixed-width font", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Switch(
+                        checked = appearance.monospaceFont,
+                        onCheckedChange = null,
+                    )
+                }
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .defaultMinSize(minHeight = 48.dp)
+                            .toggleable(
+                                value = appearance.dynamicColor,
+                                role = Role.Switch,
+                                onValueChange = { updateAppearance(appearance.copy(dynamicColor = it)) },
+                            ),
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Material You Dynamic Colors", style = MaterialTheme.typography.bodyLarge)
+                            Text("Match wallpaper palette on Android 12+", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Switch(
+                            checked = appearance.dynamicColor,
+                            onCheckedChange = null,
                         )
+                    }
+                }
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .defaultMinSize(minHeight = 48.dp)
+                        .toggleable(
+                            value = appearance.amoledDark,
+                            role = Role.Switch,
+                            onValueChange = { updateAppearance(appearance.copy(amoledDark = it)) },
+                        ),
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("AMOLED pure black", style = MaterialTheme.typography.bodyLarge)
+                        Text("Pitch-black background in dark mode", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Switch(
+                        checked = appearance.amoledDark,
+                        onCheckedChange = null,
+                    )
+                }
+
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Message text size", style = MaterialTheme.typography.titleSmall)
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    ) {
+                        listOf("Small" to 0.9f, "Default" to 1f, "Large" to 1.15f, "Extra Large" to 1.25f).forEach { (label, scale) ->
+                            FilterChip(
+                                selected = kotlin.math.abs(appearance.textScale - scale) < 0.01f,
+                                onClick = { updateAppearance(appearance.copy(textScale = scale)) },
+                                label = { Text(label) },
+                            )
+                        }
                     }
                 }
             }

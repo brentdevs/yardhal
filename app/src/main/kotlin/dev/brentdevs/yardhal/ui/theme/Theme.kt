@@ -1,12 +1,19 @@
 package dev.brentdevs.yardhal.ui.theme
 
+import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.dynamicDarkColorScheme
+import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.platform.LocalContext
+import dev.brentdevs.yardhal.core.data.ThemeDefinition
 
 private val LightColors = lightColorScheme(
     primary = Color(0xFF00639A),
@@ -49,27 +56,53 @@ public fun nickColor(nick: String): Color {
 
 @Composable
 public fun YardhalTheme(
-    themeDefinition: dev.brentdevs.yardhal.core.data.ThemeDefinition? = null,
+    themeDefinition: ThemeDefinition? = null,
+    dynamicColor: Boolean = false,
+    amoledDark: Boolean = false,
     content: @Composable () -> Unit,
 ) {
-    val custom = themeDefinition?.let { def ->
-        fun c(value: Long): Color = Color(value.toULong().toLong())
-        val scheme = if (def.dark) darkColorScheme() else lightColorScheme()
-        scheme.copy(
-            background = c(def.colors.background),
-            surface = c(def.colors.background),
-            primary = c(def.colors.primary),
-            secondary = c(def.colors.secondary),
-            tertiary = c(def.colors.tertiary),
-            surfaceVariant = c(def.colors.surfaceVariant),
-        )
-    }
-    MaterialTheme(
-        colorScheme = when {
+    val context = LocalContext.current
+    val isDark = isSystemInDarkTheme()
+    val scheme = remember(themeDefinition, dynamicColor, amoledDark, isDark, context) {
+        val custom = themeDefinition?.let { def ->
+            fun c(value: Long): Color = Color(value.toULong().toLong())
+            val base = if (def.dark) darkColorScheme() else lightColorScheme()
+            base.copy(
+                background = c(def.colors.background),
+                surface = c(def.colors.background),
+                primary = c(def.colors.primary),
+                secondary = c(def.colors.secondary),
+                tertiary = c(def.colors.tertiary),
+                surfaceVariant = c(def.colors.surfaceVariant),
+            )
+        }
+
+        val dynamicAvailable = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+        var s = when {
             custom != null -> custom
-            isSystemInDarkTheme() -> DarkColors
+            dynamicColor && dynamicAvailable && isDark -> dynamicDarkColorScheme(context)
+            dynamicColor && dynamicAvailable && !isDark -> dynamicLightColorScheme(context)
+            isDark -> DarkColors
             else -> LightColors
-        },
+        }
+
+        if (isDark && amoledDark) {
+            s = s.copy(
+                background = Color.Black,
+                surface = Color.Black,
+                surfaceDim = Color.Black,
+                surfaceContainerLowest = Color.Black,
+                surfaceContainerLow = lerp(Color.Black, s.surfaceContainerLow, 0.4f),
+                surfaceContainer = lerp(Color.Black, s.surfaceContainer, 0.55f),
+                surfaceContainerHigh = lerp(Color.Black, s.surfaceContainerHigh, 0.7f),
+                surfaceContainerHighest = lerp(Color.Black, s.surfaceContainerHighest, 0.85f),
+            )
+        }
+        s
+    }
+
+    MaterialTheme(
+        colorScheme = scheme,
         content = content,
     )
 }

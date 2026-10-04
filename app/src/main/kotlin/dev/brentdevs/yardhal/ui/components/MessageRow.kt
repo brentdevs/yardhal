@@ -1,35 +1,50 @@
 package dev.brentdevs.yardhal.ui.components
 
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.defaultMinSize
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.brentdevs.yardhal.coordinator.ChatMessage
 import dev.brentdevs.yardhal.coordinator.UserProfile
 import dev.brentdevs.yardhal.core.data.ChatAppearancePreferences
 import dev.brentdevs.yardhal.core.data.MessageKind
+import dev.brentdevs.yardhal.ui.image.LocalRemoteImageLoader
+import dev.brentdevs.yardhal.ui.image.RemoteImageState
+import dev.brentdevs.yardhal.ui.image.rememberRemoteImage
 import dev.brentdevs.yardhal.ui.theme.nickColor
 import java.time.Instant
 import java.time.ZoneId
@@ -50,17 +65,37 @@ public fun MessageRow(
     onToggleReaction: (String) -> Unit,
     onOpenAttachment: (String) -> Unit = {},
     onOpenChannel: (String) -> Unit = {},
+    onOpenNick: (String) -> Unit = {},
+    onOpenUrl: (String) -> Unit = {},
     modifier: Modifier = Modifier,
     profile: UserProfile? = null,
 ) {
     when (message.kind) {
         MessageKind.SYSTEM, MessageKind.JOIN, MessageKind.PART -> SystemLine(message, appearance, modifier)
-        else -> ChatLine(message, profile, groupedWithPrevious, focused, appearance, reactions, quotedText, onLongPress, onToggleReaction, onOpenAttachment, onOpenChannel, modifier)
+        else -> ChatLine(
+            message = message,
+            profile = profile,
+            groupedWithPrevious = groupedWithPrevious,
+            focused = focused,
+            appearance = appearance,
+            reactions = reactions,
+            quotedText = quotedText,
+            onLongPress = onLongPress,
+            onToggleReaction = onToggleReaction,
+            onOpenAttachment = onOpenAttachment,
+            onOpenChannel = onOpenChannel,
+            onOpenNick = onOpenNick,
+            onOpenUrl = onOpenUrl,
+            modifier = modifier,
+        )
     }
 }
 
 @Composable
 private fun SystemLine(message: ChatMessage, appearance: ChatAppearancePreferences, modifier: Modifier) {
+    val chatFontFamily = if (appearance.monospaceFont) FontFamily.Monospace else null
+    val scaledFontSize = MaterialTheme.typography.bodySmall.fontSize * appearance.textScale
+    val scaledLineHeight = MaterialTheme.typography.bodySmall.lineHeight * appearance.textScale
     Row(
         modifier = modifier
             .fillMaxWidth()
@@ -70,7 +105,9 @@ private fun SystemLine(message: ChatMessage, appearance: ChatAppearancePreferenc
         Text(
             text = "·",
             style = MaterialTheme.typography.bodySmall.copy(
-                fontSize = MaterialTheme.typography.bodySmall.fontSize * appearance.textScale,
+                fontSize = scaledFontSize,
+                lineHeight = scaledLineHeight,
+                fontFamily = chatFontFamily,
             ),
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.width(14.dp),
@@ -78,7 +115,9 @@ private fun SystemLine(message: ChatMessage, appearance: ChatAppearancePreferenc
         Text(
             text = message.text,
             style = MaterialTheme.typography.bodySmall.copy(
-                fontSize = MaterialTheme.typography.bodySmall.fontSize * appearance.textScale,
+                fontSize = scaledFontSize,
+                lineHeight = scaledLineHeight,
+                fontFamily = chatFontFamily,
             ),
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             fontStyle = FontStyle.Italic,
@@ -100,6 +139,8 @@ private fun ChatLine(
     onToggleReaction: (String) -> Unit,
     onOpenAttachment: (String) -> Unit,
     onOpenChannel: (String) -> Unit,
+    onOpenNick: (String) -> Unit,
+    onOpenUrl: (String) -> Unit,
     modifier: Modifier,
 ) {
     HighlightedSurface(
@@ -166,15 +207,21 @@ private fun ChatLine(
                     Surface(
                         shape = RoundedCornerShape(12.dp),
                         color = MaterialTheme.colorScheme.secondaryContainer,
-                        modifier = Modifier.padding(top = 2.dp),
+                        modifier = Modifier
+                            .padding(top = 2.dp)
+                            .defaultMinSize(minHeight = 48.dp),
                         onClick = { onOpenChannel(channel) },
                     ) {
-                        Text(
-                            text = "re: $channel",
+                        Box(
+                            contentAlignment = Alignment.CenterStart,
                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSecondaryContainer,
-                        )
+                        ) {
+                            Text(
+                                text = "re: $channel",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                            )
+                        }
                     }
                 }
                 if (message.replyToMsgid != null) {
@@ -187,24 +234,42 @@ private fun ChatLine(
                     )
                 }
                 if (message.attachmentUrl != null) {
-                    TextButton(onClick = { onOpenAttachment(message.attachmentUrl) }) {
-                        Text("📎 Open attachment", style = MaterialTheme.typography.labelSmall)
-                    }
+                    AttachmentPreview(
+                        url = message.attachmentUrl,
+                        onOpen = { onOpenAttachment(message.attachmentUrl) },
+                    )
                 }
+                val chatFontFamily = if (appearance.monospaceFont) FontFamily.Monospace else null
+                val scaledFontSize = MaterialTheme.typography.bodyMedium.fontSize * appearance.textScale
+                val scaledLineHeight = MaterialTheme.typography.bodyMedium.lineHeight * appearance.textScale
                 if (message.kind == MessageKind.ACTION) {
                     Text(
-                        text = "✦ ${message.text}",
-                        style = MaterialTheme.typography.bodyMedium.copy(
-                            fontSize = MaterialTheme.typography.bodyMedium.fontSize * appearance.textScale,
+                        text = formattedMessage(
+                            text = "✦ ${message.text}",
+                            defaultColor = nickColor(message.sender),
+                            defaultFontStyle = FontStyle.Italic,
+                            onOpenChannel = onOpenChannel,
+                            onOpenNick = onOpenNick,
+                            onOpenUrl = onOpenUrl,
                         ),
-                        fontStyle = FontStyle.Italic,
-                        color = nickColor(message.sender),
+                        style = MaterialTheme.typography.bodyMedium.copy(
+                            fontSize = scaledFontSize,
+                            lineHeight = scaledLineHeight,
+                            fontFamily = chatFontFamily,
+                        ),
                     )
                 } else {
                     Text(
-                        text = formattedMessage(message.text),
+                        text = formattedMessage(
+                            text = message.text,
+                            onOpenChannel = onOpenChannel,
+                            onOpenNick = onOpenNick,
+                            onOpenUrl = onOpenUrl,
+                        ),
                         style = MaterialTheme.typography.bodyMedium.copy(
-                            fontSize = MaterialTheme.typography.bodyMedium.fontSize * appearance.textScale,
+                            fontSize = scaledFontSize,
+                            lineHeight = scaledLineHeight,
+                            fontFamily = chatFontFamily,
                         ),
                     )
                 }
@@ -215,16 +280,20 @@ private fun ChatLine(
                     ) {
                         for ((emoji, nicks) in reactions) {
                             Surface(
-                                shape = RoundedCornerShape(12.dp),
-                                color = MaterialTheme.colorScheme.surfaceVariant,
-                                modifier = Modifier.defaultMinSize(minHeight = 48.dp),
                                 onClick = { onToggleReaction(emoji) },
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant,
+                                modifier = Modifier.defaultMinSize(minHeight = 48.dp, minWidth = 48.dp),
                             ) {
-                                Text(
-                                    text = "$emoji ${nicks.size}",
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
-                                    style = MaterialTheme.typography.labelSmall,
-                                )
+                                Box(
+                                    contentAlignment = Alignment.Center,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                ) {
+                                    Text(
+                                        text = "$emoji ${nicks.size}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                    )
+                                }
                             }
                         }
                     }
@@ -235,24 +304,167 @@ private fun ChatLine(
 }
 
 @Composable
+private fun AttachmentPreview(
+    url: String,
+    onOpen: () -> Unit,
+) {
+    val cleanUrl = url.substringBefore('?').substringBefore('#')
+    val isImage = cleanUrl.endsWith(".png", true) || cleanUrl.endsWith(".jpg", true) ||
+        cleanUrl.endsWith(".jpeg", true) || cleanUrl.endsWith(".gif", true) || cleanUrl.endsWith(".webp", true)
+    val displayName = cleanUrl.substringAfterLast('/').ifEmpty { "Attachment" }
+
+    if (isImage) {
+        var loadPreview by rememberSaveable(url) { mutableStateOf(false) }
+        if (!loadPreview) {
+            Surface(
+                onClick = { loadPreview = true },
+                shape = RoundedCornerShape(8.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                modifier = Modifier
+                    .padding(vertical = 4.dp)
+                    .defaultMinSize(minHeight = 48.dp),
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Image,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(20.dp),
+                    )
+                    Text(
+                        text = "Load image: $displayName",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        } else {
+            val image = rememberRemoteImage(LocalRemoteImageLoader.current, url, 512).value
+            Surface(
+                onClick = onOpen,
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                modifier = Modifier.padding(vertical = 4.dp),
+            ) {
+                if (image is RemoteImageState.Success) {
+                    Image(
+                        bitmap = image.bitmap,
+                        contentDescription = "Image attachment: $displayName",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier
+                            .heightIn(max = 200.dp)
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp)),
+                    )
+                } else {
+                    Row(
+                        modifier = Modifier
+                            .padding(horizontal = 12.dp, vertical = 8.dp)
+                            .defaultMinSize(minHeight = 48.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        if (image == RemoteImageState.Loading) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp,
+                            )
+                        } else {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.OpenInNew,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(20.dp),
+                            )
+                        }
+                        Column {
+                            Text(
+                                text = displayName,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.primary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            if (image == RemoteImageState.Unavailable) {
+                                Text(
+                                    text = "Preview unavailable · Open externally",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.primary,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        Surface(
+            onClick = onOpen,
+            shape = RoundedCornerShape(8.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+            modifier = Modifier
+                .padding(vertical = 3.dp)
+                .defaultMinSize(minHeight = 48.dp),
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.AttachFile,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(18.dp),
+                )
+                Text(
+                    text = displayName,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
+}
+
+@Composable
 public fun DayPill(label: String, modifier: Modifier = Modifier) {
-    Box(
+    Row(
         modifier = modifier
             .fillMaxWidth()
-            .padding(vertical = 10.dp),
-        contentAlignment = Alignment.Center,
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
+        HorizontalDivider(
+            modifier = Modifier.weight(1f),
+            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f),
+            thickness = 0.5.dp,
+        )
         Surface(
-            shape = RoundedCornerShape(50),
+            shape = RoundedCornerShape(12.dp),
             color = MaterialTheme.colorScheme.surfaceVariant,
+            modifier = Modifier.padding(horizontal = 8.dp),
         ) {
             Text(
                 text = label,
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 3.dp),
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 2.dp),
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+        HorizontalDivider(
+            modifier = Modifier.weight(1f),
+            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f),
+            thickness = 0.5.dp,
+        )
     }
 }
 
@@ -261,22 +473,34 @@ public fun formatTime(epochMs: Long): String =
 
 @Composable
 public fun NewMessagesDivider(label: String, modifier: Modifier = Modifier) {
-    Box(
+    Row(
         modifier = modifier
             .fillMaxWidth()
-            .padding(vertical = 8.dp),
-        contentAlignment = Alignment.Center,
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
+        HorizontalDivider(
+            modifier = Modifier.weight(1f),
+            color = MaterialTheme.colorScheme.error.copy(alpha = 0.7f),
+            thickness = 1.dp,
+        )
         Surface(
-            shape = RoundedCornerShape(50),
-            color = MaterialTheme.colorScheme.primary,
+            shape = RoundedCornerShape(12.dp),
+            color = MaterialTheme.colorScheme.errorContainer,
+            modifier = Modifier.padding(horizontal = 8.dp),
         ) {
             Text(
                 text = label,
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 3.dp),
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 2.dp),
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onPrimary,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onErrorContainer,
             )
         }
+        HorizontalDivider(
+            modifier = Modifier.weight(1f),
+            color = MaterialTheme.colorScheme.error.copy(alpha = 0.7f),
+            thickness = 1.dp,
+        )
     }
 }
