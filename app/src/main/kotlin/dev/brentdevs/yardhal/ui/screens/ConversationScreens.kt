@@ -16,17 +16,35 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.DriveFileMove
+import androidx.compose.material.icons.automirrored.filled.Reply
+import androidx.compose.material.icons.filled.AlternateEmail
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.filled.Mail
+import androidx.compose.material.icons.filled.MarkChatRead
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.NotificationsOff
 import androidx.compose.material.icons.filled.People
+import androidx.compose.material.icons.filled.PushPin
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
 import androidx.compose.material3.Card
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedTextField
@@ -49,6 +67,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -65,6 +84,7 @@ import dev.brentdevs.yardhal.ui.components.MessageRow
 import dev.brentdevs.yardhal.ui.components.NetworkBadge
 import dev.brentdevs.yardhal.ui.components.NewMessagesDivider
 import dev.brentdevs.yardhal.ui.components.NickAvatar
+import dev.brentdevs.yardhal.ui.components.StatusDot
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
@@ -438,48 +458,148 @@ public fun ConversationScreen(
     if (actionTarget != null) {
         val target = actionTarget ?: return
         ModalBottomSheet(onDismissRequest = { actionTarget = null }) {
-            Column(modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) {
-                Text(target.sender.ifEmpty { "Message" }, style = MaterialTheme.typography.titleMedium)
-                Text(target.text, style = MaterialTheme.typography.bodySmall, maxLines = 2)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    NickAvatar(nick = target.sender, size = 36.dp)
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = target.sender.ifEmpty { "Message" },
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            text = target.text,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2,
+                        )
+                    }
+                }
                 if (target.msgid != null) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        QUICK_REACTIONS.forEach { emoji ->
-                            TextButton(onClick = {
-                                target.msgid?.let { msgid -> onReact(msgid, emoji) }
-                                actionTarget = null
-                            }) { Text(emoji) }
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 6.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            QUICK_REACTIONS.forEach { emoji ->
+                                Box(
+                                    modifier = Modifier
+                                        .size(38.dp)
+                                        .clip(CircleShape)
+                                        .clickable {
+                                            target.msgid?.let { msgid -> onReact(msgid, emoji) }
+                                            actionTarget = null
+                                        },
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text(emoji, style = MaterialTheme.typography.titleMedium)
+                                }
+                            }
                         }
                     }
                 }
-                TextButton(onClick = {
-                    val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
-                    clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("Message", target.text))
-                    actionTarget = null
-                }) { Text("Copy message") }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    if (!target.sentByUs && target.msgid != null) {
+                        OutlinedButton(
+                            onClick = {
+                                onSetReplyDraft(target)
+                                actionTarget = null
+                            },
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Icon(Icons.AutoMirrored.Filled.Reply, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Reply")
+                        }
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                            clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("Message", target.text))
+                            actionTarget = null
+                        },
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Icon(Icons.Filled.ContentCopy, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Copy")
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            val sendIntent = android.content.Intent().apply {
+                                action = android.content.Intent.ACTION_SEND
+                                putExtra(android.content.Intent.EXTRA_TEXT, target.text)
+                                type = "text/plain"
+                            }
+                            context.startActivity(android.content.Intent.createChooser(sendIntent, null))
+                            actionTarget = null
+                        },
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Icon(Icons.Filled.Share, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Share")
+                    }
+                }
                 val firstLink = HTTP_LINK.find(target.text)?.value?.trimEnd('.', ',', ';', ')')
                 if (firstLink != null) {
-                    TextButton(onClick = {
-                        openLink(firstLink)
-                        actionTarget = null
-                    }) { Text("Open link") }
-                }
-                if (!target.sentByUs && target.msgid != null) {
-                    TextButton(onClick = {
-                        onSetReplyDraft(target)
-                        actionTarget = null
-                    }) { Text("Reply") }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                openLink(firstLink)
+                                actionTarget = null
+                            }
+                            .padding(vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Icon(Icons.Filled.Link, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                        Text("Open link", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
+                    }
                 }
                 if (target.sentByUs && target.msgid != null) {
-                    TextButton(onClick = {
-                        target.msgid?.let(onDelete)
-                        actionTarget = null
-                    }) { Text("Delete message") }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                target.msgid?.let(onDelete)
+                                actionTarget = null
+                            }
+                            .padding(vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Icon(Icons.Filled.Delete, contentDescription = null, tint = MaterialTheme.colorScheme.error)
+                        Text("Delete message", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
+                    }
                 }
+                Spacer(modifier = Modifier.height(12.dp))
             }
         }
     }
 
     if (membersVisible) {
+        var memberQuery by remember { mutableStateOf("") }
         val operators = buffer.members.filter { it.isOperator }
         val voices = buffer.members.filter { it.isVoice }
         val isBot: (dev.brentdevs.yardhal.core.data.ChannelMember) -> Boolean = { member ->
@@ -487,18 +607,58 @@ public fun ConversationScreen(
         }
         val bots = buffer.members.filter { isBot(it) }
         val plain = buffer.members.filter { member -> !member.isOperator && !member.isVoice && !isBot(member) }
+
+        val filterPred: (dev.brentdevs.yardhal.core.data.ChannelMember) -> Boolean = { m ->
+            if (memberQuery.isBlank()) true
+            else m.nick.contains(memberQuery, ignoreCase = true) ||
+                profiles.forNick(m.nick)?.displayName?.contains(memberQuery, ignoreCase = true) == true
+        }
+
+        val filteredOps = operators.filter(filterPred)
+        val filteredVoices = voices.filter(filterPred)
+        val filteredBots = bots.filter(filterPred)
+        val filteredPlain = plain.filter(filterPred)
+
         ModalBottomSheet(onDismissRequest = { membersVisible = false }) {
-            Text(
-                text = "Members · ${buffer.members.size}",
-                style = MaterialTheme.typography.titleMedium,
-                modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp),
-            )
+            Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text(
+                        text = "Members",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.secondaryContainer,
+                    ) {
+                        Text(
+                            text = "${buffer.members.size}",
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer,
+                        )
+                    }
+                }
+                OutlinedTextField(
+                    value = memberQuery,
+                    onValueChange = { memberQuery = it },
+                    placeholder = { Text("Filter members…") },
+                    leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                    shape = RoundedCornerShape(24.dp),
+                )
+            }
             LazyColumn(modifier = Modifier.padding(horizontal = 8.dp)) {
                 val sections = listOf(
-                    "Operators" to operators,
-                    "Voices" to voices,
-                    "Bots & Relays" to bots,
-                    "Users" to plain,
+                    "Operators (${filteredOps.size})" to filteredOps,
+                    "Voices (${filteredVoices.size})" to filteredVoices,
+                    "Bots & Relays (${filteredBots.size})" to filteredBots,
+                    "Users (${filteredPlain.size})" to filteredPlain,
                 )
                 for ((label, section) in sections) {
                     if (section.isEmpty()) continue
@@ -517,6 +677,7 @@ public fun ConversationScreen(
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
                                 .clickable { memberTarget = member.nick }
                                 .padding(horizontal = 12.dp, vertical = 8.dp),
                             verticalAlignment = Alignment.CenterVertically,
@@ -547,21 +708,29 @@ public fun ConversationScreen(
                             }
                             Text(member.nick, style = MaterialTheme.typography.bodyLarge)
                             memberProfile?.displayName?.let { displayName ->
-                                Text(
-                                    text = displayName,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    maxLines = 1,
-                                    modifier = Modifier.padding(start = 8.dp),
-                                )
+                                if (displayName != member.nick) {
+                                    Text(
+                                        text = displayName,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        modifier = Modifier.padding(start = 8.dp),
+                                    )
+                                }
                             }
                             presence?.account?.let { account ->
-                                Text(
-                                    text = "✓ $account",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                Surface(
+                                    shape = RoundedCornerShape(6.dp),
+                                    color = MaterialTheme.colorScheme.surfaceVariant,
                                     modifier = Modifier.padding(start = 8.dp),
-                                )
+                                ) {
+                                    Text(
+                                        text = "✓ $account",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp),
+                                    )
+                                }
                             }
                         }
                     }
@@ -571,43 +740,180 @@ public fun ConversationScreen(
         }
     }
 
-    if (memberTarget != null && membersVisible) {
+    if (memberTarget != null) {
         val nick = memberTarget ?: return
-        AlertDialog(
-            onDismissRequest = { memberTarget = null },
-            title = { Text(nick) },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    TextButton(onClick = { onOpenDm(nick); memberTarget = null }) {
-                        Text("Message")
+        val member = buffer.members.firstOrNull { it.nick == nick }
+        val presence = buffer.memberPresence[nick]
+        val memberProfile = profiles.forNick(nick)
+        val isOp = member?.isOperator == true
+        val isVoice = member?.isVoice == true
+        val isBot = presence?.isBot == true || member?.looksLikeBot == true
+        val account = presence?.account
+        val realName = presence?.realName
+        val userHost = listOfNotNull(presence?.user, presence?.host).joinToString("@").takeIf { it.isNotEmpty() }
+        val away = presence?.away == true
+        val awayMsg = presence?.awayMessage
+
+        ModalBottomSheet(onDismissRequest = { memberTarget = null }) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 24.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    Box {
+                        NickAvatar(
+                            nick = nick,
+                            size = 54.dp,
+                            avatarUrl = memberProfile?.avatarUrl,
+                        )
+                        StatusDot(
+                            status = if (away) ConnectionStatus.CONNECTING else ConnectionStatus.REGISTERED,
+                            modifier = Modifier.align(Alignment.BottomEnd),
+                            size = 14.dp,
+                        )
                     }
-                    TextButton(onClick = { onMemberAction(MemberAction.WHOIS, nick); memberTarget = null }) {
-                        Text("WHOIS")
-                    }
-                    if (buffer.ref.kind == dev.brentdevs.yardhal.core.data.ConversationKind.CHANNEL) {
-                        TextButton(onClick = { onMemberAction(MemberAction.KICK, nick); memberTarget = null }) {
-                            Text("Kick")
+                    Column(modifier = Modifier.weight(1f)) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            if (member?.symbol != null) {
+                                Text(
+                                    text = member.symbol.toString(),
+                                    color = MaterialTheme.colorScheme.tertiary,
+                                    fontWeight = FontWeight.Bold,
+                                    style = MaterialTheme.typography.titleMedium,
+                                )
+                            }
+                            Text(
+                                text = nick,
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold,
+                            )
+                            if (account != null) {
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = MaterialTheme.colorScheme.primaryContainer,
+                                ) {
+                                    Text(
+                                        text = "✓ $account",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                    )
+                                }
+                            }
                         }
-                        TextButton(onClick = { onMemberAction(MemberAction.BAN, nick); memberTarget = null }) {
-                            Text("Ban")
+                        memberProfile?.displayName?.let { displayName ->
+                            if (displayName != nick) {
+                                Text(
+                                    text = displayName,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
                         }
-                        val account = buffer.memberPresence[nick]?.account
-                        TextButton(
-                            enabled = accountBanAvailable && account != null,
-                            onClick = { onMemberAction(MemberAction.BAN_ACCOUNT, nick); memberTarget = null },
-                        ) {
-                            Text(if (account != null) "Ban account ($account)" else "Ban account")
+                        if (realName != null) {
+                            Text(
+                                text = realName,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
                         }
-                    }
-                    TextButton(onClick = { onMemberAction(MemberAction.IGNORE, nick); memberTarget = null }) {
-                        Text("Ignore")
+                        if (userHost != null) {
+                            Text(
+                                text = userHost,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.outline,
+                                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                            )
+                        }
                     }
                 }
-            },
-            confirmButton = {
-                TextButton(onClick = { memberTarget = null }) { Text("Close") }
-            },
-        )
+
+                if (isOp || isVoice || isBot || away) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (isOp) {
+                            Surface(shape = RoundedCornerShape(8.dp), color = MaterialTheme.colorScheme.tertiaryContainer) {
+                                Text("Operator", modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp), style = MaterialTheme.typography.labelSmall)
+                            }
+                        }
+                        if (isVoice) {
+                            Surface(shape = RoundedCornerShape(8.dp), color = MaterialTheme.colorScheme.secondaryContainer) {
+                                Text("Voice", modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp), style = MaterialTheme.typography.labelSmall)
+                            }
+                        }
+                        if (isBot) {
+                            Surface(shape = RoundedCornerShape(8.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
+                                Text("Bot", modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp), style = MaterialTheme.typography.labelSmall)
+                            }
+                        }
+                        if (away) {
+                            Surface(shape = RoundedCornerShape(8.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
+                                Text(awayMsg?.let { "Away: $it" } ?: "Away", modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp), style = MaterialTheme.typography.labelSmall)
+                            }
+                        }
+                    }
+                }
+
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    FilledTonalButton(
+                        onClick = { onOpenDm(nick); memberTarget = null },
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Icon(Icons.Filled.Mail, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Message")
+                    }
+                    OutlinedButton(
+                        onClick = { onMemberAction(MemberAction.WHOIS, nick); memberTarget = null },
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Icon(Icons.Filled.Info, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("WHOIS")
+                    }
+                }
+
+                if (buffer.ref.kind == dev.brentdevs.yardhal.core.data.ConversationKind.CHANNEL) {
+                    Text("Channel moderation", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        TextButton(onClick = { onMemberAction(MemberAction.KICK, nick); memberTarget = null }) {
+                            Text("Kick", color = MaterialTheme.colorScheme.error)
+                        }
+                        TextButton(onClick = { onMemberAction(MemberAction.BAN, nick); memberTarget = null }) {
+                            Text("Ban", color = MaterialTheme.colorScheme.error)
+                        }
+                        if (accountBanAvailable && account != null) {
+                            TextButton(onClick = { onMemberAction(MemberAction.BAN_ACCOUNT, nick); memberTarget = null }) {
+                                Text("Ban account", color = MaterialTheme.colorScheme.error)
+                            }
+                        }
+                        TextButton(onClick = { onMemberAction(MemberAction.IGNORE, nick); memberTarget = null }) {
+                            Text("Ignore")
+                        }
+                    }
+                } else {
+                    TextButton(
+                        onClick = { onMemberAction(MemberAction.IGNORE, nick); memberTarget = null },
+                        modifier = Modifier.align(Alignment.End),
+                    ) {
+                        Text("Ignore user")
+                    }
+                }
+                Spacer(modifier = Modifier.height(16.dp))
+            }
+        }
     }
 }
 
@@ -1117,38 +1423,99 @@ public fun NetworkOverviewScreen(
     }
 
     if (rowMenuFor != null) {
-        val buffer = entries.filterIsInstance<OverviewEntry.BufferRow>().firstOrNull { it.buffer.key == rowMenuFor }
-        if (buffer != null) {
-            DropdownMenu(
-                expanded = true,
-                onDismissRequest = { rowMenuFor = null },
-            ) {
-                DropdownMenuItem(
-                    text = { Text("Mark as read") },
-                    onClick = { onMarkRead(buffer.buffer.key); rowMenuFor = null },
-                )
-                DropdownMenuItem(
-                    text = { Text(if (buffer.pinned) "Unpin" else "Pin") },
-                    onClick = { onTogglePin(buffer.buffer.key); rowMenuFor = null },
-                )
-                DropdownMenuItem(
-                    text = { Text(if (buffer.muted) "Unmute" else "Mute") },
-                    onClick = { onToggleMute(buffer.buffer.key); rowMenuFor = null },
-                )
-                DropdownMenuItem(
-                    text = { Text("Move to group…") },
-                    onClick = { moveTarget = buffer.buffer.key; rowMenuFor = null },
-                )
-                if (buffer.buffer.joinState == dev.brentdevs.yardhal.coordinator.JoinState.FAILED) {
-                    DropdownMenuItem(
-                        text = { Text("Retry join") },
-                        onClick = { onRetryJoin(buffer.buffer.key); rowMenuFor = null },
+        val entry = entries.filterIsInstance<OverviewEntry.BufferRow>().firstOrNull { it.buffer.key == rowMenuFor }
+        if (entry != null) {
+            val buf = entry.buffer
+            ModalBottomSheet(onDismissRequest = { rowMenuFor = null }) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 20.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    Text(
+                        text = buf.displayName,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 6.dp),
                     )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable { onMarkRead(buf.key); rowMenuFor = null }
+                            .padding(horizontal = 8.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                    ) {
+                        Icon(Icons.Filled.MarkChatRead, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                        Text("Mark as read", style = MaterialTheme.typography.bodyLarge)
+                    }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable { onTogglePin(buf.key); rowMenuFor = null }
+                            .padding(horizontal = 8.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                    ) {
+                        Icon(Icons.Filled.PushPin, contentDescription = null)
+                        Text(if (entry.pinned) "Unpin" else "Pin to top", style = MaterialTheme.typography.bodyLarge)
+                    }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable { onToggleMute(buf.key); rowMenuFor = null }
+                            .padding(horizontal = 8.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                    ) {
+                        Icon(Icons.Filled.NotificationsOff, contentDescription = null)
+                        Text(if (entry.muted) "Unmute notifications" else "Mute notifications", style = MaterialTheme.typography.bodyLarge)
+                    }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable { moveTarget = buf.key; rowMenuFor = null }
+                            .padding(horizontal = 8.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                    ) {
+                        Icon(Icons.AutoMirrored.Filled.DriveFileMove, contentDescription = null)
+                        Text("Move to group…", style = MaterialTheme.typography.bodyLarge)
+                    }
+                    if (buf.joinState == dev.brentdevs.yardhal.coordinator.JoinState.FAILED) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { onRetryJoin(buf.key); rowMenuFor = null }
+                                .padding(horizontal = 8.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(14.dp),
+                        ) {
+                            Icon(Icons.Filled.Refresh, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                            Text("Retry join", style = MaterialTheme.typography.bodyLarge)
+                        }
+                    }
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable { pendingLeave = buf; rowMenuFor = null }
+                            .padding(horizontal = 8.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                    ) {
+                        Icon(Icons.Filled.Close, contentDescription = null, tint = MaterialTheme.colorScheme.error)
+                        Text("Leave", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.error)
+                    }
+                    Spacer(modifier = Modifier.height(16.dp))
                 }
-                DropdownMenuItem(
-                    text = { Text("Leave") },
-                    onClick = { pendingLeave = buffer.buffer; rowMenuFor = null },
-                )
             }
         }
     }
