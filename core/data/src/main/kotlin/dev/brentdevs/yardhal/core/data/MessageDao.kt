@@ -19,6 +19,12 @@ public interface MessageDao {
     public suspend fun existsByHash(networkId: String, conversation: String, hash: String): Boolean
 
     @Query(
+        "SELECT rowId FROM messages WHERE contentHash = :hash AND conversation = :conversation AND networkId = :networkId " +
+            "ORDER BY rowId LIMIT 1",
+    )
+    public suspend fun rowIdByHash(networkId: String, conversation: String, hash: String): Long?
+
+    @Query(
         "SELECT * FROM messages WHERE networkId = :networkId AND conversation = :conversation " +
             "ORDER BY timestampMs DESC, rowId DESC LIMIT :limit",
     )
@@ -86,6 +92,9 @@ public interface MessageDao {
 
     @Query("UPDATE messages SET contentHash = :hash WHERE rowId = :rowId")
     public suspend fun updateContentHash(rowId: Long, hash: String)
+
+    @Query("DELETE FROM messages WHERE rowId = :rowId")
+    public suspend fun deleteRow(rowId: Long)
 
     @Query("SELECT * FROM messages")
     public suspend fun allRows(): List<MessageRow>

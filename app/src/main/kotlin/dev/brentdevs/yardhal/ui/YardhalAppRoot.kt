@@ -69,7 +69,7 @@ public fun YardhalAppRoot(
     coordinator: LiveCoordinator,
     appearanceStore: ChatAppearanceStore,
     presets: List<NetworkPresetUi>,
-    onNetworkSaved: (NetworkDraft) -> Unit,
+    onNetworkSaved: (NetworkDraft) -> Boolean,
     sharedTextProvider: () -> String? = { null },
     onSharedConsumed: () -> Unit = {},
     modifier: Modifier = Modifier,
@@ -317,23 +317,25 @@ public fun YardhalAppRoot(
         returnToSearch = false
     }
 
+    val initialNetworkConfig = if (networkEditorVisible) editingNetworkId?.let(coordinator.networkStore::byId) else null
+    val missingEditTarget = networkEditorVisible && editingNetworkId != null && initialNetworkConfig == null
+    if (missingEditTarget) {
+        LaunchedEffect(editingNetworkId) { dismissNetworkEditor() }
+    }
+
     Surface(modifier = modifier.fillMaxSize()) {
-        if (networkEditorVisible) {
-            val initialConfig = editingNetworkId?.let(coordinator.networkStore::byId)
-            if (editingNetworkId != null && initialConfig == null) {
-                LaunchedEffect(editingNetworkId) { dismissNetworkEditor() }
-            } else {
-                NetworkEditorSheet(
-                    presets = presets,
-                    initialPreset = presets.firstOrNull { it.id == pendingPresetId },
-                    initialConfig = initialConfig,
-                    onSave = {
-                        onNetworkSaved(it)
-                        dismissNetworkEditor()
-                    },
-                    onDismiss = ::dismissNetworkEditor,
-                )
-            }
+        if (networkEditorVisible && !missingEditTarget) {
+            NetworkEditorSheet(
+                presets = presets,
+                initialPreset = presets.firstOrNull { it.id == pendingPresetId },
+                initialConfig = initialNetworkConfig,
+                onSave = {
+                    val saved = onNetworkSaved(it)
+                    if (saved) dismissNetworkEditor()
+                    saved
+                },
+                onDismiss = ::dismissNetworkEditor,
+            )
         } else if (searchVisible) {
             val searchScreen: @Composable (Modifier) -> Unit = { searchModifier -> MessageSearchScreen(
                 query = searchQuery,

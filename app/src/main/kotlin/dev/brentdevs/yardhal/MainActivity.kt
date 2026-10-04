@@ -9,14 +9,11 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Modifier
 import dev.brentdevs.yardhal.coordinator.LiveCoordinator
-import dev.brentdevs.yardhal.core.data.NetworkConfig
 import dev.brentdevs.yardhal.core.data.NetworkPresets
 import dev.brentdevs.yardhal.ui.YardhalAppRoot
 import dev.brentdevs.yardhal.ui.image.LocalRemoteImageLoader
-import dev.brentdevs.yardhal.ui.screens.NetworkDraft
 import dev.brentdevs.yardhal.ui.screens.NetworkPresetUi
 import dev.brentdevs.yardhal.ui.theme.YardhalTheme
-import java.util.UUID
 
 class MainActivity : ComponentActivity() {
 
@@ -27,6 +24,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         val app = application as YardhalApplication
         coordinator = app.coordinator
+        val networkSaver = NetworkSaver(coordinator, app.vault)
 
         setContent {
             YardhalTheme(
@@ -39,7 +37,7 @@ class MainActivity : ComponentActivity() {
                         presets = NetworkPresets.ALL.map {
                             NetworkPresetUi(it.id, it.name, it.host, it.port, it.tls)
                         },
-                        onNetworkSaved = ::saveNetwork,
+                        onNetworkSaved = networkSaver::save,
                         sharedTextProvider = { (application as YardhalApplication).sharedText },
                         onSharedConsumed = { (application as YardhalApplication).sharedText = null },
                         modifier = Modifier,
@@ -83,58 +81,4 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun saveNetwork(draft: NetworkDraft) {
-        val app = application as YardhalApplication
-        val existing = draft.networkId?.let { app.networkStore.byId(it) ?: return }
-        val id = existing?.id ?: UUID.randomUUID().toString()
-        val previousPasswordRef = existing?.saslPasswordRef
-        val replacementPassword = draft.saslPassword.takeUnless { draft.clearSaslPassword }
-        val passwordRef = when {
-            draft.clearSaslPassword -> null
-            replacementPassword != null -> {
-                if (previousPasswordRef != null && previousPasswordRef == existing?.serverPasswordRef) {
-                    "sasl-$id-${UUID.randomUUID()}"
-                } else {
-                    previousPasswordRef ?: "sasl-$id"
-                }
-            }
-            else -> previousPasswordRef
-        }
-        val authcid = draft.saslAuthcid ?: passwordRef?.let { draft.nick }
-        val config = existing?.copy(
-            name = draft.displayName,
-            host = draft.host,
-            port = draft.port,
-            tls = draft.tls,
-            nick = draft.nick,
-            autojoin = draft.autojoin,
-            saslAuthcid = authcid,
-            saslPasswordRef = passwordRef,
-            saslPassword = null,
-        ) ?: NetworkConfig(
-            id = id,
-            name = draft.displayName,
-            host = draft.host,
-            port = draft.port,
-            tls = draft.tls,
-            nick = draft.nick,
-            autojoin = draft.autojoin,
-            saslAuthcid = authcid,
-            saslPasswordRef = passwordRef,
-        )
-        if (replacementPassword != null && passwordRef != null) {
-            app.vault.storePassword(passwordRef, replacementPassword)
-        }
-        if (existing == null) {
-            if (!app.networkStore.add(config)) return
-            coordinator.connect(config)
-        } else if (!coordinator.updateNetwork(config, credentialsChanged = replacementPassword != null)) {
-            return
-        }
-        if (previousPasswordRef != null && previousPasswordRef != passwordRef &&
-            previousPasswordRef != config.serverPasswordRef
-        ) {
-            app.vault.deletePassword(previousPasswordRef)
-        }
-    }
 }

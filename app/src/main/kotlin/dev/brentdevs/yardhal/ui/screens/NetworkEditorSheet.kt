@@ -121,7 +121,7 @@ public fun NetworkEditorSheet(
     presets: List<NetworkPresetUi>,
     initialPreset: NetworkPresetUi? = null,
     initialConfig: NetworkConfig? = null,
-    onSave: (draft: NetworkDraft) -> Unit,
+    onSave: (draft: NetworkDraft) -> Boolean,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -141,6 +141,7 @@ public fun NetworkEditorSheet(
         var clearPassword by rememberSaveable { mutableStateOf(false) }
         var channels by rememberSaveable { mutableStateOf(initialConfig?.autojoin?.joinToString(",") ?: "") }
         var name by rememberSaveable { mutableStateOf(initialConfig?.name ?: initialPreset?.name ?: "") }
+        var saveFailed by rememberSaveable { mutableStateOf(false) }
 
         fun applyPreset(selected: NetworkPresetUi) {
             presetId = selected.id
@@ -229,7 +230,7 @@ public fun NetworkEditorSheet(
                     if (hasSavedPassword) {
                         Text(
                             if (clearPassword) "The saved password will be removed."
-                            else "Leave blank to keep the saved password, or enter a new password to replace it.",
+                            else "Leave empty to keep the saved password, or enter a new password to replace it.",
                         )
                     }
                 },
@@ -269,19 +270,25 @@ public fun NetworkEditorSheet(
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
+            if (saveFailed) {
+                Text(
+                    "Couldn't save this network. Your changes are still here; try again or cancel.",
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.align(Alignment.End)) {
                 OutlinedButton(onClick = onDismiss) { Text("Cancel") }
                 val portValid = port.toIntOrNull()?.let { it in 1..65535 } == true
                 Button(
                     enabled = host.isNotBlank() && nick.isNotBlank() && portValid,
                     onClick = {
-                        onSave(
+                        saveFailed = !onSave(
                             NetworkDraft(
                                 host = host.trim(),
                                 port = port.toInt(),
                                 tls = tls,
                                 nick = nick.trim(),
-                                saslPassword = if (clearPassword) null else password.takeIf { it.isNotBlank() },
+                                saslPassword = if (clearPassword) null else password.takeIf { it.isNotEmpty() },
                                 autojoin = channels.split(',').mapNotNull { it.trim().takeIf(String::isNotEmpty) },
                                 displayName = name.trim().ifBlank { host.trim() },
                                 networkId = initialConfig?.id,

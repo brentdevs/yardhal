@@ -24,6 +24,7 @@ public class InboundContext(
     public val hasBuffer: (String) -> Boolean = { true },
     public val openChannels: () -> List<String> = { emptyList() },
     public val latestReadMarkerMs: () -> Long? = { null },
+    public val isParted: (String) -> Boolean = { false },
 )
 
 public data class OpenBatch(
@@ -278,10 +279,9 @@ public class PerNetworkState(
         channels.clear()
         for (old in oldChannels) {
             val ref = channelRef(old.ref.rawTarget)
-            val fresh = ChannelState(ref)
+            val fresh = channels.getOrPut(ref.storageKey) { ChannelState(ref) }
             for (member in old.members.values) fresh.members[fold(member.nick)] = member
             fresh.metadata.putAll(old.metadata)
-            channels[ref.storageKey] = fresh
         }
         val oldUsers = users.values.toList()
         users.clear()
@@ -293,9 +293,13 @@ public class PerNetworkState(
         pendingNames.clear()
         for ((key, members) in oldPending) {
             val rawTarget = oldChannels.firstOrNull { it.ref.storageKey == key }?.ref?.rawTarget ?: continue
-            val rebuilt = LinkedHashMap<String, ChannelMember>()
+            val rebuilt = pendingNames.getOrPut(channelRef(rawTarget).storageKey) { LinkedHashMap() }
             for (member in members.values) rebuilt[fold(member.nick)] = member
-            pendingNames[channelRef(rawTarget).storageKey] = rebuilt
+        }
+        for ((label, pending) in pendingLabels.toMap()) {
+            pendingLabels[label] = pending.copy(
+                origin = pending.origin.copy(normalizedTarget = fold(pending.origin.rawTarget)),
+            )
         }
     }
 

@@ -9,6 +9,7 @@ import dev.brentdevs.yardhal.core.client.StsPolicy
 import dev.brentdevs.yardhal.core.data.ChannelOrderStore
 import dev.brentdevs.yardhal.core.data.ConversationRef
 import dev.brentdevs.yardhal.core.data.InMemoryCredentialVault
+import dev.brentdevs.yardhal.core.data.MessageDao
 import dev.brentdevs.yardhal.core.data.MessageKind
 import dev.brentdevs.yardhal.core.data.MessageStore
 import dev.brentdevs.yardhal.core.data.MuteStore
@@ -17,6 +18,7 @@ import dev.brentdevs.yardhal.core.data.NetworkStore
 import dev.brentdevs.yardhal.core.data.ReadMarkerStore
 import dev.brentdevs.yardhal.core.data.StoredMessage
 import dev.brentdevs.yardhal.core.data.YardhalDatabase
+import dev.brentdevs.yardhal.core.protocol.CaseMapping
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
@@ -34,24 +36,33 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestCoroutineScheduler
+import kotlinx.coroutines.test.TestDispatcher
 import kotlinx.coroutines.withTimeout
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 
+@OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
 class NetworkEditLifecycleTests {
+    private var scheduler: TestCoroutineScheduler? = null
     private class Server(
         private val welcomeAutomatically: Boolean = true,
         private val publishProfiles: Boolean = false,
         private val dropOnAccept: Boolean = false,
         private val stsPort: Int? = null,
+        private val casemapping: String? = null,
+        private val acknowledgeParts: Boolean = true,
     ) : AutoCloseable {
         private val listener = ServerSocket(0, 10, InetAddress.getLoopbackAddress())
         private val executor = Executors.newCachedThreadPool()
@@ -93,6 +104,8 @@ class NetworkEditLifecycleTests {
                                     send(":srv METADATA alice display-name * :Old Alice")
                                 }
                             }
+                            line.startsWith("PART ") && acknowledgeParts ->
+                                send(":$nick!u@h PART ${line.substringAfter("PART ").substringBefore(' ')}")
                         }
                     }
                 } finally {
@@ -101,6 +114,7 @@ class NetworkEditLifecycleTests {
             }
 
             fun welcome() {
+                casemapping?.let { send(":srv 005 $nick CASEMAPPING=$it :are supported") }
                 send(":srv 001 $nick :Welcome")
                 if (publishProfiles) {
                     send(":srv 005 $nick BOT=B EXTBAN=~,a draft/ICON=https://example.org/old.png :are supported")
@@ -169,18 +183,30 @@ class NetworkEditLifecycleTests {
         val directory: File,
         val config: NetworkConfig,
         dispatcher: CoroutineDispatcher = Dispatchers.Default,
+        afterDiscovery: (suspend () -> Unit)? = null,
     ) : AutoCloseable {
         private val scopeJob = SupervisorJob()
         private val scope = CoroutineScope(scopeJob + dispatcher)
         val database = YardhalDatabase.inMemory(ApplicationProvider.getApplicationContext<Context>())
-        val messages = MessageStore(database.messageDao())
+        private val dao = database.messageDao()
+        val messages = MessageStore(
+            if (afterDiscovery == null) dao else object : MessageDao by dao {
+                override suspend fun conversations(networkId: String): List<String> {
+                    val targets = dao.conversations(networkId)
+                    afterDiscovery()
+                    return targets
+                }
+            },
+        )
         val vault = InMemoryCredentialVault()
         val policies = InMemoryStsPolicyStore()
         val networks = NetworkStore(directory).also { it.add(config) }
         val readMarkers = ReadMarkerStore(directory)
         val mutes = MuteStore(directory)
         val channelOrder = ChannelOrderStore(directory)
+        val createdConfigs: MutableList<NetworkConfig> = CopyOnWriteArrayList()
         private val connectionFactory = ConnectionFactory { updated, onStsUpgrade ->
+            createdConfigs.add(updated)
             IrcConnection(
                 IrcConnectionConfig(
                     host = updated.host,
@@ -230,7 +256,20 @@ class NetworkEditLifecycleTests {
 
         override fun close() {
             coordinator.disconnect(config.id)
-            runBlocking { scopeJob.cancelAndJoin() }
+            val testDispatcher = scope.coroutineContext[kotlin.coroutines.ContinuationInterceptor] as? TestDispatcher
+            if (testDispatcher == null) {
+                runBlocking { scopeJob.cancelAndJoin() }
+            } else {
+                scopeJob.cancel()
+                runBlocking {
+                    withTimeout(5_000) {
+                        while (!scopeJob.isCompleted) {
+                            testDispatcher.scheduler.runCurrent()
+                            delay(10)
+                        }
+                    }
+                }
+            }
             database.close()
             directory.deleteRecursively()
         }
@@ -246,8 +285,15 @@ class NetworkEditLifecycleTests {
         autojoin = listOf("#room"),
     )
 
-    private fun harness(config: NetworkConfig, dispatcher: CoroutineDispatcher = Dispatchers.Default): Harness =
-        Harness(Files.createTempDirectory("yardhal-network-edit").toFile(), config, dispatcher)
+    private fun harness(
+        config: NetworkConfig,
+        dispatcher: CoroutineDispatcher? = null,
+        afterDiscovery: (suspend () -> Unit)? = null,
+    ): Harness {
+        val effectiveDispatcher = dispatcher ?: StandardTestDispatcher()
+        scheduler = (effectiveDispatcher as? TestDispatcher)?.scheduler
+        return Harness(Files.createTempDirectory("yardhal-network-edit").toFile(), config, effectiveDispatcher, afterDiscovery)
+    }
 
     @Test
     fun nameOnlyAndNoOpEditsKeepTheRegisteredSocketAndPersistTheNewName() = runBlocking {
@@ -313,6 +359,8 @@ class NetworkEditLifecycleTests {
                     await { coordinator.profiles.value[room.networkId]?.forNick("alice")?.displayName == "Old Alice" }
                     await { coordinator.networks.value.single().iconUrl != null }
                     await { coordinator.buffers.value[room.storageKey]?.memberPresence?.get("alice")?.away == true }
+                    oldServer.clients.single().send(":alice!u@h TOPIC #room :Topic before editing")
+                    await { coordinator.buffers.value[room.storageKey]?.topic == "Topic before editing" }
                     assertTrue(coordinator.loadPersistedHistory(room.storageKey))
                     await { coordinator.buffers.value[room.storageKey]?.messages?.any { it.msgid == "saved-message" } == true }
                     oldServer.clients.single().send(
@@ -329,6 +377,8 @@ class NetworkEditLifecycleTests {
                     coordinator.addToGroup(group, room.storageKey)
                     val previous = assertNotNull(coordinator.buffers.value[room.storageKey])
                     val order = coordinator.orderState.value
+                    assertEquals(listOf(room.storageKey), order.pinnedKeys)
+                    assertEquals(listOf(room.storageKey), order.groups.single().memberKeys)
                     val updated = harness.config.copy(
                         name = "Edited network",
                         host = "localhost",
@@ -345,6 +395,7 @@ class NetworkEditLifecycleTests {
                     assertEquals(previous.messages, preserved.messages)
                     assertEquals(previous.readAtMs, preserved.readAtMs)
                     assertEquals(previous.hasUnread, preserved.hasUnread)
+                    assertEquals(null, preserved.topic)
                     assertTrue(preserved.members.isEmpty())
                     assertTrue(preserved.memberPresence.isEmpty())
                     assertTrue(preserved.typingUsers.isEmpty())
@@ -461,7 +512,9 @@ class NetworkEditLifecycleTests {
                 }
                 assertEquals("\u0000anotherAccount\u0000replacement-secret", credentials(server.clients.last()))
                 await { first.closed && second.closed }
-                delay(1_300)
+                assertNotNull(scheduler).advanceTimeBy(60_000)
+                assertNotNull(scheduler).runCurrent()
+                assertEquals(3, harness.createdConfigs.size)
                 assertEquals(3, server.clients.size)
                 assertEquals(1, server.clients.last().received.count { it.startsWith("USER ") })
             }
@@ -529,10 +582,18 @@ class NetworkEditLifecycleTests {
                     val coordinator = harness.coordinator
                     coordinator.startAll()
                     await { oldServer.clients.singleOrNull()?.closed == true }
+                    await {
+                        assertNotNull(scheduler).advanceTimeBy(50)
+                        harness.createdConfigs.size >= 2
+                    }
+                    await { oldServer.clients.size == 2 && oldServer.clients.all { it.closed } }
+                    assertEquals(2, harness.createdConfigs.size)
                     assertTrue(coordinator.updateNetwork(harness.config.copy(port = replacement.port, nick = "recovered")))
                     await { coordinator.networks.value.singleOrNull()?.status == ConnectionStatus.REGISTERED }
-                    delay(1_300)
-                    assertEquals(1, oldServer.clients.size)
+                    assertNotNull(scheduler).advanceTimeBy(60_000)
+                    assertNotNull(scheduler).runCurrent()
+                    assertEquals(3, harness.createdConfigs.size)
+                    assertEquals(2, oldServer.clients.size)
                     assertEquals(1, replacement.clients.size)
                     assertTrue("NICK recovered" in replacement.clients.single().received)
                 }
@@ -584,11 +645,15 @@ class NetworkEditLifecycleTests {
                             harness(config(oldServer)).use { harness ->
                                 val coordinator = harness.coordinator
                                 coordinator.startAll()
-                                await { oldTls.clients.isNotEmpty() }
+                                await {
+                                    assertNotNull(scheduler).advanceTimeBy(50)
+                                    oldTls.clients.isNotEmpty()
+                                }
                                 val changedHost = harness.config.copy(host = "localhost", port = replacement.port)
                                 assertTrue(coordinator.updateNetwork(changedHost))
                                 await { coordinator.networks.value.singleOrNull()?.status == ConnectionStatus.REGISTERED }
                                 assertEquals(1, replacement.clients.size)
+                                await { oldServer.clients.firstOrNull()?.closed == true && oldTls.clients.all { it.closed } }
                                 assertTrue("NICK tester" in replacement.clients.single().received)
 
                                 harness.policies.save(
@@ -608,6 +673,261 @@ class NetworkEditLifecycleTests {
         }
     }
 
+    @Test
+    fun advertisedCasemappingMergesChannelAndDirectMessageHistoryAndMetadataAcrossEditAndReload() = runBlocking {
+        Server(casemapping = "ascii").use { oldServer ->
+            Server(casemapping = "rfc1459").use { replacement ->
+                val config = config(oldServer).copy(autojoin = listOf("#[room]"))
+                harness(config).use { harness ->
+                    val coordinator = harness.coordinator
+                    val room = ConversationRef.channel(config.id, "#[room]", CaseMapping.ASCII)
+                    val alias = ConversationRef.channel(config.id, "#{room}", CaseMapping.ASCII)
+                    val direct = ConversationRef.directMessage(config.id, "[alice]", CaseMapping.ASCII)
+                    val directAlias = ConversationRef.directMessage(config.id, "{alice}", CaseMapping.ASCII)
+                    record(harness, room, "room-before", "First channel", 1_000)
+                    record(harness, alias, "alias-before", "Second channel", 2_000)
+                    record(harness, room, null, "Same playback", 3_000)
+                    record(harness, alias, null, "Same playback", 3_000)
+                    record(harness, direct, "direct-before", "First direct message", 1_000)
+                    record(harness, directAlias, "direct-alias-before", "Second direct message", 2_000)
+                    coordinator.startAll()
+                    await { coordinator.buffers.value[room.storageKey]?.joinState == JoinState.JOINED }
+                    for (ref in listOf(room, alias, direct, directAlias)) {
+                        coordinator.ensureConversation(config.id, ref.rawTarget)
+                        assertTrue(coordinator.loadPersistedHistory(ref.storageKey))
+                    }
+                    await {
+                        listOf(room, alias, direct, directAlias).all { ref ->
+                            coordinator.buffers.value[ref.storageKey]?.messages?.isNotEmpty() == true
+                        }
+                    }
+                    coordinator.markRead(alias.storageKey)
+                    coordinator.markRead(directAlias.storageKey)
+                    coordinator.toggleMute(room.storageKey)
+                    coordinator.togglePin(room.storageKey)
+                    coordinator.togglePin(alias.storageKey)
+                    val group = coordinator.createGroup("Mapping-sensitive channels")
+                    coordinator.addToGroup(group, room.storageKey)
+                    val alternateGroup = coordinator.createGroup("Colliding channel group")
+                    coordinator.addToGroup(alternateGroup, alias.storageKey)
+                    coordinator.trackSelection(room.storageKey)
+                    val reply = assertNotNull(coordinator.buffers.value[room.storageKey]).messages.first()
+                    assertTrue(coordinator.sendText(config.id, room.storageKey, "Queued before CASEMAPPING"))
+                    coordinator.setReplyDraft(config.id, room.storageKey, reply)
+                    val edited = config.copy(port = replacement.port)
+                    assertTrue(coordinator.updateNetwork(edited))
+                    val mergedRoom = ConversationRef.channel(config.id, "#[room]")
+                    val mergedDirect = ConversationRef.directMessage(config.id, "[alice]")
+                    await { coordinator.buffers.value[mergedRoom.storageKey]?.joinState == JoinState.JOINED }
+                    await {
+                        val persisted = harness.messages.recent(mergedRoom, 20)
+                        val ids = persisted.map { it.rowId }.toSet()
+                        persisted.size == 4 && coordinator.buffers.value[mergedRoom.storageKey]?.messages
+                            ?.all { it.storedRowId in ids } == true && harness.messages.recent(mergedDirect, 20).size == 2
+                    }
+                    val channelBuffer = assertNotNull(coordinator.buffers.value[mergedRoom.storageKey])
+                    assertFalse(room.storageKey in coordinator.buffers.value)
+                    assertFalse(direct.storageKey in coordinator.buffers.value)
+                    assertEquals(mergedRoom.storageKey, coordinator.followRenamedSelection(room.storageKey, coordinator.buffers.value.keys))
+                    val persistedIds = harness.messages.recent(mergedRoom, 20).map { it.rowId }.toSet()
+                    assertTrue(channelBuffer.messages.all { it.storedRowId in persistedIds })
+                    assertEquals(1, channelBuffer.messages.count { it.text == "Same playback" })
+                    assertEquals(4, channelBuffer.messages.size)
+                    assertEquals(3_000L, channelBuffer.readAtMs)
+                    assertFalse(channelBuffer.hasUnread)
+                    assertEquals(reply, channelBuffer.replyDraft)
+                    assertFalse(coordinator.loadPersistedHistory(mergedRoom.storageKey))
+                    assertEquals(2, coordinator.buffers.value[mergedDirect.storageKey]?.messages?.size)
+                    assertEquals(2_000L, coordinator.buffers.value[mergedDirect.storageKey]?.readAtMs)
+                    assertEquals(setOf(mergedRoom.storageKey), coordinator.mutedState.value)
+                    assertEquals(listOf(mergedRoom.storageKey), coordinator.orderState.value.pinnedKeys)
+                    assertEquals(listOf(mergedRoom.storageKey), coordinator.orderState.value.groups.first { it.id == group }.memberKeys)
+                    assertTrue(coordinator.orderState.value.groups.first { it.id == alternateGroup }.memberKeys.isEmpty())
+                    assertEquals(listOf(group, alternateGroup), coordinator.orderState.value.groupOrder)
+                    assertEquals(listOf("Mapping-sensitive channels", "Colliding channel group"), coordinator.orderState.value.groups.map { it.name })
+                    assertEquals(coordinator.orderState.value, ChannelOrderStore(harness.directory).snapshot())
+                    assertEquals(3_000L, ReadMarkerStore(harness.directory).marker(mergedRoom.storageKey))
+                    assertTrue(harness.messages.recent(room, 20).isEmpty())
+                    assertTrue(harness.messages.recent(direct, 20).isEmpty())
+                    await { oldServer.clients.single().closed }
+
+                    val reloaded = harness.reloadCoordinator()
+                    reloaded.startAll()
+                    await { reloaded.buffers.value[mergedRoom.storageKey]?.joinState == JoinState.JOINED }
+                    await { mergedDirect.storageKey in reloaded.buffers.value }
+                    assertTrue(reloaded.loadPersistedHistory(mergedRoom.storageKey))
+                    assertTrue(reloaded.loadPersistedHistory(mergedDirect.storageKey))
+                    await { reloaded.buffers.value[mergedRoom.storageKey]?.messages?.size == 4 }
+                    await { reloaded.buffers.value[mergedDirect.storageKey]?.messages?.size == 2 }
+                    val client = replacement.clients.last()
+                    client.send("@msgid=room-after :alice!u@h PRIVMSG #[room] :Channel after reload")
+                    client.send("@msgid=direct-after :[alice]!u@h PRIVMSG tester :Direct after reload")
+                    await { reloaded.buffers.value[mergedRoom.storageKey]?.messages?.size == 5 }
+                    await { reloaded.buffers.value[mergedDirect.storageKey]?.messages?.size == 3 }
+                    await { harness.messages.recent(mergedRoom, 20).size == 5 }
+                    await { harness.messages.recent(mergedDirect, 20).size == 3 }
+                    assertEquals(setOf(mergedRoom.storageKey), reloaded.mutedState.value)
+                    assertEquals(listOf(mergedRoom.storageKey), reloaded.orderState.value.pinnedKeys)
+                    assertEquals(listOf(mergedRoom.storageKey), reloaded.orderState.value.groups.first { it.id == group }.memberKeys)
+                    assertTrue(reloaded.orderState.value.groups.first { it.id == alternateGroup }.memberKeys.isEmpty())
+                    assertEquals(coordinator.orderState.value, reloaded.orderState.value)
+                    assertEquals(3_000L, reloaded.buffers.value[mergedRoom.storageKey]?.readAtMs)
+                    assertEquals(2_000L, reloaded.buffers.value[mergedDirect.storageKey]?.readAtMs)
+                    assertEquals(1, reloaded.buffers.value.values.count { it.ref.rawTarget.contains("room") })
+                    assertEquals(1, reloaded.buffers.value.values.count { it.ref.rawTarget.contains("alice") })
+                }
+            }
+        }
+    }
+
+    @Test
+    fun lessPermissiveAdvertisedCasemappingRekeysKnownRawTargetsWithoutStrandingHistory() = runBlocking {
+        Server(casemapping = "rfc1459").use { oldServer ->
+            Server(casemapping = "ascii").use { replacement ->
+                val config = config(oldServer).copy(autojoin = listOf("#[room]"))
+                harness(config).use { harness ->
+                    val coordinator = harness.coordinator
+                    val room = ConversationRef.channel(config.id, "#[room]")
+                    val direct = ConversationRef.directMessage(config.id, "[alice]")
+                    coordinator.startAll()
+                    await { coordinator.buffers.value[room.storageKey]?.joinState == JoinState.JOINED }
+                    oldServer.clients.single().send("@msgid=room-before :alice!u@h PRIVMSG #[room] :Old channel history")
+                    oldServer.clients.single().send("@msgid=direct-before :[alice]!u@h PRIVMSG tester :Old direct history")
+                    await { harness.messages.recent(room, 20).size == 1 && harness.messages.recent(direct, 20).size == 1 }
+                    coordinator.markRead(direct.storageKey)
+                    val marker = harness.readMarkers.marker(direct.storageKey)
+                    coordinator.toggleMute(direct.storageKey)
+                    coordinator.trackSelection(direct.storageKey)
+                    assertTrue(coordinator.loadPersistedHistory(room.storageKey))
+                    assertTrue(coordinator.loadPersistedHistory(direct.storageKey))
+                    assertTrue(coordinator.updateNetwork(config.copy(port = replacement.port)))
+                    val changedRoom = ConversationRef.channel(config.id, "#[room]", CaseMapping.ASCII)
+                    val changedDirect = ConversationRef.directMessage(config.id, "[alice]", CaseMapping.ASCII)
+                    await { coordinator.buffers.value[changedRoom.storageKey]?.joinState == JoinState.JOINED }
+                    await { harness.messages.recent(changedDirect, 20).size == 1 }
+                    assertTrue(harness.messages.recent(room, 20).isEmpty())
+                    assertTrue(harness.messages.recent(direct, 20).isEmpty())
+                    assertFalse(coordinator.loadPersistedHistory(changedRoom.storageKey))
+                    assertFalse(coordinator.loadPersistedHistory(changedDirect.storageKey))
+                    assertEquals(changedDirect.storageKey, coordinator.followRenamedSelection(direct.storageKey, coordinator.buffers.value.keys))
+                    assertEquals(setOf(changedDirect.storageKey), coordinator.mutedState.value)
+                    val reloaded = harness.reloadCoordinator()
+                    reloaded.startAll()
+                    await { reloaded.buffers.value[changedRoom.storageKey]?.joinState == JoinState.JOINED }
+                    await { changedDirect.storageKey in reloaded.buffers.value }
+                    assertTrue(reloaded.loadPersistedHistory(changedRoom.storageKey))
+                    assertTrue(reloaded.loadPersistedHistory(changedDirect.storageKey))
+                    await { reloaded.buffers.value[changedRoom.storageKey]?.messages?.singleOrNull()?.msgid == "room-before" }
+                    await { reloaded.buffers.value[changedDirect.storageKey]?.messages?.singleOrNull()?.msgid == "direct-before" }
+                    assertEquals(marker, reloaded.buffers.value[changedDirect.storageKey]?.readAtMs)
+                    assertEquals(setOf(changedDirect.storageKey), reloaded.mutedState.value)
+                    replacement.clients.last().send("@msgid=direct-after :[alice]!u@h PRIVMSG tester :New direct history")
+                    await { harness.messages.recent(changedDirect, 20).size == 2 }
+                    assertEquals(2, reloaded.buffers.value[changedDirect.storageKey]?.messages?.size)
+                    assertFalse(reloaded.buffers.value[changedDirect.storageKey]?.hasUnread == true)
+                    assertFalse(direct.storageKey in reloaded.buffers.value)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun historyDiscoveredBeforeMappingChangeCannotReopenTheOldNormalizedTarget() = runBlocking {
+        Server(casemapping = "rfc1459").use { oldServer ->
+            Server(casemapping = "ascii").use { replacement ->
+                val config = config(oldServer).copy(autojoin = listOf("#[room]"))
+                var holdDiscovery = false
+                val discovered = CompletableDeferred<Unit>()
+                val release = CompletableDeferred<Unit>()
+                harness(config, afterDiscovery = {
+                    if (holdDiscovery) {
+                        discovered.complete(Unit)
+                        release.await()
+                    }
+                }).use { harness ->
+                    val coordinator = harness.coordinator
+                    val original = ConversationRef.channel(config.id, "#[room]")
+                    val updated = ConversationRef.channel(config.id, "#[room]", CaseMapping.ASCII)
+                    coordinator.startAll()
+                    await { coordinator.buffers.value[original.storageKey]?.joinState == JoinState.JOINED }
+                    record(harness, original, "held-history", "Retained history", 1_000)
+                    holdDiscovery = true
+                    try {
+                        assertTrue(coordinator.updateNetwork(config.copy(port = replacement.port)))
+                        await { discovered.isCompleted &&
+                            coordinator.buffers.value[updated.storageKey]?.joinState == JoinState.JOINED }
+                        holdDiscovery = false
+                        release.complete(Unit)
+                        assertNotNull(scheduler).runCurrent()
+                        await { harness.messages.recent(updated, 20).any { it.msgid == "held-history" } }
+                        assertTrue(harness.messages.recent(original, 20).isEmpty())
+                        assertEquals(
+                            setOf(updated.storageKey),
+                            coordinator.buffers.value.values.filter { it.ref.kind ==
+                                dev.brentdevs.yardhal.core.data.ConversationKind.CHANNEL }.map { it.key }.toSet(),
+                        )
+                        assertTrue(replacement.clients.single().received.none { it == "JOIN #{room}" })
+                    } finally {
+                        holdDiscovery = false
+                        release.complete(Unit)
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun pendingAndAcknowledgedPartsStayPartedAcrossEditUntilDeliberatelyReaddedToAutojoin() = runBlocking {
+        for (acknowledgeParts in listOf(false, true)) {
+            Server(acknowledgeParts = acknowledgeParts).use { oldServer ->
+                Server().use { replacement ->
+                    harness(config(oldServer)).use { harness ->
+                        val coordinator = harness.coordinator
+                        val room = ConversationRef.channel(harness.config.id, "#room")
+                        coordinator.startAll()
+                        await { coordinator.buffers.value[room.storageKey]?.joinState == JoinState.JOINED }
+                        assertTrue(coordinator.sendText(room.networkId, room.storageKey, "/part"))
+                        await { "PART #room" in oldServer.clients.single().received }
+                        if (acknowledgeParts) await { room.storageKey !in coordinator.buffers.value }
+                        coordinator.ensureConversation(room.networkId, "#room")
+                        val edited = harness.config.copy(port = replacement.port)
+                        assertTrue(coordinator.updateNetwork(edited))
+                        await { coordinator.networks.value.singleOrNull()?.status == ConnectionStatus.REGISTERED }
+                        assertTrue(coordinator.sendText(room.networkId, room.storageKey, "/raw PING :part-barrier"))
+                        await { "PING :part-barrier" in replacement.clients.single().received }
+                        assertTrue(replacement.clients.single().received.none { it == "JOIN #room" })
+                        assertEquals(JoinState.IDLE, coordinator.buffers.value[room.storageKey]?.joinState)
+                        assertTrue(coordinator.orderState.value.isParted(room.storageKey))
+                        assertTrue(ChannelOrderStore(harness.directory).isParted(room.storageKey))
+                        assertTrue(coordinator.updateNetwork(edited.copy(autojoin = emptyList())))
+                        await { replacement.clients.size == 2 && coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                        assertTrue(coordinator.updateNetwork(edited))
+                        await { replacement.clients.size == 3 && coordinator.buffers.value[room.storageKey]?.joinState == JoinState.JOINED }
+                        assertTrue("JOIN #room" in replacement.clients.last().received)
+                        assertFalse(coordinator.orderState.value.isParted(room.storageKey))
+                    }
+                }
+            }
+        }
+    }
+
+    private suspend fun record(harness: Harness, ref: ConversationRef, msgid: String?, text: String, timestampMs: Long) {
+        harness.messages.record(
+            StoredMessage(
+                networkId = ref.networkId,
+                conversation = ref,
+                msgid = msgid,
+                senderNick = "alice",
+                senderUser = "u",
+                senderHost = "h",
+                kind = MessageKind.PRIVMSG,
+                text = text,
+                sentByUs = false,
+                timestampMs = timestampMs,
+            ),
+        )
+    }
+
     private fun credentials(client: Server.Client): String {
         val encoded = client.received.first { it.startsWith("AUTHENTICATE ") && it != "AUTHENTICATE PLAIN" }
             .substringAfter("AUTHENTICATE ")
@@ -616,7 +936,11 @@ class NetworkEditLifecycleTests {
 
     private suspend fun await(condition: suspend () -> Boolean) {
         withTimeout(5_000) {
-            while (!condition()) delay(10)
+            while (true) {
+                scheduler?.runCurrent()
+                if (condition()) break
+                delay(10)
+            }
         }
     }
 }

@@ -115,20 +115,44 @@ A display-name-only or unchanged save updates the live name without reconnecting
 Connection, identity, autojoin or credential changes replace the session once;
 the old session's child scope is canceled and stale events are rejected.
 Membership, presence, typing, topics and connection features reset before the
-updated connection starts. STS remains host-specific. Open channels continue to
-rejoin; removing an autojoin entry does not leave or delete its conversation.
+updated connection starts. STS remains host-specific. Open, unparted channels
+continue to rejoin; removing an autojoin entry does not leave or delete its
+conversation. Explicit PART intent is recorded before the server reply and
+survives edits and reconnects. An explicit join or newly added autojoin entry
+clears that intent.
 
-Passwords stay in the credential vault and are never prefilled. A blank edit
-password keeps the saved secret; a replacement updates it; **Clear saved SASL
-password** removes it. The SASL account is independent of nickname and can remain
-saved without a password, but the effective connection disables SASL until a
-password is configured. Nonsecret drafts survive rotation; plaintext password
-drafts do not. Cancel and Android Back discard edits.
+Advertised CASEMAPPING changes rekey retained conversations, selection, history
+reservations and persistent metadata. Colliding conversations merge transcripts;
+pins, read markers, mutes and group definitions survive, with one group membership
+per merged conversation. Room writes, key migrations and history reads are
+ordered, and queued restoration retains the original live target spelling.
+Initial bootstrap casemapping is not evidence of how existing database keys were
+normalized; persisted keys are left intact until the prior mapping is known.
+Closed legacy history stores only normalized names: unavailable original
+spellings cannot be reverse-expanded safely when a server uses a less permissive
+mapping.
 
-`NetworkEditLifecycleTests` covers persistence, cosmetic saves, endpoint and
-registration changes, conversation-state preservation, stale events, backoff
-cutover, credential replacement/removal, restart restoration and STS enforcement
-with Room and real loopback connections.
+Passwords stay in the credential vault and are never prefilled. An empty edit
+password keeps the saved secret; any nonempty replacement, including only spaces,
+uses a fresh vault key. `NetworkSaver` deletes that staged key on a rejected add
+or update and reports failure to the editor, which shows an error and retains the
+draft. The previous SASL key is deleted only after a successful save and only
+when it is not also the configured server-password key. **Clear saved SASL
+password** removes the SASL reference without deleting a shared server secret.
+The SASL account is independent of nickname and can remain saved without a
+password, but the effective connection disables SASL until a password is
+configured. Nonsecret drafts survive rotation; plaintext password drafts do not.
+Cancel and Android Back discard edits. A restored, missing edit target falls
+through to normal content while its stale editor state is dismissed.
+
+`NetworkSaverTests` exercises production credential saves, shared-key handling
+and rejected-save rollback with real stores and loopback authentication.
+`NetworkEditLifecycleTests` covers cosmetic saves, endpoint and registration
+changes, conversation-state preservation, stale events, virtual-time backoff
+cutover, restart restoration, STS enforcement, CASEMAPPING collisions and queued
+history restoration with Room and real loopback connections. Editor prefill,
+rotation, cancellation and rejected-save presentation are verified on Android;
+there is no Compose test suite.
 
 ## Conventions
 
