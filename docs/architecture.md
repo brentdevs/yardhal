@@ -90,9 +90,25 @@ retargeted across rapid renames before buffer publication. Consuming a redirect,
 changing selection, reusing its source or removing its destination/network clears
 the pending state; no historical alias map is retained.
 
-Remote image state is remembered by loader, resolved URL and requested size.
-A changed identity starts with its matching cached image or a placeholder, never
-the previous identity's bitmap; keyed loading retains cancellation behavior.
+Remote image state is remembered by loader, resolved URL and requested size,
+with explicit loading, success and unavailable outcomes. A changed identity
+starts with its matching cached image or a placeholder, never the previous
+identity's bitmap; keyed loading retains cancellation behavior. Attachment
+previews load only on tap. Rejected URLs and failed downloads or decoding show
+an unavailable state with an external-open action rather than a loading spinner.
+
+Transcript channel links preserve full punctuation and Unicode names and route
+through `LiveCoordinator.openChannel`: joined or joining buffers are reused;
+new or failed channels use the normal JOIN command path. Offline join attempts
+keep the target in the join dialog. External HTTP(S) links normalize their scheme.
+Composer sendability uses parsed visible text, so formatting-only drafts cannot
+send while formatted messages retain their original wire content.
+
+Network collapse state belongs to the root's saved state, shared by the overview
+and drawer across navigation and configuration changes. Event-run keys use the
+smallest monotonic local message ID so adding live or restored events does not
+reset expansion. Unread and mention scans inspect all messages: server-time
+timestamps can arrive out of order, especially during playback.
 
 Reducer behaviour is pinned by plain-JVM tests
 (`app/src/test/.../coordinator/*ReducerTests.kt`, `PerNetworkStateTests.kt`)

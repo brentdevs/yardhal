@@ -41,6 +41,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.material3.rememberDrawerState
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
@@ -68,6 +69,11 @@ import dev.brentdevs.yardhal.ui.screens.NetworkOverviewScreen
 import dev.brentdevs.yardhal.ui.screens.NetworkPresetUi
 import dev.brentdevs.yardhal.ui.screens.WelcomeScreen
 
+private val NETWORK_ID_SET_SAVER = listSaver<Set<String>, String>(
+    save = { it.toList() },
+    restore = { it.toSet() },
+)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 public fun YardhalAppRoot(
@@ -93,6 +99,9 @@ public fun YardhalAppRoot(
     var addNetworkVisible by remember { mutableStateOf(false) }
     var pendingPreset by remember { mutableStateOf<NetworkPresetUi?>(null) }
     var selectedKey by rememberSaveable { mutableStateOf<String?>(null) }
+    var collapsedNetworkIds by rememberSaveable(stateSaver = NETWORK_ID_SET_SAVER) {
+        mutableStateOf(emptySet<String>())
+    }
     fun selectConversation(key: String?) {
         coordinator.trackSelection(key)
         selectedKey = key
@@ -172,6 +181,14 @@ public fun YardhalAppRoot(
             networks = networks,
             mutedKeys = mutedKeys,
             orderState = orderState,
+            collapsedNetworkIds = collapsedNetworkIds,
+            onToggleNetwork = { networkId ->
+                collapsedNetworkIds = if (networkId in collapsedNetworkIds) {
+                    collapsedNetworkIds - networkId
+                } else {
+                    collapsedNetworkIds + networkId
+                }
+            },
             onSelect = { key ->
                 coordinator.markRead(key)
                 selectConversation(key)
@@ -267,9 +284,17 @@ public fun YardhalAppRoot(
                     hasBotMode = networkFeatures?.hasBotMode == true,
                     accountBanAvailable = networkFeatures?.accountBanAvailable == true,
                     onOpenChannel = { channel ->
-                        selectConversation(coordinator.ensureConversation(networkId, channel))
-                        searchTargetRowId = null
-                        returnToSearch = false
+                        val channelKey = coordinator.openChannel(networkId, channel)
+                        if (channelKey != null) {
+                            selectConversation(channelKey)
+                            searchTargetRowId = null
+                            returnToSearch = false
+                        } else {
+                            joinNetworkId = networkId
+                            joinDraft = channel
+                            joinSendFailed = true
+                            joinDialogVisible = true
+                        }
                     },
                     sharedDraft = sharedDraft,
                     onSharedConsumed = onSharedConsumed,

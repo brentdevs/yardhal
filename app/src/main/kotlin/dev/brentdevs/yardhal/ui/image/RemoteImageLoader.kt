@@ -163,15 +163,29 @@ public class RemoteImageLoader(
 public val LocalRemoteImageLoader: androidx.compose.runtime.ProvidableCompositionLocal<RemoteImageLoader?> =
     staticCompositionLocalOf { null }
 
+public sealed interface RemoteImageState {
+    public data object Loading : RemoteImageState
+    public data class Success(public val bitmap: ImageBitmap) : RemoteImageState
+    public data object Unavailable : RemoteImageState
+}
+
 @Composable
-public fun rememberRemoteImage(loader: RemoteImageLoader?, rawUrl: String?, sizePx: Int): State<ImageBitmap?> {
+public fun rememberRemoteImage(loader: RemoteImageLoader?, rawUrl: String?, sizePx: Int): State<RemoteImageState> {
     val url = ImageUrlPolicy.resolve(rawUrl, sizePx)
     val image = remember(loader, url, sizePx) {
-        val initial = if (loader == null || url == null) null else loader.cached(url, sizePx)?.asImageBitmap()
-        mutableStateOf(initial)
+        val initial = if (loader == null || url == null) {
+            RemoteImageState.Unavailable
+        } else {
+            loader.cached(url, sizePx)?.let { RemoteImageState.Success(it.asImageBitmap()) }
+                ?: RemoteImageState.Loading
+        }
+        mutableStateOf<RemoteImageState>(initial)
     }
     LaunchedEffect(loader, url, sizePx) {
-        image.value = if (loader == null || url == null) null else loader.load(url, sizePx)?.asImageBitmap()
+        if (loader != null && url != null) {
+            image.value = loader.load(url, sizePx)?.let { RemoteImageState.Success(it.asImageBitmap()) }
+                ?: RemoteImageState.Unavailable
+        }
     }
     return image
 }

@@ -65,7 +65,6 @@ import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -131,6 +130,7 @@ private fun buildTranscript(buffer: ConversationBuffer): List<TranscriptEntry> {
     var renderedUnreadDivider = false
 
     val pendingEvents = ArrayList<Pair<Int, ChatMessage>>()
+    var eventGroupId = Long.MAX_VALUE
     fun flushEvents() {
         if (pendingEvents.isEmpty()) return
         if (pendingEvents.size == 1) {
@@ -138,11 +138,11 @@ private fun buildTranscript(buffer: ConversationBuffer): List<TranscriptEntry> {
             val isGrouped = grouped[origIndex].groupedWithPrevious
             entries.add(TranscriptEntry.Message(single, isGrouped))
         } else {
-            val newestId = pendingEvents.first().second.localId
             val eventsInChronologicalOrder = pendingEvents.map { it.second }.reversed()
-            entries.add(TranscriptEntry.CollapsedEvents(eventsInChronologicalOrder, "collapsed-$newestId"))
+            entries.add(TranscriptEntry.CollapsedEvents(eventsInChronologicalOrder, "collapsed-$eventGroupId"))
         }
         pendingEvents.clear()
+        eventGroupId = Long.MAX_VALUE
     }
 
     for (index in ordered.indices) {
@@ -165,6 +165,7 @@ private fun buildTranscript(buffer: ConversationBuffer): List<TranscriptEntry> {
             message.kind == dev.brentdevs.yardhal.core.data.MessageKind.PART
         if (isEvent) {
             pendingEvents.add(index to message)
+            eventGroupId = minOf(eventGroupId, message.localId)
         } else {
             flushEvents()
             entries.add(TranscriptEntry.Message(message, grouped[index].groupedWithPrevious))
@@ -235,8 +236,8 @@ public fun ConversationScreen(
     var overflowVisible by remember { mutableStateOf(false) }
     val context = LocalContext.current
     fun openLink(url: String) {
-        val uri = android.net.Uri.parse(url)
-        if (uri.scheme !in setOf("http", "https")) return
+        val uri = android.net.Uri.parse(url).normalizeScheme()
+        if (uri.scheme != "http" && uri.scheme != "https") return
         runCatching {
             context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, uri))
         }
@@ -1062,7 +1063,7 @@ private fun countUnreadMessages(buffer: ConversationBuffer): Int {
     var count = 0
     for (i in buffer.messages.indices.reversed()) {
         val msg = buffer.messages[i]
-        if (msg.timestampMs < cutoff) break
+        if (msg.timestampMs < cutoff) continue
         if (msg.countsAsUnread) count++
     }
     return count
@@ -1141,6 +1142,8 @@ public fun NetworkOverviewScreen(
     networks: List<dev.brentdevs.yardhal.coordinator.UiNetwork>,
     mutedKeys: Set<String>,
     orderState: dev.brentdevs.yardhal.core.data.ChannelOrderState,
+    collapsedNetworkIds: Set<String>,
+    onToggleNetwork: (String) -> Unit,
     onSelect: (String) -> Unit,
     onSelectServer: (String) -> Unit,
     onAddNetwork: () -> Unit,
@@ -1176,11 +1179,6 @@ public fun NetworkOverviewScreen(
     var pendingLeave by remember { mutableStateOf<ConversationBuffer?>(null) }
     var moveTarget by remember { mutableStateOf<String?>(null) }
     var newGroupName by remember { mutableStateOf("") }
-    val stringSetSaver = listSaver<Set<String>, String>(
-        save = { it.toList() },
-        restore = { it.toSet() },
-    )
-    var collapsedNetworkIds by rememberSaveable(stateSaver = stringSetSaver) { mutableStateOf(emptySet<String>()) }
 
     val entries = remember(networks, buffers, mutedKeys, orderState, collapsedNetworkIds) {
         buildOverviewEntries(networks, buffers, mutedKeys, orderState, collapsedNetworkIds)
@@ -1335,20 +1333,13 @@ public fun NetworkOverviewScreen(
                 when (val entry = entries[index]) {
                     is OverviewEntry.NetworkHeader -> {
                         val network = entry.network
-                        val toggleCollapse = {
-                            collapsedNetworkIds = if (entry.isCollapsed) {
-                                collapsedNetworkIds - network.id
-                            } else {
-                                collapsedNetworkIds + network.id
-                            }
-                        }
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clickable(
                                     role = Role.Button,
                                     onClickLabel = if (entry.isCollapsed) "Expand ${network.name}" else "Collapse ${network.name}",
-                                    onClick = toggleCollapse,
+                                    onClick = { onToggleNetwork(network.id) },
                                 )
                                 .defaultMinSize(minHeight = 56.dp)
                                 .padding(start = 16.dp, end = 12.dp, top = 14.dp, bottom = 4.dp),
@@ -1474,7 +1465,7 @@ public fun NetworkOverviewScreen(
                             var found = false
                             for (i in buffer.messages.indices.reversed()) {
                                 val msg = buffer.messages[i]
-                                if (msg.timestampMs < cutoff) break
+                                if (msg.timestampMs < cutoff) continue
                                 if (msg.highlightsMe) {
                                     found = true
                                     break

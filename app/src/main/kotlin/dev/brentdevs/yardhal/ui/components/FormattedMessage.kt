@@ -15,7 +15,7 @@ import dev.brentdevs.yardhal.core.protocol.IrcFormatting
 import dev.brentdevs.yardhal.ui.theme.IrcPalette
 
 private val URL_REGEX = Regex("""https?://[^\s<>"{}|\\^`\[\]]+""", RegexOption.IGNORE_CASE)
-private val CHANNEL_REGEX = Regex("""(?<![^\s(\[<])((?:##|[#&])[a-zA-Z0-9_\-+.~/]+)""")
+private val CHANNEL_REGEX = Regex("""(?<![^\s\u0007,:(\[<])([#&][^ \r\n\u0007,:]+)""")
 private val MENTION_REGEX = Regex("""(?<![^\s(\[<])@([a-zA-Z_\\\[\]\{\}\^`|][a-zA-Z0-9_\\\[\]\{\}\^`|-]*)""")
 private val HEX_COLOR_REGEX = Regex("""^#[0-9a-fA-F]{3,8}$""")
 private val HTML_ENTITY_REGEX = Regex("""^&(?:amp|lt|gt|quot|apos|nbsp);?$""", RegexOption.IGNORE_CASE)
@@ -134,11 +134,11 @@ public fun buildFormattedMessage(
                 cursor = end
             }
             channelMatch -> {
-                val (cleanChannel, _) = stripTrailingPunctuation(nextMatch.groupValues[1])
+                val (cleanChannel, _) = stripTrailingPunctuation(nextMatch.groupValues[1], stripAngleBrackets = true)
                 val isHex = HEX_COLOR_REGEX.matches(cleanChannel)
                 val isEntity = HTML_ENTITY_REGEX.matches(cleanChannel)
                 val hasLetter = cleanChannel.any { it.isLetter() }
-                if (!isHex && !isEntity && hasLetter) {
+                if (!isHex && !isEntity && hasLetter && '\u0000' !in cleanChannel) {
                     val end = matchStart + cleanChannel.length
                     if (onOpenChannel != null) {
                         builder.addLink(
@@ -206,7 +206,7 @@ private fun stripTrailingBrackets(token: String): Pair<String, String> {
     return clean to trailing
 }
 
-private fun stripTrailingPunctuation(url: String): Pair<String, String> {
+private fun stripTrailingPunctuation(url: String, stripAngleBrackets: Boolean = false): Pair<String, String> {
     var clean = url
     var trailing = ""
     while (clean.isNotEmpty()) {
@@ -221,6 +221,9 @@ private fun stripTrailingPunctuation(url: String): Pair<String, String> {
             trailing = last + trailing
             clean = clean.dropLast(1)
         } else if (last == '}' && clean.count { it == '{' } < clean.count { it == '}' }) {
+            trailing = last + trailing
+            clean = clean.dropLast(1)
+        } else if (stripAngleBrackets && last == '>' && clean.count { it == '<' } < clean.count { it == '>' }) {
             trailing = last + trailing
             clean = clean.dropLast(1)
         } else {

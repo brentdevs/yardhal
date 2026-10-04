@@ -27,6 +27,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.brentdevs.yardhal.coordinator.ConnectionStatus
 import dev.brentdevs.yardhal.ui.image.LocalRemoteImageLoader
+import dev.brentdevs.yardhal.ui.image.RemoteImageState
 import dev.brentdevs.yardhal.ui.image.rememberRemoteImage
 import dev.brentdevs.yardhal.ui.theme.nickColor
 
@@ -38,7 +39,7 @@ public fun NickAvatar(
     avatarUrl: String? = null,
 ) {
     val image by rememberRemoteImage(LocalRemoteImageLoader.current, avatarUrl, size.roundToPxInt())
-    val loaded = image
+    val loaded = (image as? RemoteImageState.Success)?.bitmap
     if (loaded != null) {
         Image(
             bitmap = loaded,
@@ -76,7 +77,7 @@ public fun NetworkBadge(
     size: Dp = 22.dp,
 ) {
     val image by rememberRemoteImage(LocalRemoteImageLoader.current, iconUrl, size.roundToPxInt())
-    val loaded = image
+    val loaded = (image as? RemoteImageState.Success)?.bitmap
     if (loaded == null) {
         StatusDot(status, modifier)
         return

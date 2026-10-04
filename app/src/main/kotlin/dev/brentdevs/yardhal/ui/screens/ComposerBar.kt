@@ -41,6 +41,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -50,6 +51,7 @@ import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
+import dev.brentdevs.yardhal.core.protocol.IrcFormatting
 import dev.brentdevs.yardhal.ui.components.NickAvatar
 
 private const val BOLD_CHAR = '\u0002'
@@ -109,7 +111,9 @@ private sealed interface SuggestionItem {
     }
 }
 
-private fun hasSendableContent(text: String): Boolean = text.isNotBlank()
+private fun hasSendableContent(text: String): Boolean =
+    if (text.none { it < ' ' }) text.isNotBlank()
+    else IrcFormatting.parse(text).any { it.text.isNotBlank() }
 
 @Composable
 public fun ComposerBar(
@@ -511,7 +515,8 @@ public fun ComposerBar(
                 ),
                 maxLines = 5,
             )
-            val canSend = hasSendableContent(draft.text) && (enabled || localCommandAvailable)
+            val hasContent = remember(draft.text) { hasSendableContent(draft.text) }
+            val canSend = hasContent && (enabled || localCommandAvailable)
             FilledIconButton(
                 onClick = { submit() },
                 enabled = canSend,

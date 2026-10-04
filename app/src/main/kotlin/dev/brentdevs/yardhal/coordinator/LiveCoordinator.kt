@@ -579,6 +579,17 @@ public class LiveCoordinator(
         return ref.storageKey
     }
 
+    public fun openChannel(networkId: String, channel: String): String? {
+        val session = sessions[networkId] ?: return null
+        val ref = ConversationRef.channel(networkId, channel, session.state.casemapping)
+        val joinState = _buffers.value[ref.storageKey]?.joinState
+        if (joinState != JoinState.JOINED && joinState != JoinState.JOINING) {
+            val serverKey = ConversationRef.server(networkId).storageKey
+            if (!sendText(networkId, serverKey, "/join $channel")) return null
+        }
+        return ref.storageKey
+    }
+
     public fun memberAction(networkId: String, storageKey: String, action: dev.brentdevs.yardhal.ui.screens.MemberAction, nick: String) {
         when (action) {
             dev.brentdevs.yardhal.ui.screens.MemberAction.WHOIS -> sendText(networkId, storageKey, "/whois $nick")

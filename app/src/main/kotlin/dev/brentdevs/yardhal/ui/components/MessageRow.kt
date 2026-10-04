@@ -17,6 +17,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -42,6 +43,7 @@ import dev.brentdevs.yardhal.coordinator.UserProfile
 import dev.brentdevs.yardhal.core.data.ChatAppearancePreferences
 import dev.brentdevs.yardhal.core.data.MessageKind
 import dev.brentdevs.yardhal.ui.image.LocalRemoteImageLoader
+import dev.brentdevs.yardhal.ui.image.RemoteImageState
 import dev.brentdevs.yardhal.ui.image.rememberRemoteImage
 import dev.brentdevs.yardhal.ui.theme.nickColor
 import java.time.Instant
@@ -343,17 +345,16 @@ private fun AttachmentPreview(
                 }
             }
         } else {
-            val image by rememberRemoteImage(LocalRemoteImageLoader.current, url, 512)
-            val loaded = image
+            val image = rememberRemoteImage(LocalRemoteImageLoader.current, url, 512).value
             Surface(
                 onClick = onOpen,
                 shape = RoundedCornerShape(12.dp),
                 color = MaterialTheme.colorScheme.surfaceVariant,
                 modifier = Modifier.padding(vertical = 4.dp),
             ) {
-                if (loaded != null) {
+                if (image is RemoteImageState.Success) {
                     Image(
-                        bitmap = loaded,
+                        bitmap = image.bitmap,
                         contentDescription = "Image attachment: $displayName",
                         contentScale = ContentScale.Fit,
                         modifier = Modifier
@@ -369,17 +370,35 @@ private fun AttachmentPreview(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(18.dp),
-                            strokeWidth = 2.dp,
-                        )
-                        Text(
-                            text = displayName,
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.primary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
+                        if (image == RemoteImageState.Loading) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp,
+                            )
+                        } else {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.OpenInNew,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(20.dp),
+                            )
+                        }
+                        Column {
+                            Text(
+                                text = displayName,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.primary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            if (image == RemoteImageState.Unavailable) {
+                                Text(
+                                    text = "Preview unavailable · Open externally",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.primary,
+                                )
+                            }
+                        }
                     }
                 }
             }

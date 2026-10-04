@@ -13,17 +13,22 @@ architecture of the Halyard iOS client.
 - **Chat** — server-time ordering, chathistory backfill, per-conversation
   Room-backed scrollback, message grouping, avatars, mIRC formatting
   (colors, bold/italic/underline/strike, hex), unread markers with a
-  jump-to-unread divider
+  jump-to-unread divider, expandable membership events, clickable channel/nick
+  links, and a formatting toolbar that rejects formatting-only drafts
 - **IRCv3 affordances** — reactions, replies, redaction, typing indicators,
   mention highlights, `MARKREAD` mirroring, netsplit collapse
-- **Navigation** — per-network channel tree with pins, custom groups, DMs,
-  last-message previews, unread sorting, swipe gestures, member sheet with
-  role sections (operators/voices/bots/users) and per-member kick/ban/ignore
+- **Navigation** — collapsible per-network channel tree with pins, custom groups,
+  DMs, server console, last-message previews, unread sorting, swipe gestures,
+  member sheet with role sections (operators/voices/bots/users) and per-member
+  kick/ban/ignore; network collapse state survives navigation and rotation
 - **Search** — SQLite FTS4 index over all history with snippet results
 - **Bouncers** — ZNC playback handling; soju `bouncer-networks` add/edit/
   connect/disconnect via the `BouncerServ` service commands
-- **Media** — file uploads through the IRCv3 filehost extension
-- **Themes** — TOML theme files applied to the Material 3 scheme
+- **Media** — file uploads through the IRCv3 filehost extension; tap-to-load image
+  previews for `+draft/attachment` messages, with an external-open fallback when
+  previews are unavailable (ordinary image URLs remain text links)
+- **Themes** — TOML theme files applied to the Material 3 scheme, opt-in Material
+  You colors, AMOLED backgrounds, and transcript font, spacing and size controls
 
 ## Quick start (NixOS)
 
