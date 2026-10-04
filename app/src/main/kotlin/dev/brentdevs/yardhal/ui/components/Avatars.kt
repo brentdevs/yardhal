@@ -129,10 +129,12 @@ public fun HighlightedSurface(
             .clip(RoundedCornerShape(6.dp))
             .background(tint)
             .drawBehind {
+                val barWidth = 3.5.dp.toPx()
+                val x = if (layoutDirection == androidx.compose.ui.unit.LayoutDirection.Rtl) size.width - barWidth else 0f
                 drawRoundRect(
                     color = accent,
-                    topLeft = Offset.Zero,
-                    size = Size(3.5.dp.toPx(), size.height),
+                    topLeft = Offset(x, 0f),
+                    size = Size(barWidth, size.height),
                     cornerRadius = CornerRadius(2.dp.toPx(), 2.dp.toPx()),
                 )
             }

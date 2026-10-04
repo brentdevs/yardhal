@@ -18,10 +18,10 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.DriveFileMove
 import androidx.compose.material.icons.automirrored.filled.Reply
-import androidx.compose.material.icons.filled.AlternateEmail
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
@@ -43,37 +43,39 @@ import androidx.compose.material.icons.filled.Tag
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
-import androidx.compose.material3.Card
-import androidx.compose.material3.FilledTonalButton
-import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
-import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -90,6 +92,8 @@ import dev.brentdevs.yardhal.ui.components.NetworkBadge
 import dev.brentdevs.yardhal.ui.components.NewMessagesDivider
 import dev.brentdevs.yardhal.ui.components.NickAvatar
 import dev.brentdevs.yardhal.ui.components.StatusDot
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
@@ -134,9 +138,9 @@ private fun buildTranscript(buffer: ConversationBuffer): List<TranscriptEntry> {
             val isGrouped = grouped[origIndex].groupedWithPrevious
             entries.add(TranscriptEntry.Message(single, isGrouped))
         } else {
-            val oldestId = pendingEvents.last().second.localId
+            val newestId = pendingEvents.first().second.localId
             val eventsInChronologicalOrder = pendingEvents.map { it.second }.reversed()
-            entries.add(TranscriptEntry.CollapsedEvents(eventsInChronologicalOrder, "collapsed-$oldestId"))
+            entries.add(TranscriptEntry.CollapsedEvents(eventsInChronologicalOrder, "collapsed-$newestId"))
         }
         pendingEvents.clear()
     }
@@ -145,12 +149,12 @@ private fun buildTranscript(buffer: ConversationBuffer): List<TranscriptEntry> {
         val message = ordered[index]
         val timestamp = message.timestampMs
         val date = Instant.ofEpochMilli(timestamp).atZone(zone).toLocalDate()
-        if (date != lastDate) {
+        if (lastDate != null && date != lastDate) {
             flushEvents()
-            entries.add(TranscriptEntry.DayHeader(formatDayLabel(date)))
-            lastDate = date
+            entries.add(TranscriptEntry.DayHeader(formatDayLabel(lastDate)))
             previousTimestamp = Long.MAX_VALUE
         }
+        lastDate = date
         if (unreadFrom != null && timestamp < unreadFrom && previousTimestamp >= unreadFrom) {
             flushEvents()
             entries.add(TranscriptEntry.UnreadDivider("New messages"))
@@ -168,6 +172,10 @@ private fun buildTranscript(buffer: ConversationBuffer): List<TranscriptEntry> {
         previousTimestamp = timestamp
     }
     flushEvents()
+
+    if (lastDate != null) {
+        entries.add(TranscriptEntry.DayHeader(formatDayLabel(lastDate)))
+    }
 
     if (unreadFrom != null && !renderedUnreadDivider) {
         entries.add(TranscriptEntry.UnreadDivider("New messages"))
@@ -223,6 +231,7 @@ public fun ConversationScreen(
     var actionTarget by remember { mutableStateOf<ChatMessage?>(null) }
     var membersVisible by remember { mutableStateOf(false) }
     var memberTarget by remember { mutableStateOf<String?>(null) }
+    var memberQuery by rememberSaveable { mutableStateOf("") }
     var overflowVisible by remember { mutableStateOf(false) }
     val context = LocalContext.current
     fun openLink(url: String) {
@@ -455,6 +464,7 @@ public fun ConversationScreen(
                                     onOpenAttachment = ::openLink,
                                     onOpenChannel = onOpenChannel,
                                     onOpenNick = onOpenDm,
+                                    onOpenUrl = ::openLink,
                                     profile = message.sender.takeIf { it.isNotEmpty() }?.let(profiles::forNick),
                                 )
                             }
@@ -611,8 +621,7 @@ public fun ConversationScreen(
         }
     }
 
-    if (membersVisible && memberTarget == null) {
-        var memberQuery by rememberSaveable { mutableStateOf("") }
+    if (membersVisible) {
         val operators = buffer.members.filter { it.isOperator }
         val voices = buffer.members.filter { it.isVoice }
         val isBot: (dev.brentdevs.yardhal.core.data.ChannelMember) -> Boolean = { member ->
@@ -668,22 +677,22 @@ public fun ConversationScreen(
             }
             LazyColumn(modifier = Modifier.padding(horizontal = 8.dp)) {
                 val sections = listOf(
-                    "Operators (${filteredOps.size})" to filteredOps,
-                    "Voices (${filteredVoices.size})" to filteredVoices,
-                    "Bots & Relays (${filteredBots.size})" to filteredBots,
-                    "Users (${filteredPlain.size})" to filteredPlain,
+                    Triple("ops", "Operators (${filteredOps.size})", filteredOps),
+                    Triple("voices", "Voices (${filteredVoices.size})", filteredVoices),
+                    Triple("bots", "Bots & Relays (${filteredBots.size})", filteredBots),
+                    Triple("users", "Users (${filteredPlain.size})", filteredPlain),
                 )
-                for ((label, section) in sections) {
+                for ((id, title, section) in sections) {
                     if (section.isEmpty()) continue
-                    item(key = "section-$label") {
+                    item(key = "section-$id") {
                         Text(
-                            text = label,
+                            text = title,
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.padding(start = 12.dp, top = 12.dp, bottom = 2.dp),
                         )
                     }
-                    items(section.size, key = { index -> "member-${label}-${section[index].nick}" }) { index ->
+                    items(section.size, key = { index -> "member-$id-${section[index].nick}" }) { index ->
                         val member = section[index]
                         val presence = buffer.memberPresence[member.nick]
                         val memberProfile = profiles.forNick(member.nick)
@@ -692,6 +701,7 @@ public fun ConversationScreen(
                                 .fillMaxWidth()
                                 .clip(RoundedCornerShape(8.dp))
                                 .clickable { memberTarget = member.nick }
+                                .defaultMinSize(minHeight = 48.dp)
                                 .padding(horizontal = 12.dp, vertical = 8.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
@@ -878,7 +888,7 @@ public fun ConversationScreen(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     FilledTonalButton(
-                        onClick = { onOpenDm(nick); memberTarget = null },
+                        onClick = { onOpenDm(nick); memberTarget = null; membersVisible = false },
                         modifier = Modifier.weight(1f),
                     ) {
                         Icon(Icons.Filled.Mail, contentDescription = null, modifier = Modifier.size(18.dp))
@@ -943,9 +953,11 @@ private fun CollapsedEventsRow(
 ) {
     val containsTarget = focusedRowId != null && entry.events.any { it.storedRowId == focusedRowId }
     var expanded by rememberSaveable(entry.id) { mutableStateOf(false) }
+    var autoExpandedTarget by rememberSaveable(entry.id) { mutableStateOf(false) }
     androidx.compose.runtime.LaunchedEffect(containsTarget) {
-        if (containsTarget) {
+        if (containsTarget && !autoExpandedTarget) {
             expanded = true
+            autoExpandedTarget = true
         }
     }
     val fontFamily = if (appearance.monospaceFont) androidx.compose.ui.text.font.FontFamily.Monospace else null
@@ -967,9 +979,15 @@ private fun CollapsedEventsRow(
             shape = RoundedCornerShape(12.dp),
             color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
             onClick = { expanded = !expanded },
+            modifier = Modifier.defaultMinSize(minHeight = 48.dp),
         ) {
             Row(
-                modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp),
+                modifier = Modifier
+                    .defaultMinSize(minHeight = 48.dp)
+                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                    .semantics {
+                        stateDescription = if (expanded) "Expanded" else "Collapsed"
+                    },
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
@@ -1038,6 +1056,18 @@ private sealed interface OverviewEntry {
     ) : OverviewEntry
 }
 
+private fun countUnreadMessages(buffer: ConversationBuffer): Int {
+    if (!buffer.hasUnread) return 0
+    val cutoff = buffer.unreadFromTimestampMs ?: buffer.readAtMs
+    var count = 0
+    for (i in buffer.messages.indices.reversed()) {
+        val msg = buffer.messages[i]
+        if (msg.timestampMs < cutoff) break
+        if (msg.countsAsUnread) count++
+    }
+    return count
+}
+
 private fun buildOverviewEntries(
     networks: List<dev.brentdevs.yardhal.coordinator.UiNetwork>,
     buffers: List<ConversationBuffer>,
@@ -1055,12 +1085,12 @@ private fun buildOverviewEntries(
         }
         val isCollapsed = network.id in collapsedNetworkIds
         val netHasUnread = own.any { it.hasUnread }
-        val netUnreadCount = own.count { it.hasUnread }
+        val netUnreadCount = own.sumOf { countUnreadMessages(it) }
         entries.add(OverviewEntry.NetworkHeader(network, isCollapsed, netHasUnread, netUnreadCount))
 
-        if (isCollapsed) continue
-
         entries.add(OverviewEntry.ServerRow(network.id, network.name))
+
+        if (isCollapsed) continue
 
         val channels = own.filter { it.ref.kind == dev.brentdevs.yardhal.core.data.ConversationKind.CHANNEL }
         val directs = own.filter { it.ref.kind == dev.brentdevs.yardhal.core.data.ConversationKind.DIRECT_MESSAGE }
@@ -1146,7 +1176,11 @@ public fun NetworkOverviewScreen(
     var pendingLeave by remember { mutableStateOf<ConversationBuffer?>(null) }
     var moveTarget by remember { mutableStateOf<String?>(null) }
     var newGroupName by remember { mutableStateOf("") }
-    var collapsedNetworkIds by rememberSaveable { mutableStateOf(emptySet<String>()) }
+    val stringSetSaver = listSaver<Set<String>, String>(
+        save = { it.toList() },
+        restore = { it.toSet() },
+    )
+    var collapsedNetworkIds by rememberSaveable(stateSaver = stringSetSaver) { mutableStateOf(emptySet<String>()) }
 
     val entries = remember(networks, buffers, mutedKeys, orderState, collapsedNetworkIds) {
         buildOverviewEntries(networks, buffers, mutedKeys, orderState, collapsedNetworkIds)
@@ -1301,16 +1335,21 @@ public fun NetworkOverviewScreen(
                 when (val entry = entries[index]) {
                     is OverviewEntry.NetworkHeader -> {
                         val network = entry.network
+                        val toggleCollapse = {
+                            collapsedNetworkIds = if (entry.isCollapsed) {
+                                collapsedNetworkIds - network.id
+                            } else {
+                                collapsedNetworkIds + network.id
+                            }
+                        }
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clickable {
-                                    collapsedNetworkIds = if (entry.isCollapsed) {
-                                        collapsedNetworkIds - network.id
-                                    } else {
-                                        collapsedNetworkIds + network.id
-                                    }
-                                }
+                                .clickable(
+                                    role = Role.Button,
+                                    onClickLabel = if (entry.isCollapsed) "Expand ${network.name}" else "Collapse ${network.name}",
+                                    onClick = toggleCollapse,
+                                )
                                 .defaultMinSize(minHeight = 56.dp)
                                 .padding(start = 16.dp, end = 12.dp, top = 14.dp, bottom = 4.dp),
                             verticalAlignment = Alignment.CenterVertically,
@@ -1332,29 +1371,20 @@ public fun NetworkOverviewScreen(
                                 }
                             }
                             if (entry.isCollapsed && entry.hasUnread) {
+                                val netBadgeText = if (entry.unreadCount > 99) "99+" else if (entry.unreadCount > 0) "${entry.unreadCount}" else "•"
                                 Badge(
                                     containerColor = MaterialTheme.colorScheme.primary,
                                     contentColor = MaterialTheme.colorScheme.onPrimary,
                                 ) {
-                                    Text(if (entry.unreadCount > 0) "${entry.unreadCount}" else "•")
+                                    Text(netBadgeText)
                                 }
                                 Spacer(modifier = Modifier.width(4.dp))
                             }
-                            IconButton(
-                                onClick = {
-                                    collapsedNetworkIds = if (entry.isCollapsed) {
-                                        collapsedNetworkIds - network.id
-                                    } else {
-                                        collapsedNetworkIds + network.id
-                                    }
-                                },
-                                modifier = Modifier.size(32.dp),
-                            ) {
-                                Icon(
-                                    imageVector = if (entry.isCollapsed) Icons.Filled.ExpandMore else Icons.Filled.ExpandLess,
-                                    contentDescription = if (entry.isCollapsed) "Expand ${network.name}" else "Collapse ${network.name}",
-                                )
-                            }
+                            Icon(
+                                imageVector = if (entry.isCollapsed) Icons.Filled.ExpandMore else Icons.Filled.ExpandLess,
+                                contentDescription = null,
+                                modifier = Modifier.size(24.dp).padding(4.dp),
+                            )
                             Box {
                                 IconButton(onClick = { networkMenuFor = network.id }) {
                                     Icon(Icons.Filled.MoreVert, contentDescription = "${network.name} options")
@@ -1438,13 +1468,19 @@ public fun NetworkOverviewScreen(
                         val buffer = entry.buffer
                         val last = buffer.messages.lastOrNull()
                         val isChannel = buffer.ref.kind == dev.brentdevs.yardhal.core.data.ConversationKind.CHANNEL
-                        val unreadCount = if (!buffer.hasUnread) 0 else {
-                            val cutoff = buffer.unreadFromTimestampMs ?: buffer.readAtMs
-                            buffer.messages.count { it.countsAsUnread && it.timestampMs >= cutoff }
-                        }
+                        val unreadCount = countUnreadMessages(buffer)
                         val hasMention = if (!buffer.hasUnread) false else {
                             val cutoff = buffer.unreadFromTimestampMs ?: buffer.readAtMs
-                            buffer.messages.any { it.highlightsMe && it.timestampMs >= cutoff }
+                            var found = false
+                            for (i in buffer.messages.indices.reversed()) {
+                                val msg = buffer.messages[i]
+                                if (msg.timestampMs < cutoff) break
+                                if (msg.highlightsMe) {
+                                    found = true
+                                    break
+                                }
+                            }
+                            found
                         }
                         val dismissState = androidx.compose.material3.rememberSwipeToDismissBoxState(
                             confirmValueChange = { value ->
@@ -1567,19 +1603,20 @@ public fun NetworkOverviewScreen(
                                 }
                                 if (buffer.hasUnread) {
                                     Spacer(modifier = Modifier.width(8.dp))
+                                    val badgeText = if (unreadCount > 99) "99+" else if (unreadCount > 0) "$unreadCount" else if (hasMention) "!" else "•"
                                     if (hasMention) {
                                         Badge(
                                             containerColor = MaterialTheme.colorScheme.error,
                                             contentColor = MaterialTheme.colorScheme.onError,
                                         ) {
-                                            Text(if (unreadCount > 0) "$unreadCount" else "!")
+                                            Text(badgeText)
                                         }
                                     } else {
                                         Badge(
                                             containerColor = MaterialTheme.colorScheme.surfaceVariant,
                                             contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
                                         ) {
-                                            Text(if (unreadCount > 0) "$unreadCount" else "•")
+                                            Text(badgeText)
                                         }
                                     }
                                 }

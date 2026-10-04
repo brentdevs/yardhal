@@ -159,10 +159,19 @@ class SlashCommandParserTests {
     fun monitorParsesSubcommandsAndSyntax() {
         assertEquals(SlashCommand.MonitorAdd("alice"), parse("/monitor + alice"))
         assertEquals(SlashCommand.MonitorAdd("alice"), parse("/monitor +alice"))
+        assertEquals(SlashCommand.MonitorAdd("alice,bob"), parse("/monitor + alice bob"))
+        assertEquals(SlashCommand.MonitorAdd("alice,bob"), parse("/monitor +alice bob"))
         assertEquals(SlashCommand.MonitorRemove("bob"), parse("/monitor - bob"))
         assertEquals(SlashCommand.MonitorRemove("bob"), parse("/monitor -bob"))
+        assertEquals(SlashCommand.MonitorRemove("alice,bob"), parse("/monitor - alice bob"))
         assertEquals(SlashCommand.MonitorList, parse("/monitor"))
         assertEquals(SlashCommand.MonitorList, parse("/monitor list"))
         assertEquals(SlashCommand.MonitorList, parse("/monitor ls"))
+        assertEquals(SlashCommand.MonitorClear, parse("/monitor c"))
+        assertEquals(SlashCommand.MonitorClear, parse("/monitor clear"))
+        assertEquals(SlashCommand.MonitorStatus, parse("/monitor s"))
+        assertEquals(SlashCommand.MonitorStatus, parse("/monitor status"))
+        assertNull(parse("/monitor +"))
+        assertNull(parse("/monitor -"))
     }
 }

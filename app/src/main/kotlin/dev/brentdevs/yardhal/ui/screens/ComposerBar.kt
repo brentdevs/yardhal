@@ -1,17 +1,20 @@
 package dev.brentdevs.yardhal.ui.screens
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -56,6 +59,7 @@ private const val STRIKETHROUGH_CHAR = '\u001E'
 private const val MONOSPACE_CHAR = '\u0011'
 private const val RESET_CHAR = '\u000F'
 private val TOKEN_DELIMITERS = charArrayOf(' ', '\n', '\t', '\u0002', '\u001d', '\u001f', '\u001e', '\u0011', '\u000f', '\u0003', '\u0004', '\u0016')
+private val IRC_FORMAT_RESET_REGEX = Regex("\u0003(?:\\d{1,2}(?:,\\d{1,2})?)?|\u0004(?:[0-9a-fA-F]{6}(?:,[0-9a-fA-F]{6})?)?|[\u0002\u001d\u001f\u001e\u0011\u0016\u000f]")
 
 private data class CommandInfo(
     val command: String,
@@ -76,9 +80,9 @@ private val COMMANDS = listOf(
     CommandInfo("/away", "/away [message]", "Set away message"),
     CommandInfo("/back", "/back", "Clear away status"),
     CommandInfo("/quote", "/quote <raw>", "Send raw IRC line"),
-    CommandInfo("/monitor", "/monitor [+|-] [nick]", "Online monitor list"),
-    CommandInfo("/ignore", "/ignore <nick>", "Ignore user"),
-    CommandInfo("/unignore", "/unignore <nick>", "Unignore user"),
+    CommandInfo("/monitor", "/monitor [+|-|c|s] [nick]", "Online monitor list"),
+    CommandInfo("/ignore", "/ignore <mask|nick>", "Ignore user"),
+    CommandInfo("/unignore", "/unignore <mask|nick>", "Unignore user"),
     CommandInfo("/mode", "/mode [target] [modes]", "Channel or user modes"),
     CommandInfo("/help", "/help [command]", "Show command help"),
 )
@@ -104,6 +108,8 @@ private sealed interface SuggestionItem {
         override val isChannel: Boolean get() = true
     }
 }
+
+private fun hasSendableContent(text: String): Boolean = text.isNotBlank()
 
 @Composable
 public fun ComposerBar(
@@ -192,13 +198,17 @@ public fun ComposerBar(
             val start = draft.selection.min
             val end = draft.selection.max
             val updated = if (code == RESET_CHAR) {
-                val stripped = selectedText.filter { it.code >= 0x20 }
+                val stripped = IRC_FORMAT_RESET_REGEX.replace(selectedText, "")
                 draft.text.replaceRange(start, end, stripped)
             } else {
                 val wrapped = "$code$selectedText$code"
                 draft.text.replaceRange(start, end, wrapped)
             }
-            val newLength = if (code == RESET_CHAR) selectedText.filter { it.code >= 0x20 }.length else selectedText.length + 2
+            val newLength = if (code == RESET_CHAR) {
+                IRC_FORMAT_RESET_REGEX.replace(selectedText, "").length
+            } else {
+                selectedText.length + 2
+            }
             draft = TextFieldValue(updated, TextRange(start + newLength))
         } else {
             val cursor = draft.selection.start.coerceIn(0, draft.text.length)
@@ -209,8 +219,8 @@ public fun ComposerBar(
     }
 
     fun submit() {
-        val text = draft.text.trimEnd { it == ' ' || it == '\t' || it == '\n' || it == '\r' }
-        if (text.isEmpty()) return
+        val text = draft.text.trimEnd()
+        if (!hasSendableContent(text)) return
         if (onSend(text)) {
             draft = TextFieldValue("")
             sendError = false
@@ -225,8 +235,8 @@ public fun ComposerBar(
 
         AnimatedVisibility(
             visible = candidates.isNotEmpty(),
-            enter = fadeIn(),
-            exit = fadeOut(),
+            enter = expandVertically() + fadeIn(),
+            exit = shrinkVertically() + fadeOut(),
         ) {
             Row(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -243,6 +253,7 @@ public fun ComposerBar(
                                 shape = RoundedCornerShape(12.dp),
                                 color = MaterialTheme.colorScheme.surfaceContainerHigh,
                                 tonalElevation = 1.dp,
+                                modifier = Modifier.defaultMinSize(minHeight = 48.dp),
                             ) {
                                 Row(
                                     verticalAlignment = Alignment.CenterVertically,
@@ -269,6 +280,7 @@ public fun ComposerBar(
                                 shape = RoundedCornerShape(12.dp),
                                 color = MaterialTheme.colorScheme.surfaceContainerHigh,
                                 tonalElevation = 1.dp,
+                                modifier = Modifier.defaultMinSize(minHeight = 48.dp),
                             ) {
                                 Row(
                                     verticalAlignment = Alignment.CenterVertically,
@@ -291,6 +303,7 @@ public fun ComposerBar(
                                 shape = RoundedCornerShape(12.dp),
                                 color = MaterialTheme.colorScheme.surfaceContainerHigh,
                                 tonalElevation = 1.dp,
+                                modifier = Modifier.defaultMinSize(minHeight = 48.dp),
                             ) {
                                 Row(
                                     verticalAlignment = Alignment.CenterVertically,
@@ -304,7 +317,7 @@ public fun ComposerBar(
                                         tint = MaterialTheme.colorScheme.primary,
                                     )
                                     Text(
-                                        text = candidate.channel.removePrefix("#"),
+                                        text = candidate.channel,
                                         style = MaterialTheme.typography.labelMedium,
                                         fontWeight = FontWeight.SemiBold,
                                         color = MaterialTheme.colorScheme.onSurface,
@@ -319,8 +332,8 @@ public fun ComposerBar(
 
         AnimatedVisibility(
             visible = showFormattingBar,
-            enter = fadeIn(),
-            exit = fadeOut(),
+            enter = expandVertically() + fadeIn(),
+            exit = shrinkVertically() + fadeOut(),
         ) {
             Row(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -334,8 +347,12 @@ public fun ComposerBar(
                     onClick = { applyFormatting(BOLD_CHAR) },
                     shape = RoundedCornerShape(8.dp),
                     color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    modifier = Modifier.defaultMinSize(minWidth = 48.dp, minHeight = 48.dp),
                 ) {
-                    Box(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                    ) {
                         Icon(
                             imageVector = Icons.Filled.FormatBold,
                             contentDescription = "Bold",
@@ -347,8 +364,12 @@ public fun ComposerBar(
                     onClick = { applyFormatting(ITALIC_CHAR) },
                     shape = RoundedCornerShape(8.dp),
                     color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    modifier = Modifier.defaultMinSize(minWidth = 48.dp, minHeight = 48.dp),
                 ) {
-                    Box(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                    ) {
                         Icon(
                             imageVector = Icons.Filled.FormatItalic,
                             contentDescription = "Italic",
@@ -360,8 +381,12 @@ public fun ComposerBar(
                     onClick = { applyFormatting(UNDERLINE_CHAR) },
                     shape = RoundedCornerShape(8.dp),
                     color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    modifier = Modifier.defaultMinSize(minWidth = 48.dp, minHeight = 48.dp),
                 ) {
-                    Box(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                    ) {
                         Icon(
                             imageVector = Icons.Filled.FormatUnderlined,
                             contentDescription = "Underline",
@@ -373,8 +398,12 @@ public fun ComposerBar(
                     onClick = { applyFormatting(STRIKETHROUGH_CHAR) },
                     shape = RoundedCornerShape(8.dp),
                     color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    modifier = Modifier.defaultMinSize(minWidth = 48.dp, minHeight = 48.dp),
                 ) {
-                    Box(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                    ) {
                         Icon(
                             imageVector = Icons.Filled.FormatStrikethrough,
                             contentDescription = "Strikethrough",
@@ -386,8 +415,12 @@ public fun ComposerBar(
                     onClick = { applyFormatting(MONOSPACE_CHAR) },
                     shape = RoundedCornerShape(8.dp),
                     color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    modifier = Modifier.defaultMinSize(minWidth = 48.dp, minHeight = 48.dp),
                 ) {
-                    Box(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                    ) {
                         Icon(
                             imageVector = Icons.Filled.Code,
                             contentDescription = "Monospace",
@@ -399,13 +432,18 @@ public fun ComposerBar(
                     onClick = { applyFormatting(RESET_CHAR) },
                     shape = RoundedCornerShape(8.dp),
                     color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    modifier = Modifier.defaultMinSize(minWidth = 48.dp, minHeight = 48.dp),
                 ) {
-                    Text(
-                        text = "Reset",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.error,
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-                    )
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                    ) {
+                        Text(
+                            text = "Reset",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
                 }
             }
         }
@@ -433,7 +471,7 @@ public fun ComposerBar(
             IconButton(
                 onClick = onAttach,
                 enabled = enabled,
-                modifier = Modifier.size(40.dp),
+                modifier = Modifier.size(48.dp),
             ) {
                 Icon(
                     imageVector = Icons.Filled.AttachFile,
@@ -452,7 +490,7 @@ public fun ComposerBar(
                 trailingIcon = {
                     IconButton(
                         onClick = { showFormattingBar = !showFormattingBar },
-                        modifier = Modifier.size(32.dp),
+                        modifier = Modifier.size(48.dp),
                     ) {
                         Icon(
                             imageVector = Icons.Filled.TextFields,
@@ -473,11 +511,11 @@ public fun ComposerBar(
                 ),
                 maxLines = 5,
             )
-            val canSend = draft.text.isNotBlank() && (enabled || localCommandAvailable)
+            val canSend = hasSendableContent(draft.text) && (enabled || localCommandAvailable)
             FilledIconButton(
                 onClick = { submit() },
                 enabled = canSend,
-                modifier = Modifier.size(44.dp),
+                modifier = Modifier.size(48.dp),
                 colors = IconButtonDefaults.filledIconButtonColors(
                     containerColor = MaterialTheme.colorScheme.primary,
                     contentColor = MaterialTheme.colorScheme.onPrimary,

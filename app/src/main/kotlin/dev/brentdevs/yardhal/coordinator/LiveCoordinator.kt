@@ -1110,6 +1110,8 @@ public class LiveCoordinator(
                 sendLabeled(session, active, LabeledCommand.MONITOR, "MONITOR - ${command.nick}")
             }
             is SlashCommand.MonitorList -> sendLabeled(session, active, LabeledCommand.MONITOR, "MONITOR L")
+            is SlashCommand.MonitorClear -> sendLabeled(session, active, LabeledCommand.MONITOR, "MONITOR C")
+            is SlashCommand.MonitorStatus -> sendLabeled(session, active, LabeledCommand.MONITOR, "MONITOR S")
             is SlashCommand.WhoQuery -> sendLabeled(
                 session,
                 active,

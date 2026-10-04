@@ -7,6 +7,7 @@ import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.semantics.Role
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
@@ -56,8 +57,9 @@ import dev.brentdevs.yardhal.coordinator.ConnectionStatus
 import dev.brentdevs.yardhal.coordinator.ConversationBuffer
 import dev.brentdevs.yardhal.coordinator.LiveCoordinator
 import dev.brentdevs.yardhal.coordinator.NetworkProfiles
-import dev.brentdevs.yardhal.core.data.ConversationRef
+import dev.brentdevs.yardhal.core.data.ChatAppearancePreferences
 import dev.brentdevs.yardhal.core.data.ChatAppearanceStore
+import dev.brentdevs.yardhal.core.data.ConversationRef
 import dev.brentdevs.yardhal.ui.screens.AddNetworkSheet
 import dev.brentdevs.yardhal.ui.screens.ConversationScreen
 import dev.brentdevs.yardhal.ui.screens.MessageSearchScreen
@@ -75,7 +77,7 @@ public fun YardhalAppRoot(
     onNetworkSaved: (NetworkDraft) -> Unit,
     sharedTextProvider: () -> String? = { null },
     onSharedConsumed: () -> Unit = {},
-    onAppearanceChanged: (dev.brentdevs.yardhal.core.data.ChatAppearancePreferences) -> Unit = {},
+    onAppearanceChanged: (ChatAppearancePreferences) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val networks by coordinator.networks.collectAsStateWithLifecycle()
@@ -446,6 +448,11 @@ public fun YardhalAppRoot(
     }
 
     if (appearanceVisible) {
+        val updateAppearance: (ChatAppearancePreferences) -> Unit = { updated ->
+            appearance = updated
+            appearanceStore.update(updated)
+            onAppearanceChanged(updated)
+        }
         ModalBottomSheet(onDismissRequest = { appearanceVisible = false }) {
             Column(
                 modifier = Modifier
@@ -460,15 +467,11 @@ public fun YardhalAppRoot(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
                         .fillMaxWidth()
+                        .defaultMinSize(minHeight = 48.dp)
                         .toggleable(
                             value = appearance.compact,
                             role = Role.Switch,
-                            onValueChange = { compact ->
-                                val updated = appearance.copy(compact = compact)
-                                appearance = updated
-                                appearanceStore.update(updated)
-                                onAppearanceChanged(updated)
-                            },
+                            onValueChange = { updateAppearance(appearance.copy(compact = it)) },
                         ),
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
@@ -485,15 +488,11 @@ public fun YardhalAppRoot(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
                         .fillMaxWidth()
+                        .defaultMinSize(minHeight = 48.dp)
                         .toggleable(
                             value = appearance.monospaceFont,
                             role = Role.Switch,
-                            onValueChange = { mono ->
-                                val updated = appearance.copy(monospaceFont = mono)
-                                appearance = updated
-                                appearanceStore.update(updated)
-                                onAppearanceChanged(updated)
-                            },
+                            onValueChange = { updateAppearance(appearance.copy(monospaceFont = it)) },
                         ),
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
@@ -511,15 +510,11 @@ public fun YardhalAppRoot(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier
                             .fillMaxWidth()
+                            .defaultMinSize(minHeight = 48.dp)
                             .toggleable(
                                 value = appearance.dynamicColor,
                                 role = Role.Switch,
-                                onValueChange = { dynamic ->
-                                    val updated = appearance.copy(dynamicColor = dynamic)
-                                    appearance = updated
-                                    appearanceStore.update(updated)
-                                    onAppearanceChanged(updated)
-                                },
+                                onValueChange = { updateAppearance(appearance.copy(dynamicColor = it)) },
                             ),
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
@@ -537,15 +532,11 @@ public fun YardhalAppRoot(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
                         .fillMaxWidth()
+                        .defaultMinSize(minHeight = 48.dp)
                         .toggleable(
                             value = appearance.amoledDark,
                             role = Role.Switch,
-                            onValueChange = { amoled ->
-                                val updated = appearance.copy(amoledDark = amoled)
-                                appearance = updated
-                                appearanceStore.update(updated)
-                                onAppearanceChanged(updated)
-                            },
+                            onValueChange = { updateAppearance(appearance.copy(amoledDark = it)) },
                         ),
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
@@ -566,13 +557,8 @@ public fun YardhalAppRoot(
                     ) {
                         listOf("Small" to 0.9f, "Default" to 1f, "Large" to 1.15f, "Extra Large" to 1.25f).forEach { (label, scale) ->
                             FilterChip(
-                                selected = appearance.textScale == scale,
-                                onClick = {
-                                    val updated = appearance.copy(textScale = scale)
-                                    appearance = updated
-                                    appearanceStore.update(updated)
-                                    onAppearanceChanged(updated)
-                                },
+                                selected = kotlin.math.abs(appearance.textScale - scale) < 0.01f,
+                                onClick = { updateAppearance(appearance.copy(textScale = scale)) },
                                 label = { Text(label) },
                             )
                         }

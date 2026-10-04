@@ -15,25 +15,33 @@ import dev.brentdevs.yardhal.core.protocol.IrcFormatting
 import dev.brentdevs.yardhal.ui.theme.IrcPalette
 
 private val URL_REGEX = Regex("""https?://[^\s<>"{}|\\^`\[\]]+""", RegexOption.IGNORE_CASE)
-private val CHANNEL_REGEX = Regex("""(?<![^\s(\[<])([#&][a-zA-Z][a-zA-Z0-9_\-+.~/]*)(?=[,\s)\]>.:;!?]|$)""")
-private val MENTION_REGEX = Regex("""(?<![^\s(\[<])@([a-zA-Z0-9_\\\[\]\{\}\^`|-]+)""")
+private val CHANNEL_REGEX = Regex("""(?<![^\s(\[<])((?:##|[#&])[a-zA-Z0-9_\-+.~/]+)""")
+private val MENTION_REGEX = Regex("""(?<![^\s(\[<])@([a-zA-Z_\\\[\]\{\}\^`|][a-zA-Z0-9_\\\[\]\{\}\^`|-]*)""")
+private val HEX_COLOR_REGEX = Regex("""^#[0-9a-fA-F]{3,8}$""")
+private val HTML_ENTITY_REGEX = Regex("""^&(?:amp|lt|gt|quot|apos|nbsp);?$""", RegexOption.IGNORE_CASE)
 
 @Composable
 public fun formattedMessage(
     text: String,
     onOpenChannel: ((String) -> Unit)? = null,
     onOpenNick: ((String) -> Unit)? = null,
+    onOpenUrl: ((String) -> Unit)? = null,
+    defaultColor: Color = Color.Unspecified,
+    defaultFontStyle: FontStyle? = null,
 ): AnnotatedString {
     val linkColor = MaterialTheme.colorScheme.primary
     val mentionColor = MaterialTheme.colorScheme.tertiary
 
-    return remember(text, linkColor, mentionColor, onOpenChannel, onOpenNick) {
+    return remember(text, linkColor, mentionColor, onOpenChannel, onOpenNick, onOpenUrl, defaultColor, defaultFontStyle) {
         buildFormattedMessage(
             text = text,
             linkColor = linkColor,
             mentionColor = mentionColor,
             onOpenChannel = onOpenChannel,
             onOpenNick = onOpenNick,
+            onOpenUrl = onOpenUrl,
+            defaultColor = defaultColor,
+            defaultFontStyle = defaultFontStyle,
         )
     }
 }
@@ -44,6 +52,9 @@ public fun buildFormattedMessage(
     mentionColor: Color,
     onOpenChannel: ((String) -> Unit)? = null,
     onOpenNick: ((String) -> Unit)? = null,
+    onOpenUrl: ((String) -> Unit)? = null,
+    defaultColor: Color = Color.Unspecified,
+    defaultFontStyle: FontStyle? = null,
 ): AnnotatedString {
     val spans = IrcFormatting.parse(text)
     if (spans.isEmpty()) return AnnotatedString("")
@@ -58,6 +69,17 @@ public fun buildFormattedMessage(
     }
     val fullText = sb.toString()
     val builder = AnnotatedString.Builder(fullText)
+
+    if (defaultColor != Color.Unspecified || defaultFontStyle != null) {
+        builder.addStyle(
+            SpanStyle(
+                color = defaultColor,
+                fontStyle = defaultFontStyle,
+            ),
+            0,
+            fullText.length,
+        )
+    }
 
     for ((range, style) in spanRanges) {
         if (range.isEmpty()) continue
@@ -98,50 +120,90 @@ public fun buildFormattedMessage(
             urlMatch -> {
                 val (cleanUrl, _) = stripTrailingPunctuation(nextMatch.value)
                 val end = matchStart + cleanUrl.length
-                builder.addLink(LinkAnnotation.Url(cleanUrl, styles = linkStyles), matchStart, end)
+                val linkAnnotation = if (onOpenUrl != null) {
+                    LinkAnnotation.Url(
+                        cleanUrl,
+                        styles = linkStyles,
+                        linkInteractionListener = { onOpenUrl(cleanUrl) },
+                    )
+                } else {
+                    LinkAnnotation.Url(cleanUrl, styles = linkStyles)
+                }
+                builder.addLink(linkAnnotation, matchStart, end)
                 builder.addStyle(SpanStyle(color = linkColor, textDecoration = TextDecoration.Underline), matchStart, end)
-                cursor = matchEnd
+                cursor = end
             }
             channelMatch -> {
-                val channel = nextMatch.groupValues[1]
-                val end = matchStart + channel.length
-                val isHtmlEntity = channel.startsWith("&") && (channel == "&amp" || channel == "&lt" || channel == "&gt" || channel == "&quot")
-                if (!isHtmlEntity && onOpenChannel != null) {
-                    builder.addLink(
-                        LinkAnnotation.Clickable(
-                            tag = channel,
-                            styles = channelStyles,
-                            linkInteractionListener = { onOpenChannel(channel) },
-                        ),
-                        matchStart,
-                        end,
-                    )
-                    builder.addStyle(SpanStyle(color = linkColor, fontWeight = FontWeight.SemiBold), matchStart, end)
+                val (cleanChannel, _) = stripTrailingPunctuation(nextMatch.groupValues[1])
+                val isHex = HEX_COLOR_REGEX.matches(cleanChannel)
+                val isEntity = HTML_ENTITY_REGEX.matches(cleanChannel)
+                val hasLetter = cleanChannel.any { it.isLetter() }
+                if (!isHex && !isEntity && hasLetter) {
+                    val end = matchStart + cleanChannel.length
+                    if (onOpenChannel != null) {
+                        builder.addLink(
+                            LinkAnnotation.Clickable(
+                                tag = cleanChannel,
+                                styles = channelStyles,
+                                linkInteractionListener = { onOpenChannel(cleanChannel) },
+                            ),
+                            matchStart,
+                            end,
+                        )
+                        builder.addStyle(SpanStyle(color = linkColor, fontWeight = FontWeight.SemiBold), matchStart, end)
+                    }
+                    cursor = end
+                } else {
+                    cursor = matchEnd
                 }
-                cursor = matchEnd
             }
             mentionMatch -> {
-                val nick = nextMatch.groupValues[1]
-                val end = matchStart + nextMatch.value.length
-                val isBroadcast = nick.equals("here", ignoreCase = true) || nick.equals("everyone", ignoreCase = true)
-                if (!isBroadcast && onOpenNick != null) {
-                    builder.addLink(
-                        LinkAnnotation.Clickable(
-                            tag = nick,
-                            styles = mentionStyles,
-                            linkInteractionListener = { onOpenNick(nick) },
-                        ),
-                        matchStart,
-                        end,
-                    )
-                    builder.addStyle(SpanStyle(color = mentionColor, fontWeight = FontWeight.SemiBold), matchStart, end)
+                val (cleanNick, _) = stripTrailingBrackets(nextMatch.groupValues[1])
+                if (cleanNick.isNotEmpty()) {
+                    val end = matchStart + 1 + cleanNick.length
+                    val isBroadcast = cleanNick.equals("here", ignoreCase = true) || cleanNick.equals("everyone", ignoreCase = true)
+                    if (!isBroadcast && onOpenNick != null) {
+                        builder.addLink(
+                            LinkAnnotation.Clickable(
+                                tag = cleanNick,
+                                styles = mentionStyles,
+                                linkInteractionListener = { onOpenNick(cleanNick) },
+                            ),
+                            matchStart,
+                            end,
+                        )
+                        builder.addStyle(SpanStyle(color = mentionColor, fontWeight = FontWeight.SemiBold), matchStart, end)
+                    }
+                    cursor = end
+                } else {
+                    cursor = matchEnd
                 }
-                cursor = matchEnd
             }
         }
     }
 
     return builder.toAnnotatedString()
+}
+
+private fun stripTrailingBrackets(token: String): Pair<String, String> {
+    var clean = token
+    var trailing = ""
+    while (clean.isNotEmpty()) {
+        val last = clean.last()
+        if (last == ')' && clean.count { it == '(' } < clean.count { it == ')' }) {
+            trailing = last + trailing
+            clean = clean.dropLast(1)
+        } else if (last == ']' && clean.count { it == '[' } < clean.count { it == ']' }) {
+            trailing = last + trailing
+            clean = clean.dropLast(1)
+        } else if (last == '}' && clean.count { it == '{' } < clean.count { it == '}' }) {
+            trailing = last + trailing
+            clean = clean.dropLast(1)
+        } else {
+            break
+        }
+    }
+    return clean to trailing
 }
 
 private fun stripTrailingPunctuation(url: String): Pair<String, String> {
