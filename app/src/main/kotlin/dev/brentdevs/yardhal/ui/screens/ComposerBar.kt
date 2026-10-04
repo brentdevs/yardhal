@@ -55,6 +55,7 @@ private const val UNDERLINE_CHAR = '\u001F'
 private const val STRIKETHROUGH_CHAR = '\u001E'
 private const val MONOSPACE_CHAR = '\u0011'
 private const val RESET_CHAR = '\u000F'
+private val TOKEN_DELIMITERS = charArrayOf(' ', '\n', '\t', '\u0002', '\u001d', '\u001f', '\u001e', '\u0011', '\u000f', '\u0003', '\u0004', '\u0016')
 
 private data class CommandInfo(
     val command: String,
@@ -75,11 +76,10 @@ private val COMMANDS = listOf(
     CommandInfo("/away", "/away [message]", "Set away message"),
     CommandInfo("/back", "/back", "Clear away status"),
     CommandInfo("/quote", "/quote <raw>", "Send raw IRC line"),
-    CommandInfo("/monitor", "/monitor [+/-nick]", "Online monitor list"),
+    CommandInfo("/monitor", "/monitor [+|-] [nick]", "Online monitor list"),
     CommandInfo("/ignore", "/ignore <nick>", "Ignore user"),
     CommandInfo("/unignore", "/unignore <nick>", "Unignore user"),
     CommandInfo("/mode", "/mode [target] [modes]", "Channel or user modes"),
-    CommandInfo("/clear", "/clear", "Clear scrollback"),
     CommandInfo("/help", "/help [command]", "Show command help"),
 )
 
@@ -134,7 +134,7 @@ public fun ComposerBar(
 
     fun tokenStart(): Int {
         val cursor = draft.selection.start.coerceIn(0, draft.text.length)
-        return draft.text.lastIndexOfAny(charArrayOf(' ', '\n', '\t'), cursor - 1) + 1
+        return draft.text.lastIndexOfAny(TOKEN_DELIMITERS, cursor - 1) + 1
     }
 
     fun suggestions(): List<SuggestionItem> {
@@ -169,7 +169,7 @@ public fun ComposerBar(
     fun complete(candidate: SuggestionItem) {
         val start = tokenStart()
         val cursor = draft.selection.start.coerceIn(start, draft.text.length)
-        val end = draft.text.indexOfAny(charArrayOf(' ', '\n', '\t'), cursor).let {
+        val end = draft.text.indexOfAny(TOKEN_DELIMITERS, cursor).let {
             if (it < 0) draft.text.length else it
         }
         val rawText = candidate.completionText
@@ -182,16 +182,24 @@ public fun ComposerBar(
         val replacement = rawText + suffix
         val updated = draft.text.replaceRange(start, end, replacement)
         draft = TextFieldValue(updated, TextRange(start + replacement.length))
+        sendError = false
     }
 
     fun applyFormatting(code: Char) {
+        sendError = false
         val selectedText = if (draft.selection.collapsed) "" else draft.text.substring(draft.selection.min, draft.selection.max)
         if (selectedText.isNotEmpty()) {
             val start = draft.selection.min
             val end = draft.selection.max
-            val wrapped = "$code$selectedText$code"
-            val updated = draft.text.replaceRange(start, end, wrapped)
-            draft = TextFieldValue(updated, TextRange(start + wrapped.length))
+            val updated = if (code == RESET_CHAR) {
+                val stripped = selectedText.filter { it.code >= 0x20 }
+                draft.text.replaceRange(start, end, stripped)
+            } else {
+                val wrapped = "$code$selectedText$code"
+                draft.text.replaceRange(start, end, wrapped)
+            }
+            val newLength = if (code == RESET_CHAR) selectedText.filter { it.code >= 0x20 }.length else selectedText.length + 2
+            draft = TextFieldValue(updated, TextRange(start + newLength))
         } else {
             val cursor = draft.selection.start.coerceIn(0, draft.text.length)
             val codeStr = "$code"
@@ -201,7 +209,7 @@ public fun ComposerBar(
     }
 
     fun submit() {
-        val text = draft.text.trimEnd()
+        val text = draft.text.trimEnd { it == ' ' || it == '\t' || it == '\n' || it == '\r' }
         if (text.isEmpty()) return
         if (onSend(text)) {
             draft = TextFieldValue("")

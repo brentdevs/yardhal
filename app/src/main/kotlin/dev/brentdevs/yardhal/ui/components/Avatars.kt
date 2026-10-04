@@ -122,16 +122,10 @@ public fun HighlightedSurface(
     modifier: Modifier = Modifier,
     content: @Composable () -> Unit,
 ) {
-    if (!highlighted) {
-        Box(modifier = modifier) {
-            content()
-        }
-        return
-    }
     val accent = MaterialTheme.colorScheme.primary
     val tint = accent.copy(alpha = 0.08f)
-    Box(
-        modifier = modifier
+    val highlightModifier = if (highlighted) {
+        Modifier
             .clip(RoundedCornerShape(6.dp))
             .background(tint)
             .drawBehind {
@@ -141,8 +135,11 @@ public fun HighlightedSurface(
                     size = Size(3.5.dp.toPx(), size.height),
                     cornerRadius = CornerRadius(2.dp.toPx(), 2.dp.toPx()),
                 )
-            },
-    ) {
+            }
+    } else {
+        Modifier
+    }
+    Box(modifier = modifier.then(highlightModifier)) {
         content()
     }
 }

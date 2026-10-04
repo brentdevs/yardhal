@@ -1,8 +1,11 @@
 package dev.brentdevs.yardhal.ui
 
+import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.semantics.Role
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
@@ -453,67 +456,105 @@ public fun YardhalAppRoot(
             ) {
                 Text("Chat appearance", style = MaterialTheme.typography.titleLarge)
 
-                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .toggleable(
+                            value = appearance.compact,
+                            role = Role.Switch,
+                            onValueChange = { compact ->
+                                val updated = appearance.copy(compact = compact)
+                                appearance = updated
+                                appearanceStore.update(updated)
+                                onAppearanceChanged(updated)
+                            },
+                        ),
+                ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text("Compact spacing", style = MaterialTheme.typography.bodyLarge)
                         Text("Reduce padding between messages", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     Switch(
                         checked = appearance.compact,
-                        onCheckedChange = { compact ->
-                            val updated = appearance.copy(compact = compact)
-                            appearance = updated
-                            appearanceStore.update(updated)
-                            onAppearanceChanged(updated)
-                        },
+                        onCheckedChange = null,
                     )
                 }
 
-                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .toggleable(
+                            value = appearance.monospaceFont,
+                            role = Role.Switch,
+                            onValueChange = { mono ->
+                                val updated = appearance.copy(monospaceFont = mono)
+                                appearance = updated
+                                appearanceStore.update(updated)
+                                onAppearanceChanged(updated)
+                            },
+                        ),
+                ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text("Monospace font", style = MaterialTheme.typography.bodyLarge)
                         Text("Render messages in fixed-width font", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     Switch(
                         checked = appearance.monospaceFont,
-                        onCheckedChange = { mono ->
-                            val updated = appearance.copy(monospaceFont = mono)
-                            appearance = updated
-                            appearanceStore.update(updated)
-                            onAppearanceChanged(updated)
-                        },
+                        onCheckedChange = null,
                     )
                 }
 
-                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("Material You Dynamic Colors", style = MaterialTheme.typography.bodyLarge)
-                        Text("Match wallpaper palette on Android 13+", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .toggleable(
+                                value = appearance.dynamicColor,
+                                role = Role.Switch,
+                                onValueChange = { dynamic ->
+                                    val updated = appearance.copy(dynamicColor = dynamic)
+                                    appearance = updated
+                                    appearanceStore.update(updated)
+                                    onAppearanceChanged(updated)
+                                },
+                            ),
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Material You Dynamic Colors", style = MaterialTheme.typography.bodyLarge)
+                            Text("Match wallpaper palette on Android 12+", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Switch(
+                            checked = appearance.dynamicColor,
+                            onCheckedChange = null,
+                        )
                     }
-                    Switch(
-                        checked = appearance.dynamicColor,
-                        onCheckedChange = { dynamic ->
-                            val updated = appearance.copy(dynamicColor = dynamic)
-                            appearance = updated
-                            appearanceStore.update(updated)
-                            onAppearanceChanged(updated)
-                        },
-                    )
                 }
 
-                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .toggleable(
+                            value = appearance.amoledDark,
+                            role = Role.Switch,
+                            onValueChange = { amoled ->
+                                val updated = appearance.copy(amoledDark = amoled)
+                                appearance = updated
+                                appearanceStore.update(updated)
+                                onAppearanceChanged(updated)
+                            },
+                        ),
+                ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text("AMOLED pure black", style = MaterialTheme.typography.bodyLarge)
                         Text("Pitch-black background in dark mode", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     Switch(
                         checked = appearance.amoledDark,
-                        onCheckedChange = { amoled ->
-                            val updated = appearance.copy(amoledDark = amoled)
-                            appearance = updated
-                            appearanceStore.update(updated)
-                            onAppearanceChanged(updated)
-                        },
+                        onCheckedChange = null,
                     )
                 }
 
@@ -523,7 +564,7 @@ public fun YardhalAppRoot(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         modifier = Modifier.horizontalScroll(rememberScrollState()),
                     ) {
-                        listOf("Small" to 0.85f, "Default" to 1f, "Large" to 1.15f, "Extra Large" to 1.25f).forEach { (label, scale) ->
+                        listOf("Small" to 0.9f, "Default" to 1f, "Large" to 1.15f, "Extra Large" to 1.25f).forEach { (label, scale) ->
                             FilterChip(
                                 selected = appearance.textScale == scale,
                                 onClick = {

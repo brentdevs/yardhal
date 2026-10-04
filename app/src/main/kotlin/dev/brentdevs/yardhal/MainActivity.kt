@@ -1,6 +1,7 @@
 package dev.brentdevs.yardhal
 
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -35,8 +36,10 @@ class MainActivity : ComponentActivity() {
         setContent {
             var appearance by remember { mutableStateOf(app.chatAppearanceStore.snapshot()) }
             val isDark = isSystemInDarkTheme()
+            val dynamicSupported = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+            val useDynamic = appearance.dynamicColor && dynamicSupported
             YardhalTheme(
-                themeDefinition = if (isDark && !appearance.dynamicColor) loadBundledTheme() else null,
+                themeDefinition = if (isDark && !useDynamic) loadBundledTheme() else null,
                 dynamicColor = appearance.dynamicColor,
                 amoledDark = appearance.amoledDark,
             ) {

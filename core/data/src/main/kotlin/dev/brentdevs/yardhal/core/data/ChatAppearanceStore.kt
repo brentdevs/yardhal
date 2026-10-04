@@ -7,7 +7,7 @@ import kotlinx.serialization.Serializable
 public data class ChatAppearancePreferences(
     public val compact: Boolean = false,
     public val textScale: Float = 1f,
-    public val dynamicColor: Boolean = true,
+    public val dynamicColor: Boolean = false,
     public val amoledDark: Boolean = false,
     public val monospaceFont: Boolean = false,
 )

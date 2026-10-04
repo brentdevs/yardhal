@@ -5,6 +5,7 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.Row
@@ -125,16 +126,17 @@ private fun buildTranscript(buffer: ConversationBuffer): List<TranscriptEntry> {
     var previousTimestamp = Long.MAX_VALUE
     var renderedUnreadDivider = false
 
-    val pendingEvents = ArrayList<ChatMessage>()
+    val pendingEvents = ArrayList<Pair<Int, ChatMessage>>()
     fun flushEvents() {
         if (pendingEvents.isEmpty()) return
         if (pendingEvents.size == 1) {
-            val single = pendingEvents[0]
-            val origIndex = ordered.indexOf(single)
-            val isGrouped = if (origIndex >= 0) grouped[origIndex].groupedWithPrevious else false
+            val (origIndex, single) = pendingEvents[0]
+            val isGrouped = grouped[origIndex].groupedWithPrevious
             entries.add(TranscriptEntry.Message(single, isGrouped))
         } else {
-            entries.add(TranscriptEntry.CollapsedEvents(pendingEvents.toList(), "collapsed-${pendingEvents.first().localId}"))
+            val oldestId = pendingEvents.last().second.localId
+            val eventsInChronologicalOrder = pendingEvents.map { it.second }.reversed()
+            entries.add(TranscriptEntry.CollapsedEvents(eventsInChronologicalOrder, "collapsed-$oldestId"))
         }
         pendingEvents.clear()
     }
@@ -158,7 +160,7 @@ private fun buildTranscript(buffer: ConversationBuffer): List<TranscriptEntry> {
         val isEvent = message.kind == dev.brentdevs.yardhal.core.data.MessageKind.JOIN ||
             message.kind == dev.brentdevs.yardhal.core.data.MessageKind.PART
         if (isEvent) {
-            pendingEvents.add(message)
+            pendingEvents.add(index to message)
         } else {
             flushEvents()
             entries.add(TranscriptEntry.Message(message, grouped[index].groupedWithPrevious))
@@ -185,7 +187,7 @@ private fun formatDayLabel(date: LocalDate): String {
 private val QUICK_REACTIONS = listOf("👍", "❤️", "😂", "🎉", "👀", "🙏")
 private val HTTP_LINK = Regex("https?://\\S+")
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
 public fun ConversationScreen(
     buffer: ConversationBuffer,
@@ -427,7 +429,11 @@ public fun ConversationScreen(
                         when (val entry = entries[index]) {
                             is TranscriptEntry.DayHeader -> DayPill(entry.label)
                             is TranscriptEntry.UnreadDivider -> NewMessagesDivider(entry.label)
-                            is TranscriptEntry.CollapsedEvents -> CollapsedEventsRow(entry)
+                            is TranscriptEntry.CollapsedEvents -> CollapsedEventsRow(
+                                entry = entry,
+                                appearance = appearance,
+                                focusedRowId = focusedRowId,
+                            )
                             is TranscriptEntry.Message -> {
                                 val message = entry.value
                                 MessageRow(
@@ -523,31 +529,33 @@ public fun ConversationScreen(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     if (!target.sentByUs && target.msgid != null) {
-                        OutlinedButton(
+                        FilledTonalButton(
                             onClick = {
                                 onSetReplyDraft(target)
                                 actionTarget = null
                             },
                             modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 8.dp),
                         ) {
                             Icon(Icons.AutoMirrored.Filled.Reply, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Reply")
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Reply", maxLines = 1)
                         }
                     }
-                    OutlinedButton(
+                    FilledTonalButton(
                         onClick = {
                             val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
                             clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("Message", target.text))
                             actionTarget = null
                         },
                         modifier = Modifier.weight(1f),
+                        contentPadding = PaddingValues(horizontal = 8.dp),
                     ) {
                         Icon(Icons.Filled.ContentCopy, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Copy")
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Copy", maxLines = 1)
                     }
-                    OutlinedButton(
+                    FilledTonalButton(
                         onClick = {
                             val sendIntent = android.content.Intent().apply {
                                 action = android.content.Intent.ACTION_SEND
@@ -558,13 +566,14 @@ public fun ConversationScreen(
                             actionTarget = null
                         },
                         modifier = Modifier.weight(1f),
+                        contentPadding = PaddingValues(horizontal = 8.dp),
                     ) {
                         Icon(Icons.Filled.Share, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Share")
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Share", maxLines = 1)
                     }
                 }
-                val firstLink = HTTP_LINK.find(target.text)?.value?.trimEnd('.', ',', ';', ')')
+                val firstLink = HTTP_LINK.find(target.text)?.value?.trimEnd('.', ',', ';', ':', ')', ']', '}')
                 if (firstLink != null) {
                     Row(
                         modifier = Modifier
@@ -602,8 +611,8 @@ public fun ConversationScreen(
         }
     }
 
-    if (membersVisible) {
-        var memberQuery by remember { mutableStateOf("") }
+    if (membersVisible && memberTarget == null) {
+        var memberQuery by rememberSaveable { mutableStateOf("") }
         val operators = buffer.members.filter { it.isOperator }
         val voices = buffer.members.filter { it.isVoice }
         val isBot: (dev.brentdevs.yardhal.core.data.ChannelMember) -> Boolean = { member ->
@@ -888,7 +897,7 @@ public fun ConversationScreen(
 
                 if (buffer.ref.kind == dev.brentdevs.yardhal.core.data.ConversationKind.CHANNEL) {
                     Text("Channel moderation", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Row(
+                    FlowRow(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
@@ -927,17 +936,37 @@ private fun LaunchedEffectOnce(key: Any?, effect: () -> Unit) {
 }
 
 @Composable
-private fun CollapsedEventsRow(entry: TranscriptEntry.CollapsedEvents) {
-    var expanded by rememberSaveable { mutableStateOf(false) }
+private fun CollapsedEventsRow(
+    entry: TranscriptEntry.CollapsedEvents,
+    appearance: dev.brentdevs.yardhal.core.data.ChatAppearancePreferences,
+    focusedRowId: Long? = null,
+) {
+    val containsTarget = focusedRowId != null && entry.events.any { it.storedRowId == focusedRowId }
+    var expanded by rememberSaveable(entry.id) { mutableStateOf(false) }
+    androidx.compose.runtime.LaunchedEffect(containsTarget) {
+        if (containsTarget) {
+            expanded = true
+        }
+    }
+    val fontFamily = if (appearance.monospaceFont) androidx.compose.ui.text.font.FontFamily.Monospace else null
+    val baseStyle = MaterialTheme.typography.bodySmall.copy(
+        fontSize = MaterialTheme.typography.bodySmall.fontSize * appearance.textScale,
+        fontFamily = fontFamily,
+    )
+    val labelStyle = MaterialTheme.typography.labelSmall.copy(
+        fontSize = MaterialTheme.typography.labelSmall.fontSize * appearance.textScale,
+        fontFamily = fontFamily,
+    )
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 2.dp),
+            .padding(horizontal = 16.dp, vertical = if (appearance.compact) 1.dp else 2.dp),
     ) {
         Surface(
             shape = RoundedCornerShape(12.dp),
             color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
-            modifier = Modifier.clickable { expanded = !expanded },
+            onClick = { expanded = !expanded },
         ) {
             Row(
                 modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp),
@@ -946,12 +975,12 @@ private fun CollapsedEventsRow(entry: TranscriptEntry.CollapsedEvents) {
             ) {
                 Text(
                     text = if (expanded) "▾" else "▸",
-                    style = MaterialTheme.typography.labelSmall,
+                    style = labelStyle,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Text(
                     text = "${entry.events.size} user events",
-                    style = MaterialTheme.typography.labelSmall,
+                    style = labelStyle,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
@@ -959,6 +988,7 @@ private fun CollapsedEventsRow(entry: TranscriptEntry.CollapsedEvents) {
         if (expanded) {
             Column(modifier = Modifier.padding(start = 12.dp, top = 2.dp)) {
                 for (event in entry.events) {
+                    val isFocused = event.storedRowId != null && event.storedRowId == focusedRowId
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -967,15 +997,16 @@ private fun CollapsedEventsRow(entry: TranscriptEntry.CollapsedEvents) {
                     ) {
                         Text(
                             text = "·",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = baseStyle,
+                            color = if (isFocused) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.width(14.dp),
                         )
                         Text(
                             text = event.text,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = baseStyle,
+                            color = if (isFocused) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                             fontStyle = FontStyle.Italic,
+                            fontWeight = if (isFocused) FontWeight.Bold else null,
                         )
                     }
                 }
@@ -1407,8 +1438,14 @@ public fun NetworkOverviewScreen(
                         val buffer = entry.buffer
                         val last = buffer.messages.lastOrNull()
                         val isChannel = buffer.ref.kind == dev.brentdevs.yardhal.core.data.ConversationKind.CHANNEL
-                        val unreadCount = buffer.messages.count { it.countsAsUnread && (buffer.unreadFromTimestampMs == null || it.timestampMs >= buffer.unreadFromTimestampMs) }
-                        val hasMention = buffer.messages.any { it.highlightsMe && (buffer.unreadFromTimestampMs == null || it.timestampMs >= buffer.unreadFromTimestampMs) }
+                        val unreadCount = if (!buffer.hasUnread) 0 else {
+                            val cutoff = buffer.unreadFromTimestampMs ?: buffer.readAtMs
+                            buffer.messages.count { it.countsAsUnread && it.timestampMs >= cutoff }
+                        }
+                        val hasMention = if (!buffer.hasUnread) false else {
+                            val cutoff = buffer.unreadFromTimestampMs ?: buffer.readAtMs
+                            buffer.messages.any { it.highlightsMe && it.timestampMs >= cutoff }
+                        }
                         val dismissState = androidx.compose.material3.rememberSwipeToDismissBoxState(
                             confirmValueChange = { value ->
                                 when (value) {

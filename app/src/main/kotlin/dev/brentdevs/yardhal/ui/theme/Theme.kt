@@ -8,6 +8,7 @@ import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalContext
@@ -60,43 +61,46 @@ public fun nickColor(nick: String): Color {
 @Composable
 public fun YardhalTheme(
     themeDefinition: dev.brentdevs.yardhal.core.data.ThemeDefinition? = null,
-    dynamicColor: Boolean = true,
+    dynamicColor: Boolean = false,
     amoledDark: Boolean = false,
     content: @Composable () -> Unit,
 ) {
     val context = LocalContext.current
     val isDark = isSystemInDarkTheme()
-    val custom = themeDefinition?.let { def ->
-        fun c(value: Long): Color = Color(value.toULong().toLong())
-        val scheme = if (def.dark) darkColorScheme() else lightColorScheme()
-        scheme.copy(
-            background = c(def.colors.background),
-            surface = c(def.colors.background),
-            primary = c(def.colors.primary),
-            secondary = c(def.colors.secondary),
-            tertiary = c(def.colors.tertiary),
-            surfaceVariant = c(def.colors.surfaceVariant),
-        )
-    }
+    val scheme = remember(themeDefinition, dynamicColor, amoledDark, isDark, context) {
+        val custom = themeDefinition?.let { def ->
+            fun c(value: Long): Color = Color(value.toULong().toLong())
+            val base = if (def.dark) darkColorScheme() else lightColorScheme()
+            base.copy(
+                background = c(def.colors.background),
+                surface = c(def.colors.background),
+                primary = c(def.colors.primary),
+                secondary = c(def.colors.secondary),
+                tertiary = c(def.colors.tertiary),
+                surfaceVariant = c(def.colors.surfaceVariant),
+            )
+        }
 
-    val dynamicAvailable = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
-    var scheme = when {
-        custom != null -> custom
-        dynamicColor && dynamicAvailable && isDark -> dynamicDarkColorScheme(context)
-        dynamicColor && dynamicAvailable && !isDark -> dynamicLightColorScheme(context)
-        isDark -> DarkColors
-        else -> LightColors
-    }
+        val dynamicAvailable = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+        var s = when {
+            custom != null -> custom
+            dynamicColor && dynamicAvailable && isDark -> dynamicDarkColorScheme(context)
+            dynamicColor && dynamicAvailable && !isDark -> dynamicLightColorScheme(context)
+            isDark -> DarkColors
+            else -> LightColors
+        }
 
-    if (isDark && amoledDark) {
-        scheme = scheme.copy(
-            background = Color.Black,
-            surface = Color.Black,
-            surfaceContainer = Color(0xFF0C0E11),
-            surfaceContainerLow = Color(0xFF060709),
-            surfaceContainerHigh = Color(0xFF14171C),
-            surfaceContainerHighest = Color(0xFF1C2026),
-        )
+        if (isDark && amoledDark) {
+            s = s.copy(
+                background = Color.Black,
+                surface = Color.Black,
+                surfaceContainer = Color(0xFF0C0E11),
+                surfaceContainerLow = Color(0xFF060709),
+                surfaceContainerHigh = Color(0xFF14171C),
+                surfaceContainerHighest = Color(0xFF1C2026),
+            )
+        }
+        s
     }
 
     MaterialTheme(

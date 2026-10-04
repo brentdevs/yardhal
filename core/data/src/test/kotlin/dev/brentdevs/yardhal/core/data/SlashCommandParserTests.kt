@@ -154,4 +154,15 @@ class SlashCommandParserTests {
         assertEquals(SlashCommand.Quit("brb"), parse("/quit brb"))
         assertEquals(SlashCommand.Quit(null), parse("/quit"))
     }
+
+    @Test
+    fun monitorParsesSubcommandsAndSyntax() {
+        assertEquals(SlashCommand.MonitorAdd("alice"), parse("/monitor + alice"))
+        assertEquals(SlashCommand.MonitorAdd("alice"), parse("/monitor +alice"))
+        assertEquals(SlashCommand.MonitorRemove("bob"), parse("/monitor - bob"))
+        assertEquals(SlashCommand.MonitorRemove("bob"), parse("/monitor -bob"))
+        assertEquals(SlashCommand.MonitorList, parse("/monitor"))
+        assertEquals(SlashCommand.MonitorList, parse("/monitor list"))
+        assertEquals(SlashCommand.MonitorList, parse("/monitor ls"))
+    }
 }

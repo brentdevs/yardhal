@@ -144,8 +144,10 @@ public object SlashCommandParser {
         return when {
             sub == "+" && target != null -> SlashCommand.MonitorAdd(target)
             sub == "-" && target != null -> SlashCommand.MonitorRemove(target)
-            sub == "l" || sub == "ls" || trimmed.isEmpty() -> SlashCommand.MonitorList
-            target == null -> SlashCommand.MonitorAdd(sub ?: return SlashCommand.MonitorList)
+            sub?.startsWith("+") == true && sub.length > 1 -> SlashCommand.MonitorAdd(parts[0].substring(1))
+            sub?.startsWith("-") == true && sub.length > 1 -> SlashCommand.MonitorRemove(parts[0].substring(1))
+            sub == "l" || sub == "ls" || sub == "list" || trimmed.isEmpty() -> SlashCommand.MonitorList
+            target == null -> SlashCommand.MonitorAdd(parts.firstOrNull() ?: return SlashCommand.MonitorList)
             else -> SlashCommand.MonitorAdd(trimmed)
         }
     }

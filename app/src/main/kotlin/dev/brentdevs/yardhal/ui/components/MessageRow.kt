@@ -37,6 +37,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.brentdevs.yardhal.coordinator.ChatMessage
 import dev.brentdevs.yardhal.coordinator.UserProfile
@@ -240,9 +241,9 @@ private fun ChatLine(
                     ) {
                         for ((emoji, nicks) in reactions) {
                             Surface(
+                                onClick = { onToggleReaction(emoji) },
                                 shape = RoundedCornerShape(8.dp),
                                 color = MaterialTheme.colorScheme.surfaceVariant,
-                                modifier = Modifier.clickable { onToggleReaction(emoji) },
                             ) {
                                 Text(
                                     text = "$emoji ${nicks.size}",
@@ -265,20 +266,20 @@ private fun AttachmentPreview(
 ) {
     val isImage = url.endsWith(".png", true) || url.endsWith(".jpg", true) ||
         url.endsWith(".jpeg", true) || url.endsWith(".gif", true) || url.endsWith(".webp", true)
+    val displayName = url.substringAfterLast('/').substringBefore('?').ifEmpty { "Attachment" }
     if (isImage) {
         val image by rememberRemoteImage(LocalRemoteImageLoader.current, url, 512)
         val loaded = image
         Surface(
+            onClick = onOpen,
             shape = RoundedCornerShape(12.dp),
             color = MaterialTheme.colorScheme.surfaceVariant,
-            modifier = Modifier
-                .padding(vertical = 4.dp)
-                .clickable(onClick = onOpen),
+            modifier = Modifier.padding(vertical = 4.dp),
         ) {
             if (loaded != null) {
                 Image(
                     bitmap = loaded,
-                    contentDescription = "Attachment preview",
+                    contentDescription = "Image attachment: $displayName",
                     contentScale = ContentScale.Fit,
                     modifier = Modifier
                         .heightIn(max = 200.dp)
@@ -287,7 +288,9 @@ private fun AttachmentPreview(
                 )
             } else {
                 Row(
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    modifier = Modifier
+                        .padding(horizontal = 12.dp, vertical = 8.dp)
+                        .defaultMinSize(minHeight = 40.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
@@ -298,20 +301,23 @@ private fun AttachmentPreview(
                         modifier = Modifier.size(18.dp),
                     )
                     Text(
-                        text = url.substringAfterLast('/'),
+                        text = displayName,
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.primary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                     )
                 }
             }
         }
     } else {
         Surface(
+            onClick = onOpen,
             shape = RoundedCornerShape(8.dp),
             color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
             modifier = Modifier
                 .padding(vertical = 3.dp)
-                .clickable(onClick = onOpen),
+                .defaultMinSize(minHeight = 40.dp),
         ) {
             Row(
                 modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
@@ -325,9 +331,11 @@ private fun AttachmentPreview(
                     modifier = Modifier.size(16.dp),
                 )
                 Text(
-                    text = url.substringAfterLast('/'),
+                    text = displayName,
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.primary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
             }
         }
