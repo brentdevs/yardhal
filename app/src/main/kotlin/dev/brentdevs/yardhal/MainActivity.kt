@@ -7,6 +7,10 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import dev.brentdevs.yardhal.coordinator.LiveCoordinator
 import dev.brentdevs.yardhal.core.data.NetworkConfig
@@ -29,8 +33,12 @@ class MainActivity : ComponentActivity() {
         coordinator = app.coordinator
 
         setContent {
+            var appearance by remember { mutableStateOf(app.chatAppearanceStore.snapshot()) }
+            val isDark = isSystemInDarkTheme()
             YardhalTheme(
-                themeDefinition = if (isSystemInDarkTheme()) loadBundledTheme() else null,
+                themeDefinition = if (isDark && !appearance.dynamicColor) loadBundledTheme() else null,
+                dynamicColor = appearance.dynamicColor,
+                amoledDark = appearance.amoledDark,
             ) {
                 CompositionLocalProvider(LocalRemoteImageLoader provides app.remoteImages) {
                     YardhalAppRoot(
@@ -42,6 +50,7 @@ class MainActivity : ComponentActivity() {
                         onNetworkSaved = { draft -> saveAndConnect(draft) },
                         sharedTextProvider = { (application as YardhalApplication).sharedText },
                         onSharedConsumed = { (application as YardhalApplication).sharedText = null },
+                        onAppearanceChanged = { appearance = it },
                         modifier = Modifier,
                     )
                 }

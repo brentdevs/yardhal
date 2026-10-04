@@ -74,6 +74,7 @@ public fun MessageRow(
 
 @Composable
 private fun SystemLine(message: ChatMessage, appearance: ChatAppearancePreferences, modifier: Modifier) {
+    val chatFontFamily = if (appearance.monospaceFont) FontFamily.Monospace else null
     Row(
         modifier = modifier
             .fillMaxWidth()
@@ -84,6 +85,7 @@ private fun SystemLine(message: ChatMessage, appearance: ChatAppearancePreferenc
             text = "·",
             style = MaterialTheme.typography.bodySmall.copy(
                 fontSize = MaterialTheme.typography.bodySmall.fontSize * appearance.textScale,
+                fontFamily = chatFontFamily,
             ),
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.width(14.dp),
@@ -92,6 +94,7 @@ private fun SystemLine(message: ChatMessage, appearance: ChatAppearancePreferenc
             text = message.text,
             style = MaterialTheme.typography.bodySmall.copy(
                 fontSize = MaterialTheme.typography.bodySmall.fontSize * appearance.textScale,
+                fontFamily = chatFontFamily,
             ),
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             fontStyle = FontStyle.Italic,
@@ -206,11 +209,13 @@ private fun ChatLine(
                         onOpen = { onOpenAttachment(message.attachmentUrl) },
                     )
                 }
+                val chatFontFamily = if (appearance.monospaceFont) FontFamily.Monospace else null
                 if (message.kind == MessageKind.ACTION) {
                     Text(
                         text = "✦ ${message.text}",
                         style = MaterialTheme.typography.bodyMedium.copy(
                             fontSize = MaterialTheme.typography.bodyMedium.fontSize * appearance.textScale,
+                            fontFamily = chatFontFamily,
                         ),
                         fontStyle = FontStyle.Italic,
                         color = nickColor(message.sender),
@@ -224,6 +229,7 @@ private fun ChatLine(
                         ),
                         style = MaterialTheme.typography.bodyMedium.copy(
                             fontSize = MaterialTheme.typography.bodyMedium.fontSize * appearance.textScale,
+                            fontFamily = chatFontFamily,
                         ),
                     )
                 }

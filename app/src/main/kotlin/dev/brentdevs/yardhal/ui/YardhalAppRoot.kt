@@ -72,6 +72,7 @@ public fun YardhalAppRoot(
     onNetworkSaved: (NetworkDraft) -> Unit,
     sharedTextProvider: () -> String? = { null },
     onSharedConsumed: () -> Unit = {},
+    onAppearanceChanged: (dev.brentdevs.yardhal.core.data.ChatAppearancePreferences) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val networks by coordinator.networks.collectAsStateWithLifecycle()
@@ -444,31 +445,96 @@ public fun YardhalAppRoot(
     if (appearanceVisible) {
         ModalBottomSheet(onDismissRequest = { appearanceVisible = false }) {
             Column(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 24.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
                 Text("Chat appearance", style = MaterialTheme.typography.titleLarge)
+
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                    Text("Compact message spacing", modifier = Modifier.weight(1f))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Compact spacing", style = MaterialTheme.typography.bodyLarge)
+                        Text("Reduce padding between messages", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                     Switch(
                         checked = appearance.compact,
                         onCheckedChange = { compact ->
-                            appearance = appearance.copy(compact = compact)
-                            appearanceStore.update(appearance)
+                            val updated = appearance.copy(compact = compact)
+                            appearance = updated
+                            appearanceStore.update(updated)
+                            onAppearanceChanged(updated)
                         },
                     )
                 }
-                Text("Message text size", style = MaterialTheme.typography.titleSmall)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("Small" to 0.9f, "Default" to 1f, "Large" to 1.15f).forEach { (label, scale) ->
-                        FilterChip(
-                            selected = appearance.textScale == scale,
-                            onClick = {
-                                appearance = appearance.copy(textScale = scale)
-                                appearanceStore.update(appearance)
-                            },
-                            label = { Text(label) },
-                        )
+
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Monospace font", style = MaterialTheme.typography.bodyLarge)
+                        Text("Render messages in fixed-width font", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Switch(
+                        checked = appearance.monospaceFont,
+                        onCheckedChange = { mono ->
+                            val updated = appearance.copy(monospaceFont = mono)
+                            appearance = updated
+                            appearanceStore.update(updated)
+                            onAppearanceChanged(updated)
+                        },
+                    )
+                }
+
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Material You Dynamic Colors", style = MaterialTheme.typography.bodyLarge)
+                        Text("Match wallpaper palette on Android 13+", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Switch(
+                        checked = appearance.dynamicColor,
+                        onCheckedChange = { dynamic ->
+                            val updated = appearance.copy(dynamicColor = dynamic)
+                            appearance = updated
+                            appearanceStore.update(updated)
+                            onAppearanceChanged(updated)
+                        },
+                    )
+                }
+
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("AMOLED pure black", style = MaterialTheme.typography.bodyLarge)
+                        Text("Pitch-black background in dark mode", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Switch(
+                        checked = appearance.amoledDark,
+                        onCheckedChange = { amoled ->
+                            val updated = appearance.copy(amoledDark = amoled)
+                            appearance = updated
+                            appearanceStore.update(updated)
+                            onAppearanceChanged(updated)
+                        },
+                    )
+                }
+
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Message text size", style = MaterialTheme.typography.titleSmall)
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    ) {
+                        listOf("Small" to 0.85f, "Default" to 1f, "Large" to 1.15f, "Extra Large" to 1.25f).forEach { (label, scale) ->
+                            FilterChip(
+                                selected = appearance.textScale == scale,
+                                onClick = {
+                                    val updated = appearance.copy(textScale = scale)
+                                    appearance = updated
+                                    appearanceStore.update(updated)
+                                    onAppearanceChanged(updated)
+                                },
+                                label = { Text(label) },
+                            )
+                        }
                     }
                 }
             }
