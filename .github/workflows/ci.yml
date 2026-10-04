@@ -22,8 +22,28 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - name: Provision pinned Ergo server
         run: bash scripts/ensure-ergo.sh
-      - name: Build, lint, and test
-        run: ./gradlew :app:assembleDebug :app:lintDebug test --stacktrace
+      - name: Build
+        timeout-minutes: 10
+        run: ./gradlew :app:assembleDebug --stacktrace
+      - name: Lint
+        timeout-minutes: 10
+        run: ./gradlew :app:lintDebug --stacktrace
+      - name: Unit and Ergo tests
+        timeout-minutes: 10
+        run: |
+          cat > "$RUNNER_TEMP/ci-test-progress.gradle" <<'EOF'
+          allprojects {
+              tasks.withType(Test).configureEach {
+                  beforeTest { descriptor ->
+                      logger.lifecycle("START ${descriptor.className}.${descriptor.name}")
+                  }
+                  afterTest { descriptor, result ->
+                      logger.lifecycle("END ${descriptor.className}.${descriptor.name}: ${result.resultType}")
+                  }
+              }
+          }
+          EOF
+          ./gradlew test --init-script "$RUNNER_TEMP/ci-test-progress.gradle" --stacktrace
       - name: Upload reports after failure
         if: failure()
         uses: actions/upload-artifact@v4

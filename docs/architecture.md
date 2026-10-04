@@ -168,6 +168,11 @@ explain why.
    demand, self-skipping when absent) — connect → CAP → register → JOIN →
    PRIVMSG echo.
 
+CI runs debug assembly, lint and the full test suite as separate ten-minute
+phases, matching the `make check` ordering within the existing thirty-minute
+job limit. Test start/end logging identifies a stalled case; a phase timeout
+leaves time for failure-report upload instead of exhausting the whole job.
+
 SCRAM uses the complete RFC 4013 Unicode 3.2 SASLprep profile: mapping, frozen
 NFKC normalization, prohibited-character checks, bidi restrictions, and the
 query/stored unassigned-character distinction. Usernames use QUERY and passwords
