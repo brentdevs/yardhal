@@ -53,3 +53,61 @@ internal fun applyReaction(
     }
     return updated
 }
+
+internal fun appendChronologically(messages: List<ChatMessage>, entry: ChatMessage): List<ChatMessage> {
+    if (messages.isEmpty() || messages.last().timestampMs <= entry.timestampMs) return messages + entry
+    var start = 0
+    var end = messages.size
+    while (start < end) {
+        val middle = (start + end).ushr(1)
+        if (messages[middle].timestampMs <= entry.timestampMs) start = middle + 1 else end = middle
+    }
+    return ArrayList<ChatMessage>(messages.size + 1).also {
+        it.addAll(messages)
+        it.add(start, entry)
+    }
+}
+
+internal fun mergeConversationMessages(
+    preferred: List<ChatMessage>,
+    incoming: List<ChatMessage>,
+    incomingCanonical: Boolean = false,
+): List<ChatMessage> {
+    if (preferred.isEmpty()) return incoming
+    if (incoming.isEmpty()) return preferred
+    val merged = ArrayList<ChatMessage>(preferred.size + incoming.size).also { it.addAll(preferred) }
+    val byMsgid = mutableMapOf<String, Int>()
+    for (index in merged.indices) merged[index].msgid?.let { byMsgid[it] = index }
+    for (message in incoming) {
+        val identified = message.msgid?.let(byMsgid::get) ?: -1
+        val anonymous = if (identified >= 0) -1 else merged.uniqueHistoryIndex {
+            (it.msgid == null || message.msgid == null) && it.sender == message.sender &&
+                it.kind == message.kind && it.text == message.text && it.timestampMs == message.timestampMs
+        }
+        val index = if (identified >= 0) identified else anonymous
+        if (index < 0) {
+            message.msgid?.let { byMsgid[it] = merged.size }
+            merged.add(message)
+        } else {
+            val previous = merged[index]
+            val base = if (incomingCanonical) message else previous
+            val other = if (incomingCanonical) previous else message
+            merged[index] = base.copy(
+                localId = previous.localId,
+                msgid = base.msgid ?: other.msgid,
+                storedRowId = base.storedRowId ?: other.storedRowId,
+                replyToMsgid = base.replyToMsgid ?: other.replyToMsgid,
+                attachmentUrl = base.attachmentUrl ?: other.attachmentUrl,
+                senderAccount = base.senderAccount ?: other.senderAccount,
+                channelContext = base.channelContext ?: other.channelContext,
+                sentByUs = previous.sentByUs || message.sentByUs,
+                historyContext = previous.historyContext && message.historyContext,
+            )
+            merged[index].msgid?.let { byMsgid[it] = index }
+        }
+    }
+    merged.sortWith(conversationMessageOrder)
+    return merged
+}
+
+private val conversationMessageOrder = compareBy<ChatMessage> { it.timestampMs }

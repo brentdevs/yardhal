@@ -126,6 +126,7 @@ class MetadataCoordinatorLoopbackTests {
             networkStore = NetworkStore(directory).also { it.add(config) },
             messageStore = MessageStore(database.messageDao()),
             readMarkers = ReadMarkerStore(directory),
+            historyCoverage = dev.brentdevs.yardhal.core.data.HistoryCoverageStore(directory),
             mutes = MuteStore(directory),
             vault = InMemoryCredentialVault(),
             channelOrder = ChannelOrderStore(directory),

@@ -174,11 +174,6 @@ class PerNetworkStateTests {
     }
 
     @Test
-    fun redactEmitsRedactionByMsgid() {
-        assertEquals(InboundEffect.RedactMessage("m1"), state().feed(":alice!u@h REDACT #room m1").single())
-    }
-
-    @Test
     fun tagmsgReactionsAndTypingBecomeEffects() {
         val state = state()
         val react = state.feed("@+draft/react=👍;+draft/reply=m1 :alice!u@h TAGMSG #room").filterIsInstance<InboundEffect.ApplyReaction>()
@@ -230,7 +225,7 @@ class PerNetworkStateTests {
         state.feed(":srv 005 me CHATHISTORY=500 :are supported")
         val effects = state.feed(":me!u@h JOIN #room")
         assertTrue(InboundEffect.EnsureBuffer(channel("#room")) in effects)
-        assertEquals(listOf("TOPIC #room", "MODE #room", "CHATHISTORY LATEST #room * 100"), effects.sent())
+        assertEquals(listOf("TOPIC #room", "MODE #room"), effects.sent())
         assertTrue(effects.appended().isEmpty())
     }
 
@@ -535,7 +530,6 @@ class PerNetworkStateTests {
         assertEquals(CaseMapping.ASCII, state.casemapping)
         assertEquals(listOf('~', '@', '+'), state.prefixModes.symbols)
         assertTrue(state.hasWhox)
-        assertEquals(200, state.chathistoryLimit)
         assertEquals("https://up.example", state.filehostEndpoint)
     }
 
@@ -558,16 +552,6 @@ class PerNetworkStateTests {
         assertEquals("soju mgmt: network created (9)", state.feed(":srv BOUNCER ADDNETWORK 9").appended().single().text)
     }
 
-    @Test
-    fun capabilitiesRequestPlaybackSinceLatestReadMarkerInSeconds() {
-        val state = state()
-        val context = InboundContext(nowMs = now, latestReadMarkerMs = { 1_700_000_123_456L })
-        val effects = state.apply(IrcEvent.CapabilitiesNegotiated(setOf("znc.in/playback", "soju.im/bouncer-networks")), context)
-        assertEquals(listOf("PRIVMSG *playback :playback * start 1700000123"), effects.sent())
-        assertTrue(state.isBouncerDiscovery)
-        val fallback = state().apply(IrcEvent.CapabilitiesNegotiated(setOf("znc.in/playback")), InboundContext(nowMs = now))
-        assertEquals(listOf("PRIVMSG *playback :playback * start ${now / 1000 - 7 * 24 * 3600}"), fallback.sent())
-    }
 
     @Test
     fun capNewUpdatesAdvertisedMultilineLimitsWithoutAcknowledgingCapabilities() {

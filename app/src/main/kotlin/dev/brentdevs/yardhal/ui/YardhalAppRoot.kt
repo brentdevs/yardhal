@@ -275,6 +275,9 @@ public fun YardhalAppRoot(
                         joinDialogVisible = true
                     },
                     onLoadHistory = { coordinator.loadPersistedHistory(key) },
+                    onLoadOlderHistory = { coordinator.loadOlderHistory(key) },
+                    onRetryHistory = { coordinator.retryHistory(key) },
+                    onFillHistoryGap = { gapId -> coordinator.fillHistoryGap(key, gapId) },
                     onLoadMembers = { coordinator.ensureMembers(networkId, key) },
                     onReact = { msgid, emoji -> coordinator.react(networkId, key, msgid, emoji) },
                     onSetReplyDraft = { message -> coordinator.setReplyDraft(networkId, key, message) },

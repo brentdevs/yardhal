@@ -67,6 +67,7 @@ class YardhalApplication : Application() {
             networkStore = networkStore,
             messageStore = messageStore,
             readMarkers = readMarkerStore,
+            historyCoverage = dev.brentdevs.yardhal.core.data.HistoryCoverageStore(dir),
             mutes = muteStore,
             vault = vault,
             channelOrder = ChannelOrderStore(dir),

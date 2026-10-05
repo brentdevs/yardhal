@@ -8,7 +8,7 @@ import androidx.room.PrimaryKey
 @Entity(
     tableName = "messages",
     indices = [
-        Index(value = ["msgid"], unique = true),
+        Index(value = ["networkId", "conversation", "msgid"], unique = true),
         Index(value = ["networkId", "conversation", "timestampMs"]),
         Index(value = ["contentHash"]),
     ],
@@ -27,4 +27,5 @@ public data class MessageRow(
     @ColumnInfo(name = "sentByUs") public val sentByUs: Boolean,
     @ColumnInfo(name = "timestampMs") public val timestampMs: Long,
     @ColumnInfo(name = "channelContext") public val channelContext: String? = null,
+    @ColumnInfo(defaultValue = "0") public val historyContext: Boolean = false,
 )

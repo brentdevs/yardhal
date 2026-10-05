@@ -1,6 +1,7 @@
 package dev.brentdevs.yardhal.coordinator
 
 import dev.brentdevs.yardhal.core.data.ConversationKind
+import dev.brentdevs.yardhal.core.data.ConversationRef
 import dev.brentdevs.yardhal.core.data.MentionMatcher
 import dev.brentdevs.yardhal.core.data.MessageKind
 import dev.brentdevs.yardhal.core.protocol.IrcCtcp
@@ -19,28 +20,31 @@ internal fun parseServerTime(value: String?): Long? {
     return runCatching { Instant.parse(value).toEpochMilli() }.getOrNull()
 }
 
-internal fun Reduction.isPlayback(message: IrcMessage): Boolean = isPlaybackBatch(message.tag("batch"))
+internal fun Reduction.isPlayback(message: IrcMessage): Boolean =
+    context.historyPlayback || playbackBatch(message.tag("batch")) != null
 
-internal fun Reduction.isPlaybackBatch(start: String?): Boolean {
+internal fun Reduction.playbackBatch(start: String?): OpenBatch? {
     var reference = start
     while (reference != null) {
-        val batch = state.openBatches[reference] ?: return false
-        if (batch.type in PLAYBACK_BATCH_TYPES) return true
+        val batch = state.openBatches[reference] ?: return null
+        if (batch.type in PLAYBACK_BATCH_TYPES) return batch
         reference = batch.parent
     }
-    return false
+    return null
 }
 
 internal fun Reduction.handleChatMessage(message: IrcMessage) {
     if (message.parameters.size < 2) return
     if (bufferMultilineLine(message)) return
+    val batch = playbackBatch(message.tag("batch"))
     emitChat(
         prefix = message.prefix,
         command = message.command,
         targetParam = message.parameters[0],
         rawText = message.parameters[1],
         tags = message.tags,
-        playback = isPlayback(message),
+        playback = context.historyPlayback || batch != null,
+        historyTarget = batch?.parameters?.firstOrNull()?.let(state::targetRef),
     )
 }
 
@@ -51,18 +55,13 @@ internal fun Reduction.emitChat(
     rawText: String,
     tags: Map<String, String?>,
     playback: Boolean,
+    historyTarget: ConversationRef? = null,
 ) {
     if (prefix == null) return
     val senderNick = prefix.nick
     val fromUs = state.isOwnNick(senderNick)
     if (!fromUs && context.isIgnored(senderNick)) return
-    val ref = when {
-        state.isChannelName(targetParam) -> state.channelRef(targetParam)
-        targetParam.startsWith("*") -> replyRef
-        fromUs -> state.directRef(targetParam)
-        prefix.isServer -> replyRef
-        else -> state.directRef(senderNick)
-    }
+    val ref = messageConversation(prefix, targetParam, historyTarget)
     val decoded = IrcCtcp.decode(rawText)
     val ctcpAction = decoded.filterIsInstance<PrivmsgContent.Ctcp>().firstOrNull { it.message.command == IrcCtcp.ACTION }
     val kind = when {
@@ -92,6 +91,7 @@ internal fun Reduction.emitChat(
             echoLabel = correlation?.takeIf { fromUs && it.command == LabeledCommand.PRIVMSG }?.label,
             senderAccount = accountValue(tags["account"]),
             channelContext = channelContext,
+            historyContext = "draft/chathistory-context" in tags,
         ),
     )
 }
@@ -99,7 +99,8 @@ internal fun Reduction.emitChat(
 internal fun Reduction.handleTagmsg(message: IrcMessage) {
     val sender = message.prefix?.nick ?: return
     val targetParam = message.parameters.firstOrNull() ?: return
-    val ref = if (state.isChannelName(targetParam)) state.channelRef(targetParam) else state.directRef(sender)
+    val historical = playbackBatch(message.tag("batch"))?.parameters?.firstOrNull()?.let(state::targetRef)
+    val ref = messageConversation(message.prefix, targetParam, historical)
     val react = message.tag("+draft/react")
     val unreact = message.tag("+draft/unreact")
     if (react != null || unreact != null) {
@@ -110,6 +111,7 @@ internal fun Reduction.handleTagmsg(message: IrcMessage) {
         emit(InboundEffect.ApplyReaction(ref, sender, emoji, refs, added = react != null))
         return
     }
+    if (isPlayback(message)) return
     val typing = message.tag("+typing") ?: return
     val expiresAt = if (typing == "active") context.nowMs + TYPING_TTL_MS else null
     emit(InboundEffect.SetTyping(ref, sender, expiresAt))
@@ -117,7 +119,27 @@ internal fun Reduction.handleTagmsg(message: IrcMessage) {
 
 internal fun Reduction.handleRedact(message: IrcMessage) {
     if (message.parameters.size < 2) return
-    emit(InboundEffect.RedactMessage(message.parameters[1]))
+    val target = message.parameters[0]
+    val historical = playbackBatch(message.tag("batch"))?.parameters?.firstOrNull()?.let(state::targetRef)
+    emit(InboundEffect.RedactMessage(messageConversation(message.prefix, target, historical), message.parameters[1]))
+}
+
+private fun Reduction.messageConversation(
+    prefix: IrcPrefix?,
+    target: String,
+    historical: ConversationRef? = null,
+): ConversationRef {
+    val history = context.historyTarget ?: historical
+    if (state.isChannelName(target)) {
+        if (history?.kind == ConversationKind.CHANNEL && history.normalizedTarget == state.casemapping.fold(target)) return history
+        return state.channelRef(target)
+    }
+    return history ?: when {
+        target.startsWith("*") -> replyRef
+        prefix != null && state.isOwnNick(prefix.nick) -> state.directRef(target)
+        prefix == null || prefix.isServer -> replyRef
+        else -> state.directRef(prefix.nick)
+    }
 }
 
 internal fun Reduction.handleInboundMarkRead(message: IrcMessage) {

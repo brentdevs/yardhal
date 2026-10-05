@@ -2,6 +2,8 @@ package dev.brentdevs.yardhal.ui.screens
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -11,6 +13,7 @@ import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -62,11 +65,14 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -82,6 +88,9 @@ import dev.brentdevs.yardhal.coordinator.ChatMessage
 import dev.brentdevs.yardhal.coordinator.ConversationBuffer
 import dev.brentdevs.yardhal.coordinator.ConnectionStatus
 import dev.brentdevs.yardhal.coordinator.JoinState
+import dev.brentdevs.yardhal.coordinator.HistoryGap
+import dev.brentdevs.yardhal.coordinator.HistoryLoadState
+import dev.brentdevs.yardhal.coordinator.HistoryLoadStatus
 import dev.brentdevs.yardhal.coordinator.NetworkProfiles
 import dev.brentdevs.yardhal.core.data.ChatAppearancePreferences
 import dev.brentdevs.yardhal.core.data.ConversationKind
@@ -93,16 +102,30 @@ import dev.brentdevs.yardhal.ui.components.NickAvatar
 import dev.brentdevs.yardhal.ui.components.StatusDot
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.collect
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
 private sealed interface TranscriptEntry {
-    public data class DayHeader(public val label: String) : TranscriptEntry
-    public data class UnreadDivider(public val label: String) : TranscriptEntry
-    public data class CollapsedEvents(public val events: List<ChatMessage>, public val id: String) : TranscriptEntry
-    public data class Message(public val value: ChatMessage, public val groupedWithPrevious: Boolean) : TranscriptEntry
+    public val key: String
+
+    public data class DayHeader(public val date: LocalDate) : TranscriptEntry {
+        override val key: String get() = "day-$date"
+    }
+    public data class UnreadDivider(public val timestampMs: Long) : TranscriptEntry {
+        override val key: String get() = "unread-$timestampMs"
+    }
+    public data class CollapsedEvents(public val events: List<ChatMessage>, public val id: String) : TranscriptEntry {
+        override val key: String get() = id
+    }
+    public data class Message(public val value: ChatMessage, public val groupedWithPrevious: Boolean) : TranscriptEntry {
+        override val key: String get() = "msg-${value.localId}"
+    }
+    public data class Gap(public val value: HistoryGap) : TranscriptEntry {
+        override val key: String get() = "gap-${value.id}"
+    }
 }
 
 public enum class MemberAction { MESSAGE, WHOIS, KICK, BAN, BAN_ACCOUNT, IGNORE }
@@ -110,6 +133,15 @@ public enum class MemberAction { MESSAGE, WHOIS, KICK, BAN, BAN_ACCOUNT, IGNORE 
 private fun buildTranscript(buffer: ConversationBuffer): List<TranscriptEntry> {
     val zone = ZoneId.systemDefault()
     val ordered = buffer.messages.asReversed()
+    val gapsAtBoundary = buffer.history.gaps.groupBy { gap ->
+        val fromIndex = gap.from.msgid?.let { msgid -> ordered.indexOfFirst { it.msgid == msgid } }
+            ?.takeIf { it >= 0 }
+        val toIndex = gap.to.msgid?.let { msgid -> ordered.indexOfFirst { it.msgid == msgid } }
+            ?.takeIf { it >= 0 }
+        fromIndex ?: toIndex?.plus(1)
+            ?: ordered.indexOfFirst { it.timestampMs <= gap.from.timestampMs }.takeIf { it >= 0 }
+            ?: ordered.size
+    }
     val grouped = dev.brentdevs.yardhal.core.data.MessageGrouper.group(
         messages = ordered.map { it.timestampMs },
         isGroupable = { index ->
@@ -130,7 +162,6 @@ private fun buildTranscript(buffer: ConversationBuffer): List<TranscriptEntry> {
     var renderedUnreadDivider = false
 
     val pendingEvents = ArrayList<Pair<Int, ChatMessage>>()
-    var eventGroupId = Long.MAX_VALUE
     fun flushEvents() {
         if (pendingEvents.isEmpty()) return
         if (pendingEvents.size == 1) {
@@ -139,25 +170,31 @@ private fun buildTranscript(buffer: ConversationBuffer): List<TranscriptEntry> {
             entries.add(TranscriptEntry.Message(single, isGrouped))
         } else {
             val eventsInChronologicalOrder = pendingEvents.map { it.second }.reversed()
-            entries.add(TranscriptEntry.CollapsedEvents(eventsInChronologicalOrder, "collapsed-$eventGroupId"))
+            entries.add(
+                TranscriptEntry.CollapsedEvents(eventsInChronologicalOrder, "collapsed-${pendingEvents[0].second.localId}"),
+            )
         }
         pendingEvents.clear()
-        eventGroupId = Long.MAX_VALUE
     }
 
     for (index in ordered.indices) {
         val message = ordered[index]
+        val gaps = gapsAtBoundary[index].orEmpty()
+        if (gaps.isNotEmpty()) {
+            flushEvents()
+            gaps.forEach { entries.add(TranscriptEntry.Gap(it)) }
+        }
         val timestamp = message.timestampMs
         val date = Instant.ofEpochMilli(timestamp).atZone(zone).toLocalDate()
         if (lastDate != null && date != lastDate) {
             flushEvents()
-            entries.add(TranscriptEntry.DayHeader(formatDayLabel(lastDate)))
+            entries.add(TranscriptEntry.DayHeader(lastDate))
             previousTimestamp = Long.MAX_VALUE
         }
         lastDate = date
         if (unreadFrom != null && timestamp < unreadFrom && previousTimestamp >= unreadFrom) {
             flushEvents()
-            entries.add(TranscriptEntry.UnreadDivider("New messages"))
+            entries.add(TranscriptEntry.UnreadDivider(unreadFrom))
             renderedUnreadDivider = true
         }
 
@@ -165,21 +202,21 @@ private fun buildTranscript(buffer: ConversationBuffer): List<TranscriptEntry> {
             message.kind == dev.brentdevs.yardhal.core.data.MessageKind.PART
         if (isEvent) {
             pendingEvents.add(index to message)
-            eventGroupId = minOf(eventGroupId, message.localId)
         } else {
             flushEvents()
-            entries.add(TranscriptEntry.Message(message, grouped[index].groupedWithPrevious))
+            entries.add(TranscriptEntry.Message(message, gaps.isEmpty() && grouped[index].groupedWithPrevious))
         }
         previousTimestamp = timestamp
     }
     flushEvents()
+    gapsAtBoundary[ordered.size].orEmpty().forEach { entries.add(TranscriptEntry.Gap(it)) }
 
     if (lastDate != null) {
-        entries.add(TranscriptEntry.DayHeader(formatDayLabel(lastDate)))
+        entries.add(TranscriptEntry.DayHeader(lastDate))
     }
 
     if (unreadFrom != null && !renderedUnreadDivider) {
-        entries.add(TranscriptEntry.UnreadDivider("New messages"))
+        entries.add(TranscriptEntry.UnreadDivider(unreadFrom))
     }
     return entries
 }
@@ -190,6 +227,73 @@ private fun formatDayLabel(date: LocalDate): String {
         today -> "Today"
         today.minusDays(1) -> "Yesterday"
         else -> date.format(DateTimeFormatter.ofPattern("MMMM d, yyyy"))
+    }
+}
+
+private class TranscriptViewport(public var pinned: Boolean) {
+    public var navigationVersion: Long = 0
+}
+
+@Composable
+private fun HistoryStateRow(
+    label: String,
+    state: HistoryLoadState,
+    completeText: String,
+    unsupportedText: String,
+    onRetry: () -> Unit,
+    onLoad: (() -> Unit)? = null,
+    loadText: String = "Load older history",
+    gap: Boolean = false,
+) {
+    val text = when (state.status) {
+        HistoryLoadStatus.IDLE -> if (gap) "Messages may be missing in this interval" else label
+        HistoryLoadStatus.LOADING -> "$label · loading…"
+        HistoryLoadStatus.EXHAUSTED -> completeText
+        HistoryLoadStatus.FAILED -> "$label · failed"
+        HistoryLoadStatus.CANCELLED -> "$label · cancelled"
+        HistoryLoadStatus.UNSUPPORTED -> unsupportedText
+        HistoryLoadStatus.WINDOW_EMPTY -> if (gap) {
+            "No messages in this gap window · the gap remains"
+        } else {
+            "No messages in this playback window · older windows may still contain history"
+        }
+    }
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(
+            text = text,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        state.error?.let { error ->
+            Text(error, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+        }
+        if (state.requiresReconnect) {
+            Text(
+                "Reconnect to retry server history. Stored history remains available offline.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            TextButton(onClick = onRetry) { Text("Reconnect and retry history") }
+        }
+        when {
+            state.requiresReconnect && onLoad != null && !gap -> {
+                TextButton(onClick = onLoad) { Text("Load stored history") }
+            }
+            state.requiresReconnect -> Unit
+            state.status == HistoryLoadStatus.FAILED || state.status == HistoryLoadStatus.CANCELLED -> {
+                TextButton(onClick = onRetry) { Text(if (gap) "Retry gap" else "Retry history") }
+            }
+            state.status == HistoryLoadStatus.WINDOW_EMPTY && onLoad != null -> {
+                TextButton(onClick = onLoad) { Text(if (gap) "Continue filling gap" else "Continue older") }
+            }
+            onLoad != null && (state.status == HistoryLoadStatus.IDLE ||
+                (gap && state.status == HistoryLoadStatus.EXHAUSTED)) -> {
+                TextButton(onClick = onLoad) { Text(loadText) }
+            }
+        }
     }
 }
 
@@ -207,6 +311,9 @@ public fun ConversationScreen(
     onSend: (String) -> Boolean,
     onOpenJoin: () -> Unit,
     onLoadHistory: () -> Unit,
+    onLoadOlderHistory: () -> Unit,
+    onRetryHistory: () -> Unit,
+    onFillHistoryGap: (String) -> Unit,
     onLoadMembers: () -> Unit,
     onReact: (String, String) -> Unit,
     onSetReplyDraft: (ChatMessage?) -> Unit,
@@ -247,6 +354,59 @@ public fun ConversationScreen(
     val unreadIndex = entries.indexOfFirst { it is TranscriptEntry.UnreadDivider }
     val coroutineScope = androidx.compose.runtime.rememberCoroutineScope()
     var focusedRowId by remember { mutableStateOf<Long?>(null) }
+    var lastAutoOlderBoundary by rememberSaveable { mutableStateOf<String?>(null) }
+    var autoFilledGapIds by rememberSaveable { mutableStateOf(emptyList<String>()) }
+    val currentBuffer by rememberUpdatedState(buffer)
+    val currentSearchTarget by rememberUpdatedState(searchTargetRowId)
+    val loadOlder by rememberUpdatedState(onLoadOlderHistory)
+    val fillGap by rememberUpdatedState(onFillHistoryGap)
+    val viewport = remember {
+        TranscriptViewport(listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset == 0)
+    }
+    val keepPinned = viewport.pinned && !listState.isScrollInProgress && searchTargetRowId == null
+    val navigationVersion = viewport.navigationVersion
+
+    LaunchedEffect(buffer.key, listState) {
+        snapshotFlow {
+            Triple(listState.firstVisibleItemIndex, listState.firstVisibleItemScrollOffset, listState.isScrollInProgress)
+        }.collect { (index, offset, scrolling) ->
+            viewport.pinned = index == 0 && offset == 0
+            if (scrolling) viewport.navigationVersion += 1
+        }
+    }
+    LaunchedEffect(buffer.messages.lastOrNull()?.localId) {
+        if (keepPinned && viewport.navigationVersion == navigationVersion &&
+            !listState.isScrollInProgress && currentSearchTarget == null && currentBuffer.messages.lastOrNull()?.playback != true
+        ) {
+            listState.scrollToItem(0)
+        }
+    }
+    LaunchedEffect(buffer.key, listState) {
+        snapshotFlow {
+            Triple(listState.layoutInfo.visibleItemsInfo.map { it.key }, currentBuffer, currentSearchTarget)
+        }.collect { (visibleKeys, latest, searchTarget) ->
+            if (searchTarget != null) return@collect
+            if ("history-older" in visibleKeys &&
+                latest.history.initial.status == HistoryLoadStatus.IDLE &&
+                latest.history.older.status == HistoryLoadStatus.IDLE &&
+                !latest.history.older.requiresReconnect
+            ) {
+                val boundary = latest.messages.firstOrNull()?.let { "msg-${it.localId}" }
+                if (boundary != null && boundary != lastAutoOlderBoundary) {
+                    lastAutoOlderBoundary = boundary
+                    loadOlder()
+                }
+            }
+            latest.history.gaps.forEach { gap ->
+                if ("gap-${gap.id}" in visibleKeys && gap.state.status == HistoryLoadStatus.IDLE &&
+                    !gap.state.requiresReconnect && gap.id !in autoFilledGapIds
+                ) {
+                    autoFilledGapIds = autoFilledGapIds + gap.id
+                    fillGap(gap.id)
+                }
+            }
+        }
+    }
 
     androidx.compose.runtime.LaunchedEffect(buffer.key, buffer.joinState) {
         if (buffer.ref.kind == ConversationKind.CHANNEL && buffer.joinState == JoinState.JOINED) {
@@ -264,6 +424,8 @@ public fun ConversationScreen(
                 }
             }
             if (index >= 0) {
+                viewport.navigationVersion += 1
+                viewport.pinned = false
                 listState.scrollToItem(index)
                 focusedRowId = searchTargetRowId
                 onSearchTargetShown()
@@ -321,6 +483,8 @@ public fun ConversationScreen(
                             if (unreadIndex >= 0) {
                                 DropdownMenuItem(text = { Text("Jump to unread") }, onClick = {
                                     overflowVisible = false
+                                    viewport.navigationVersion += 1
+                                    viewport.pinned = false
                                     coroutineScope.launch { listState.animateScrollToItem(unreadIndex) }
                                 })
                             }
@@ -381,27 +545,10 @@ public fun ConversationScreen(
         },
     ) { padding ->
         LaunchedEffectOnce(key = buffer.key, effect = onLoadHistory)
-        if (buffer.messages.isEmpty()) {
-            Box(modifier = Modifier.padding(padding).fillMaxSize(), contentAlignment = Alignment.Center) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(
-                        text = when {
-                            buffer.joinState == JoinState.FAILED -> "Could not join ${buffer.displayName}"
-                            connected -> "No messages yet — say hello."
-                            else -> "Offline · waiting for a connection"
-                        },
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    if (buffer.joinState == JoinState.FAILED) {
-                        TextButton(onClick = onRetryJoin) { Text("Retry join") }
-                    }
-                }
-            }
-        } else {
-            Column(modifier = Modifier.padding(padding).fillMaxSize()) {
+        Column(modifier = Modifier.padding(padding).fillMaxSize()) {
                 val statusText = when {
                     buffer.joinState == JoinState.FAILED -> "Could not join ${buffer.displayName}"
-                    !connected -> "Offline · messages will resume after reconnection"
+                    !connected -> "Offline · browsing stored history; server history resumes after reconnection"
                     buffer.joinState == JoinState.JOINING -> "Joining ${buffer.displayName}…"
                     else -> null
                 }
@@ -422,23 +569,74 @@ public fun ConversationScreen(
                         }
                     }
                 }
+                Column(
+                    modifier = Modifier.fillMaxWidth().heightIn(max = 160.dp).verticalScroll(rememberScrollState()),
+                ) {
+                    if (buffer.history.initial.status != HistoryLoadStatus.IDLE) {
+                        HistoryStateRow(
+                            label = "Recent history",
+                            state = buffer.history.initial,
+                            completeText = if (buffer.messages.isEmpty()) "No recent history found" else "Recent history loaded",
+                            unsupportedText = "Server history unavailable · stored history remains available",
+                            onRetry = onRetryHistory,
+                        )
+                    }
+                    if (buffer.history.catchUp.status != HistoryLoadStatus.IDLE) {
+                        HistoryStateRow(
+                            label = "Reconnect catch-up",
+                            state = buffer.history.catchUp,
+                            completeText = "Reconnect catch-up complete",
+                            unsupportedText = "Server catch-up unavailable · browsing stored history",
+                            onRetry = onRetryHistory,
+                        )
+                    }
+                    if (buffer.history.discovery.status != HistoryLoadStatus.IDLE) {
+                        HistoryStateRow(
+                            label = "Offline conversation discovery",
+                            state = buffer.history.discovery,
+                            completeText = "Offline conversation discovery complete for the bounded window",
+                            unsupportedText = "Offline conversation discovery is not supported by this server",
+                            onRetry = onRetryHistory,
+                        )
+                    }
+                    if (buffer.history.discoveryTruncated) {
+                        Text(
+                            "Discovery was limited · additional offline conversations may be missing.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                        )
+                    }
+                }
                 LazyColumn(
                     state = listState,
                     modifier = Modifier.weight(1f).fillMaxWidth(),
                     reverseLayout = true,
                     contentPadding = PaddingValues(vertical = 4.dp),
                 ) {
-                    items(entries.size, key = { index ->
-                        when (val entry = entries[index]) {
-                            is TranscriptEntry.DayHeader -> "header-${entry.label}-$index"
-                            is TranscriptEntry.UnreadDivider -> "unread-$index"
-                            is TranscriptEntry.CollapsedEvents -> entry.id
-                            is TranscriptEntry.Message -> "msg-${entry.value.localId}"
+                    if (buffer.messages.isEmpty()) {
+                        item(key = "history-empty") {
+                            Text(
+                                text = if (connected) "No messages loaded yet." else "No stored messages loaded yet.",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.fillMaxWidth().padding(16.dp),
+                            )
                         }
-                    }) { index ->
+                    }
+                    items(entries.size, key = { index -> entries[index].key }) { index ->
                         when (val entry = entries[index]) {
-                            is TranscriptEntry.DayHeader -> DayPill(entry.label)
-                            is TranscriptEntry.UnreadDivider -> NewMessagesDivider(entry.label)
+                            is TranscriptEntry.DayHeader -> DayPill(formatDayLabel(entry.date))
+                            is TranscriptEntry.UnreadDivider -> NewMessagesDivider("New messages")
+                            is TranscriptEntry.Gap -> HistoryStateRow(
+                                label = "Missing messages",
+                                state = entry.value.state,
+                                completeText = "History gap remains · the response did not fill the entire interval",
+                                unsupportedText = "This server cannot fill this history gap",
+                                onRetry = { onFillHistoryGap(entry.value.id) },
+                                onLoad = { onFillHistoryGap(entry.value.id) },
+                                loadText = "Fill remaining gap",
+                                gap = true,
+                            )
                             is TranscriptEntry.CollapsedEvents -> CollapsedEventsRow(
                                 entry = entry,
                                 appearance = appearance,
@@ -471,9 +669,18 @@ public fun ConversationScreen(
                             }
                         }
                     }
+                    item(key = "history-older") {
+                        HistoryStateRow(
+                            label = "Older history",
+                            state = buffer.history.older,
+                            completeText = "Beginning of available history",
+                            unsupportedText = "No more stored history · server history is unavailable",
+                            onRetry = onRetryHistory,
+                            onLoad = onLoadOlderHistory,
+                        )
+                    }
                 }
             }
-        }
     }
 
     if (actionTarget != null) {

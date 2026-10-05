@@ -259,7 +259,6 @@ class MessagingReducerTests {
         val effects = state.feed(":me!u@h JOIN #room")
         assertTrue(InboundEffect.SetJoinState(state.channelRef("#room"), JoinState.JOINED) in effects)
         assertTrue(state.channel(state.channelRef("#room").storageKey)?.memberList().orEmpty().isEmpty())
-        assertTrue(effects.filterIsInstance<InboundEffect.SendRaw>().any { it.line == "CHATHISTORY LATEST #room * 50" })
     }
 
     @Test
@@ -293,15 +292,11 @@ class MessagingReducerTests {
         assertFalse(state.registered)
         assertTrue(state.hasWhox)
         assertEquals(listOf('~', '@', '+'), state.prefixModes.symbols)
-        assertEquals(200, state.chathistoryLimit)
         state.feed(":srv 005 me -CASEMAPPING -PREFIX -WHOX -CHATHISTORY -soju.im/FILEHOST :are supported")
         assertEquals(dev.brentdevs.yardhal.core.protocol.CaseMapping.RFC1459, state.casemapping)
         assertEquals(dev.brentdevs.yardhal.core.protocol.ChannelPrefixModes.DEFAULT, state.prefixModes)
         assertFalse(state.hasWhox)
-        assertEquals(0, state.chathistoryLimit)
         assertNull(state.filehostEndpoint)
-        val joined = state.feed(":me!u@h JOIN #room")
-        assertFalse(joined.filterIsInstance<InboundEffect.SendRaw>().any { it.line.startsWith("CHATHISTORY") })
     }
 
     @Test

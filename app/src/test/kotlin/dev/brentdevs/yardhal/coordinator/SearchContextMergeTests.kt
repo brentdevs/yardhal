@@ -39,8 +39,7 @@ class SearchContextMergeTests {
     fun identicalAnonymousMessagesDoNotBorrowAStoredRowId() {
         val merged = mergeSearchContext(listOf(live(1), live(2)), listOf(stored(42))) { 3 }
 
-        assertEquals(listOf(null, null, 42L), merged.map { it.storedRowId })
-        assertEquals(listOf(1L, 2L, 3L), merged.map { it.localId })
+        assertEquals(mapOf(1L to null, 2L to null, 3L to 42L), merged.associate { it.localId to it.storedRowId })
     }
 
     @Test

@@ -8,6 +8,8 @@ import dev.brentdevs.yardhal.core.data.WhoisInfo
 public sealed interface InboundEffect {
     public data class SendRaw(public val line: String) : InboundEffect
 
+    public data class RequestHistory(public val ref: ConversationRef) : InboundEffect
+
     public data class ScheduleRaw(
         public val line: String,
         public val delayMs: Long,
@@ -44,6 +46,7 @@ public sealed interface InboundEffect {
         public val echoLabel: String? = null,
         public val senderAccount: String? = null,
         public val channelContext: String? = null,
+        public val historyContext: Boolean = false,
     ) : InboundEffect
 
     public data class SetTopic(public val ref: ConversationRef, public val topic: String?) : InboundEffect
@@ -72,7 +75,7 @@ public sealed interface InboundEffect {
         public val added: Boolean,
     ) : InboundEffect
 
-    public data class RedactMessage(public val msgid: String) : InboundEffect
+    public data class RedactMessage(public val ref: ConversationRef, public val msgid: String) : InboundEffect
 
     public data class ApplyReadMarker(public val ref: ConversationRef, public val timestampMs: Long) : InboundEffect
 

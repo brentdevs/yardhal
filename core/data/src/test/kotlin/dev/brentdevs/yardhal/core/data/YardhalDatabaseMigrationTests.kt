@@ -6,6 +6,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
 import kotlinx.coroutines.runBlocking
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -31,13 +32,14 @@ class YardhalDatabaseMigrationTests {
                 val store = MessageStore(db.messageDao())
                 assertEquals(legacy, store.recent(ref, 10))
                 assertEquals(legacy, store.after(ref, 0))
-                assertEquals(legacy, store.before(ref, 3000, 10))
+                assertEquals(legacy, store.before(ref, MessageCursor(3000, 0), 10))
                 assertEquals(legacy, store.around(ref, 57, 2000))
-                assertEquals(2, db.openHelper.writableDatabase.version)
+                assertEquals(3, db.openHelper.writableDatabase.version)
                 assertEquals(
                     legacy.map { it.rowId to MessageStore.contentHash(it) },
                     db.messageDao().allRows().sortedBy { it.rowId }.map { it.rowId to it.contentHash },
                 )
+                assertTrue(db.messageDao().allRows().none { it.historyContext })
                 assertEquals(listOf(57L, 41L), store.search("archiveindex").map { it.rowId })
 
                 val contextual = message(ref, 0, "new-1", "contextual notice", 3000).copy(channelContext = "#Room")
@@ -57,7 +59,7 @@ class YardhalDatabaseMigrationTests {
                 val store = MessageStore(reopened.messageDao())
                 assertEquals(legacy + added, store.recent(ref, 10))
                 assertEquals(listOf(added), store.after(ref, 2000))
-                assertEquals(legacy + added, store.before(ref, 4000, 10))
+                assertEquals(legacy + added, store.before(ref, MessageCursor(4000, 0), 10))
                 assertEquals(legacy + added, store.around(ref, added.rowId, added.timestampMs))
                 assertEquals(listOf(57L, 41L), store.search("archiveindex").map { it.rowId })
                 assertEquals(listOf(added.rowId), store.search("contextual").map { it.rowId })
@@ -66,6 +68,99 @@ class YardhalDatabaseMigrationTests {
             }
         } finally {
             context.deleteDatabase(name)
+        }
+    }
+
+    @Test
+    fun versionTwoUpgradeScopesMsgidsWithoutRebuildingRowsOrSearch() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val name = "message-migration-v2-test.db"
+        val ref = ConversationRef.channel("n1", "#room")
+        val legacy = listOf(
+            message(ref, 41, "shared-id", "first legacy notice", 1000).copy(channelContext = "#Context"),
+            message(ref, 57, null, "second legacy notice", 2000),
+        )
+        val added = mutableListOf<StoredMessage>()
+        context.deleteDatabase(name)
+        try {
+            createVersionTwoDatabase(context, name, legacy)
+            val db = YardhalDatabase.build(context, name)
+            try {
+                val store = MessageStore(db.messageDao())
+                assertEquals(legacy, store.recent(ref, 10))
+                assertEquals(legacy, store.after(ref, 0))
+                assertEquals(legacy, store.before(ref, MessageCursor(3000, 0), 10))
+                assertEquals(legacy, store.around(ref, 57, 2000))
+                assertEquals(listOf(legacy.last()), store.historyAnchors("n1"))
+                assertTrue(db.messageDao().allRows().none { it.historyContext })
+                db.openHelper.writableDatabase.query("PRAGMA table_info(messages)").use { columns ->
+                    var found = false
+                    while (columns.moveToNext()) {
+                        if (columns.getString(columns.getColumnIndexOrThrow("name")) == "historyContext") {
+                            assertEquals("INTEGER", columns.getString(columns.getColumnIndexOrThrow("type")))
+                            assertEquals(1, columns.getInt(columns.getColumnIndexOrThrow("notnull")))
+                            assertEquals("0", columns.getString(columns.getColumnIndexOrThrow("dflt_value")))
+                            found = true
+                        }
+                    }
+                    assertTrue(found)
+                }
+                assertEquals(3, db.openHelper.writableDatabase.version)
+                assertEquals(
+                    legacy.map { it.rowId to MessageStore.contentHash(it) },
+                    db.messageDao().allRows().sortedBy { it.rowId }.map { it.rowId to it.contentHash },
+                )
+                assertEquals(listOf(57L, 41L), store.search("archiveindex").map { it.rowId })
+                for (other in listOf(
+                    ConversationRef.channel("n1", "#other"),
+                    ConversationRef.directMessage("n1", "bob"),
+                    ConversationRef.channel("n2", "#room"),
+                )) {
+                    val replay = message(other, 0, "shared-id", "new replay notice", 3000).copy(historyContext = true)
+                    val rowId = assertNotNull(store.recordWithRowId(replay))
+                    added.add(replay.copy(rowId = rowId))
+                    assertEquals(listOf(replay.copy(rowId = rowId)), store.recent(other, 10))
+                    assertEquals(rowId, store.findStoredMessage(replay)?.rowId)
+                }
+                assertEquals(listOf(201L, 202L, 203L), added.map { it.rowId })
+                assertFalse(store.record(legacy.first().copy(text = "overlapping replay")))
+                assertEquals(legacy, store.recent(ref, 10))
+            } finally {
+                db.close()
+            }
+            val reopened = YardhalDatabase.build(context, name)
+            try {
+                val store = MessageStore(reopened.messageDao())
+                assertEquals(legacy, store.recent(ref, 10))
+                assertEquals(listOf(57L, 41L), store.search("archiveindex").map { it.rowId })
+                for (replay in added) {
+                    assertEquals(listOf(replay), store.recent(replay.conversation, 10))
+                    assertEquals(replay.rowId, store.findStoredMessage(replay)?.rowId)
+                    assertTrue(store.historyAnchors(replay.networkId).none { it.conversation == replay.conversation })
+                }
+                assertEquals(added.map { it.rowId }.toSet(), store.search("new replay").map { it.rowId }.toSet())
+            } finally {
+                reopened.close()
+            }
+        } finally {
+            context.deleteDatabase(name)
+        }
+    }
+
+    private fun createVersionTwoDatabase(context: Context, name: String, messages: List<StoredMessage>) {
+        createVersionOneDatabase(context, name, messages)
+        context.openOrCreateDatabase(name, Context.MODE_PRIVATE, null).use { db ->
+            db.execSQL("ALTER TABLE messages ADD COLUMN channelContext TEXT")
+            for (message in messages) {
+                db.execSQL(
+                    "UPDATE messages SET channelContext = ? WHERE rowId = ?",
+                    arrayOf<Any?>(message.channelContext, message.rowId),
+                )
+            }
+            db.execSQL(
+                "UPDATE room_master_table SET identity_hash = 'b56564ddcdccf4e400805570c63ed494' WHERE id = 42",
+            )
+            db.version = 2
         }
     }
 

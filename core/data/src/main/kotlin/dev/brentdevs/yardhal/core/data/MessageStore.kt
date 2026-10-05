@@ -21,16 +21,36 @@ public class MessageStore(private val dao: MessageDao) {
             sentByUs = message.sentByUs,
             timestampMs = message.timestampMs,
             channelContext = message.channelContext,
+            historyContext = message.historyContext,
         )
         if (row.msgid != null) {
-            val inserted = dao.insert(row)
-            if (inserted != -1L) indexForFts(inserted, row.senderNick, row.text)
-            return inserted.takeIf { it != -1L }
+            val identified = dao.rowIdByMsgid(row.networkId, row.conversation, row.msgid)
+            if (identified != null) {
+                if (!row.historyContext) dao.promoteHistoryContext(identified)
+                return null
+            }
+            val overlapping = dao.rowIdWithoutMsgidByHash(row.networkId, row.conversation, hash)
+            if (overlapping != null) {
+                dao.healMsgid(overlapping, row.msgid)
+                if (!row.historyContext) dao.promoteHistoryContext(overlapping)
+                return null
+            }
+        } else {
+            val overlapping = dao.rowIdByHash(row.networkId, row.conversation, hash)
+            if (overlapping != null) {
+                if (!row.historyContext) dao.promoteHistoryContext(overlapping)
+                return null
+            }
         }
-        if (dao.existsByHash(message.networkId, row.conversation, hash)) return null
         val inserted = dao.insert(row)
         if (inserted != -1L) indexForFts(inserted, row.senderNick, row.text)
         return inserted.takeIf { it != -1L }
+    }
+
+    public suspend fun findStoredMessage(message: StoredMessage): StoredMessage? {
+        val conversation = message.conversation.normalizedTarget
+        val byMsgid = message.msgid?.let { dao.byMsgid(message.networkId, conversation, it) }
+        return (byMsgid ?: dao.byHash(message.networkId, conversation, contentHash(message)))?.toStored(message.conversation)
     }
 
     private suspend fun indexForFts(rowId: Long, sender: String, body: String) {
@@ -49,8 +69,8 @@ public class MessageStore(private val dao: MessageDao) {
     public suspend fun after(conversation: ConversationRef, afterMs: Long): List<StoredMessage> =
         dao.after(conversation.networkId, conversation.normalizedTarget, afterMs).map { it.toStored(conversation) }
 
-    public suspend fun before(conversation: ConversationRef, beforeMs: Long, limit: Int): List<StoredMessage> =
-        dao.before(conversation.networkId, conversation.normalizedTarget, beforeMs, limit)
+    public suspend fun before(conversation: ConversationRef, cursor: MessageCursor, limit: Int): List<StoredMessage> =
+        dao.before(conversation.networkId, conversation.normalizedTarget, cursor.timestampMs, cursor.rowId, limit)
             .map { it.toStored(conversation) }
             .reversed()
 
@@ -65,14 +85,10 @@ public class MessageStore(private val dao: MessageDao) {
         dao.latestTimestamp(conversation.networkId, conversation.normalizedTarget)
 
     public suspend fun knownConversations(networkId: String): List<ConversationRef> =
-        dao.conversations(networkId).map { target ->
-            val kind = when {
-                target == ConversationRef.SERVER_TARGET -> ConversationKind.SERVER
-                target.firstOrNull()?.let { it in "#&" } == true -> ConversationKind.CHANNEL
-                else -> ConversationKind.DIRECT_MESSAGE
-            }
-            ConversationRef(networkId, kind, target, target)
-        }
+        dao.conversations(networkId).map { target -> conversationRef(networkId, target) }
+
+    public suspend fun historyAnchors(networkId: String): List<StoredMessage> =
+        dao.historyAnchors(networkId).map { row -> row.toStored(conversationRef(networkId, row.conversation)) }
 
     public suspend fun trimTo(conversation: ConversationRef, keep: Int) {
         dao.trim(conversation.networkId, conversation.normalizedTarget, keep)
@@ -86,21 +102,27 @@ public class MessageStore(private val dao: MessageDao) {
         if (from.networkId != to.networkId || from.normalizedTarget == to.normalizedTarget) return 0
         val moving = dao.allIn(from.networkId, from.normalizedTarget)
         if (moving.isEmpty()) return 0
-        val renamed = dao.renameConversation(from.networkId, from.normalizedTarget, to.normalizedTarget)
         for (row in moving) {
             val hash = hashOf(row.networkId, to.normalizedTarget, row.senderNick, row.kind, row.text, row.timestampMs)
-            val duplicate = if (row.msgid == null) dao.rowIdByHash(row.networkId, to.normalizedTarget, hash) else null
+            val duplicate = if (row.msgid == null) {
+                dao.rowIdByHash(row.networkId, to.normalizedTarget, hash)
+            } else {
+                dao.rowIdByMsgid(row.networkId, to.normalizedTarget, row.msgid)
+                    ?: dao.rowIdWithoutMsgidByHash(row.networkId, to.normalizedTarget, hash)
+            }
             if (duplicate != null) {
+                if (row.msgid != null) dao.healMsgid(duplicate, row.msgid)
+                if (!row.historyContext) dao.promoteHistoryContext(duplicate)
                 dao.deleteFtsForNetworkRaw(
                     androidx.sqlite.db.SimpleSQLiteQuery("DELETE FROM message_fts WHERE rowid = ?", arrayOf<Any>(row.rowId)),
                 )
                 dao.deleteRow(row.rowId)
                 onRowMerged(row.rowId, duplicate)
             } else {
-                dao.updateContentHash(row.rowId, hash)
+                dao.renameRow(row.rowId, to.normalizedTarget, hash)
             }
         }
-        return renamed
+        return moving.size
     }
 
     public suspend fun reindexAll() {
@@ -192,6 +214,15 @@ public class MessageStore(private val dao: MessageDao) {
             return digest.digest(payload.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
         }
 
+        private fun conversationRef(networkId: String, target: String): ConversationRef {
+            val kind = when {
+                target == ConversationRef.SERVER_TARGET -> ConversationKind.SERVER
+                target.firstOrNull()?.let { it in "#&" } == true -> ConversationKind.CHANNEL
+                else -> ConversationKind.DIRECT_MESSAGE
+            }
+            return ConversationRef(networkId, kind, target, target)
+        }
+
         private fun MessageRow.toStored(conversation: ConversationRef): StoredMessage = StoredMessage(
             rowId = rowId,
             networkId = networkId,
@@ -205,6 +236,9 @@ public class MessageStore(private val dao: MessageDao) {
             sentByUs = sentByUs,
             timestampMs = timestampMs,
             channelContext = channelContext,
+            historyContext = historyContext,
         )
     }
 }
+
+public data class MessageCursor(public val timestampMs: Long, public val rowId: Long)

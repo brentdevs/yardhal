@@ -144,6 +144,7 @@ class MessagingCoordinatorTests {
         val networks = NetworkStore(directory).also { it.add(config) }
         val messages = MessageStore(database.messageDao())
         val readMarkers = ReadMarkerStore(directory)
+        val historyCoverage = dev.brentdevs.yardhal.core.data.HistoryCoverageStore(directory)
         val mutes = MuteStore(directory)
         val channelOrder = ChannelOrderStore(directory)
         val coordinator = LiveCoordinator(
@@ -151,6 +152,7 @@ class MessagingCoordinatorTests {
             networkStore = networks,
             messageStore = messages,
             readMarkers = readMarkers,
+            historyCoverage = historyCoverage,
             mutes = mutes,
             vault = InMemoryCredentialVault(),
             channelOrder = channelOrder,
@@ -427,6 +429,7 @@ class MessagingCoordinatorTests {
                 networkStore = harness.networks,
                 messageStore = harness.messages,
                 readMarkers = harness.readMarkers,
+                historyCoverage = harness.historyCoverage,
                 mutes = harness.mutes,
                 vault = InMemoryCredentialVault(),
                 channelOrder = harness.channelOrder,
