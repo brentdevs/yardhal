@@ -288,6 +288,12 @@ class HistoryCoordinatorIntegrationTests {
         withTimeout(5_000) { while (!predicate()) delay(10) }
     }
 
+    private suspend fun awaitProcessed(peer: Peer, harness: Harness, marker: String) {
+        val ref = ConversationRef.server(harness.config.id)
+        peer.send(":srv 372 tester :$marker")
+        await { harness.coordinator.buffers.value[ref.storageKey]?.messages?.any { it.text == marker } == true }
+    }
+
     private suspend fun query(server: Server, operation: String, target: String, after: Int = 0): Query {
         await { server.queries.drop(after).any { it.operation == operation && it.target == target } }
         return server.queries.drop(after).first { it.operation == operation && it.target == target }
@@ -374,8 +380,6 @@ class HistoryCoordinatorIntegrationTests {
         harness.seed(bob, "bob-anchor")
         harness.seed(ConversationRef.server(harness.config.id), "server-cache", NOW + 60_000)
         harness.coordinator.startAll()
-        val targetsQuery = query(server, "TARGETS", "timestamp=${iso(BASE - 1)}")
-        assertEquals(BASE - 1, Instant.parse(targetsQuery.message.parameters[1].substringAfter('=')).toEpochMilli())
         val answered = mutableSetOf<Query>()
         val targetsSeen = mutableSetOf<String>()
         withTimeout(5_000) {
@@ -399,6 +403,8 @@ class HistoryCoordinatorIntegrationTests {
                 }
             }
         }
+        val targetsQuery = query(server, "TARGETS", "timestamp=${iso(BASE - 1)}")
+        assertEquals(BASE - 1, Instant.parse(targetsQuery.message.parameters[1].substringAfter('=')).toEpochMilli())
         await { harness.coordinator.buffers.value[bob.storageKey]?.messages?.any { it.msgid == "bob-offline" } == true &&
             harness.coordinator.buffers.value[carol.storageKey]?.messages?.any { it.msgid == "carol-offline" } == true }
         await { harness.messages.recent(carol, 10).singleOrNull()?.msgid == "carol-offline" }
@@ -443,8 +449,7 @@ class HistoryCoordinatorIntegrationTests {
         await { harness.buffer().history.catchUp.status == HistoryLoadStatus.FAILED }
         assertTrue(harness.buffer().history.catchUp.requiresReconnect)
         server.reply(timedOut, listOf(WireRow("stale-old-socket", BASE + 1_000)), end = true)
-        timedOut.peer.send("PING :old-response-barrier")
-        await { timedOut.peer.received.any { it.contains("old-response-barrier") && it.startsWith("PONG") } }
+        awaitProcessed(timedOut.peer, harness, "old-response-barrier")
         assertFalse(harness.buffer().messages.any { it.msgid == "stale-old-socket" })
         val offset = server.queries.size
         harness.coordinator.retryHistory(key)
@@ -558,8 +563,7 @@ class HistoryCoordinatorIntegrationTests {
         val peer = server.peers.single()
         peer.send(":srv BATCH +held znc.in/playback #room")
         peer.send("@batch=held;time=${iso(BASE + 1_000)};msgid=partial :alice!u@h PRIVMSG #room :tester partial replay")
-        peer.send("PING :playback-started")
-        await { peer.received.any { it.startsWith("PONG") && it.contains("playback-started") } }
+        awaitProcessed(peer, harness, "playback-started")
         harness.elapsed.addAndGet(6_001)
         peer.send("PING :expire-playback")
         val serverRef = ConversationRef.server(harness.config.id)
@@ -569,8 +573,7 @@ class HistoryCoordinatorIntegrationTests {
         peer.send("@batch=late;time=${iso(BASE + 2_000)};msgid=late-batch :alice!u@h PRIVMSG #room :tester late batch")
         peer.send(":srv BATCH -late")
         peer.send("@time=${iso(BASE + 3_000)};msgid=late-bare :alice!u@h PRIVMSG #room :tester late bare")
-        peer.send("PING :late-playback-barrier")
-        await { peer.received.any { it.startsWith("PONG") && it.contains("late-playback-barrier") } }
+        awaitProcessed(peer, harness, "late-playback-barrier")
         assertFalse(harness.buffer().messages.any { it.msgid in setOf("partial", "late-batch", "late-bare") })
         assertFalse(harness.messages.recent(harness.channel, 20).any { it.msgid in setOf("partial", "late-batch", "late-bare") })
         assertTrue(harness.highlights.isEmpty())
@@ -613,8 +616,7 @@ class HistoryCoordinatorIntegrationTests {
         assertEquals("*", discovery.message.parameters[2])
         server.replyPlayback(discovery, "#room", (6..10).map { WireRow("native-$it", BASE + it * 1_000) })
         server.replyPlayback(discovery, "carol", listOf(WireRow("new-dm", BASE + 5_000, "tester offline DM")))
-        discovery.peer.send("PING :discovery-complete")
-        await { discovery.peer.received.any { it.startsWith("PONG") && it.contains("discovery-complete") } }
+        awaitProcessed(discovery.peer, harness, "discovery-complete")
         harness.elapsed.addAndGet(2_001)
         discovery.peer.send("PING :finish-discovery")
         await { harness.buffer().history.gaps.size == 1 }
@@ -682,8 +684,7 @@ class HistoryCoordinatorIntegrationTests {
         request.peer.send(":srv BATCH +invalid znc.in/playback #room")
         request.peer.send("@batch=invalid :alice!u@h PRIVMSG #room :invalid missing timestamp")
         request.peer.send(":srv BATCH -invalid")
-        request.peer.send("PING :invalid-complete")
-        await { request.peer.received.any { it.startsWith("PONG") && it.contains("invalid-complete") } }
+        awaitProcessed(request.peer, harness, "invalid-complete")
         harness.elapsed.addAndGet(2_001)
         request.peer.send("PING :finish-invalid")
         val serverRef = ConversationRef.server(harness.config.id)
