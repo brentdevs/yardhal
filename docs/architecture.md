@@ -257,6 +257,13 @@ phases, matching the `make check` ordering within the existing thirty-minute
 job limit. Test start/end logging identifies a stalled case; a phase timeout
 leaves time for failure-report upload instead of exhausting the whole job.
 
+The in-memory Room factory runs its query executor inline. Cancelling and joining
+a coordinator scope can otherwise leave Room's detached query work opening SQLite
+after the harness has closed the database, racing Robolectric's native reset.
+Inline execution keeps the query within the caller's lifetime; harnesses still
+join their scopes before closing Room. The on-disk application builder retains
+Room's asynchronous executors.
+
 SCRAM uses the complete RFC 4013 Unicode 3.2 SASLprep profile: mapping, frozen
 NFKC normalization, prohibited-character checks, bidi restrictions, and the
 query/stored unassigned-character distinction. Usernames use QUERY and passwords

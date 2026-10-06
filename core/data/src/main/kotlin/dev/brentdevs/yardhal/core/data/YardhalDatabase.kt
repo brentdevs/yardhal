@@ -50,6 +50,7 @@ public abstract class YardhalDatabase : RoomDatabase() {
             Room.inMemoryDatabaseBuilder(context, YardhalDatabase::class.java)
                 .addCallback(callback)
                 .allowMainThreadQueries()
+                .setQueryExecutor { it.run() }
                 .build()
     }
 }
