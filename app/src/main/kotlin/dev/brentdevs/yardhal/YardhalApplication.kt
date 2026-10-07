@@ -98,7 +98,7 @@ class YardhalApplication : Application() {
         coordinator.startAll()
         appScope.launch {
             coordinator.networks.collect { networks ->
-                if (networks.isEmpty()) {
+                if (networks.all { it.status == ConnectionStatus.DISCONNECTED }) {
                     ConnectionService.stop(this@YardhalApplication)
                 } else {
                     ConnectionService.start(

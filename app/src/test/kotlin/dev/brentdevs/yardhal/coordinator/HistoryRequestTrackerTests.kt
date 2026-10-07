@@ -276,6 +276,67 @@ class HistoryRequestTrackerTests {
     }
 
     @Test
+    fun lateLabeledTimeoutErrorsAndAcksAreConsumedWhileAnotherRequestIsActive() {
+        val tracker = tracker()
+        tracker.begin(request(label = "old"), 0L)
+        assertNotNull(tracker.expire(6_000L))
+        val replacement = request(id = 2L, label = "new")
+        assertTrue(tracker.begin(replacement, 6_100L))
+        val retired = listOf(
+            "@label=old :srv FAIL CHATHISTORY MESSAGE_ERROR BEFORE #room :Late failure",
+            "@label=old :srv ACK",
+            "@label=old :srv 403 Me #room :No such channel",
+        )
+        retired.forEach { line ->
+            val receipt = tracker.feed(line, 6_200L)
+            assertTrue(receipt.consumed, line)
+            assertNull(receipt.result, line)
+            assertEquals(replacement, tracker.pending)
+        }
+        val live = listOf(
+            "@label=old :bob!u@h PRIVMSG #room :live message",
+            "@label=old :srv FAIL PRIVMSG INVALID_TARGET #room :Live failure",
+            "@label=old :srv FAIL CHATHISTORY MESSAGE_ERROR LATEST #room :Other operation",
+            "@label=old :srv FAIL CHATHISTORY MESSAGE_ERROR BEFORE #other :Other target",
+            "@label=unrelated :srv ACK",
+            ":srv ACK",
+        )
+        live.forEach { line -> assertFalse(tracker.feed(line, 6_200L).consumed, line) }
+        tracker.feed("@label=new :srv BATCH +history chathistory #room", 6_300L)
+        val result = assertNotNull(tracker.feed(":srv BATCH -history", 6_300L).result)
+        assertEquals(replacement, result.request)
+        assertNull(result.error)
+        assertEquals(2, result.frames.size)
+    }
+
+    @Test
+    fun lateLabeledCancellationErrorsAndAcksCannotInterruptANewHistoryBatch() {
+        val tracker = tracker()
+        tracker.begin(request(label = "old"), 0L)
+        tracker.feed("@label=old :srv BATCH +oldhistory chathistory #room")
+        assertNotNull(tracker.cancel("Cancelled by user"))
+        val replacement = request(id = 2L, label = "new")
+        assertTrue(tracker.begin(replacement, 200L))
+        tracker.feed("@label=new :srv BATCH +history chathistory #room", 300L)
+        for (line in listOf(
+            "@label=old :srv FAIL CHATHISTORY INVALID_TARGET BEFORE #room :Late failure",
+            "@label=old :srv ACK",
+            "@batch=oldhistory :bob!u@h PRIVMSG #room :late playback",
+            ":srv BATCH -oldhistory",
+        )) {
+            val receipt = tracker.feed(line, 300L)
+            assertTrue(receipt.consumed, line)
+            assertNull(receipt.result, line)
+            assertEquals(replacement, tracker.pending)
+        }
+        val result = assertNotNull(tracker.feed(":srv BATCH -history", 400L).result)
+        assertEquals(replacement, result.request)
+        assertNull(result.error)
+        assertEquals(2, result.frames.size)
+        assertFalse(tracker.requiresReconnect)
+    }
+
+    @Test
     fun cancellationRetainsPartialReplayButClearsPendingAndDeadline() {
         val tracker = tracker()
         tracker.begin(request(label = "cancelled"), 0L)
@@ -343,7 +404,7 @@ class HistoryRequestTrackerTests {
     }
 
     @Test
-    fun unfinishedNestedBatchFailsRatherThanClaimingCoverage() {
+    fun closedHistoryReferenceIsReusableWhileUnfinishedNestedBatchRemainsQuarantined() {
         val tracker = tracker()
         tracker.begin(request(), 0L)
         tracker.feed(":srv BATCH +history chathistory #room")
@@ -352,24 +413,159 @@ class HistoryRequestTrackerTests {
         assertNotNull(result.error)
         assertFalse(result.end)
         assertNull(tracker.pending)
+        assertTrue(tracker.requiresReconnect)
+        val live = listOf(
+            ":bob!u@h BATCH +history draft/multiline #room",
+            "@batch=history :bob!u@h PRIVMSG #room :live message",
+            ":bob!u@h BATCH -history",
+        )
+        live.forEach { line -> assertFalse(tracker.feed(line).consumed, line) }
+        assertTrue(tracker.feed("@batch=multi :bob!u@h PRIVMSG #room :late fragment").consumed)
         assertTrue(tracker.feed(":srv BATCH -multi").consumed)
+        assertFalse(tracker.feed(":bob!u@h BATCH +multi draft/multiline #room").consumed)
+        assertFalse(tracker.feed("@batch=multi :bob!u@h PRIVMSG #room :live fragment").consumed)
+        assertFalse(tracker.feed(":bob!u@h BATCH -multi").consumed)
+        assertTrue(tracker.requiresReconnect)
+        assertFalse(tracker.begin(request(id = 2L), 200L))
     }
 
     @Test
-    fun ackIsNotHistoryCompletionAndEmptyOuterResponseFails() {
+    fun topLevelLabeledAckFinishesEveryHistoryOperationWithoutClaimingEmptyArchive() {
+        for (operation in HistoryOperation.entries) {
+            val tracker = tracker()
+            val pending = request(
+                target = if (operation == HistoryOperation.TARGETS) null else "#room",
+                operation = operation,
+                label = "ack",
+            )
+            assertTrue(tracker.begin(pending, 0L))
+            val ack = tracker.feed("@label=ack :srv ACK")
+            assertTrue(ack.consumed)
+            val result = assertNotNull(ack.result)
+            assertEquals(pending, result.request)
+            assertEquals("History response acknowledged without a complete history batch", result.error)
+            assertFalse(result.end)
+            assertFalse(result.batchComplete)
+            assertTrue(result.frames.isEmpty())
+            assertTrue(result.targets.isEmpty())
+            assertNull(tracker.pending)
+            assertNull(tracker.deadlineMs)
+            assertNull(tracker.expire(6_000L))
+            assertFalse(tracker.requiresReconnect)
+            val next = request(id = 2L, label = "next")
+            assertTrue(tracker.begin(next, 6_100L))
+            tracker.feed("@label=next :srv BATCH +history chathistory #room", 6_200L)
+            val nextResult = assertNotNull(tracker.feed(":srv BATCH -history", 6_200L).result)
+            assertEquals(next, nextResult.request)
+            assertNull(nextResult.error)
+            assertTrue(nextResult.batchComplete)
+        }
+    }
+
+    @Test
+    fun inheritedAckWaitsForWrapperCloseAndCannotReplaceMissingHistory() {
         val tracker = tracker()
-        tracker.begin(request(label = "ack"), 0L)
-        val ack = tracker.feed("@label=ack :srv ACK")
+        tracker.begin(request(label = "empty"), 0L)
+        tracker.feed("@label=empty :srv BATCH +outer labeled-response")
+        val ack = tracker.feed("@batch=outer :srv ACK")
         assertTrue(ack.consumed)
         assertNull(ack.result)
         assertNotNull(tracker.pending)
-        assertNotNull(tracker.expire(6_000L)?.error)
-        val outer = tracker()
-        outer.begin(request(label = "empty"), 0L)
-        outer.feed("@label=empty :srv BATCH +outer labeled-response")
-        val result = assertNotNull(outer.feed(":srv BATCH -outer").result)
+        val result = assertNotNull(tracker.feed(":srv BATCH -outer").result)
         assertNotNull(result.error)
         assertFalse(result.end)
+        assertFalse(result.batchComplete)
+        assertEquals(2, result.frames.size)
+        assertFalse(tracker.requiresReconnect)
+        assertTrue(tracker.begin(request(id = 2L, label = "next"), 200L))
+    }
+
+    @Test
+    fun topLevelAckCannotDeclareAnOpenHistoryBatchComplete() {
+        val tracker = tracker()
+        tracker.begin(request(label = "old"), 0L)
+        tracker.feed("@label=old;draft/chathistory-end :srv BATCH +history chathistory #room")
+        tracker.feed("@batch=history :bob!u@h PRIVMSG #room :partial")
+        val result = assertNotNull(tracker.feed("@label=old :srv ACK").result)
+        assertNotNull(result.error)
+        assertFalse(result.end)
+        assertFalse(result.batchComplete)
+        assertEquals(2, result.frames.size)
+        assertTrue(tracker.begin(request(id = 2L, label = "new"), 200L))
+        assertTrue(tracker.feed("@batch=history :bob!u@h PRIVMSG #room :late").consumed)
+        assertTrue(tracker.feed(":srv BATCH -history").consumed)
+        assertEquals("new", tracker.pending?.label)
+    }
+
+    @Test
+    fun captureLimitOnRootCloseDoesNotQuarantineAReusedLiveReference() {
+        val tracker = tracker()
+        tracker.begin(request(label = "old"), 0L)
+        tracker.feed("@label=old :srv BATCH +history chathistory #room")
+        val payload = message("@batch=history :bob!u@h PRIVMSG #room :${"x".repeat(384)}")
+        repeat(4_780) { assertNull(tracker.receive(payload, 100L).result) }
+        val result = assertNotNull(tracker.feed("@padding=${"x".repeat(2_048)} :srv BATCH -history").result)
+        assertEquals("History response exceeded the capture limit", result.error)
+        assertFalse(result.end)
+        assertFalse(result.batchComplete)
+        assertFalse(tracker.requiresReconnect)
+        assertTrue(tracker.begin(request(id = 2L, label = "new"), 200L))
+        val live = listOf(
+            ":bob!u@h BATCH +history draft/multiline #room",
+            "@batch=history :bob!u@h PRIVMSG #room :live message",
+            ":bob!u@h BATCH -history",
+        )
+        live.forEach { line -> assertFalse(tracker.feed(line, 300L).consumed, line) }
+        tracker.feed("@label=new :srv BATCH +history chathistory #room", 400L)
+        assertNull(assertNotNull(tracker.feed(":srv BATCH -history", 400L).result).error)
+    }
+
+    @Test
+    fun captureLimitOnNestedCloseRetainsOnlyTheActuallyOpenRoot() {
+        val tracker = tracker()
+        tracker.begin(request(label = "old"), 0L)
+        tracker.feed("@label=old :srv BATCH +history chathistory #room")
+        tracker.feed("@batch=history :bob!u@h BATCH +nestedx draft/multiline #room")
+        val payload = message("@batch=nestedx :bob!u@h PRIVMSG #room :${"x".repeat(384)}")
+        repeat(4_780) { assertNull(tracker.receive(payload, 100L).result) }
+        val result = assertNotNull(tracker.feed("@padding=${"x".repeat(2_048)} :srv BATCH -nestedx").result)
+        assertEquals("History response exceeded the capture limit", result.error)
+        assertFalse(result.end)
+        assertFalse(result.batchComplete)
+        assertTrue(tracker.begin(request(id = 2L, label = "new"), 200L))
+        val live = listOf(
+            ":bob!u@h BATCH +nestedx draft/multiline #room",
+            "@batch=nestedx :bob!u@h PRIVMSG #room :live message",
+            ":bob!u@h BATCH -nestedx",
+        )
+        live.forEach { line -> assertFalse(tracker.feed(line, 300L).consumed, line) }
+        assertTrue(tracker.feed("@batch=history :bob!u@h PRIVMSG #room :late", 300L).consumed)
+        assertTrue(tracker.feed(":srv BATCH -history", 300L).consumed)
+        tracker.feed("@label=new :srv BATCH +history chathistory #room", 400L)
+        assertNull(assertNotNull(tracker.feed(":srv BATCH -history", 400L).result).error)
+    }
+
+    @Test
+    fun malformedClosedBatchesDoNotAccumulateTowardTheOpenBatchLimit() {
+        val tracker = tracker()
+        repeat(300) { index ->
+            val pending = request(id = index.toLong() + 1, label = "request$index")
+            assertTrue(tracker.begin(pending, 0L))
+            assertNull(tracker.feed("@label=request$index :srv BATCH +history$index chathistory #room").result)
+            assertNull(tracker.feed("@batch=history$index :bob!u@h BATCH +multi$index draft/multiline #room").result)
+            val result = assertNotNull(tracker.feed(":srv BATCH -history$index").result)
+            assertEquals("History batch closed with unfinished nested batches", result.error)
+            assertFalse(result.end)
+            assertTrue(tracker.feed(":srv BATCH -multi$index").consumed)
+            assertFalse(tracker.requiresReconnect)
+        }
+        val next = request(id = 301L, label = "next")
+        assertTrue(tracker.begin(next, 200L))
+        assertNull(tracker.feed("@label=next :srv BATCH +history chathistory #room", 300L).result)
+        val result = assertNotNull(tracker.feed(":srv BATCH -history", 300L).result)
+        assertEquals(next, result.request)
+        assertNull(result.error)
+        assertTrue(result.batchComplete)
     }
 
     @Test

@@ -70,6 +70,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
@@ -108,7 +109,7 @@ import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
-private sealed interface TranscriptEntry {
+internal sealed interface TranscriptEntry {
     public val key: String
 
     public data class DayHeader(public val date: LocalDate) : TranscriptEntry {
@@ -130,8 +131,7 @@ private sealed interface TranscriptEntry {
 
 public enum class MemberAction { MESSAGE, WHOIS, KICK, BAN, BAN_ACCOUNT, IGNORE }
 
-private fun buildTranscript(buffer: ConversationBuffer): List<TranscriptEntry> {
-    val zone = ZoneId.systemDefault()
+internal fun buildTranscript(buffer: ConversationBuffer, zone: ZoneId = ZoneId.systemDefault()): List<TranscriptEntry> {
     val ordered = buffer.messages.asReversed()
     val gapsAtBoundary = buffer.history.gaps.groupBy { gap ->
         val fromIndex = gap.from.msgid?.let { msgid -> ordered.indexOfFirst { it.msgid == msgid } }
@@ -171,7 +171,7 @@ private fun buildTranscript(buffer: ConversationBuffer): List<TranscriptEntry> {
         } else {
             val eventsInChronologicalOrder = pendingEvents.map { it.second }.reversed()
             entries.add(
-                TranscriptEntry.CollapsedEvents(eventsInChronologicalOrder, "collapsed-${pendingEvents[0].second.localId}"),
+                TranscriptEntry.CollapsedEvents(eventsInChronologicalOrder, "collapsed-${pendingEvents.minOf { it.second.localId }}"),
             )
         }
         pendingEvents.clear()
@@ -189,10 +189,9 @@ private fun buildTranscript(buffer: ConversationBuffer): List<TranscriptEntry> {
         if (lastDate != null && date != lastDate) {
             flushEvents()
             entries.add(TranscriptEntry.DayHeader(lastDate))
-            previousTimestamp = Long.MAX_VALUE
         }
         lastDate = date
-        if (unreadFrom != null && timestamp < unreadFrom && previousTimestamp >= unreadFrom) {
+        if (unreadFrom != null && !renderedUnreadDivider && timestamp < unreadFrom && previousTimestamp >= unreadFrom) {
             flushEvents()
             entries.add(TranscriptEntry.UnreadDivider(unreadFrom))
             renderedUnreadDivider = true
@@ -232,6 +231,63 @@ private fun formatDayLabel(date: LocalDate): String {
 
 private class TranscriptViewport(public var pinned: Boolean) {
     public var navigationVersion: Long = 0
+}
+
+internal class TranscriptHistoryAutoLoader private constructor(
+    private var wasConnected: Boolean,
+    private var olderBoundary: Long?,
+    private val filledGapIds: MutableSet<String>,
+) {
+    public constructor(connected: Boolean) : this(connected, null, mutableSetOf())
+
+    public fun loadVisible(
+        buffer: ConversationBuffer,
+        visibleKeys: List<Any>,
+        connected: Boolean,
+        searchTargetRowId: Long?,
+        loadOlder: () -> Unit,
+        fillGap: (String) -> Unit,
+    ) {
+        if (connected && !wasConnected) {
+            olderBoundary = null
+            filledGapIds.clear()
+        }
+        wasConnected = connected
+        if (buffer.history.older.canRearmAutoLoad()) olderBoundary = null
+        filledGapIds.removeAll { id ->
+            buffer.history.gaps.firstOrNull { it.id == id }?.state?.canRearmAutoLoad() != false
+        }
+        if (searchTargetRowId != null) return
+        if ("history-older" in visibleKeys &&
+            buffer.history.initial.status == HistoryLoadStatus.IDLE &&
+            buffer.history.older.status == HistoryLoadStatus.IDLE &&
+            !buffer.history.older.requiresReconnect
+        ) {
+            val boundary = buffer.messages.firstOrNull()?.localId
+            if (boundary != null && boundary != olderBoundary) {
+                olderBoundary = boundary
+                loadOlder()
+            }
+        }
+        if (!connected) return
+        for (gap in buffer.history.gaps) {
+            if ("gap-${gap.id}" in visibleKeys && gap.state.status == HistoryLoadStatus.IDLE &&
+                !gap.state.requiresReconnect && filledGapIds.add(gap.id)
+            ) {
+                fillGap(gap.id)
+            }
+        }
+    }
+
+    private fun HistoryLoadState.canRearmAutoLoad(): Boolean =
+        requiresReconnect || status == HistoryLoadStatus.FAILED || status == HistoryLoadStatus.CANCELLED
+
+    public companion object {
+        public val Saver = listSaver<TranscriptHistoryAutoLoader, String>(
+            save = { listOf(it.wasConnected.toString(), it.olderBoundary?.toString().orEmpty()) + it.filledGapIds },
+            restore = { TranscriptHistoryAutoLoader(it[0].toBooleanStrict(), it[1].toLongOrNull(), it.drop(2).toMutableSet()) },
+        )
+    }
 }
 
 @Composable
@@ -354,9 +410,11 @@ public fun ConversationScreen(
     val unreadIndex = entries.indexOfFirst { it is TranscriptEntry.UnreadDivider }
     val coroutineScope = androidx.compose.runtime.rememberCoroutineScope()
     var focusedRowId by remember { mutableStateOf<Long?>(null) }
-    var lastAutoOlderBoundary by rememberSaveable { mutableStateOf<String?>(null) }
-    var autoFilledGapIds by rememberSaveable { mutableStateOf(emptyList<String>()) }
+    val autoHistoryLoader = rememberSaveable(saver = TranscriptHistoryAutoLoader.Saver) {
+        TranscriptHistoryAutoLoader(connected)
+    }
     val currentBuffer by rememberUpdatedState(buffer)
+    val currentConnected by rememberUpdatedState(connected)
     val currentSearchTarget by rememberUpdatedState(searchTargetRowId)
     val loadOlder by rememberUpdatedState(onLoadOlderHistory)
     val fillGap by rememberUpdatedState(onFillHistoryGap)
@@ -383,28 +441,10 @@ public fun ConversationScreen(
     }
     LaunchedEffect(buffer.key, listState) {
         snapshotFlow {
-            Triple(listState.layoutInfo.visibleItemsInfo.map { it.key }, currentBuffer, currentSearchTarget)
-        }.collect { (visibleKeys, latest, searchTarget) ->
-            if (searchTarget != null) return@collect
-            if ("history-older" in visibleKeys &&
-                latest.history.initial.status == HistoryLoadStatus.IDLE &&
-                latest.history.older.status == HistoryLoadStatus.IDLE &&
-                !latest.history.older.requiresReconnect
-            ) {
-                val boundary = latest.messages.firstOrNull()?.let { "msg-${it.localId}" }
-                if (boundary != null && boundary != lastAutoOlderBoundary) {
-                    lastAutoOlderBoundary = boundary
-                    loadOlder()
-                }
-            }
-            latest.history.gaps.forEach { gap ->
-                if ("gap-${gap.id}" in visibleKeys && gap.state.status == HistoryLoadStatus.IDLE &&
-                    !gap.state.requiresReconnect && gap.id !in autoFilledGapIds
-                ) {
-                    autoFilledGapIds = autoFilledGapIds + gap.id
-                    fillGap(gap.id)
-                }
-            }
+            Triple(listState.layoutInfo.visibleItemsInfo.map { it.key }, currentBuffer, currentSearchTarget) to currentConnected
+        }.collect { (visible, isConnected) ->
+            val (visibleKeys, latest, searchTarget) = visible
+            autoHistoryLoader.loadVisible(latest, visibleKeys, isConnected, searchTarget, loadOlder, fillGap)
         }
     }
 
@@ -632,7 +672,9 @@ public fun ConversationScreen(
                                 state = entry.value.state,
                                 completeText = "History gap remains · the response did not fill the entire interval",
                                 unsupportedText = "This server cannot fill this history gap",
-                                onRetry = { onFillHistoryGap(entry.value.id) },
+                                onRetry = if (entry.value.state.requiresReconnect) onRetryHistory else {
+                                    { onFillHistoryGap(entry.value.id) }
+                                },
                                 onLoad = { onFillHistoryGap(entry.value.id) },
                                 loadText = "Fill remaining gap",
                                 gap = true,

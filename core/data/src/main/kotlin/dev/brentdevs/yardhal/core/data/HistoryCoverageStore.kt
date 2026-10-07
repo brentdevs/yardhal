@@ -30,21 +30,33 @@ public class HistoryCoverageStore(directory: File) {
     public fun put(storageKey: String, gaps: List<StoredHistoryGap>): Unit = synchronized(coverage) {
         val unique = gaps.distinct()
         if (coverage[storageKey].orEmpty() != unique) {
-            if (unique.isEmpty()) coverage.remove(storageKey) else coverage[storageKey] = unique
-            store.save(coverage.toMap())
+            val next = coverage.toMutableMap()
+            if (unique.isEmpty()) next.remove(storageKey) else next[storageKey] = unique
+            store.save(next)
+            coverage.clear()
+            coverage.putAll(next)
         }
     }
 
     public fun rename(fromKey: String, toKey: String): Boolean = synchronized(coverage) {
         if (fromKey == toKey) return false
-        val moved = coverage.remove(fromKey) ?: return false
-        coverage[toKey] = (coverage[toKey].orEmpty() + moved).distinct()
-        store.save(coverage.toMap())
+        val moved = coverage[fromKey] ?: return false
+        val next = coverage.toMutableMap()
+        next.remove(fromKey)
+        next[toKey] = (next[toKey].orEmpty() + moved).distinct()
+        store.save(next)
+        coverage.clear()
+        coverage.putAll(next)
         true
     }
 
     public fun removeNetwork(networkId: String): Unit = synchronized(coverage) {
         val prefix = "$networkId|"
-        if (coverage.keys.removeAll { it.startsWith(prefix) }) store.save(coverage.toMap())
+        val next = coverage.filterKeys { !it.startsWith(prefix) }
+        if (next.size != coverage.size) {
+            store.save(next)
+            coverage.clear()
+            coverage.putAll(next)
+        }
     }
 }

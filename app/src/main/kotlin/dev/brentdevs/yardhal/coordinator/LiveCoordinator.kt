@@ -148,7 +148,7 @@ public class LiveCoordinator(
         override fun mergeStoredHistory(ref: ConversationRef, messages: List<StoredMessage>) {
             val key = currentRef(ref).storageKey
             updateBufferKey(key) { current ->
-                val merged = mergeSearchContext(current.messages, messages) { idGenerator.getAndIncrement() }
+                val merged = mergeSearchContext(current.messages, messages, prependEqualTimestamp = true) { idGenerator.getAndIncrement() }
                 val marker = maxOf(current.readAtMs, readMarkers.marker(key))
                 val boundary = if (mutes.isMuted(key)) null else merged.asSequence()
                     .filter { it.countsAsUnread && it.timestampMs > marker }.minOfOrNull { it.timestampMs }
@@ -166,6 +166,7 @@ public class LiveCoordinator(
             generation: Long,
             epoch: Long,
             result: HistoryResult,
+            excludedKeys: Set<String>,
             beforeReplay: (List<InboundEffect>) -> Unit,
         ) {
             val session = sessions[networkId] ?: return
@@ -199,9 +200,13 @@ public class LiveCoordinator(
                             }
                         }
                         for (effect in session.state.apply(IrcEvent.MessageReceived(frame), context)) {
-                            if (effect is InboundEffect.AppendMessage || effect is InboundEffect.ApplyReaction ||
-                                effect is InboundEffect.RedactMessage
-                            ) effects.add(effect)
+                            val ref = when (effect) {
+                                is InboundEffect.AppendMessage -> effect.ref
+                                is InboundEffect.ApplyReaction -> effect.ref
+                                is InboundEffect.RedactMessage -> effect.ref
+                                else -> null
+                            }
+                            if (ref != null && ref.storageKey !in excludedKeys) effects.add(effect)
                         }
                     }
                     beforeReplay(effects)
@@ -211,11 +216,7 @@ public class LiveCoordinator(
                 for (effect in effects) processEffect(session, effect)
                 if (result.request.operation == HistoryOperation.BEFORE && target != null) {
                     updateBufferKey(target.storageKey) { current ->
-                        current.copy(messages = current.messages.sortedWith { left, right ->
-                            val timeOrder = left.timestampMs.compareTo(right.timestampMs)
-                            if (timeOrder != 0) timeOrder else
-                                (if (left.localId >= firstNewId) 0 else 1).compareTo(if (right.localId >= firstNewId) 0 else 1)
-                        })
+                        current.copy(messages = orderBeforeReplay(current.messages, firstNewId))
                     }
                 }
             }
@@ -1066,7 +1067,7 @@ public class LiveCoordinator(
         enqueuePersistence {
             val context = messageStore.around(ref, hit.rowId, hit.timestampMs)
             updateBufferKey(currentRef(ref).storageKey) { current ->
-                current.copy(messages = mergeSearchContext(current.messages, context, idGenerator::getAndIncrement))
+                current.copy(messages = mergeSearchContext(current.messages, context, nextLocalId = idGenerator::getAndIncrement))
             }
         }
         return storageKey
@@ -1208,11 +1209,13 @@ public class LiveCoordinator(
         senderAccount: String? = null,
         channelContext: String? = null,
         historyContext: Boolean = false,
+        optimistic: Boolean = false,
     ) {
         val newLocalId = idGenerator.getAndIncrement()
         val muted = mutes.isMuted(ref.storageKey)
         var appended = false
         var persistedLocalId = newLocalId
+        var persistedTimestampMs = timestampMs
         updateBuffer(ref) { buffer ->
             appended = false
             if (reconcilePendingEcho && !playback) {
@@ -1268,8 +1271,10 @@ public class LiveCoordinator(
             } else {
                 buffer.unreadFromTimestampMs
             }
+            val messages = appendChronologically(buffer.messages, entry, optimistic)
+            if (optimistic) persistedTimestampMs = messages.last().timestampMs
             buffer.copy(
-                messages = appendChronologically(buffer.messages, entry),
+                messages = messages,
                 hasUnread = buffer.hasUnread || countsAsUnread,
                 unreadFromTimestampMs = boundary,
             )
@@ -1280,7 +1285,7 @@ public class LiveCoordinator(
             } else {
                 _buffers.value[ref.storageKey]?.messages?.firstOrNull { it.msgid == msgid }?.localId ?: persistedLocalId
             }
-            persistAsync(session, ref, sender, kind, text, msgid, timestampMs, sentByUs, localId, channelContext, historyContext)
+            persistAsync(session, ref, sender, kind, text, msgid, persistedTimestampMs, sentByUs, localId, channelContext, historyContext)
         }
         if (appended && highlightsMe && !sentByUs && !playback && !muted) {
             notifier.onHighlight(session.config.name, sender, ConversationNames.forRef(ref), text)
@@ -1678,6 +1683,7 @@ public class LiveCoordinator(
                 pendingEcho = echoed,
                 persist = !echoed,
                 echoLabel = label,
+                optimistic = true,
             )
             val batchTags = buildMap {
                 if (label != null) put("label", label)
@@ -1720,6 +1726,7 @@ public class LiveCoordinator(
                 pendingEcho = echoExpected,
                 persist = !echoExpected,
                 echoLabel = label,
+                optimistic = true,
             )
         }
         val tags = buildMap {

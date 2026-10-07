@@ -211,6 +211,18 @@ class PerNetworkStateTests {
     }
 
     @Test
+    fun redactEmitsRedactionForTheWireConversation() {
+        val state = state()
+        assertEquals(InboundEffect.RedactMessage(channel("#room"), "same-id"),
+            state.feed(":alice!u@h REDACT #room same-id").only<InboundEffect.RedactMessage>())
+        assertEquals(InboundEffect.RedactMessage(state.directRef("alice"), "dm-id"),
+            state.feed(":alice!u@h REDACT me dm-id").only<InboundEffect.RedactMessage>())
+        assertEquals(InboundEffect.RedactMessage(state.directRef("bob"), "outgoing-id"),
+            state.feed(":me!u@h REDACT bob outgoing-id").only<InboundEffect.RedactMessage>())
+        assertTrue(state.feed(":alice!u@h REDACT #room").filterIsInstance<InboundEffect.RedactMessage>().isEmpty())
+    }
+
+    @Test
     fun markreadAppliesTimestampToTheTargetAndIgnoresStarTargets() {
         val state = state()
         val marker = state.feed(":srv MARKREAD #room timestamp=2024-01-01T00:00:00.000Z").single()
@@ -226,6 +238,8 @@ class PerNetworkStateTests {
         val effects = state.feed(":me!u@h JOIN #room")
         assertTrue(InboundEffect.EnsureBuffer(channel("#room")) in effects)
         assertEquals(listOf("TOPIC #room", "MODE #room"), effects.sent())
+        assertEquals(listOf(InboundEffect.RequestHistory(channel("#room"))),
+            effects.filterIsInstance<InboundEffect.RequestHistory>())
         assertTrue(effects.appended().isEmpty())
     }
 

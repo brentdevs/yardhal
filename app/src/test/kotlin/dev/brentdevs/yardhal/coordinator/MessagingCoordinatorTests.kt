@@ -9,6 +9,7 @@ import dev.brentdevs.yardhal.core.data.ChannelOrderStore
 import dev.brentdevs.yardhal.core.data.ConversationRef
 import dev.brentdevs.yardhal.core.data.InMemoryCredentialVault
 import dev.brentdevs.yardhal.core.data.MessageStore
+import dev.brentdevs.yardhal.core.data.MessageKind
 import dev.brentdevs.yardhal.core.data.MuteStore
 import dev.brentdevs.yardhal.core.data.NetworkConfig
 import dev.brentdevs.yardhal.core.data.NetworkStore
@@ -21,6 +22,7 @@ import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.nio.file.Files
+import java.time.Instant
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import kotlin.test.Test
@@ -130,7 +132,7 @@ class MessagingCoordinatorTests {
         }
     }
 
-    private class Harness(directory: java.io.File, server: Server, val scope: CoroutineScope) {
+    private class Harness(directory: java.io.File, server: Server, val scope: CoroutineScope, clock: () -> Long) {
         val database: YardhalDatabase = YardhalDatabase.inMemory(ApplicationProvider.getApplicationContext<Context>())
         val config = NetworkConfig(
             id = "network",
@@ -177,19 +179,21 @@ class MessagingCoordinatorTests {
                 )
             },
             stsPolicies = InMemoryStsPolicyStore(),
+            clock = clock,
         )
     }
 
     private fun withHarness(
         advertised: String,
         echoText: (String) -> String = { it },
+        clock: () -> Long = System::currentTimeMillis,
         body: suspend (Server, Harness) -> Unit,
     ) = runBlocking {
         val directory = Files.createTempDirectory("yardhal-messaging").toFile()
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         Server(advertised, echoText).use { server ->
             server.start()
-            val harness = Harness(directory, server, scope)
+            val harness = Harness(directory, server, scope, clock)
             try {
                 harness.coordinator.startAll()
                 val ref = ConversationRef.channel(harness.config.id, "#room")
@@ -210,6 +214,108 @@ class MessagingCoordinatorTests {
             }
         }
     }
+
+    @Test
+    fun clockSkewedOptimisticSendsStayAtTheBottomAndCanonicalEchoesRestoreChronologicalOrder() {
+        for (deviceTime in listOf("2023-01-01T00:00:00Z", "2025-01-01T00:00:00Z")) {
+            withHarness(
+                "echo-message server-time batch labeled-response",
+                clock = { Instant.parse(deviceTime).toEpochMilli() },
+            ) { server, harness ->
+                val ref = ConversationRef.channel(harness.config.id, "#room")
+                val coordinator = harness.coordinator
+                server.send("@msgid=alice-first;time=2024-01-01T00:00:00.002Z :alice!u@h PRIVMSG #room :first from alice")
+                server.send("@msgid=alice-second;time=2024-01-01T00:00:00.002Z :alice!u@h PRIVMSG #room :second from alice")
+                await { coordinator.buffers.value[ref.storageKey]?.messages?.any { it.msgid == "alice-second" } == true }
+
+                assertTrue(coordinator.sendText(harness.config.id, ref.storageKey, "first from us"))
+                assertTrue(coordinator.sendText(harness.config.id, ref.storageKey, "second from us"))
+                val before = coordinator.buffers.value.getValue(ref.storageKey).messages
+                val firstPending = before.single { it.text == "first from us" }
+                val secondPending = before.single { it.text == "second from us" }
+                assertEquals(listOf(firstPending.localId, secondPending.localId), before.takeLast(2).map { it.localId })
+                assertTrue(before.zipWithNext().all { (left, right) -> left.timestampMs <= right.timestampMs })
+                assertTrue(firstPending.pendingEcho)
+                assertTrue(secondPending.pendingEcho)
+                await {
+                    server.received.mapNotNull { IrcMessage.parse(it) }
+                        .any { it.command == "PRIVMSG" && it.parameters.lastOrNull() == "second from us" }
+                }
+                val sent = server.received.mapNotNull { IrcMessage.parse(it) }.filter { it.command == "PRIVMSG" }
+                val firstLabel = assertNotNull(sent.single { it.parameters.last() == "first from us" }.tag("label"))
+                val secondLabel = assertNotNull(sent.single { it.parameters.last() == "second from us" }.tag("label"))
+                assertEquals(firstLabel, firstPending.echoLabel)
+                assertEquals(secondLabel, secondPending.echoLabel)
+
+                server.send("@msgid=later;time=2024-01-01T00:00:00.003Z :alice!u@h PRIVMSG #room :later from alice")
+                server.send("@label=$firstLabel;msgid=own-first;time=2024-01-01T00:00:00.001Z :tester!u@h PRIVMSG #room :first from us")
+                await { coordinator.buffers.value[ref.storageKey]?.messages?.any { it.msgid == "own-first" } == true }
+                val afterFirstEcho = coordinator.buffers.value.getValue(ref.storageKey).messages
+                assertEquals(secondPending, afterFirstEcho.single { it.localId == secondPending.localId })
+                assertEquals(firstPending.localId, afterFirstEcho.single { it.msgid == "own-first" }.localId)
+
+                server.send("@label=$secondLabel;msgid=own-second;time=2024-01-01T00:00:00.002Z :tester!u@h PRIVMSG #room :second from us")
+                await { coordinator.buffers.value[ref.storageKey]?.messages?.any { it.msgid == "own-second" } == true }
+                val messages = coordinator.buffers.value.getValue(ref.storageKey).messages
+                val chat = messages.filter { it.kind == MessageKind.PRIVMSG }
+                assertEquals(listOf("own-first", "alice-first", "alice-second", "own-second", "later"), chat.map { it.msgid })
+                assertEquals(firstPending.localId, chat.single { it.msgid == "own-first" }.localId)
+                assertEquals(secondPending.localId, chat.single { it.msgid == "own-second" }.localId)
+                assertTrue(chat.filter { it.sentByUs }.all { !it.pendingEcho && it.echoLabel == null })
+                assertTrue(messages.zipWithNext().all { (left, right) -> left.timestampMs <= right.timestampMs })
+                await { harness.messages.recent(ref, 20).count { it.msgid?.startsWith("own-") == true } == 2 }
+                val stored = harness.messages.recent(ref, 20).filter { it.msgid?.startsWith("own-") == true }
+                assertEquals(
+                    listOf(Instant.parse("2024-01-01T00:00:00.001Z").toEpochMilli(), Instant.parse("2024-01-01T00:00:00.002Z").toEpochMilli()),
+                    stored.map { it.timestampMs },
+                )
+            }
+        }
+    }
+
+    @Test
+    fun sendsWithoutEchoMessageAppendAndPersistAfterNewerServerClockMessages() =
+        withHarness("server-time batch", clock = { Instant.parse("2023-01-01T00:00:00Z").toEpochMilli() }) { server, harness ->
+            val ref = ConversationRef.channel(harness.config.id, "#room")
+            val timestamp = Instant.parse("2024-01-01T00:00:00.002Z").toEpochMilli()
+            server.send("@msgid=server-newer;time=2024-01-01T00:00:00.002Z :alice!u@h PRIVMSG #room :from alice")
+            await { harness.coordinator.buffers.value[ref.storageKey]?.messages?.any { it.msgid == "server-newer" } == true }
+            assertTrue(harness.coordinator.sendText(harness.config.id, ref.storageKey, "without echo"))
+            assertTrue(harness.coordinator.sendText(harness.config.id, ref.storageKey, "still without echo"))
+
+            val messages = harness.coordinator.buffers.value.getValue(ref.storageKey).messages
+            assertEquals(listOf("without echo", "still without echo"), messages.takeLast(2).map { it.text })
+            assertEquals(listOf(timestamp, timestamp), messages.takeLast(2).map { it.timestampMs })
+            assertTrue(messages.takeLast(2).all { !it.pendingEcho })
+            await { harness.messages.recent(ref, 20).count { it.sentByUs } == 2 }
+            val stored = harness.messages.recent(ref, 20).filter { it.sentByUs }
+            assertEquals(listOf("without echo", "still without echo"), stored.map { it.text })
+            assertEquals(listOf(timestamp, timestamp), stored.map { it.timestampMs })
+        }
+
+    @Test
+    fun wireRedactionOnlyChangesTheNamedConversationWhenMessageIdsOverlap() =
+        withHarness("server-time batch") { server, harness ->
+            val room = ConversationRef.channel(harness.config.id, "#room")
+            val other = ConversationRef.channel(harness.config.id, "#other")
+            server.send("@msgid=shared;time=2024-01-01T00:00:00.001Z :alice!u@h PRIVMSG #room :room original")
+            server.send("@msgid=shared;time=2024-01-01T00:00:00.002Z :alice!u@h PRIVMSG #other :other original")
+            await { harness.messages.recent(room, 20).any { it.msgid == "shared" } }
+            await { harness.messages.recent(other, 20).any { it.msgid == "shared" } }
+            val beforeRoom = harness.coordinator.buffers.value.getValue(room.storageKey).messages.single { it.msgid == "shared" }
+            val beforeOther = harness.coordinator.buffers.value.getValue(other.storageKey).messages.single { it.msgid == "shared" }
+
+            server.send(":alice!u@h REDACT #room shared :removed")
+            await {
+                harness.coordinator.buffers.value[room.storageKey]?.messages
+                    ?.singleOrNull { it.msgid == "shared" }?.kind == MessageKind.SYSTEM
+            }
+            val redacted = harness.coordinator.buffers.value.getValue(room.storageKey).messages.single { it.msgid == "shared" }
+            assertEquals("message deleted", redacted.text)
+            assertEquals(beforeRoom.localId, redacted.localId)
+            assertEquals(beforeOther, harness.coordinator.buffers.value.getValue(other.storageKey).messages.single { it.msgid == "shared" })
+            assertEquals("other original", harness.messages.recent(other, 20).single { it.msgid == "shared" }.text)
+        }
 
     @Test
     fun multilineComposerTextIsBatchedAndReconciledAgainstTheEchoedBatch() =
@@ -264,10 +370,9 @@ class MessagingCoordinatorTests {
             assertTrue(frames.filter { it !in openings }.all { it.tag("label") == null })
             val messages = harness.coordinator.buffers.value.getValue(ref.storageKey).messages.filter { it.sentByUs }
             assertEquals(
-                listOf("one (filtered)\ntwo (filtered)", "three (filtered)\nfour (filtered)"),
-                messages.map { it.text },
+                mapOf<String?, String>("ml-echo-1" to "one (filtered)\ntwo (filtered)", "ml-echo-2" to "three (filtered)\nfour (filtered)"),
+                messages.associate { it.msgid to it.text },
             )
-            assertEquals(listOf("ml-echo-1", "ml-echo-2"), messages.map { it.msgid })
             assertTrue(messages.all { it.echoLabel == null })
             await { harness.messages.recent(ref, 10).count { it.msgid?.startsWith("ml-echo-") == true } == 2 }
         }

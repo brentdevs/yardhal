@@ -122,7 +122,8 @@ internal class HistoryRequestTracker(
         val batch = message.tag("batch")?.let(batches::get)
         val label = effectiveLabel(message, batch)
         if (batch?.retired == true && labelMatches(message, batch.label, label)) return HistoryReceipt(true)
-        val current = active ?: return HistoryReceipt(isRetiredReply(message, label))
+        if (isRetiredReply(message, label)) return HistoryReceipt(true)
+        val current = active ?: return HistoryReceipt(false)
         if (!labelMatches(message, current.request.label, label)) return HistoryReceipt(false)
         val owned = batch?.takeIf { it.ownerId == current.request.id && !it.retired }
         if (message.tag("batch") != null && owned == null) return HistoryReceipt(false)
@@ -139,7 +140,11 @@ internal class HistoryRequestTracker(
             return HistoryReceipt(true)
         }
         if (current.request.label != null && message.command.equals("ACK", ignoreCase = true)) {
-            return HistoryReceipt(true)
+            return HistoryReceipt(true, finish(
+                current,
+                "History response acknowledged without a complete history batch",
+                uncertain = current.openBatchCount > 0,
+            ))
         }
         if (current.request.transport == HistoryTransport.ZNC_PLAYBACK &&
             message.tag("batch") == null && matchesBarePlayback(message, current.request)
@@ -227,14 +232,14 @@ internal class HistoryRequestTracker(
             batches.remove(reference)
             return HistoryReceipt(false)
         }
+        batches.remove(reference)
+        current.openBatchCount--
+        current.historyRoots.remove(reference)
         val captured = capture(current, message, nowMs)
         if (captured.result != null) return captured
         if (batches.any { (_, child) -> child.parent == reference && child.ownerId == current.request.id }) {
             return HistoryReceipt(true, finish(current, "History batch closed with unfinished nested batches", uncertain = true))
         }
-        batches.remove(reference)
-        current.openBatchCount--
-        current.historyRoots.remove(reference)
         if (current.request.transport == HistoryTransport.ZNC_PLAYBACK && current.request.target == "*") {
             return HistoryReceipt(true)
         }

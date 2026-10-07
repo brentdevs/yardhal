@@ -2,16 +2,14 @@ package dev.brentdevs.yardhal.coordinator
 
 import dev.brentdevs.yardhal.core.data.StoredMessage
 
-private val storedHistoryOrder = compareBy<ChatMessage> { it.timestampMs }
-    .thenBy { it.storedRowId ?: Long.MAX_VALUE }
-    .thenBy { it.localId }
-
 internal fun mergeSearchContext(
     current: List<ChatMessage>,
     context: List<StoredMessage>,
+    prependEqualTimestamp: Boolean = false,
     nextLocalId: () -> Long,
 ): List<ChatMessage> {
     val merged = current.toMutableList()
+    var added = false
     for (row in context) {
         val identified = merged.indexOfFirst { message ->
             message.storedRowId == row.rowId || (row.msgid != null && message.msgid == row.msgid)
@@ -30,6 +28,7 @@ internal fun mergeSearchContext(
                 historyContext = existing.historyContext && row.historyContext,
             )
         } else {
+            added = true
             merged.add(
                 ChatMessage(
                     localId = nextLocalId(),
@@ -47,7 +46,11 @@ internal fun mergeSearchContext(
             )
         }
     }
-    merged.sortWith(storedHistoryOrder)
+    if (!added) return merged
+    if (prependEqualTimestamp && current.isNotEmpty()) {
+        java.util.Collections.rotate(merged, merged.size - current.size)
+    }
+    merged.sortBy { it.timestampMs }
     return merged
 }
 

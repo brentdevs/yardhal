@@ -32,6 +32,7 @@ internal interface HistoryHost {
         generation: Long,
         epoch: Long,
         result: HistoryResult,
+        excludedKeys: Set<String>,
         beforeReplay: (List<InboundEffect>) -> Unit,
     )
     fun sendHistory(networkId: String, generation: Long, epoch: Long, line: String): Boolean
@@ -102,25 +103,34 @@ internal class HistoryCoordinator(
     ) {
         val tracker = HistoryRequestTracker({ mapping.fold(it) }, { nick })
         val queue = ArrayDeque<Work>()
+        val completionLock = Any()
+        val excludedKeys = mutableSetOf<String>()
+        var enqueuing = 0
         val bootstrap = LinkedHashSet<String>()
         var anchors = mutableMapOf<String, SavedAnchor>()
         var seeded = false
         var current: Work? = null
         var currentId: Long? = null
         var finishing = false
+        var retired = false
+        @Volatile
+        var disposed = false
         var deadline: Job? = null
     }
 
     private val lock = Any()
+    private val coverageLock = Any()
     private val ids = AtomicLong(1)
     private val local = mutableMapOf<String, Local>()
     private val networks = mutableMapOf<String, Network>()
     private val retryWork = mutableMapOf<String, Work>()
+    private val reconnectWork = mutableMapOf<String, Work>()
 
     fun open(key: String): Boolean {
+        val buffer = host.historyBuffers[key] ?: return false
         val read = synchronized(lock) {
-            val buffer = host.historyBuffers[key] ?: return false
             val state = local.getOrPut(key) { Local(buffer.ref) }
+            networks[buffer.ref.networkId]?.excludedKeys?.remove(key)
             if (state.migrating) { state.pendingOpen = true; return true }
             if (state.opened || state.reading || state.removed) return false
             state.opened = true
@@ -140,12 +150,13 @@ internal class HistoryCoordinator(
                     ?: return@enqueueHistoryStorage
                 host.mergeStoredHistory(target.ref, page)
                 update(target.ref) { history -> history.copy(initial = HistoryLoadState()) }
+                val unavailable = unavailable(target.ref.networkId)
                 if (target.exhausted && historyProviderUnavailable(target.ref.networkId)) {
-                    update(target.ref) { it.copy(older = unavailable(target.ref.networkId)) }
+                    update(target.ref) { it.copy(older = unavailable) }
                 }
                 val network = synchronized(lock) { networks[target.ref.networkId] }
                 if (page.isEmpty() && target.ref.kind != ConversationKind.SERVER && !target.pendingOpen) {
-                    if (network == null) update(target.ref) { it.copy(older = unavailable(target.ref.networkId)) }
+                    if (network == null) update(target.ref) { it.copy(older = unavailable) }
                     else bootstrap(network.id, target.ref)
                 }
                 continueLocal(target)
@@ -159,8 +170,8 @@ internal class HistoryCoordinator(
     }
 
     fun older(key: String) {
+        val buffer = host.historyBuffers[key] ?: return
         val state = synchronized(lock) {
-            val buffer = host.historyBuffers[key] ?: return
             local.getOrPut(key) { Local(buffer.ref) }.also {
                 if (it.migrating) { it.pendingOlder = true; return }
                 if (it.reading || it.removed || buffer.history.older.status == HistoryLoadStatus.LOADING) return
@@ -187,8 +198,9 @@ internal class HistoryCoordinator(
                     val target = finishLocalRead(read, page.firstOrNull()?.cursor(), stored.size <= PAGE_SIZE)
                         ?: return@enqueueHistoryStorage
                     host.mergeStoredHistory(target.ref, page)
-                    update(target.ref) { it.copy(older = if (target.exhausted && historyProviderUnavailable(target.ref.networkId))
-                        unavailable(target.ref.networkId) else HistoryLoadState()) }
+                    val olderState = if (target.exhausted && historyProviderUnavailable(target.ref.networkId))
+                        unavailable(target.ref.networkId) else HistoryLoadState()
+                    update(target.ref) { it.copy(older = olderState) }
                     if (page.isEmpty() && !target.pendingOpen) older(target.ref.storageKey)
                     continueLocal(target)
                 } catch (error: Exception) {
@@ -201,7 +213,8 @@ internal class HistoryCoordinator(
         }
         val network = synchronized(lock) { networks[state.ref.networkId] }
         if (network == null || !host.historyConnectionActive(network.id, network.generation, network.epoch)) {
-            update(state.ref) { it.copy(older = unavailable(state.ref.networkId)) }
+            val unavailable = unavailable(state.ref.networkId)
+            update(state.ref) { it.copy(older = unavailable) }
             return
         }
         if (state.ref.kind == ConversationKind.SERVER) {
@@ -225,7 +238,8 @@ internal class HistoryCoordinator(
             val from = (to - ZNC_WINDOW_MS).coerceAtLeast(0)
             enqueue(network, Work(Purpose.OLDER, state.ref, HistoryOperation.BEFORE, anchor, fromMs = from, toMs = to))
         } else {
-            update(state.ref) { it.copy(older = unavailable(state.ref.networkId)) }
+            val unavailable = unavailable(state.ref.networkId)
+            update(state.ref) { it.copy(older = unavailable) }
         }
     }
 
@@ -249,6 +263,7 @@ internal class HistoryCoordinator(
             buffer.history.catchUp.requiresReconnect || buffer.history.discovery.requiresReconnect ||
             buffer.history.older.requiresReconnect || buffer.history.gaps.any { it.state.requiresReconnect }
         if (requiresReconnect) {
+            rememberReconnectWork(buffer)
             host.reconnectHistory(buffer.ref.networkId)
             return
         }
@@ -258,6 +273,7 @@ internal class HistoryCoordinator(
             buffer.history.older.status == HistoryLoadStatus.CANCELLED ||
             buffer.history.gaps.any { it.state.status == HistoryLoadStatus.CANCELLED })
         ) {
+            rememberReconnectWork(buffer)
             host.reconnectHistory(buffer.ref.networkId)
             return
         }
@@ -268,6 +284,20 @@ internal class HistoryCoordinator(
             open(key)
         } else {
             older(key)
+        }
+    }
+
+    private fun rememberReconnectWork(buffer: ConversationBuffer) {
+        synchronized(lock) {
+            val saved = retryWork[buffer.ref.storageKey]
+            val gap = buffer.history.gaps.firstOrNull {
+                it.state.requiresReconnect || it.state.status == HistoryLoadStatus.CANCELLED
+            }
+            val work = saved ?: gap?.let {
+                Work(Purpose.GAP, buffer.ref, HistoryOperation.BETWEEN, it.from, it.to, it.id,
+                    it.from.timestampMs - 1, it.to.timestampMs + 1)
+            }
+            if (work != null) reconnectWork[buffer.ref.storageKey] = work
         }
     }
 
@@ -294,14 +324,24 @@ internal class HistoryCoordinator(
                 for (buffer in host.historyBuffers.values) if (buffer.ref.networkId == networkId) update(buffer.ref) { it.copy(catchUp = state) }
                 return@enqueueHistoryStorage
             }
+            if (!host.historyConnectionActive(networkId, generation, epoch)) return@enqueueHistoryStorage
             synchronized(lock) {
-                if (networks[networkId] !== network || !host.historyConnectionActive(networkId, generation, epoch)) return@enqueueHistoryStorage
+                if (networks[networkId] !== network) return@enqueueHistoryStorage
                 for (row in anchors) {
                     network.anchors[network.mapping.fold(row.conversation.rawTarget)] =
                         SavedAnchor(row.conversation.rawTarget, HistoryAnchor(row.timestampMs, row.msgid), row)
                 }
                 network.seeded = true
             }
+            val retries = synchronized(lock) {
+                reconnectWork.values.filter { it.ref.networkId == networkId }.also { work ->
+                    for (pending in work) {
+                        reconnectWork.remove(pending.ref.storageKey)
+                        retryWork.remove(pending.ref.storageKey)
+                    }
+                }
+            }
+            for (work in retries) enqueue(network, work)
             discover(network)
             val waiting = synchronized(lock) { network.bootstrap.toList().also { network.bootstrap.clear() } }
             for (target in waiting) bootstrap(networkId, host.historyRef(networkId, target))
@@ -361,7 +401,7 @@ internal class HistoryCoordinator(
         } else if ("znc.in/playback" in network.capabilities) {
             val saved = synchronized(lock) { network.anchors.values.toList() }
             for (anchor in saved) {
-                if (anchor.value.timestampMs < boundedFrom) addGap(host.historyRef(network.id, anchor.target), anchor.value, HistoryAnchor(boundedFrom))
+                if (anchor.value.timestampMs < boundedFrom) addGap(network, host.historyRef(network.id, anchor.target), anchor.value, HistoryAnchor(boundedFrom))
             }
             enqueue(network, Work(Purpose.ZNC_DISCOVERY, server, HistoryOperation.LATEST,
                 fromMs = boundedFrom - 1, toMs = now))
@@ -372,11 +412,15 @@ internal class HistoryCoordinator(
         if (ref.kind == ConversationKind.SERVER || ref.rawTarget.startsWith("*")) return
         val network = synchronized(lock) {
             val current = networks[networkId] ?: return
+            current.excludedKeys.remove(ref.storageKey)
             if (!current.seeded) { current.bootstrap.add(ref.rawTarget); return }
             current
         }
         if (!network.support.enabled) {
-            if ("znc.in/playback" !in network.capabilities) update(ref) { it.copy(catchUp = unavailable(networkId)) }
+            if ("znc.in/playback" !in network.capabilities) {
+                val unavailable = unavailable(networkId)
+                update(ref) { it.copy(catchUp = unavailable) }
+            }
             return
         }
         val anchor = synchronized(lock) { network.anchors[network.mapping.fold(ref.rawTarget)]?.value }
@@ -398,6 +442,7 @@ internal class HistoryCoordinator(
     fun reset(networkId: String, reason: String) {
         val network = synchronized(lock) {
             val current = networks.remove(networkId) ?: return
+            current.disposed = true
             current.deadline?.cancel()
             current.tracker.cancel("connection reset")
             current
@@ -407,7 +452,6 @@ internal class HistoryCoordinator(
     }
 
     fun rename(from: ConversationRef, to: ConversationRef) {
-        val network: Network?
         synchronized(lock) {
             local.remove(from.storageKey)?.let { previous ->
                 val existing = local[to.storageKey]
@@ -430,29 +474,36 @@ internal class HistoryCoordinator(
                 }
             }
             retryWork.remove(from.storageKey)?.let { retryWork[to.storageKey] = it.retarget(to) }
-            network = networks[from.networkId]
+            reconnectWork.remove(from.storageKey)?.let { reconnectWork[to.storageKey] = it.retarget(to) }
+            val network = networks[from.networkId]
             if (network != null) {
                 val queued = network.queue.map { if (it.ref.storageKey == from.storageKey) it.retarget(to) else it }
                 network.queue.clear(); network.queue.addAll(queued)
                 val anchor = network.anchors.remove(network.mapping.fold(from.rawTarget))
                 if (anchor != null) network.anchors[network.mapping.fold(to.rawTarget)] = anchor.copy(target = to.rawTarget)
-                network.current?.takeIf { it.ref.storageKey == from.storageKey }?.let { network.current = it.retarget(to) }
+                network.excludedKeys.add(from.storageKey)
+                network.current?.takeIf { it.ref.storageKey == from.storageKey }?.let { current ->
+                    network.retired = true
+                    val replacement = current.retarget(to)
+                    replacement.expiresAtMs = elapsedClock() + QUEUE_TIMEOUT_MS
+                    if (replacement !in network.queue) network.queue.addFirst(replacement)
+                }
             }
         }
-        host.enqueueHistoryStorage { coverageStore.rename(from.storageKey, to.storageKey) }
-        if (network?.current?.ref?.storageKey == to.storageKey) cancelWork(network, "Conversation changed", resume = false)
+        synchronized(coverageLock) { coverageStore.rename(from.storageKey, to.storageKey) }
     }
 
     fun remove(key: String) {
         val ref = host.historyBuffers[key]?.ref
-        val network = synchronized(lock) {
+        synchronized(lock) {
             local.remove(key)?.removed = true
             retryWork.remove(key)
+            reconnectWork.remove(key)
             val current = ref?.networkId?.let(networks::get)
+            current?.excludedKeys?.add(key)
             current?.queue?.removeAll { it.ref.storageKey == key }
-            current
+            if (current?.current?.ref?.storageKey == key) current.retired = true
         }
-        if (network?.current?.ref?.storageKey == key) cancelWork(network, "Conversation closed")
     }
 
     fun removeNetwork(networkId: String) {
@@ -460,8 +511,10 @@ internal class HistoryCoordinator(
         synchronized(lock) {
             val keys = local.filterValues { it.ref.networkId == networkId }.keys.toList()
             for (key in keys) { local.remove(key)?.removed = true; retryWork.remove(key) }
+            reconnectWork.values.removeAll { it.ref.networkId == networkId }
+            retryWork.values.removeAll { it.ref.networkId == networkId }
         }
-        host.enqueueHistoryStorage { coverageStore.removeNetwork(networkId) }
+        synchronized(coverageLock) { coverageStore.removeNetwork(networkId) }
     }
 
     private fun enqueue(network: Network, work: Work) {
@@ -471,7 +524,12 @@ internal class HistoryCoordinator(
             work.expiresAtMs = elapsedClock() + QUEUE_TIMEOUT_MS
             if (work.purpose == Purpose.OLDER || work.purpose == Purpose.GAP) network.queue.addFirst(work)
             else network.queue.addLast(work)
+            network.enqueuing++
+        }
+        try {
             setState(work, HistoryLoadState(HistoryLoadStatus.LOADING))
+        } finally {
+            synchronized(lock) { network.enqueuing-- }
         }
         drain(network)
     }
@@ -481,11 +539,14 @@ internal class HistoryCoordinator(
             var rejectedWork: Work? = null
             var rejectedState: HistoryLoadState? = null
             var outgoing: PendingHistoryRequest? = null
+            val active = host.historyConnectionActive(network.id, network.generation, network.epoch)
             synchronized(lock) {
-                if (networks[network.id] !== network || !network.seeded || network.current != null || network.finishing) return
+                if (networks[network.id] !== network || !network.seeded || network.current != null ||
+                    network.finishing || network.enqueuing > 0
+                ) return
                 val work = network.queue.removeFirstOrNull() ?: return
                 val state = when {
-                    !host.historyConnectionActive(network.id, network.generation, network.epoch) ->
+                    !active ->
                         HistoryLoadState(HistoryLoadStatus.CANCELLED, "Connection closed")
                     network.tracker.requiresReconnect -> failed("History request timed out; reconnect before retrying", true)
                     elapsedClock() >= work.expiresAtMs -> failed("History request expired while waiting for another reply")
@@ -522,6 +583,7 @@ internal class HistoryCoordinator(
                         if (network.tracker.begin(request, elapsedClock())) {
                             network.current = work
                             network.currentId = id
+                            network.retired = false
                             outgoing = request
                         } else {
                             rejectedWork = work
@@ -582,17 +644,20 @@ internal class HistoryCoordinator(
     }
 
     private fun cancelWork(network: Network, reason: String, resume: Boolean = true) {
+        var cancelledWork: Work? = null
         val result = synchronized(lock) {
             if (networks[network.id] !== network) return
             network.deadline?.cancel()
             network.tracker.cancel(reason).also {
                 if (it == null) {
-                    network.current?.let { work -> setState(work, HistoryLoadState(HistoryLoadStatus.CANCELLED, reason)) }
+                    cancelledWork = network.current
                     network.current = null
                     network.currentId = null
+                    network.retired = false
                 }
             }
         }
+        cancelledWork?.let { setState(it, HistoryLoadState(HistoryLoadStatus.CANCELLED, reason)) }
         if (result != null) complete(network, result, cancelled = true, resume = resume)
         else if (resume) drain(network)
     }
@@ -614,7 +679,7 @@ internal class HistoryCoordinator(
     }
 
     private fun complete(network: Network, result: HistoryResult, cancelled: Boolean = false, resume: Boolean = true) {
-        val sessionLock = host.historySessionLock(network.id, network.generation, network.epoch) ?: lock
+        val sessionLock = host.historySessionLock(network.id, network.generation, network.epoch) ?: network.completionLock
         synchronized(sessionLock) { finish(network, result, cancelled, resume) }
     }
 
@@ -627,6 +692,7 @@ internal class HistoryCoordinator(
             current
         }
         try {
+            if (synchronized(lock) { network.retired }) return
             if (!host.historyConnectionActive(network.id, network.generation, network.epoch)) {
                 setState(work, HistoryLoadState(HistoryLoadStatus.CANCELLED, "Connection closed"))
                 return
@@ -653,7 +719,8 @@ internal class HistoryCoordinator(
             }
             val page = historyPage(result.frames)
             var lowerWitnessed = false
-            host.replayHistory(network.id, network.generation, network.epoch, result) { effects ->
+            val excludedKeys = synchronized(lock) { network.excludedKeys.toSet() }
+            host.replayHistory(network.id, network.generation, network.epoch, result, excludedKeys) { effects ->
                 check(!page.unsupportedMetadata) { "History response lacks usable sender/server-time metadata" }
                 if (result.request.transport == HistoryTransport.ZNC_PLAYBACK) {
                     if (work.purpose == Purpose.ZNC_DISCOVERY) playbackGaps(network, effects)
@@ -664,7 +731,7 @@ internal class HistoryCoordinator(
                 if (work.operation == HistoryOperation.LATEST && work.anchor != null && page.count > 0 && !result.end) {
                     val first = page.first
                     val from = overlapping(network, work.anchor, -LATEST_FUZZ_MS)
-                    if (first != null && first != from) addGap(work.ref, from, first)
+                    if (first != null && first != from) addGap(network, work.ref, from, first)
                 }
             }
             synchronized(lock) {
@@ -687,9 +754,6 @@ internal class HistoryCoordinator(
                     val to = work.toMs ?: clock()
                     val lower = page.first?.takeIf { it.timestampMs < to }
                     state.zncBeforeMs = lower?.timestampMs ?: work.fromMs
-                    if (page.count > 0 && lower == null) {
-                        addGap(work.ref, HistoryAnchor(work.fromMs ?: 0), HistoryAnchor(to))
-                    }
                     update(work.ref) { it.copy(older = HistoryLoadState(
                         if (page.count == 0 || lower == null) HistoryLoadStatus.WINDOW_EMPTY else HistoryLoadStatus.IDLE,
                         windowBeforeMs = state.zncBeforeMs,
@@ -698,12 +762,12 @@ internal class HistoryCoordinator(
                     val stuck = page.count > 0 && page.first != null && work.anchor != null &&
                         page.first.timestampMs == work.anchor.timestampMs && !usableMsgid(network, page.first)
                     update(work.ref) { it.copy(older = when {
-                        stuck -> failed("Server cannot advance a timestamp-only reference; older history is retained")
                         result.end -> HistoryLoadState(HistoryLoadStatus.EXHAUSTED)
+                        stuck -> failed("Server cannot advance a timestamp-only reference; older history is retained")
                         page.first == null -> failed("History response has no usable pagination reference")
                         else -> HistoryLoadState()
                     }) }
-                    if (stuck) synchronized(lock) { retryWork[work.ref.storageKey] = work }
+                    if (stuck && !result.end) synchronized(lock) { retryWork[work.ref.storageKey] = work }
                 }
             } else {
                 setState(work, HistoryLoadState())
@@ -724,6 +788,7 @@ internal class HistoryCoordinator(
                     network.current = null
                     network.currentId = null
                     network.finishing = false
+                    network.retired = false
                 }
             }
             if (resume) drain(network)
@@ -731,33 +796,38 @@ internal class HistoryCoordinator(
     }
 
     private fun finishGap(network: Network, work: Work, result: HistoryResult, page: HistoryPage, lowerWitnessed: Boolean) {
-        val gap = host.historyBuffers[work.ref.storageKey]?.history?.gaps?.firstOrNull { it.id == work.gapId } ?: return
+        val gap = synchronized(coverageLock) {
+            coverageStore.gaps(work.ref.storageKey).firstOrNull { it.id == work.gapId }?.toHistoryGap()
+        } ?: return
+        if (gap.from != work.anchor || gap.to != work.to) {
+            setGap(work.ref, gap.id, HistoryLoadState())
+            return
+        }
         if (result.request.transport == HistoryTransport.ZNC_PLAYBACK) {
             val first = page.first
             when {
                 lowerWitnessed && result.batchComplete ->
-                    update(work.ref) { it.copy(gaps = it.gaps.filterNot { existing -> existing.id == gap.id }) }
+                    mutateGaps(network, work.ref) { it.filterNot { existing -> existing.id == gap.id } }
                 page.count == 0 -> setGap(work.ref, gap.id, HistoryLoadState(HistoryLoadStatus.WINDOW_EMPTY))
                 first != null && first != gap.to && first.timestampMs > gap.from.timestampMs ->
-                    update(work.ref) { it.copy(gaps = it.gaps.map { existing ->
-                        if (existing.id == gap.id) existing.copy(to = first, state = HistoryLoadState()) else existing
-                    }) }
+                    mutateGaps(network, work.ref) { it.map { existing ->
+                        if (existing.id == gap.id) existing.copy(to = first) else existing
+                    } }
                 else -> setGap(work.ref, gap.id, failed("Playback cannot advance its range; the remaining gap is retained"))
             }
         } else if (result.end) {
-            update(work.ref) { it.copy(gaps = it.gaps.filterNot { gap -> gap.id == work.gapId }) }
+            mutateGaps(network, work.ref) { it.filterNot { existing -> existing.id == work.gapId } }
         } else {
             val backwards = gap.from.timestampMs > gap.to.timestampMs &&
                 !(usableMsgid(network, gap.from) && usableMsgid(network, gap.to))
             val next = if (backwards) page.first else page.last
             if (next != null && next != gap.from &&
                 (usableMsgid(network, next) || next.timestampMs != gap.from.timestampMs)
-            ) update(work.ref) { it.copy(gaps = it.gaps.map { existing ->
-                if (existing.id == gap.id) existing.copy(from = next, state = HistoryLoadState()) else existing
-            }) }
+            ) mutateGaps(network, work.ref) { it.map { existing ->
+                if (existing.id == gap.id) existing.copy(from = next) else existing
+            } }
             else setGap(work.ref, gap.id, failed("History cannot advance its reference; the remaining gap is retained"))
         }
-        persistGaps(work.ref)
     }
 
     private fun playbackWitness(
@@ -790,31 +860,53 @@ internal class HistoryCoordinator(
                     !effect.historyContext && effect.timestampMs >= saved.value.timestampMs
             } as? InboundEffect.AppendMessage ?: continue
             host.ensureHistoryBuffer(ref)
-            addGap(ref, saved.value, HistoryAnchor(first.timestampMs, first.msgid))
+            addGap(network, ref, saved.value, HistoryAnchor(first.timestampMs, first.msgid))
         }
     }
 
-    private fun addGap(ref: ConversationRef, from: HistoryAnchor, to: HistoryAnchor) {
+    private fun addGap(network: Network, ref: ConversationRef, from: HistoryAnchor, to: HistoryAnchor) {
         if (from == to) return
         val id = "${from.timestampMs}:${from.msgid.orEmpty()}-${to.timestampMs}:${to.msgid.orEmpty()}"
-        update(ref) { it.copy(gaps = (it.gaps + HistoryGap(id, from, to)).distinctBy { gap -> gap.id }) }
-        persistGaps(ref, beforeMessages = true)
+        mutateGaps(network, ref) { normalizeGaps(it + HistoryGap(id, from, to)) }
     }
 
-    private fun persistGaps(ref: ConversationRef, beforeMessages: Boolean = false) {
-        val gaps = host.historyBuffers[ref.storageKey]?.history?.gaps.orEmpty().map {
-            StoredHistoryGap(it.id, it.from.timestampMs, it.from.msgid, it.to.timestampMs, it.to.msgid)
+    private fun normalizeGaps(gaps: List<HistoryGap>): List<HistoryGap> {
+        val forwards = gaps.filter { it.from.timestampMs < it.to.timestampMs }.sortedBy { it.from.timestampMs }
+        val merged = mutableListOf<HistoryGap>()
+        for (gap in forwards) {
+            val previous = merged.lastOrNull()
+            if (previous != null && gap.from.timestampMs <= previous.to.timestampMs &&
+                (gap.from.timestampMs != previous.from.timestampMs || gap.from == previous.from) &&
+                (gap.to.timestampMs != previous.to.timestampMs || gap.to == previous.to)
+            ) {
+                val to = if (gap.to.timestampMs > previous.to.timestampMs) gap.to else previous.to
+                merged[merged.lastIndex] = previous.copy(to = to)
+            } else merged.add(gap)
         }
-        if (beforeMessages) coverageStore.put(ref.storageKey, gaps)
-        else host.enqueueHistoryStorage {
-            try {
-                coverageStore.put(ref.storageKey, gaps)
-            } catch (error: Exception) {
-                if (error is CancellationException) throw error
-                update(ref) { it.copy(initial = failed(error.message ?: "Unable to persist history coverage")) }
+        return merged + gaps.filter { it.from.timestampMs >= it.to.timestampMs }.distinctBy { it.id }
+    }
+
+    private fun mutateGaps(network: Network, ref: ConversationRef, transform: (List<HistoryGap>) -> List<HistoryGap>) {
+        synchronized(coverageLock) {
+            if (network.disposed) return
+            val current = coverageStore.gaps(ref.storageKey).map { it.toHistoryGap() }
+            transform(current).also { updated ->
+                coverageStore.put(ref.storageKey, updated.map {
+                    StoredHistoryGap(it.id, it.from.timestampMs, it.from.msgid, it.to.timestampMs, it.to.msgid)
+                })
             }
         }
+        update(ref) { history ->
+            if (network.disposed) return@update history
+            val gaps = coverageStore.gaps(ref.storageKey).map { it.toHistoryGap() }
+            history.copy(gaps = gaps.map { gap ->
+                history.gaps.firstOrNull { it.id == gap.id && it.from == gap.from && it.to == gap.to } ?: gap
+            })
+        }
     }
+
+    private fun StoredHistoryGap.toHistoryGap(): HistoryGap =
+        HistoryGap(id, HistoryAnchor(fromTimestampMs, fromMsgid), HistoryAnchor(toTimestampMs, toMsgid))
 
     private fun readTarget(source: Local): Local? {
         var target = source
