@@ -84,7 +84,12 @@ encoded = base64.b64encode(zlib.compress(payload, level=9)).decode("ascii")
 
 chunks = [encoded[index:index + 116] for index in range(0, len(encoded), 116)]
 print("    private const val ENCODED =")
-for index, chunk in enumerate(chunks):
-    suffix = " +" if index + 1 < len(chunks) else ""
-    print(f'        "{chunk}"{suffix}')
+for group_start in range(0, len(chunks), 32):
+    group = chunks[group_start:group_start + 32]
+    print("        (")
+    for index, chunk in enumerate(group):
+        suffix = " +" if index + 1 < len(group) else ""
+        print(f'            "{chunk}"{suffix}')
+    suffix = " +" if group_start + len(group) < len(chunks) else ""
+    print(f"        ){suffix}")
 print(f"Unicode {ucd.unidata_version}; uncompressed table SHA256: {digest}", file=sys.stderr)

@@ -402,6 +402,10 @@ B.1, C.1.2, prohibited, A.1, D.1 and D.2 ranges; combining-class pairs;
 expanded NFKD code-point/offset/length triples; decomposition values; and canonical
 composition triples. Hangul normalization is algorithmic. Its uncompressed SHA256
 is `42a08a6261c74bc6e3ee56b62b408ae7af3fdf6f6512432ceacc6f910cc43761`.
+The generator groups at most 32 literals per parenthesized constant segment instead
+of one deeply nested addition chain. This bounds compiler IR traversal on cold
+builds while preserving a single compile-time constant and the identical payload;
+there is no runtime concatenation.
 
 The prepared loopback fixture covers normalization-changing Unicode credentials.
 The live Ergo scenario covers a normalized username and NFKC-stable Unicode
