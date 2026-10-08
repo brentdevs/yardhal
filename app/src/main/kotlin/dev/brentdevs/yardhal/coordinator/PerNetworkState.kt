@@ -23,8 +23,9 @@ public class InboundContext(
     public val isIgnored: (String) -> Boolean = { false },
     public val hasBuffer: (String) -> Boolean = { true },
     public val openChannels: () -> List<String> = { emptyList() },
-    public val latestReadMarkerMs: () -> Long? = { null },
     public val isParted: (String) -> Boolean = { false },
+    public val historyPlayback: Boolean = false,
+    public val historyTarget: ConversationRef? = null,
 )
 
 public data class OpenBatch(
@@ -95,8 +96,6 @@ public class PerNetworkState(
     public var prefixModes: ChannelPrefixModes = ChannelPrefixModes.DEFAULT
         internal set
     public var hasWhox: Boolean = false
-        internal set
-    public var chathistoryLimit: Int = 0
         internal set
     public var filehostEndpoint: String? = null
         internal set
@@ -256,7 +255,6 @@ public class PerNetworkState(
         isupport = ISupport.EMPTY
         prefixModes = ChannelPrefixModes.DEFAULT
         hasWhox = false
-        chathistoryLimit = 0
         filehostEndpoint = null
         monitored.clear()
         multilineLimits = null

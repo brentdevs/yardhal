@@ -45,7 +45,10 @@ Phase numbers refer to `docs/architecture.md`.
 
 - [x] batch: BATCH +/- frames tracked per session; netsplit/netjoin collapse; playback classified as history (P5)
 - [x] chathistory batch type: replay routed as history (no unread/notification noise) (P5)
-- [x] draft/chathistory: negotiated capability or CHATHISTORY ISUPPORT enables LATEST bootstrap on channel join; playback batches suppress live-message effects (P5)
+- [x] draft/chathistory: negotiated capability or CHATHISTORY ISUPPORT enables anchored channel/DM LATEST and local-first BEFORE paging; server/local limits and MSGREFTYPES honored; finite loading/error/retry/cancellation states (P5; parity phase 1)
+- [x] CHATHISTORY TARGETS: bounded seven-day discovery, plain ISO target times, explicit incomplete-discovery indication without claiming unlimited recovery (P5)
+- [x] CHATHISTORY BETWEEN: persisted interior-gap bounds, residual progress; short nonempty pages never imply completion; failure/cancellation never fabricate coverage (P5)
+- [x] draft/chathistory-context and draft/chathistory-end: contextual extras preserved without counting against primary-message limits or advancing durable anchors; end-tag presence or successful empty CHATHISTORY completes the requested range (P5)
 - [x] netsplit/netjoin batches: collapse into one event (P5)
 - [x] labeled-response: /raw, /whois, /who, /mode family, /topic, /monitor, LIST and PRIVMSG sends labelled when acked; single replies, labelled batches and ACK correlated in the reducer; generic replies routed to the origin buffer; echoes reconciled by label (text match fallback) (P5)
 - [x] standard-replies: FAIL/WARN/NOTE → tagged system lines (P5)
@@ -75,7 +78,7 @@ Phase numbers refer to `docs/architecture.md`.
 ## Bouncer extensions (soju)
 
 - [x] soju.im/bouncer-networks: capability + notify requested, BOUNCER NETWORK upsert/delete parsing with escaped attributes, ADDNETWORK/DELNETWORK, CONNECT/DISCONNECTNETWORK, BouncerServ service commands, draft diffing (P7)
-- [x] znc.in/playback: playback start request + batch classification (P7)
+- [x] znc.in/playback: bounded global channel/DM discovery, older six-hour PLAY windows, canonical overlap deduplication, retained gaps under clipping, finite empty/error/reconnect outcomes; no invented archive end or missing msgids (P7; parity phase 1)
 
 ## Coverage audit
 
@@ -107,15 +110,18 @@ Ergo and runs all real-server tests without skips.
 | +draft/reply | `PerNetworkStateTests.channelPrivmsgBecomesAChannelMessageWithServerTimeAndTags`; `IrcMultilineTests.framesBatchWithTargetReferenceAndClientTagsOnOpening` |
 | +draft/react / +draft/unreact | `PerNetworkStateTests.tagmsgReactionsAndTypingBecomeEffects`; `PerNetworkStateTests.reactionFoldAddsAndRemovesPerSender` |
 | +typing | `PerNetworkStateTests.tagmsgReactionsAndTypingBecomeEffects` |
-| draft/message-redaction | `PerNetworkStateTests.redactEmitsRedactionByMsgid`; `PerNetworkStateTests.redactionReplacesOnlyTheMatchingMessage` |
+| draft/message-redaction | `PerNetworkStateTests.redactEmitsRedactionForTheWireConversation`; `PerNetworkStateTests.redactionReplacesOnlyTheMatchingMessage`; `MessagingCoordinatorTests.wireRedactionOnlyChangesTheNamedConversationWhenMessageIdsOverlap` |
 | draft/read-marker | `PerNetworkStateTests.markreadAppliesTimestampToTheTargetAndIgnoresStarTargets` |
 | draft/multiline | `IrcMultilineTests.splitsLongLinesBetweenWordsWithConcatTagAndRoundTrips`; `MessagingReducerTests.multilineNestedInChathistoryIsPlayback`; `MessagingCoordinatorTests.multilineComposerTextIsBatchedAndReconciledAgainstTheEchoedBatch`; `ErgoRoundTripTest.multilineEchoAndChannelRenameAgainstRealServer` |
 | +draft/channel-context | `MessagingReducerTests.channelContextTagStoredOnDirectMessages`; `MessagingReducerTests.channelContextOnMultilineBatchOpeningApplies`; `MessagingCoordinatorTests.channelContextSurvivesCoordinatorHistoryReload`; `LiveCoordinatorIntegrationTests.openingPersistedSearchHitRestoresChannelContextIntoAnAbsentConversation`; `MessageStoreTests.channelContextRoundTripsThroughRecentAndHistory`; `YardhalDatabaseMigrationTests.versionOneUpgradePreservesTranscriptHashesRowIdsAndSearch` |
 | batch | `PerNetworkStateTests.playbackBatchesIncludingNestedOnesSuppressHighlights`; `PerNetworkStateTests.disconnectReportsConnectingAndReconnectResetsConnectionState` |
 | chathistory batch type | `MessagingReducerTests.multilineNestedInChathistoryIsPlayback` |
-| draft/chathistory | `PerNetworkStateTests.ownJoinOpensBufferAndRequestsTopicModeAndHistory`; `MessagingReducerTests.noImplicitNamesJoinCompletesWithoutWaitingForNames` |
+| draft/chathistory / limits / MSGREFTYPES | `IrcChatHistoryTests`; `PerNetworkStateTests.ownJoinOpensBufferAndRequestsTopicModeAndHistory`; `HistoryCoordinatorIntegrationTests.offlineTimestampTiedPagesPreserveEveryRowAndExistingLocalIdentity`; `HistoryCoordinatorIntegrationTests.localPagesTransitionToBeforeAndAdvanceWireReferencesWithoutReorderingEqualTimeRows`; `HistoryCoordinatorIntegrationTests.timestampOnlyBeforeOverlapAtArchiveStartHonorsExplicitEnd`; `HistoryCoordinatorIntegrationTests.labeledFailureCanRetryWithoutReplacingCachedIdentity` |
+| CHATHISTORY TARGETS | `HistoryRequestTrackerTests.targetsRowsPreserveServerOrderAndWaitForBatchCompletion`; `HistoryCoordinatorIntegrationTests.targetsDiscoverKnownAndNewOfflineDirectMessagesWithoutProtocolTranscript`; `HistoryCoordinatorIntegrationTests.limitedTargetsWithoutEndExposeIncompleteDiscoveryWhileEveryReturnedConversationLoads` |
+| CHATHISTORY BETWEEN / durable coverage | `HistoryCoordinatorIntegrationTests.emptySuccessfulBetweenClosesResidualGapWithoutDiscardingCachedRows`; `HistoryCoordinatorIntegrationTests.backgroundCatchupPreservesPreviouslyPersistedGapBeforeTranscriptIsOpened`; `HistoryCoordinatorIntegrationTests.queuedStorageCannotRestoreCompletedGapOverNewGapOrResurrectRenamedCoverage`; `HistoryCoverageStoreTests` |
+| History context / multiline | `MessageHistoryTests.laterContextAndContextOnlyConversationsCannotAdvanceAnchors`; `HistoryCoordinatorIntegrationTests.relatedFutureContextCannotAdvancePersistedReconnectAnchorOrLoseReplyIdentity`; `HistoryCoordinatorIntegrationTests.multilineHistoryPreservesCompleteBodyIdentityAndSearchAcrossManyWireFragments` |
 | netsplit/netjoin | `PerNetworkStateTests.netsplitBatchCollapsesQuitsIntoOneSummaryLine`; `PerNetworkStateTests.netjoinBatchSuppressesJoinLinesButTracksMembers` |
-| labeled-response | `LabeledResponseReducerTests.labelledBatchIsRoutedToOriginAndClearedAtBatchEnd`; `LabeledResponseReducerTests.ackClearsPendingLabelWithoutOutput`; `ErgoRoundTripTest.labeledResponsesCarryLabelsFromRealServer` |
+| labeled-response / history lifecycles | `LabeledResponseReducerTests.labelledBatchIsRoutedToOriginAndClearedAtBatchEnd`; `ErgoRoundTripTest.labeledResponsesCarryLabelsFromRealServer`; `HistoryRequestTrackerTests.labeledCasefoldedHistoryPreservesNestedMultilineWireOrder`; `HistoryRequestTrackerTests.closedHistoryReferenceIsReusableWhileUnfinishedNestedBatchRemainsQuarantined`; `HistoryRequestTrackerTests.lateLabeledTimeoutErrorsAndAcksAreConsumedWhileAnotherRequestIsActive`; `HistoryRequestTrackerTests.topLevelLabeledAckFinishesEveryHistoryOperationWithoutClaimingEmptyArchive`; `HistoryCoordinatorIntegrationTests.closingUnlabelledHistoryDrainsOldReplyBeforeNextConversationWithoutReconnect`; `HistoryCoordinatorIntegrationTests.explicitReconnectRetryResumesFailedGapOnFreshSocketWithoutDiscardingCache` |
 | standard-replies | `PerNetworkStateTests.standardRepliesAreTaggedByVerb` |
 | sts | `StsTests.plainConnectionUpgradesUnderActivePolicy`; `StsTests.expiredPolicyDeletedAndIgnored`; `FileStsPolicyStoreTests.policySurvivesStoreRecreation` |
 | SNI | `TlsServerNameIndicationTests.clientHelloNamesTheConfiguredHost` |
@@ -131,11 +137,24 @@ Ergo and runs all real-server tests without skips.
 | UTF8ONLY | `LineFramerTests.malformedUtf8IsReplacedNotDecodedAsLatin1`; `LineFramerTests.truncationNeverSplitsACodepoint` |
 | draft/extended-isupport | `IrcConnectionIntegrationTests.extendedIsupportRequestsIsupportBeforeCapEnd`; `ISupportTests.negatedTokensRemoveEarlierValues` |
 | draft/ICON | `MetadataReducerTests.iconIsupportTokenSetsAndClearsNetworkIcon`; `ImageUrlPolicyTests.sizeTemplateIsExpanded` |
-| draft/channel-rename | `MessagingCoordinatorTests.renameMovesBufferTranscriptMarkersMutesPinsAndAutojoin`; `MessageStoreRenameTests.renamedRowsStaySearchableUnderTheNewConversation`; `MessagingReducerTests.outstandingLabeledReplyFollowsRenamedConversation` |
+| draft/channel-rename | `MessagingCoordinatorTests.renameMovesBufferTranscriptMarkersMutesPinsAndAutojoin`; `MessageStoreRenameTests.renamedRowsStaySearchableUnderTheNewConversation`; `MessagingReducerTests.outstandingLabeledReplyFollowsRenamedConversation`; `HistoryCoordinatorIntegrationTests.channelRenameDrainsUnlabelledResponseAndReissuesForNewTargetWithoutNetworkPoisoning` |
 | soju.im/bouncer-networks | `IrcBouncerNetworksTests.commandBuilders`; `BouncerNetworkDraftTests.diffContainsOnlyChangedKeys`; `PerNetworkStateTests.bouncerNetIdBindsAndNetworkUpdatesBumpVersion` |
-| znc.in/playback | `PerNetworkStateTests.capabilitiesRequestPlaybackSinceLatestReadMarkerInSeconds` |
+| znc.in/playback | `HistoryRequestTrackerTests.bareZncPlaybackRequiresTimestampBoundsAndCorrectDmIdentity`; `HistoryCoordinatorIntegrationTests.clippedNativePlaybackRetainsGapUntilClosedRangeWitnessesCachedLowerBoundary`; `HistoryCoordinatorIntegrationTests.timedOutWildcardPlaybackCannotInjectLateBatchesBareMessagesOrNotifications`; `HistoryCoordinatorIntegrationTests.invalidNativeMetadataCannotInventGapOrPersistFallbackClockMessage`; `HistoryCoordinatorIntegrationTests.repeatedBoundedPlaybackReconnectsMergeDurableGapsWithoutOpeningClosedConversations`; `HistoryCoordinatorIntegrationTests.inclusivePlaybackUpperBoundaryAdvancesFiniteEmptyWindowsWithoutInventingGapsOrArchiveEnd` |
 
 Emulator smoke (`make play`) exercises rendered network icons, avatars,
 display names, verified-account/away/bot member rows, account-ban wire syntax,
 multiline send/echo, selected channel rename, channel-context navigation and
 the traffic console. Protocol-only tests above do not claim UI rendering proof.
+
+Parity phase 1 was also exercised on actual Android 15 transcripts against
+Ergo 2.14.0 with persistent history capped at five messages, ZNC 1.10.3 with native
+playback and client LIMIT 4, and Ergo with history disabled. The observed paths
+include repeated channel/DM paging, offline/new-DM recovery, short-page residual
+gap filling, delayed-response timeout/late-response rejection, cancellation/retry,
+missing-time rejection, and preserved old gaps before background replay.
+The local-only fixture traversed all 451 equal-millisecond rows online and offline;
+an oldest-message search returned its original row. Held-response/query screenshots
+showed unchanged cached reading-anchor bounds through server and local prepends.
+Live notification controls were enabled; historical replay did not recreate them.
+The real native module omitted replay msgids and supplied no archive-end guarantee;
+those limitations remain explicit rather than being counted as protocol coverage.

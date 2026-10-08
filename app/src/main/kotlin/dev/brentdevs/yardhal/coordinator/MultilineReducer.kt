@@ -59,13 +59,15 @@ internal fun Reduction.flushMultiline(batch: OpenBatch, buffer: MultilineBuffer)
     buffer.byteCount = 0
     val previousCorrelation = correlation
     correlation = correlateLabel(buffer.opening, "BATCH") ?: previousCorrelation
+    val playback = playbackBatch(batch.parent)
     emitChat(
         prefix = buffer.opening.prefix ?: first.prefix,
         command = first.command,
         targetParam = batch.parameters.firstOrNull() ?: first.parameters[0],
         rawText = text,
         tags = tags,
-        playback = isPlaybackBatch(batch.parent),
+        playback = context.historyPlayback || playback != null,
+        historyTarget = playback?.parameters?.firstOrNull()?.let(state::targetRef),
     )
     correlation = previousCorrelation
 }

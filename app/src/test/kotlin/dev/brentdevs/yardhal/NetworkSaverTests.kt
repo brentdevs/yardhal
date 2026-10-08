@@ -159,6 +159,7 @@ class NetworkSaverTests {
             networkStore = networks,
             messageStore = MessageStore(database.messageDao()),
             readMarkers = ReadMarkerStore(directory),
+            historyCoverage = dev.brentdevs.yardhal.core.data.HistoryCoverageStore(directory),
             mutes = MuteStore(directory),
             vault = vault,
             channelOrder = ChannelOrderStore(directory),

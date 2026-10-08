@@ -25,7 +25,7 @@ internal fun Reduction.handleJoin(message: IrcMessage) {
         }
         emit(InboundEffect.SendRaw("TOPIC $channelName"))
         emit(InboundEffect.SendRaw("MODE $channelName"))
-        requestChathistory(ref)
+        requestHistory(ref)
     } else {
         system(ref, "→ $nick joined", MessageKind.JOIN)
     }

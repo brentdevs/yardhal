@@ -230,6 +230,7 @@ class NetworkEditLifecycleTests {
             networkStore = networks,
             messageStore = messages,
             readMarkers = readMarkers,
+            historyCoverage = dev.brentdevs.yardhal.core.data.HistoryCoverageStore(directory),
             mutes = mutes,
             vault = vault,
             channelOrder = channelOrder,
@@ -245,6 +246,7 @@ class NetworkEditLifecycleTests {
                 networkStore = NetworkStore(directory),
                 messageStore = MessageStore(database.messageDao()),
                 readMarkers = ReadMarkerStore(directory),
+                historyCoverage = dev.brentdevs.yardhal.core.data.HistoryCoverageStore(directory),
                 mutes = MuteStore(directory),
                 vault = vault,
                 channelOrder = ChannelOrderStore(directory),
@@ -560,7 +562,6 @@ class NetworkEditLifecycleTests {
                 await { server.clients.single().closed }
                 val renamed = harness.config.copy(name = "Offline rename")
                 assertTrue(coordinator.updateNetwork(renamed))
-                assertTrue(coordinator.networks.value.isEmpty())
                 assertEquals(1, server.clients.size)
 
                 val updated = renamed.copy(nick = "onlineAgain", username = "newUser", realName = "New Realname")

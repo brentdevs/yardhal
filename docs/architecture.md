@@ -40,7 +40,8 @@ Each layer depends only on the ones below it.
   Credentials live in Android Keystore-backed storage.
 - **`app`** — Compose UI plus the application-owned `LiveCoordinator`, the
   central owner of per-network state. The foreground service keeps the process
-  alive while networks are configured and raises notifications.
+  alive while networks are connected, connecting or retrying and raises notifications;
+  configured but disconnected networks do not keep it running.
 
 ## Data flow on an inbound message
 
@@ -87,10 +88,11 @@ or pending NAMES replies remain tracked; unshared users and profiles are pruned.
 Profile removals publish immediately unless an open metadata/join batch defers
 publication until its close.
 
-Room schema 2 stores nullable channel context through live transcripts, history
-reloads and search-hit context restoration. Its explicit 1→2 migration only adds
-the column; existing row IDs, deduplication hashes and the FTS index survive.
-There is no destructive fallback.
+Room schema 3 stores nullable channel context and history-context eligibility
+through transcript reloads and search-hit restoration. The explicit 1→2 migration
+adds channel context; 2→3 adds the context flag and scopes the unique message-ID
+index to `(networkId, conversation, msgid)`. Existing row IDs, content hashes and
+FTS rows survive both migrations. There is no destructive fallback.
 Rename-following retains only the active selected key and one pending destination,
 retargeted across rapid renames before buffer publication. Consuming a redirect,
 changing selection, reusing its source or removing its destination/network clears
@@ -113,8 +115,9 @@ send while formatted messages retain their original wire content.
 Network collapse state belongs to the root's saved state, shared by the overview
 and drawer across navigation and configuration changes. Event-run keys use the
 smallest monotonic local message ID so adding live or restored events does not
-reset expansion. Unread and mention scans inspect all messages: server-time
-timestamps can arrive out of order, especially during playback.
+reset expansion. The transcript emits at most one unread divider, including across
+date changes. Unread and mention scans inspect all messages: server-time timestamps
+can arrive out of order, especially during playback.
 
 Reducer behaviour is pinned by plain-JVM tests
 (`app/src/test/.../coordinator/*ReducerTests.kt`, `PerNetworkStateTests.kt`)
@@ -124,6 +127,86 @@ Outbound mirrors it: composer line → `SlashCommandParser.parse` →
 `LiveCoordinator.dispatchCommand` → connection send. Coordinator calls that
 change protocol state (WHOIS expectation, LIST browsing, leaving a channel)
 go through the same per-session lock.
+
+## History recovery
+
+[Halyard parity phase 1 / issue 12](https://github.com/brentdevs/yardhal/issues/12)
+adds history recovery without renumbering the architecture roadmap below.
+
+- `HistoryCoordinator` owns local cursors, provider selection, reconnect anchors,
+  bounded discovery, request queues and persisted gap intervals.
+  `HistoryRequestTracker` correlates complete responses before replay crosses
+  into transcript or storage effects.
+- Room pages contain 200 rows with a lexicographic `(timestampMs, rowId)` boundary.
+  Timestamp ties cannot strand rows. Local pages are consumed before server
+  `CHATHISTORY BEFORE`; offline and unsupported servers retain disk navigation.
+  Explicit end indications take precedence over a timestamp-only overlap that
+  cannot advance its reference.
+  Saved networks remain visible after `/quit`, without a live connection.
+- Registration seeds each conversation from its newest eligible stored
+  PRIVMSG/NOTICE/ACTION, using row ID to break timestamp ties. Server/control
+  buffers and contextual history extras are excluded. Existing channels and DMs
+  use anchored LATEST; new conversations use unanchored LATEST.
+- CHATHISTORY capability or ISUPPORT enables the provider. Requests honor the
+  advertised limit, capped locally at 100, and use only supported MSGREFTYPES.
+  Opaque msgids preserve timestamp ties and ordering across clock skew;
+  timestamp-only catch-up overlaps by ten seconds. A rejected msgid reference
+  can be retried explicitly with a supported timestamp.
+  `MESSAGE_ERROR` retries preserve cached identity while switching to timestamp.
+- TARGETS scans at most seven days, starting from the oldest eligible reconnect
+  anchor when newer, with at most the server/local request limit. Plain ISO
+  timestamps in target rows are parsed as server time. Missing end indication
+  is displayed as incomplete discovery, even for a short nonempty response.
+  One bounded response does not establish unlimited offline-DM discovery.
+- One request is in flight per network: six-second hard deadline, thirty-second
+  queue lifetime, and an eight-MiB conservative parsed-frame capture budget.
+  Logical multiline messages and contextual extras are not mistaken for the
+  server's primary-message count. Partial, failed and cancelled responses do not
+  replay messages or establish coverage.
+- Labels, inherited labeled-response wrappers, nested batches and CASEMAPPING
+  protect request identity. Socket epochs and session generations reject replaced
+  connections. Ambiguous unlabelled timeout/cancellation quarantines late replay
+  until a fresh connection; the transcript exposes reconnect-and-retry, including
+  failed gap requests. Closing or renaming a buffer drains its in-flight response
+  without replay before sending the next request on the same connection.
+  Retired labels and closed batch references cannot contaminate later requests.
+- A top-level labeled ACK completes the request immediately as a protocol error,
+  not successful empty history. [Labeled response](https://ircv3.net/specs/extensions/labeled-response)
+  does not establish archive completeness; [CHATHISTORY](https://ircv3.net/specs/extensions/chathistory)
+  requires its successful response batch.
+- Gap mutations read current durable coverage rather than an open-buffer snapshot,
+  so unopened conversations retain previous intervals without being reopened.
+  Durable read-modify-write operations are serialized; storage publishes its
+  in-memory map only after saving succeeds, and transcript publication reads the
+  latest committed intervals. Bounds are persisted before new anchors reach Room.
+  BETWEEN progresses residual gaps; only an explicit end indication or a successful
+  empty CHATHISTORY response closes coverage. A short nonempty page is not proof
+  of completion. History locks never invoke callbacks that acquire coordinator locks.
+- Native ZNC uses `ZNC *playback PLAY` rather than an echoed `PRIVMSG *playback`
+  command. Discovery is bounded to seven days; older navigation uses six-hour
+  floating-point Unix-second windows. Wildcard replay aggregates closed batches
+  with a two-second quiet period; an open batch still has the hard deadline.
+  Closed range replay can finish a known gap when it witnesses its cached lower
+  boundary, by msgid or exact sender/kind/body/server-time identity. Bare quiet
+  replay and empty windows do not prove archive completeness. Inclusive upper-boundary
+  rows advance a finite empty window without inventing a gap. Repeated overlapping
+  reconnect intervals are merged conservatively; distinct equal-time msgid bounds
+  remain separate. Clipped or nonadvancing ranges retain unknown coverage with controls.
+- Transcript keys and Compose anchoring preserve the readable message and offset
+  through prepends and gap fills. Historical catch-up never forces follow-latest.
+  Offline auto-load guards rearm after reconnection or an explicit retry.
+  Canonical overlap heals persisted msgids/row IDs without replacing existing
+  local IDs, FTS identities or richer in-memory reply/context metadata. Equal-time
+  search merges retain established transcript order; newly loaded BEFORE rows
+  precede cached ties. Optimistic sends append with a timestamp floor, then canonical
+  echoes reposition the same identity using the received timestamp. Replay itself
+  neither raises live notifications nor regresses read markers.
+
+Semantics follow the [IRCv3 CHATHISTORY specification](https://ircv3.net/specs/extensions/chathistory)
+and [ZNC Playback module interface](https://wiki.znc.in/Playback). Native playback
+does not guarantee archive retention, precise progress through clipped timestamp
+ties, or tags which the module omits. The exercised module strips replay msgids;
+stored IDs are retained through canonical matching, not invented from wire data.
 
 ## Network configuration
 
@@ -195,6 +278,26 @@ phases, matching the `make check` ordering within the existing thirty-minute
 job limit. Test start/end logging identifies a stalled case; a phase timeout
 leaves time for failure-report upload instead of exhausting the whole job.
 
+The in-memory Room factory runs its query executor inline. Cancelling and joining
+a coordinator scope can otherwise leave Room's detached query work opening SQLite
+after the harness has closed the database, racing Robolectric's native reset.
+Inline execution keeps the query within the caller's lifetime; harnesses still
+join their scopes before closing Room. The on-disk application builder retains
+Room's asynchronous executors.
+
+Loopback harnesses wait for a server numeric marker in the coordinator's transcript
+before advancing fake elapsed clocks or asserting that late replies were rejected.
+PONG is generated by the connection reader before its incoming event reaches the
+coordinator; it proves socket progress, not consumption of queued playback frames.
+Discovery and autojoin catch-up can enqueue concurrently; fixtures answer the active
+request rather than requiring TARGETS to precede every LATEST request.
+
+History regression harnesses also cover local-to-server BEFORE transitions,
+timestamp-only terminal overlaps, limited TARGETS discovery, msgid rejection fallback,
+ordinary close/rename draining, gap reconnect retries and concurrent local/bootstrap
+progress. Coverage-store failure tests retry after a failed save and reopen the file
+to verify that neither the cached nor durable map advanced prematurely.
+
 SCRAM uses the complete RFC 4013 Unicode 3.2 SASLprep profile: mapping, frozen
 NFKC normalization, prohibited-character checks, bidi restrictions, and the
 query/stored unassigned-character distinction. Usernames use QUERY and passwords
@@ -240,9 +343,10 @@ Phases land in order; each phase ships with tests and updated docs.
 - **Phase 4 — MVP UI**: network/channel lists, transcript, composer with
   nick completion, join sheet, foreground service + notifications,
   settings. ✅ (settings screen minimal)
-- **Phase 5 — IRCv3 breadth**: server-time everywhere, chathistory LATEST
-  bootstrap, gap-free history seeding from the store, labeled replies,
-  echo-message reconciliation, msgid-gated reactions/replies/redaction,
+- **Phase 5 — IRCv3 breadth**: server-time everywhere, local tuple paging,
+  anchored channel/DM chathistory LATEST/BEFORE/BETWEEN, bounded TARGETS discovery
+  and retained gap coverage, labeled replies, echo-message reconciliation,
+  msgid-gated reactions/replies/redaction,
   typing both ways, NAMES + PREFIX and WHOX presence, account/away/host/realname
   notifications, extended MONITOR, standard replies, MARKREAD mirroring,
   netsplit/netjoin collapse, limit-aware multiline composition and reassembly,
@@ -258,9 +362,9 @@ Phases land in order; each phase ships with tests and updated docs.
   identity-preserving network editing with credential-vault updates.
   Remaining: moderation surfaces beyond these actions and slash verbs,
   per-message link auto-open polish.
-- **Phase 7 — Bouncers**: ZNC `znc.in/playback` requested; playback
-  batches classified as history (no unread/highlight noise);
-  `*status`/`*playback` routed to the server buffer. soju
+- **Phase 7 — Bouncers**: ZNC `znc.in/playback` uses bounded discovery,
+  older windows and coverage-aware gap filling; replay suppresses live
+  notification effects. soju
   `soju.im/bouncer-networks` ported from Halyard: attribute model with
   escape-aware tokenizer, BOUNCER NETWORK upsert/delete parsing,
   ADDNETWORK/DELNETWORK/CONNECTNETWORK/DISCONNECTNETWORK, BouncerServ

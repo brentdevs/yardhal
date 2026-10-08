@@ -67,6 +67,7 @@ class YardhalApplication : Application() {
             networkStore = networkStore,
             messageStore = messageStore,
             readMarkers = readMarkerStore,
+            historyCoverage = dev.brentdevs.yardhal.core.data.HistoryCoverageStore(dir),
             mutes = muteStore,
             vault = vault,
             channelOrder = ChannelOrderStore(dir),
@@ -97,7 +98,7 @@ class YardhalApplication : Application() {
         coordinator.startAll()
         appScope.launch {
             coordinator.networks.collect { networks ->
-                if (networks.isEmpty()) {
+                if (networks.all { it.status == ConnectionStatus.DISCONNECTED }) {
                     ConnectionService.stop(this@YardhalApplication)
                 } else {
                     ConnectionService.start(

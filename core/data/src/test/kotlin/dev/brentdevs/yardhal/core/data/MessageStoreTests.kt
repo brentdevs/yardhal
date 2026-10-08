@@ -87,7 +87,7 @@ class MessageStoreTests {
         val after = store.after(ref, 250)
         assertEquals(listOf(300L, 400L, 500L), after.map { it.timestampMs })
 
-        val before = store.before(ref, 450, 2)
+        val before = store.before(ref, MessageCursor(450, 0), 2)
         assertEquals(listOf(300L, 400L), before.map { it.timestampMs })
     }
 
@@ -110,7 +110,7 @@ class MessageStoreTests {
 
             assertEquals(expected, store.recent(ref, 10))
             assertEquals(expected, store.after(ref, 0))
-            assertEquals(expected, store.before(ref, 400, 10))
+            assertEquals(expected, store.before(ref, MessageCursor(400, 0), 10))
             assertEquals(expected, store.around(ref, expected[1].rowId, expected[1].timestampMs))
         } finally {
             db.close()

@@ -174,11 +174,6 @@ class PerNetworkStateTests {
     }
 
     @Test
-    fun redactEmitsRedactionByMsgid() {
-        assertEquals(InboundEffect.RedactMessage("m1"), state().feed(":alice!u@h REDACT #room m1").single())
-    }
-
-    @Test
     fun tagmsgReactionsAndTypingBecomeEffects() {
         val state = state()
         val react = state.feed("@+draft/react=👍;+draft/reply=m1 :alice!u@h TAGMSG #room").filterIsInstance<InboundEffect.ApplyReaction>()
@@ -216,6 +211,18 @@ class PerNetworkStateTests {
     }
 
     @Test
+    fun redactEmitsRedactionForTheWireConversation() {
+        val state = state()
+        assertEquals(InboundEffect.RedactMessage(channel("#room"), "same-id"),
+            state.feed(":alice!u@h REDACT #room same-id").only<InboundEffect.RedactMessage>())
+        assertEquals(InboundEffect.RedactMessage(state.directRef("alice"), "dm-id"),
+            state.feed(":alice!u@h REDACT me dm-id").only<InboundEffect.RedactMessage>())
+        assertEquals(InboundEffect.RedactMessage(state.directRef("bob"), "outgoing-id"),
+            state.feed(":me!u@h REDACT bob outgoing-id").only<InboundEffect.RedactMessage>())
+        assertTrue(state.feed(":alice!u@h REDACT #room").filterIsInstance<InboundEffect.RedactMessage>().isEmpty())
+    }
+
+    @Test
     fun markreadAppliesTimestampToTheTargetAndIgnoresStarTargets() {
         val state = state()
         val marker = state.feed(":srv MARKREAD #room timestamp=2024-01-01T00:00:00.000Z").single()
@@ -230,7 +237,9 @@ class PerNetworkStateTests {
         state.feed(":srv 005 me CHATHISTORY=500 :are supported")
         val effects = state.feed(":me!u@h JOIN #room")
         assertTrue(InboundEffect.EnsureBuffer(channel("#room")) in effects)
-        assertEquals(listOf("TOPIC #room", "MODE #room", "CHATHISTORY LATEST #room * 100"), effects.sent())
+        assertEquals(listOf("TOPIC #room", "MODE #room"), effects.sent())
+        assertEquals(listOf(InboundEffect.RequestHistory(channel("#room"))),
+            effects.filterIsInstance<InboundEffect.RequestHistory>())
         assertTrue(effects.appended().isEmpty())
     }
 
@@ -535,7 +544,6 @@ class PerNetworkStateTests {
         assertEquals(CaseMapping.ASCII, state.casemapping)
         assertEquals(listOf('~', '@', '+'), state.prefixModes.symbols)
         assertTrue(state.hasWhox)
-        assertEquals(200, state.chathistoryLimit)
         assertEquals("https://up.example", state.filehostEndpoint)
     }
 
@@ -558,16 +566,6 @@ class PerNetworkStateTests {
         assertEquals("soju mgmt: network created (9)", state.feed(":srv BOUNCER ADDNETWORK 9").appended().single().text)
     }
 
-    @Test
-    fun capabilitiesRequestPlaybackSinceLatestReadMarkerInSeconds() {
-        val state = state()
-        val context = InboundContext(nowMs = now, latestReadMarkerMs = { 1_700_000_123_456L })
-        val effects = state.apply(IrcEvent.CapabilitiesNegotiated(setOf("znc.in/playback", "soju.im/bouncer-networks")), context)
-        assertEquals(listOf("PRIVMSG *playback :playback * start 1700000123"), effects.sent())
-        assertTrue(state.isBouncerDiscovery)
-        val fallback = state().apply(IrcEvent.CapabilitiesNegotiated(setOf("znc.in/playback")), InboundContext(nowMs = now))
-        assertEquals(listOf("PRIVMSG *playback :playback * start ${now / 1000 - 7 * 24 * 3600}"), fallback.sent())
-    }
 
     @Test
     fun capNewUpdatesAdvertisedMultilineLimitsWithoutAcknowledgingCapabilities() {

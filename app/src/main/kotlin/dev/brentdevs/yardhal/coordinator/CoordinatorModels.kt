@@ -42,9 +42,10 @@ public data class ChatMessage(
     public val storedRowId: Long? = null,
     public val senderAccount: String? = null,
     public val channelContext: String? = null,
+    public val historyContext: Boolean = false,
 ) {
     public val countsAsUnread: Boolean
-        get() = !sentByUs && !playback &&
+        get() = !sentByUs && !playback && !historyContext &&
             (kind == MessageKind.PRIVMSG || kind == MessageKind.NOTICE || kind == MessageKind.ACTION)
 }
 
@@ -79,6 +80,7 @@ public data class ConversationBuffer(
     public val joinState: JoinState = JoinState.JOINED,
     public val unreadFromTimestampMs: Long? = null,
     public val readAtMs: Long = 0L,
+    public val history: ConversationHistory = ConversationHistory(),
 ) {
     public val key: String get() = ref.storageKey
 
