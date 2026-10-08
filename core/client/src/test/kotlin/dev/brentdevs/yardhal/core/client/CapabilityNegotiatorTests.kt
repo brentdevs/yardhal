@@ -214,7 +214,7 @@ class CapabilityNegotiatorTests {
     }
 
     @Test
-    fun failedSaslKeepsCapabilityAcknowledged() {
+    fun saslCompletionKeepsCapabilityAcknowledged() {
         val harness = Harness()
         harness.negotiator.begin()
         harness.negotiator.handle(harness.cap("LS", "sasl"))

@@ -16,6 +16,7 @@ internal fun Reduction.handleCapabilities(capabilities: Set<String>, values: Map
 }
 
 internal fun Reduction.handleRegistered(nickname: String) {
+    if (state.registered || state.authenticationRejected) return
     state.ownNick = nickname
     state.registered = true
     emit(InboundEffect.StatusChanged(ConnectionStatus.REGISTERED))

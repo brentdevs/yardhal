@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import dev.brentdevs.yardhal.core.data.CredentialVault
+import java.io.IOException
 
 class AndroidCredentialVault(context: Context) : CredentialVault {
 
@@ -21,12 +22,12 @@ class AndroidCredentialVault(context: Context) : CredentialVault {
     }
 
     override fun storePassword(key: String, password: String) {
-        prefs.edit().putString(key, password).apply()
+        if (!prefs.edit().putString(key, password).commit()) throw IOException("Unable to save protected credentials")
     }
 
     override fun readPassword(key: String): String? = prefs.getString(key, null)
 
     override fun deletePassword(key: String) {
-        prefs.edit().remove(key).apply()
+        if (!prefs.edit().remove(key).commit()) throw IOException("Unable to remove protected credentials")
     }
 }

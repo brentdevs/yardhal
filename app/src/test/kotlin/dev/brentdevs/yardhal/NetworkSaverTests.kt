@@ -15,11 +15,16 @@ import dev.brentdevs.yardhal.core.data.MessageStore
 import dev.brentdevs.yardhal.core.data.MuteStore
 import dev.brentdevs.yardhal.core.data.NetworkConfig
 import dev.brentdevs.yardhal.core.data.NetworkStore
+import dev.brentdevs.yardhal.core.data.SaslMode
+import dev.brentdevs.yardhal.core.data.SocksProxyConfig
 import dev.brentdevs.yardhal.core.data.ReadMarkerStore
 import dev.brentdevs.yardhal.core.data.YardhalDatabase
+import dev.brentdevs.yardhal.core.protocol.IrcMessage
 import dev.brentdevs.yardhal.ui.screens.NetworkDraft
 import java.io.BufferedReader
 import java.io.InputStreamReader
+import java.io.File
+import java.io.IOException
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -36,6 +41,10 @@ import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -46,6 +55,7 @@ import kotlinx.coroutines.withTimeout
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 
+@OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
 class NetworkSaverTests {
     private class Server : AutoCloseable {
@@ -87,6 +97,10 @@ class NetworkSaverTests {
                 it.startsWith("AUTHENTICATE ") && it != "AUTHENTICATE PLAIN" && it != "AUTHENTICATE +"
             }?.substringAfter("AUTHENTICATE ")?.let {
                 String(Base64.getDecoder().decode(it), Charsets.UTF_8)
+            }
+
+            fun parameters(command: String): List<String>? = received.firstNotNullOfOrNull {
+                IrcMessage.parse(it)?.takeIf { message -> message.command == command }?.parameters
             }
 
             override fun close() {
@@ -138,22 +152,25 @@ class NetworkSaverTests {
     ) : CredentialVault by real {
         val storedKeys = CopyOnWriteArrayList<String>()
         @Volatile var stage: Stage? = null
+        @Volatile var failOnStoreNumber: Int? = null
 
         override fun storePassword(key: String, password: String) {
             real.storePassword(key, password)
             storedKeys.add(key)
+            if (storedKeys.size == failOnStoreNumber) throw IOException("Credential storage unavailable")
             stage?.block(key)
         }
     }
 
-    private class Harness : AutoCloseable {
+    private class Harness(private val dispatcher: CoroutineDispatcher = Dispatchers.Default) : AutoCloseable {
         val directory = Files.createTempDirectory("yardhal-network-save").toFile()
         private val job = SupervisorJob()
-        private val scope = CoroutineScope(job + Dispatchers.Default)
+        private val scope = CoroutineScope(job + dispatcher)
         private val database = YardhalDatabase.inMemory(ApplicationProvider.getApplicationContext<Context>())
         val vault = ObservedVault()
         val networks = NetworkStore(directory)
         private val policies = InMemoryStsPolicyStore()
+        val attemptedConnections = CopyOnWriteArrayList<NetworkConfig>()
         val coordinator = LiveCoordinator(
             scope = scope,
             networkStore = networks,
@@ -164,6 +181,7 @@ class NetworkSaverTests {
             vault = vault,
             channelOrder = ChannelOrderStore(directory),
             connectionFactory = ConnectionFactory { config, onStsUpgrade ->
+                attemptedConnections.add(config)
                 IrcConnection(
                     IrcConnectionConfig(
                         host = config.host,
@@ -174,8 +192,9 @@ class NetworkSaverTests {
                         realName = config.realName,
                         saslAuthcid = config.saslAuthcid,
                         saslPassword = config.saslPassword,
-                        serverPassword = config.serverPasswordRef?.let(vault::readPassword),
+                        serverPassword = config.serverPassword,
                         capabilities = setOf("sasl"),
+                        saslMode = config.saslMode.name,
                         connectTimeoutMillis = 1_000,
                     ),
                     stsPolicyStore = policies,
@@ -196,6 +215,7 @@ class NetworkSaverTests {
         suspend fun registered(id: String) {
             withTimeout(5_000) {
                 while (coordinator.networks.value.none { it.id == id && it.status == ConnectionStatus.REGISTERED }) {
+                    (dispatcher as? TestDispatcher)?.scheduler?.runCurrent()
                     delay(10)
                 }
             }
@@ -222,7 +242,19 @@ class NetworkSaverTests {
 
         override fun close() {
             coordinator.networks.value.forEach { coordinator.disconnect(it.id) }
-            runBlocking { job.cancelAndJoin() }
+            if (dispatcher is TestDispatcher) {
+                job.cancel()
+                runBlocking {
+                    withTimeout(5_000) {
+                        while (!job.isCompleted) {
+                            dispatcher.scheduler.runCurrent()
+                            delay(10)
+                        }
+                    }
+                }
+            } else {
+                runBlocking { job.cancelAndJoin() }
+            }
             database.close()
             directory.deleteRecursively()
         }
@@ -311,8 +343,9 @@ class NetworkSaverTests {
                 assertEquals("Renamed network", harness.coordinator.networks.value.single().name)
                 assertEquals(1, server.clients.size)
                 assertEquals("\u0000account\u0000old-password", client.saslPlain())
-                assertTrue("USER hidden-user 0 * :Hidden real name" in client.received)
-                assertTrue("PASS old-password" in client.received)
+                assertEquals("hidden-user", client.parameters("USER")?.firstOrNull())
+                assertEquals("Hidden real name", client.parameters("USER")?.lastOrNull())
+                assertEquals(listOf("old-password"), client.parameters("PASS"))
             }
         }
     }
@@ -355,7 +388,7 @@ class NetworkSaverTests {
                 harness.registered(saved.id)
                 val client = server.clients.last()
                 assertEquals(2, server.clients.size)
-                assertTrue("PASS old-password" in client.received)
+                assertEquals(listOf("old-password"), client.parameters("PASS"))
                 assertEquals("\u0000account\u0000   ", client.saslPlain())
             }
         }
@@ -371,6 +404,8 @@ class NetworkSaverTests {
                 assertEquals(original.copy(saslPasswordRef = null), harness.saved())
                 assertNull(harness.vault.readPassword("old-secret"))
                 assertEquals(listOf("old-secret"), harness.vault.storedKeys.toList())
+                assertTrue(server.clients.isEmpty())
+                harness.coordinator.connectNetwork(original.id)
                 harness.registered(original.id)
                 assertNull(server.clients.single().saslPlain())
             }
@@ -386,11 +421,14 @@ class NetworkSaverTests {
                 assertTrue(harness.saver.save(draft(original).copy(clearSaslPassword = true)))
                 assertEquals(original.copy(saslPasswordRef = null), harness.saved())
                 assertEquals("old-password", harness.vault.readPassword("old-secret"))
+                assertTrue(server.clients.isEmpty())
+                harness.coordinator.connectNetwork(original.id)
                 harness.registered(original.id)
                 val client = server.clients.single()
                 assertNull(client.saslPlain())
-                assertTrue("PASS old-password" in client.received)
-                assertTrue("USER hidden-user 0 * :Hidden real name" in client.received)
+                assertEquals(listOf("old-password"), client.parameters("PASS"))
+                assertEquals("hidden-user", client.parameters("USER")?.firstOrNull())
+                assertEquals("Hidden real name", client.parameters("USER")?.lastOrNull())
             }
         }
     }
@@ -463,4 +501,300 @@ class NetworkSaverTests {
             }
         }
     }
+
+    @Test
+    fun savesAllAuthenticationProxyIdentityAndIntentSettingsAsOneDurableConfiguration() {
+        Harness().use { harness ->
+            val original = offlineConfig()
+            seedAllCredentials(harness, original)
+            val input = draft(original).copy(
+                realName = "Edited realname",
+                alternateNicks = listOf("alternate", "another"),
+                autoConnect = false,
+                saslMode = SaslMode.SCRAM_SHA_256,
+                saslPassword = "new-sasl-password",
+                serverPassword = "new-server-password",
+                nickServAccount = "edited-nickserv-account",
+                nickServService = "AccountService",
+                nickServPassword = "new-nickserv-password",
+                waitForNickServ = false,
+                proxyEnabled = true,
+                proxyHost = "new-proxy.example",
+                proxyPort = 1082,
+                proxyUsername = "new-proxy-user",
+                proxyPassword = "new-proxy-password",
+                tlsClientAlias = "new-keychain-alias",
+            )
+            assertTrue(harness.saver.save(input))
+            val saved = harness.saved()
+            val references = passwordReferences(saved)
+            assertEquals(4, references.size)
+            assertEquals(4, references.distinct().size)
+            assertTrue(references.none { it in passwordReferences(original) })
+            assertEquals("new-sasl-password", harness.vault.readPassword(assertNotNull(saved.saslPasswordRef)))
+            assertEquals("new-server-password", harness.vault.readPassword(assertNotNull(saved.serverPasswordRef)))
+            assertEquals("new-nickserv-password", harness.vault.readPassword(assertNotNull(saved.nickServPasswordRef)))
+            assertEquals("new-proxy-password", harness.vault.readPassword(assertNotNull(saved.proxy?.passwordRef)))
+            passwordReferences(original).forEach { assertNull(harness.vault.readPassword(it)) }
+            assertEquals(
+                original.copy(
+                    realName = "Edited realname",
+                    alternateNicks = listOf("alternate", "another"),
+                    autoConnect = false,
+                    saslMode = SaslMode.SCRAM_SHA_256,
+                    saslPasswordRef = saved.saslPasswordRef,
+                    serverPasswordRef = saved.serverPasswordRef,
+                    nickServAccount = "edited-nickserv-account",
+                    nickServService = "AccountService",
+                    nickServPasswordRef = saved.nickServPasswordRef,
+                    waitForNickServ = false,
+                    proxy = SocksProxyConfig("new-proxy.example", 1082, "new-proxy-user", saved.proxy?.passwordRef),
+                    tlsClientAlias = "new-keychain-alias",
+                ),
+                saved,
+            )
+            assertEquals("hidden-user", saved.username)
+            assertTrue(saved.userDisconnected)
+            assertNull(saved.saslPassword)
+            assertNull(saved.serverPassword)
+            assertNull(saved.nickServPassword)
+            assertNull(saved.proxyPassword)
+        }
+    }
+
+    @Test
+    fun unspecifiedNewFieldsPreserveHiddenIdentityUnusedSettingsAndDisconnectIntent() {
+        Harness().use { harness ->
+            val original = offlineConfig().copy(saslMode = SaslMode.EXTERNAL)
+            seedAllCredentials(harness, original)
+            val keys = harness.vault.storedKeys.toList()
+            assertTrue(harness.saver.save(draft(original).copy(displayName = "Renamed")))
+            assertEquals(original.copy(name = "Renamed"), harness.saved())
+            assertEquals(keys, harness.vault.storedKeys.toList())
+            passwordReferences(original).forEach { assertNotNull(harness.vault.readPassword(it)) }
+        }
+    }
+
+    @Test
+    fun explicitClearActionsRemoveEveryCredentialAndIdentityWithoutDiscardingOtherSettings() {
+        Harness().use { harness ->
+            val original = offlineConfig()
+            seedAllCredentials(harness, original)
+            assertTrue(
+                harness.saver.save(
+                    draft(original).copy(
+                        clearSaslPassword = true,
+                        clearServerPassword = true,
+                        clearNickServPassword = true,
+                        clearProxyPassword = true,
+                        proxyEnabled = false,
+                        clearTlsClientAlias = true,
+                        saslPassword = "ignored",
+                        serverPassword = "ignored",
+                        nickServPassword = "ignored",
+                        proxyPassword = "ignored",
+                    ),
+                ),
+            )
+            assertEquals(
+                original.copy(
+                    saslPasswordRef = null,
+                    serverPasswordRef = null,
+                    nickServPasswordRef = null,
+                    proxy = null,
+                    tlsClientAlias = null,
+                ),
+                harness.saved(),
+            )
+            passwordReferences(original).forEach { assertNull(harness.vault.readPassword(it)) }
+            assertEquals(4, harness.vault.storedKeys.size)
+        }
+    }
+
+    @Test
+    fun replacementRetainsEveryOldReferenceSharedByAnotherNetworksDifferentCredentialRole() {
+        Harness().use { harness ->
+            val original = offlineConfig()
+            seedAllCredentials(harness, original)
+            val other = original.copy(
+                id = "other",
+                saslPasswordRef = original.proxy?.passwordRef,
+                serverPasswordRef = original.nickServPasswordRef,
+                nickServPasswordRef = original.serverPasswordRef,
+                proxy = SocksProxyConfig("other-proxy.example", passwordRef = original.saslPasswordRef),
+            )
+            assertTrue(harness.networks.add(other))
+            assertTrue(harness.saver.save(replacingAllCredentials(draft(original))))
+            passwordReferences(original).forEach { assertNotNull(harness.vault.readPassword(it)) }
+            assertEquals(other, NetworkStore(harness.directory).byId(other.id))
+            val saved = assertNotNull(NetworkStore(harness.directory).byId(original.id))
+            assertTrue(passwordReferences(saved).none { it in passwordReferences(original) })
+        }
+    }
+
+    @Test
+    fun failedDurableUpdateRollsBackAllFourStagedSecretsAndLeavesConfigAndOldSecretsIntact() {
+        Harness().use { harness ->
+            val original = offlineConfig()
+            seedAllCredentials(harness, original)
+            val previousKeys = harness.vault.storedKeys.toList()
+            val blocker = File(harness.directory, "networks.json.tmp")
+            assertTrue(blocker.mkdir())
+            assertFalse(harness.saver.save(replacingAllCredentials(draft(original))))
+            assertEquals(original, harness.saved())
+            assertEquals(original, harness.networks.byId(original.id))
+            val stagedKeys = harness.vault.storedKeys.filterNot { it in previousKeys }
+            assertEquals(4, stagedKeys.size)
+            stagedKeys.forEach { assertNull(harness.vault.readPassword(it)) }
+            passwordReferences(original).forEach { assertNotNull(harness.vault.readPassword(it)) }
+            assertTrue(blocker.delete())
+            assertTrue(harness.saver.save(replacingAllCredentials(draft(original))))
+            assertEquals(4, passwordReferences(harness.saved()).size)
+        }
+    }
+
+    @Test
+    fun partialVaultFailureRollsBackEveryAttemptedWriteIncludingTheFailingWrite() {
+        Harness().use { harness ->
+            val original = offlineConfig()
+            seedAllCredentials(harness, original)
+            val previousKeys = harness.vault.storedKeys.toList()
+            harness.vault.failOnStoreNumber = previousKeys.size + 3
+            assertFalse(harness.saver.save(replacingAllCredentials(draft(original))))
+            val stagedKeys = harness.vault.storedKeys.filterNot { it in previousKeys }
+            assertEquals(3, stagedKeys.size)
+            stagedKeys.forEach { assertNull(harness.vault.readPassword(it)) }
+            assertEquals(original, harness.saved())
+            passwordReferences(original).forEach { assertNotNull(harness.vault.readPassword(it)) }
+            harness.vault.failOnStoreNumber = null
+            assertTrue(harness.saver.save(replacingAllCredentials(draft(original))))
+        }
+    }
+
+    @Test
+    fun disabledStartupAddPersistsWithoutAttemptingAConnection() = runBlocking {
+        Server().use { server ->
+            val dispatcher = StandardTestDispatcher()
+            Harness(dispatcher).use { harness ->
+                val input = draft(config(server)).copy(
+                    networkId = null,
+                    saslAuthcid = null,
+                    autoConnect = false,
+                    realName = "Saved realname",
+                    alternateNicks = listOf("alternate"),
+                    saslMode = SaslMode.AUTO,
+                )
+                harness.coordinator.startAll()
+                assertTrue(harness.saver.save(input))
+                harness.coordinator.startAll()
+                harness.coordinator.onForegroundResume()
+                dispatcher.scheduler.advanceTimeBy(60_000)
+                dispatcher.scheduler.runCurrent()
+                val saved = harness.saved()
+                assertFalse(saved.autoConnect)
+                assertFalse(saved.userDisconnected)
+                assertEquals("Saved realname", saved.realName)
+                assertEquals(listOf("alternate"), saved.alternateNicks)
+                assertEquals(SaslMode.AUTO, saved.saslMode)
+                assertEquals(ConnectionStatus.DISCONNECTED, harness.coordinator.networks.value.single().status)
+                assertTrue(harness.attemptedConnections.isEmpty())
+                assertTrue(server.clients.isEmpty())
+                harness.coordinator.connectNetwork(saved.id)
+                harness.registered(saved.id)
+                assertEquals(1, harness.attemptedConnections.size)
+                assertEquals(1, server.clients.size)
+                assertEquals("Saved realname", server.clients.single().parameters("USER")?.last())
+            }
+        }
+    }
+
+    @Test
+    fun clearingProxyPasswordKeepsProxyEndpointAndOtherCredentialRoles() {
+        Harness().use { harness ->
+            val original = offlineConfig()
+            seedAllCredentials(harness, original)
+            assertTrue(harness.saver.save(draft(original).copy(clearProxyPassword = true)))
+            assertEquals(
+                original.copy(proxy = assertNotNull(original.proxy).copy(passwordRef = null)),
+                harness.saved(),
+            )
+            assertNull(harness.vault.readPassword(assertNotNull(original.proxy?.passwordRef)))
+            listOfNotNull(original.saslPasswordRef, original.serverPasswordRef, original.nickServPasswordRef).forEach {
+                assertNotNull(harness.vault.readPassword(it))
+            }
+        }
+    }
+
+    @Test
+    fun explicitEmptyOptionalAccountsClearWithoutRemovingCredentialsOrHiddenUserIdentity() {
+        Harness().use { harness ->
+            val original = offlineConfig()
+            seedAllCredentials(harness, original)
+            assertTrue(harness.saver.save(draft(original).copy(nickServAccount = "", proxyUsername = "")))
+            assertEquals(
+                original.copy(nickServAccount = null, proxy = assertNotNull(original.proxy).copy(username = null)),
+                harness.saved(),
+            )
+            passwordReferences(original).forEach { assertNotNull(harness.vault.readPassword(it)) }
+        }
+    }
+
+    @Test
+    fun rejectedAddRollsBackAllSecretRolesBeforePublishingAnyNetwork() {
+        Harness().use { harness ->
+            val blocker = File(harness.directory, "networks.json.tmp")
+            assertTrue(blocker.mkdir())
+            val input = replacingAllCredentials(draft(offlineConfig())).copy(
+                networkId = null,
+                autoConnect = false,
+                proxyEnabled = true,
+                proxyHost = "proxy.example",
+                proxyPort = 1080,
+            )
+            assertFalse(harness.saver.save(input))
+            assertEquals(4, harness.vault.storedKeys.size)
+            harness.vault.storedKeys.forEach { assertNull(harness.vault.readPassword(it)) }
+            assertTrue(harness.networks.all().isEmpty())
+            assertTrue(NetworkStore(harness.directory).all().isEmpty())
+            assertTrue(harness.coordinator.networks.value.isEmpty())
+        }
+    }
+
+    private fun offlineConfig(): NetworkConfig = NetworkConfig(
+        id = "network",
+        name = "Saved network",
+        host = "irc.example",
+        nick = "tester",
+        username = "hidden-user",
+        realName = "Hidden realname",
+        alternateNicks = listOf("saved-alternate"),
+        autoConnect = false,
+        userDisconnected = true,
+        saslAuthcid = "account",
+        saslPasswordRef = "old-sasl",
+        serverPasswordRef = "old-server",
+        nickServAccount = "nickserv-account",
+        nickServService = "NickServ",
+        nickServPasswordRef = "old-nickserv",
+        waitForNickServ = true,
+        proxy = SocksProxyConfig("proxy.example", 1081, "proxy-user", "old-proxy"),
+        tlsClientAlias = "saved-keychain-alias",
+    )
+
+    private fun passwordReferences(config: NetworkConfig): List<String> =
+        listOfNotNull(config.saslPasswordRef, config.serverPasswordRef, config.nickServPasswordRef, config.proxy?.passwordRef)
+
+    private fun seedAllCredentials(harness: Harness, config: NetworkConfig) {
+        harness.seed(config)
+        listOfNotNull(config.serverPasswordRef, config.nickServPasswordRef, config.proxy?.passwordRef).forEach {
+            harness.vault.storePassword(it, "old-password-for-$it")
+        }
+    }
+
+    private fun replacingAllCredentials(draft: NetworkDraft): NetworkDraft = draft.copy(
+        saslPassword = "replacement-sasl",
+        serverPassword = "replacement-server",
+        nickServPassword = "replacement-nickserv",
+        proxyPassword = "replacement-proxy",
+    )
 }

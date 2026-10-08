@@ -15,8 +15,9 @@ internal class SaslAuthenticator(
     private val sendRaw: (String) -> Unit,
     private val onOutcome: (SaslOutcome) -> Unit,
     private val createMechanism: (String) -> SaslMechanism = { name -> defaultMechanism(name, authcid, password) },
+    private val mode: String = "AUTO",
 ) {
-    private var candidates: List<String> = preferredAmong(advertisedMechanisms ?: setOf(PLAIN))
+    private var candidates: List<String> = selectedAmong(advertisedMechanisms)
     private val attempted = HashSet<String>()
     private var mechanism: SaslMechanism? = null
     private var serverMechanisms: Set<String>? = null
@@ -67,7 +68,6 @@ internal class SaslAuthenticator(
 
     fun handleNumeric(numeric: Int, message: IrcMessage) {
         if (isFinished) return
-        val description = message.parameters.lastOrNull() ?: "authentication failed"
         when (numeric) {
             RPL_SASLMECHS -> serverMechanisms = parseMechanismList(message.parameters.getOrNull(1))
             RPL_SASLSUCCESS ->
@@ -76,8 +76,11 @@ internal class SaslAuthenticator(
                 } else {
                     fail(numeric, "server reported success without proving its identity")
                 }
-            ERR_SASLFAIL -> if (!fallBackToOfferedMechanism()) fail(numeric, description)
-            ERR_NICKLOCKED, ERR_SASLTOOLONG, ERR_SASLABORTED, ERR_SASLALREADY -> fail(numeric, description)
+            ERR_SASLFAIL -> if (!fallBackToOfferedMechanism()) fail(numeric, "SASL credentials were rejected; check the account and authentication settings")
+            ERR_NICKLOCKED -> fail(numeric, "SASL account is locked or unavailable")
+            ERR_SASLTOOLONG -> fail(numeric, "Server rejected the SASL response length")
+            ERR_SASLABORTED -> fail(numeric, "SASL authentication was aborted")
+            ERR_SASLALREADY -> fail(numeric, "Server rejected the requested SASL authentication exchange")
             else -> Unit
         }
     }
@@ -86,7 +89,7 @@ internal class SaslAuthenticator(
         val offered = serverMechanisms ?: return false
         val current = mechanism?.name
         if (current != null && current in offered) return false
-        candidates = preferredAmong(offered)
+        candidates = selectedAmong(offered)
         return startNextMechanism()
     }
 
@@ -134,9 +137,21 @@ internal class SaslAuthenticator(
         onOutcome(SaslOutcome.Failure(numeric, description))
     }
 
+    private fun selectedAmong(offered: Set<String>?): List<String> {
+        val selected = when (mode.uppercase()) {
+            "AUTO" -> if (offered == null) listOf(PLAIN) else PREFERRED_MECHANISMS
+            "PLAIN" -> listOf(PLAIN)
+            "SCRAM_SHA_256" -> listOf(SCRAM_SHA_256)
+            "EXTERNAL" -> listOf(EXTERNAL)
+            else -> emptyList()
+        }
+        return if (offered == null) selected else selected.filter { it in offered }
+    }
+
     internal companion object {
         const val PLAIN: String = "PLAIN"
         const val SCRAM_SHA_256: String = "SCRAM-SHA-256"
+        const val EXTERNAL: String = "EXTERNAL"
         val PREFERRED_MECHANISMS: List<String> = listOf(SCRAM_SHA_256, PLAIN)
 
         const val AUTHENTICATE_COMMAND: String = "AUTHENTICATE"
@@ -158,12 +173,13 @@ internal class SaslAuthenticator(
             return names?.takeIf { it.isNotEmpty() }
         }
 
-        private fun preferredAmong(offered: Set<String>): List<String> = PREFERRED_MECHANISMS.filter { it in offered }
 
         private fun defaultMechanism(name: String, authcid: String, password: String): SaslMechanism =
             when (name) {
                 SCRAM_SHA_256 -> ScramSha256Mechanism(authcid, password)
-                else -> PlainMechanism(authcid, password)
+                PLAIN -> PlainMechanism(authcid, password)
+                EXTERNAL -> ExternalMechanism(authcid)
+                else -> throw SaslMechanismException("unsupported SASL mechanism")
             }
     }
 }

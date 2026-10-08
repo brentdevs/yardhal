@@ -208,17 +208,90 @@ does not guarantee archive retention, precise progress through clipped timestamp
 ties, or tags which the module omits. The exercised module strips replay msgids;
 stored IDs are retained through canonical matching, not invented from wire data.
 
+## Connection recovery and authentication
+
+[Halyard parity phase 2 / issue 13](https://github.com/brentdevs/yardhal/issues/13)
+keeps Android connectivity and lifecycle handling outside the pure-JVM client.
+`AndroidConnectivityObserver` publishes Internet-capable, unblocked, nonsuspended
+default-network availability and route changes; public Internet validation is not
+a prerequisite for private IRC routes. `MainActivity.onResume` requests validation.
+`ConnectionRecoveryPolicy` distinguishes offline, connecting, registered,
+server-unreachable, explicit disconnect, identification and blocked auth/cert states.
+One `IrcReconnector` loop pauses offline retries and wakes eligible recovery immediately.
+
+Established connections share a five-second, matching-token PING/PONG probe.
+The response boundary checks its monotonic deadline. Session identity, published
+factory epoch, accepted transport epoch and reducer epoch reject retired events,
+probes and STS callbacks; terminal failures already published before offline
+retirement remain actionable. Reconnects retain transcripts and history anchors.
+`autoConnect` controls cold startup, not an active manually connected session.
+Explicit Disconnect persists opt-out; Connect durably clears it. Dormant channels
+are idle, not falsely joining. Persistence failures do not claim saved intent or trust.
+An unsaved Disconnect remains locally stopped and offers **Retry saving Disconnect**
+without opening another transport. Foreground-service stop commands run after
+foreground promotion so an immediate authentication or certificate rejection cannot
+cancel a pending foreground start and trigger Android's startup watchdog.
+
+Initial required SASL, PASS, proxy or client-identity failures stop automatic retries;
+missing referenced secrets never fall back to guest registration. Post-registration
+OPER/PASS errors and unsuccessful SASL reauthentication do not tear down a healthy
+session or enforce an initial required-capability gate again. Explicit PLAIN/SCRAM
+requires a password; EXTERNAL requires TLS and an accessible Android KeyChain identity.
+The optional NickServ gate holds registration, autojoin and history until
+identity-specific confirmation or a seven-second deadline. A confirmed live own
+account matching the intended identity skips IDENTIFY; pre-NICK account numerics
+require successful SASL in the same accepted transport epoch before binding to the
+welcome nickname. Unknown, different, logged-out or historical accounts do not bypass
+the gate. Own nickname changes retarget confirmation without extending its deadline.
+A service rejection disconnects and blocks automatic retries whether or not waiting
+was enabled. A waiting timeout does the same; a nonwaiting timeout reports a diagnostic
+without disconnecting or repeating joins and history requests. Validated account
+references are excluded from language filters, not negative status text elsewhere.
+
+SOCKS5 implements RFC 1928/1929, authenticated-method negotiation, proxy-side
+destination resolution and a shared deadline that also bounds proxy-host DNS for
+the caller. DNS work uses a bounded executor; a noninterruptible platform lookup
+may retain a worker until the OS returns. TLS verifies the logical IRC destination,
+not the proxy. Absolute DNS endpoints normalize their trailing dot for SNI and
+verification; invalid SNI is omitted without disabling hostname verification.
+Equivalent numeric IPv6 spellings share only the same endpoint and port.
+Factory-proven layered socket provenance accounts for providers reporting the
+physical proxy port without weakening endpoint checks. Inspectable trust failures
+expose endpoint, chain identity, validity, SAN and SHA-256. Explicit consent pins
+only the inspected endpoint and leaf; changed leaves fail, hostname/validity checks
+and STS remain enabled, and removal restores platform trust. An expired leaf reports
+validity instead of a changed fingerprint; matching-pin hostname or validity failures
+are terminal, not another pin-replacement prompt.
+Client identity import uses Android's PKCS#12 installer, a unique network/draft name
+suggestion and private-key grant flow. Activity-owned chooser state retains results
+through configuration recreation and rejects superseded editor requests. Binder
+callbacks cannot survive process death; a restored editor is idle and can retry.
+
+Configured secrets and encoded authentication echoes are masked before console,
+transcript, Room and notification publication. Manual service password commands,
+qualified service names, space/tab-separated credential components and secrets
+beginning with the redaction marker are covered; account names and unrelated chat
+remain visible while the socket receives unchanged wire commands. Config diagnostics omit secret
+fields. Native Android 15 smoke exercised these paths against Ergo 2.14.0 and an
+authenticated microsocks relay, including changed certificates and real KeyChain
+EXTERNAL. Real TLS/mTLS JVM regressions use PKCS#12 fixtures. Robolectric's
+Conscrypt 2.5.2 needs the app test JVM's `java.base/java.net` opening on JDK 21;
+native Android and production TLS providers are not replaced or bypassed.
+
 ## Network configuration
 
-Each network's overview menu exposes **Edit network**. The shared add/edit form
-prefills host, port, TLS, nickname, display name, autojoin channels and SASL
-account. Editing keeps the network ID and preserves unexposed configuration
-fields, transcripts, selection, read markers, pins, groups and mutes.
+Each network's overview and transcript expose **Edit network**, Connect and
+Disconnect. The shared form edits endpoint/TLS, nickname and configured alternates,
+realname, display name, channels, startup preference, SASL mode/account,
+server password, NickServ, SOCKS5 and per-network client identity. Editing retains
+the network ID, hidden USER username, transcripts, selection, read markers,
+pins, groups and mutes.
 
 `LiveCoordinator.updateNetwork` persists an existing ID through `NetworkStore`.
-A display-name-only or unchanged save updates the live name without reconnecting.
-Connection, identity, autojoin or credential changes replace the session once;
-the old session's child scope is canceled and stale events are rejected.
+A cosmetic, startup-preference-only or unchanged save does not reconnect.
+Connection, identity, autojoin or credential changes replace a wanted session once;
+editing a disconnected network never implicitly connects it. The old child scope
+is canceled and stale events are rejected.
 Membership, presence, typing, topics and connection features reset before the
 updated connection starts. STS remains host-specific. Open, unparted channels
 continue to rejoin; removing an autojoin entry does not leave or delete its
@@ -237,27 +310,36 @@ Closed legacy history stores only normalized names: unavailable original
 spellings cannot be reverse-expanded safely when a server uses a less permissive
 mapping.
 
-Passwords stay in the credential vault and are never prefilled. An empty edit
-password keeps the saved secret; any nonempty replacement, including only spaces,
-uses a fresh vault key. `NetworkSaver` deletes that staged key on a rejected add
-or update and reports failure to the editor, which shows an error and retains the
-draft. The previous SASL key is deleted only after a successful save and only
-when it is not also the configured server-password key. **Clear saved SASL
-password** removes the SASL reference without deleting a shared server secret.
+Passwords stay in the credential vault and are never prefilled. Empty edits keep
+saved secrets; nonempty replacements, including only spaces, use fresh vault keys.
+`NetworkSaver` rolls back every staged key on a rejected add/update and retains
+the draft with an error. After durable configuration publication, old keys are
+retired only when no SASL, server, NickServ or proxy role on any saved network
+references them. Clear actions remove individual references without deleting
+shared credentials. Vault mutations use checked commits; JSON stores sync the
+replacement file and containing directories before publishing immutable cached state.
+Failure cleanup removes owned temporary files. A post-rename directory-sync failure
+retains the prior cache and reports failure without destructively rolling the disk
+back; retry completes publication. Removed-network vault-cleanup failures surface in
+the root snackbar, including after the last network disappears.
 The SASL account is independent of nickname and can remain saved without a
-password, but the effective connection disables SASL until a password is
-configured. Nonsecret drafts survive rotation; plaintext password drafts do not.
+password: AUTO then disables password SASL, while explicit PLAIN/SCRAM fails
+closed and EXTERNAL uses its selected identity. Nonsecret drafts survive rotation;
+plaintext password drafts do not.
+The editor validates explicit password SASL, paired proxy credentials, alternate
+nicknames separated by commas or whitespace, and realnames without wire delimiters
+before saving or attempting a connection.
 Cancel and Android Back discard edits. A restored, missing edit target falls
 through to normal content while its stale editor state is dismissed.
 
 `NetworkSaverTests` exercises production credential saves, shared-key handling
 and rejected-save rollback with real stores and loopback authentication.
-`NetworkEditLifecycleTests` covers cosmetic saves, endpoint and registration
-changes, conversation-state preservation, stale events, virtual-time backoff
-cutover, restart restoration, STS enforcement, CASEMAPPING collisions and queued
-history restoration with Room and real loopback connections. Editor prefill,
-rotation, cancellation and rejected-save presentation are verified on Android;
-there is no Compose test suite.
+`NetworkEditLifecycleTests` covers durable intent, offline wake, coalesced probes,
+stale events/results, bounded NickServ gates, rejected/missing auth, correction,
+pin consent/removal and STS scoping, actual per-network mTLS/EXTERNAL, shared-key
+retirement and filesystem save failures, alongside conversation/history and
+CASEMAPPING preservation. Editor and native certificate flows are exercised on
+Android; there is no Compose test suite.
 
 ## Conventions
 
@@ -320,6 +402,10 @@ B.1, C.1.2, prohibited, A.1, D.1 and D.2 ranges; combining-class pairs;
 expanded NFKD code-point/offset/length triples; decomposition values; and canonical
 composition triples. Hangul normalization is algorithmic. Its uncompressed SHA256
 is `42a08a6261c74bc6e3ee56b62b408ae7af3fdf6f6512432ceacc6f910cc43761`.
+The generator groups at most 32 literals per parenthesized constant segment instead
+of one deeply nested addition chain. This bounds compiler IR traversal on cold
+builds while preserving a single compile-time constant and the identical payload;
+there is no runtime concatenation.
 
 The prepared loopback fixture covers normalization-changing Unicode credentials.
 The live Ergo scenario covers a normalized username and NFKC-stable Unicode

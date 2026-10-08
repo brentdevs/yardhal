@@ -10,6 +10,8 @@ public class CapabilityNegotiator(
     private val beforeCapEnd: () -> Unit = {},
     private val onDeleted: (Set<String>) -> Unit = {},
     private val registrationHandshake: Boolean = true,
+    private val required: Set<String> = emptySet(),
+    private val onRequiredUnavailable: (Set<String>) -> Unit = {},
 ) {
     public enum class Phase { IDLE, LISTING, REQUESTING, AUTHENTICATING, FINISHED }
 
@@ -112,6 +114,7 @@ public class CapabilityNegotiator(
     }
 
     private fun completeListing() {
+        if (rejectMissingRequired(available)) return
         requestSubset(wanted intersect available)
     }
 
@@ -127,12 +130,22 @@ public class CapabilityNegotiator(
 
     private fun completeRequest() {
         if (phase != Phase.REQUESTING) return
+        if (rejectMissingRequired(acknowledged)) return
         if (SASL_CAP in acknowledgedThisRound) {
             phase = Phase.AUTHENTICATING
             onSaslAcknowledged()
         } else {
             finish()
         }
+    }
+
+    private fun rejectMissingRequired(offered: Set<String>): Boolean {
+        if (!registrationHandshake || capEndSent) return false
+        val missing = required - offered
+        if (missing.isEmpty()) return false
+        phase = Phase.FINISHED
+        onRequiredUnavailable(missing)
+        return true
     }
 
     private fun finish() {

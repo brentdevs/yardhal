@@ -3,10 +3,13 @@ package dev.brentdevs.yardhal.core.client
 import java.util.concurrent.atomic.AtomicInteger
 import java.net.Socket
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertIs
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -22,7 +25,7 @@ internal class EventCollector(
     private val channel = Channel<IrcEvent>(Channel.UNLIMITED)
 
     init {
-        scope.launch { events.collect { channel.trySend(it) } }
+        scope.launch(start = CoroutineStart.UNDISPATCHED) { events.collect { channel.trySend(it) } }
     }
 
     suspend fun await(timeoutMillis: Long = 5_000): IrcEvent = withTimeout(timeoutMillis) { channel.receive() }
@@ -46,6 +49,15 @@ internal class EventCollector(
                 }
                 else -> seen.add(event)
             }
+        }
+    }
+
+    suspend fun drainUntilDisconnected(): List<IrcEvent> {
+        val seen = ArrayList<IrcEvent>()
+        while (true) {
+            val event = await()
+            seen += event
+            if (event is IrcEvent.Disconnected) return seen
         }
     }
 
@@ -317,7 +329,7 @@ class IrcConnectionIntegrationTests {
                     val registered = CompletableDeferred<Unit>()
                     val watcher = scope.launch {
                         reconnector.events.collect { event ->
-                            if (event is IrcEvent.Registered) {
+                            if (event.event is IrcEvent.Registered) {
                                 registrations += 1
                                 registered.complete(Unit)
                             }
@@ -457,33 +469,33 @@ class IrcConnectionIntegrationTests {
     }
 
     @org.junit.jupiter.api.Test
-    fun saslPreparationFailureSurfacesAndRegistrationContinues() {
+    fun saslPreparationFailurePreventsRegistration() {
         withLoopback(
             config = { saslConfig(it).copy(saslPassword = "password\uD83D\uDE00") },
             respond = { line -> handleCapBasics(line, "sasl=PLAIN,SCRAM-SHA-256 cap-notify") },
         ) { _, collector, server ->
-            val events = collector.drainUntilRegistered()
+            val events = collector.drainUntilDisconnected()
             val failure = events.filterIsInstance<IrcEvent.SaslResult>().single().outcome
             assertTrue(failure is SaslOutcome.Failure && failure.description.contains("unassigned"))
-            assertTrue(events.any { it is IrcEvent.Registered })
-            assertTrue("CAP END" in server.receivedLines)
-            assertFalse(server.receivedLines.any { it.startsWith("AUTHENTICATE ") })
+            assertFalse(events.any { it is IrcEvent.Registered })
+            assertTrue((events.last() as IrcEvent.Disconnected).cause is AuthenticationRejectedException)
+            assertFalse(server.receivedLines.any { it == "CAP END" || it.startsWith("USER ") || it.startsWith("AUTHENTICATE ") })
         }
     }
 
     @org.junit.jupiter.api.Test
-    fun scramBadServerSignatureFailsClosedAndContinuesWithoutAccount() {
+    fun scramBadServerSignaturePreventsUnauthenticatedRegistration() {
         val fixture = ScramServerFixture(password = "sesame")
         withLoopback(
             config = { saslConfig(it) },
             respond = scramResponder(fixture, tamperSignature = true),
         ) { _, collector, server ->
-            val events = collector.drainUntilRegistered()
+            val events = collector.drainUntilDisconnected()
             val failure = events.filterIsInstance<IrcEvent.SaslResult>().single().outcome
             assertTrue(failure is SaslOutcome.Failure && failure.description.contains("signature"))
-            val lines = server.receivedLines.toList()
-            assertTrue(lines.indexOf("AUTHENTICATE *") in 0 until lines.indexOf("CAP END"))
-            assertFalse(lines.contains("AUTHENTICATE +"))
+            assertFalse(events.any { it is IrcEvent.Registered })
+            assertTrue((events.last() as IrcEvent.Disconnected).cause is AuthenticationRejectedException)
+            assertFalse(server.receivedLines.any { it == "CAP END" || it.startsWith("USER ") || it == "AUTHENTICATE PLAIN" })
         }
     }
 
@@ -536,6 +548,287 @@ class IrcConnectionIntegrationTests {
             assertEquals(3, server.receivedLines.count { it == "AUTHENTICATE PLAIN" })
             assertEquals(1, server.receivedLines.count { it == "CAP END" })
             assertEquals(1, server.receivedLines.count { it == "CAP REQ :sasl" })
+        }
+    }
+
+    private suspend fun assertRegisteredSessionResponds(connection: IrcConnection, collector: EventCollector) {
+        connection.sendLine("PING :still-registered")
+        while (true) {
+            when (val event = collector.await()) {
+                is IrcEvent.MessageReceived -> if (event.message.command == "PONG") {
+                    assertEquals("still-registered", event.message.parameters.last())
+                    assertTrue(connection.isRegistered)
+                    return
+                }
+                is IrcEvent.Disconnected -> error("Established session disconnected: ${event.cause}")
+                else -> Unit
+            }
+        }
+    }
+
+    private suspend fun awaitSessionMessage(collector: EventCollector, predicate: (dev.brentdevs.yardhal.core.protocol.IrcMessage) -> Boolean): dev.brentdevs.yardhal.core.protocol.IrcMessage {
+        while (true) {
+            when (val event = collector.await()) {
+                is IrcEvent.MessageReceived -> if (predicate(event.message)) return event.message
+                is IrcEvent.Disconnected -> error("Established session disconnected: ${event.cause}")
+                else -> Unit
+            }
+        }
+    }
+
+    @org.junit.jupiter.api.Test
+    fun operAndPassFailuresAfterRegistrationRemainOrdinaryEvents() {
+        for (password in listOf(null, "server-secret")) {
+            withLoopback(
+                config = { plainConfig("127.0.0.1", it).copy(serverPassword = password) },
+                respond = { line ->
+                    when {
+                        line.startsWith("USER ") -> sendLine(":srv 001 yardhal-test :Welcome")
+                        line.startsWith("OPER ") -> sendLine(":srv 464 yardhal-test :Password incorrect")
+                        line.startsWith("PING ") -> sendLine(":srv PONG srv :${line.substringAfter(':')}")
+                    }
+                },
+            ) { connection, collector, server ->
+                collector.drainUntilRegistered()
+                connection.sendLine("OPER admin incorrect")
+                assertEquals(464, awaitSessionMessage(collector) { it.numeric == 464 }.numeric)
+                for (line in listOf(":srv 461 yardhal-test PASS :Not enough parameters", ":srv FAIL PASS INVALID_PASSWORD :Password rejected")) {
+                    server.sendLine(line)
+                    assertEquals(line, collector.awaitInstance<IrcEvent.MessageReceived>().message.toWire())
+                }
+                assertRegisteredSessionResponds(connection, collector)
+            }
+        }
+    }
+
+    @org.junit.jupiter.api.Test
+    fun initialPassFailuresCannotBeOverriddenByWelcome() {
+        for (failure in listOf(":srv 464 yardhal-test :Password incorrect", ":srv 461 yardhal-test PASS :Not enough parameters", ":srv FAIL PASS INVALID_PASSWORD :Password rejected")) {
+            withLoopback(
+                config = { plainConfig("127.0.0.1", it).copy(serverPassword = "server-secret") },
+                respond = { line ->
+                    if (line.startsWith("PASS ")) {
+                        sendLine(failure)
+                        sendLine(":srv 001 yardhal-test :Welcome")
+                    }
+                },
+            ) { _, collector, _ ->
+                val events = collector.drainUntilDisconnected()
+                assertIs<AuthenticationRejectedException>((events.last() as IrcEvent.Disconnected).cause)
+                assertFalse(events.any { it is IrcEvent.Registered })
+            }
+        }
+    }
+
+    private fun exerciseRegisteredSaslFailures(reoffer: Boolean) {
+        for ((numeric, description) in listOf(902 to "Account locked", 904 to "Bad credentials", 905 to "Response too long", 906 to "Aborted", 907 to "Already authenticated", 904 to "Rate limit exceeded")) {
+            val attempts = AtomicInteger()
+            val tapped = java.util.concurrent.CopyOnWriteArrayList<String>()
+            withLoopback(
+                config = { saslConfig(it).copy(saslMode = "PLAIN") },
+                respond = { line ->
+                    when {
+                        handleCapBasics(line, "sasl=PLAIN cap-notify") -> Unit
+                        line == "AUTHENTICATE PLAIN" -> {
+                            if (attempts.incrementAndGet() == 1) sendLine("AUTHENTICATE +")
+                            else sendLine(":srv $numeric yardhal-test :$description sesame")
+                        }
+                        line.startsWith("AUTHENTICATE ") -> sendLine(":srv 903 * :SASL authentication successful")
+                        line.startsWith("PING ") -> sendLine(":srv PONG srv :${line.substringAfter(':')}")
+                    }
+                },
+                rawTap = { _, line -> tapped += line },
+            ) { connection, collector, server ->
+                collector.drainUntilRegistered()
+                if (reoffer) {
+                    server.sendLine(":srv CAP yardhal-test DEL :sasl")
+                    server.sendLine(":srv CAP yardhal-test NEW :sasl=PLAIN")
+                } else {
+                    assertTrue(connection.reauthenticate())
+                }
+                val failure = assertIs<SaslOutcome.Failure>(collector.awaitInstance<IrcEvent.SaslResult>().outcome)
+                assertEquals(numeric, failure.numeric)
+                assertFalse("sesame" in failure.description)
+                assertEquals(numeric, awaitSessionMessage(collector) { it.numeric == numeric }.numeric)
+                assertRegisteredSessionResponds(connection, collector)
+                assertEquals(1, server.receivedLines.count { it == "CAP END" })
+                assertFalse(tapped.any { "sesame" in it })
+                assertTrue(connection.reauthenticate())
+                assertIs<SaslOutcome.Failure>(collector.awaitInstance<IrcEvent.SaslResult>().outcome)
+                assertRegisteredSessionResponds(connection, collector)
+            }
+        }
+    }
+
+    @org.junit.jupiter.api.Test
+    fun manualReauthenticationFailuresRetainRegisteredSession() {
+        exerciseRegisteredSaslFailures(reoffer = false)
+    }
+
+    @org.junit.jupiter.api.Test
+    fun capNewAuthenticationFailuresRetainRegisteredSession() {
+        exerciseRegisteredSaslFailures(reoffer = true)
+    }
+
+    @org.junit.jupiter.api.Test
+    fun initialSaslRejectionsCannotRegisterAsGuest() {
+        for (numeric in listOf(902, 904, 905, 906, 907)) {
+            withLoopback(
+                config = { saslConfig(it).copy(saslMode = "PLAIN") },
+                respond = { line ->
+                    when {
+                        handleCapBasics(line, "sasl=PLAIN cap-notify") -> Unit
+                        line == "AUTHENTICATE PLAIN" -> sendLine("AUTHENTICATE +")
+                        line.startsWith("AUTHENTICATE ") -> {
+                            sendLine(":srv $numeric * :Authentication rejected")
+                            sendLine(":srv 001 yardhal-test :Guest welcome")
+                        }
+                    }
+                },
+            ) { _, collector, server ->
+                val events = collector.drainUntilDisconnected()
+                assertEquals(numeric, assertIs<SaslOutcome.Failure>(events.filterIsInstance<IrcEvent.SaslResult>().single().outcome).numeric)
+                assertIs<AuthenticationRejectedException>((events.last() as IrcEvent.Disconnected).cause)
+                assertFalse(events.any { it is IrcEvent.Registered })
+                val credentials = server.receivedLines.single { it.startsWith("AUTHENTICATE ") && it != "AUTHENTICATE PLAIN" }.substringAfter(' ')
+                assertEquals("\u0000jilles\u0000sesame", java.util.Base64.getDecoder().decode(credentials).toString(Charsets.UTF_8))
+                assertFalse(server.receivedLines.any { it == "CAP END" || it.startsWith("NICK ") || it.startsWith("USER ") })
+            }
+        }
+    }
+
+    @org.junit.jupiter.api.Test
+    fun initialMissingOrRejectedSaslCapabilityPreventsRegistration() {
+        for (offered in listOf(false, true)) {
+            withLoopback(
+                config = { saslConfig(it) },
+                respond = { line ->
+                    when {
+                        line.startsWith("CAP LS") -> sendLine(":srv CAP * LS :${if (offered) "sasl=PLAIN" else "server-time"}")
+                        line.startsWith("CAP REQ") -> sendLine(":srv CAP * NAK :sasl")
+                    }
+                },
+            ) { _, collector, server ->
+                val events = collector.drainUntilDisconnected()
+                assertIs<SaslOutcome.Failure>(events.filterIsInstance<IrcEvent.SaslResult>().single().outcome)
+                assertIs<AuthenticationRejectedException>((events.last() as IrcEvent.Disconnected).cause)
+                assertFalse(events.any { it is IrcEvent.Registered })
+                assertFalse(server.receivedLines.any { it == "CAP END" || it.startsWith("NICK ") || it.startsWith("USER ") })
+            }
+        }
+    }
+
+    @org.junit.jupiter.api.Test
+    fun saslDeletionDoesNotRejectUnrelatedRuntimeCapabilityAck() {
+        withLoopback(
+            config = { saslConfig(it, capabilities = setOf("sasl", "cap-notify", "server-time")) },
+            respond = { line ->
+                when {
+                    handleCapBasics(line, "sasl=PLAIN cap-notify") -> Unit
+                    line == "AUTHENTICATE PLAIN" -> sendLine("AUTHENTICATE +")
+                    line.startsWith("AUTHENTICATE ") -> sendLine(":srv 903 * :SASL authentication successful")
+                    line.startsWith("PING ") -> sendLine(":srv PONG srv :${line.substringAfter(':')}")
+                }
+            },
+        ) { connection, collector, server ->
+            collector.drainUntilRegistered()
+            server.sendLine(":srv CAP yardhal-test DEL :sasl")
+            server.sendLine(":srv CAP yardhal-test NEW :server-time")
+            while (true) {
+                val event = collector.await()
+                assertFalse(event is IrcEvent.Disconnected || event is IrcEvent.SaslResult)
+                if (event is IrcEvent.CapabilitiesNegotiated && "server-time" in event.capabilities) {
+                    assertFalse("sasl" in event.capabilities)
+                    break
+                }
+            }
+            assertRegisteredSessionResponds(connection, collector)
+            assertEquals(1, server.receivedLines.count { it == "CAP END" })
+        }
+    }
+
+    @org.junit.jupiter.api.Test
+    fun withdrawingSaslDuringManualReauthenticationKeepsSessionHealthy() {
+        val attempts = AtomicInteger()
+        withLoopback(
+            config = { saslConfig(it).copy(saslMode = "PLAIN") },
+            respond = { line ->
+                when {
+                    handleCapBasics(line, "sasl=PLAIN cap-notify") -> Unit
+                    line == "AUTHENTICATE PLAIN" -> if (attempts.incrementAndGet() == 1) sendLine("AUTHENTICATE +")
+                    line.startsWith("AUTHENTICATE ") -> sendLine(":srv 903 * :SASL authentication successful")
+                    line.startsWith("PING ") -> sendLine(":srv PONG srv :${line.substringAfter(':')}")
+                }
+            },
+        ) { connection, collector, server ->
+            collector.drainUntilRegistered()
+            assertTrue(connection.reauthenticate())
+            server.sendLine(":srv CAP yardhal-test DEL :sasl")
+            val failure = assertIs<SaslOutcome.Failure>(collector.awaitInstance<IrcEvent.SaslResult>().outcome)
+            assertEquals(0, failure.numeric)
+            assertFalse(connection.reauthenticate())
+            assertRegisteredSessionResponds(connection, collector)
+        }
+    }
+
+    @org.junit.jupiter.api.Test
+    fun incompatibleReofferedSaslMechanismDoesNotCloseRegisteredSession() {
+        withLoopback(
+            config = { saslConfig(it).copy(saslMode = "PLAIN") },
+            respond = { line ->
+                when {
+                    handleCapBasics(line, "sasl=PLAIN cap-notify") -> Unit
+                    line == "AUTHENTICATE PLAIN" -> sendLine("AUTHENTICATE +")
+                    line.startsWith("AUTHENTICATE ") -> sendLine(":srv 903 * :SASL authentication successful")
+                    line.startsWith("PING ") -> sendLine(":srv PONG srv :${line.substringAfter(':')}")
+                }
+            },
+        ) { connection, collector, server ->
+            collector.drainUntilRegistered()
+            server.sendLine(":srv CAP yardhal-test DEL :sasl")
+            server.sendLine(":srv CAP yardhal-test NEW :sasl=EXTERNAL")
+            val failure = assertIs<SaslOutcome.Failure>(collector.awaitInstance<IrcEvent.SaslResult>().outcome)
+            assertEquals(0, failure.numeric)
+            assertRegisteredSessionResponds(connection, collector)
+            assertEquals(1, server.receivedLines.count { it == "CAP END" })
+            assertEquals(1, server.receivedLines.count { it.startsWith("AUTHENTICATE PLAIN") })
+        }
+    }
+
+    @org.junit.jupiter.api.Test
+    fun missingRequiredSaslCredentialsNeverStartTransport() = runBlocking {
+        LoopbackIrcServer().use { server ->
+            server.start()
+            for ((account, password) in listOf(null to null, "" to "sesame", "jilles" to null)) {
+                val scope = newScope()
+                val connection = IrcConnection(plainConfig("127.0.0.1", server.port, saslAuthcid = account, saslPassword = password).copy(saslMode = "PLAIN"))
+                try {
+                    val collector = EventCollector(scope, connection.events)
+                    connection.start()
+                    val events = collector.drainUntilDisconnected()
+                    assertIs<AuthenticationRejectedException>((events.last() as IrcEvent.Disconnected).cause)
+                    assertFalse(events.any { it == IrcEvent.ConnectionOpened || it is IrcEvent.Registered })
+                    assertFalse(server.awaitClient(timeoutSeconds = 0))
+                    assertTrue(server.receivedLines.isEmpty())
+                } finally {
+                    connection.disconnect()
+                    scope.cancel()
+                }
+            }
+        }
+    }
+
+    @org.junit.jupiter.api.Test
+    fun invalidRealNameCannotInjectUserCommandsOrStartTransport() {
+        LoopbackIrcServer().use { server ->
+            server.start()
+            for (realName in listOf("Name\rJOIN #guest", "Name\nJOIN #guest", "Name\r\nJOIN #guest", "Name\u0000")) {
+                assertFailsWith<IllegalArgumentException> {
+                    IrcConnection(plainConfig("127.0.0.1", server.port).copy(realName = realName)).start()
+                }
+            }
+            assertFalse(server.awaitClient(timeoutSeconds = 0))
+            assertTrue(server.receivedLines.isEmpty())
         }
     }
 

@@ -363,6 +363,12 @@ public fun ConversationScreen(
     networkName: String,
     channels: List<String> = emptyList(),
     connected: Boolean,
+    network: dev.brentdevs.yardhal.coordinator.UiNetwork?,
+    onConnectNetwork: () -> Unit,
+    onDisconnectNetwork: () -> Unit,
+    onEditNetwork: () -> Unit,
+    onTrustCertificate: (dev.brentdevs.yardhal.core.client.CertificateInspection) -> Boolean,
+    onRemoveCertificateTrust: () -> Boolean,
     canSendOffline: (String) -> Boolean = { false },
     onSend: (String) -> Boolean,
     onOpenJoin: () -> Unit,
@@ -586,9 +592,19 @@ public fun ConversationScreen(
     ) { padding ->
         LaunchedEffectOnce(key = buffer.key, effect = onLoadHistory)
         Column(modifier = Modifier.padding(padding).fillMaxSize()) {
+                network?.let {
+                    dev.brentdevs.yardhal.ui.components.NetworkConnectionPanel(
+                        network = it,
+                        onConnect = onConnectNetwork,
+                        onDisconnect = onDisconnectNetwork,
+                        onEdit = onEditNetwork,
+                        onTrustCertificate = onTrustCertificate,
+                        onRemoveCertificateTrust = onRemoveCertificateTrust,
+                    )
+                }
                 val statusText = when {
                     buffer.joinState == JoinState.FAILED -> "Could not join ${buffer.displayName}"
-                    !connected -> "Offline · browsing stored history; server history resumes after reconnection"
+                    !connected -> "Browsing stored history; server history resumes after reconnection"
                     buffer.joinState == JoinState.JOINING -> "Joining ${buffer.displayName}…"
                     else -> null
                 }
@@ -1397,6 +1413,10 @@ public fun NetworkOverviewScreen(
     onSelectServer: (String) -> Unit,
     onAddNetwork: () -> Unit,
     onEditNetwork: (String) -> Unit,
+    onConnectNetwork: (String) -> Unit,
+    onDisconnectNetwork: (String) -> Unit,
+    onTrustCertificate: (String, dev.brentdevs.yardhal.core.client.CertificateInspection) -> Boolean,
+    onRemoveCertificateTrust: (String) -> Boolean,
     onJoinChannel: (String?) -> Unit,
     onRemoveNetwork: (String) -> Unit,
     onBrowseChannels: (String) -> Unit,
@@ -1595,7 +1615,7 @@ public fun NetworkOverviewScreen(
                                 .padding(start = 16.dp, end = 12.dp, top = 14.dp, bottom = 4.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            NetworkBadge(network.status, network.iconUrl)
+                            NetworkBadge(network.connectionPhase, network.iconUrl)
                             Spacer(modifier = Modifier.width(10.dp))
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
@@ -1603,13 +1623,6 @@ public fun NetworkOverviewScreen(
                                     style = MaterialTheme.typography.titleMedium,
                                     fontWeight = FontWeight.Bold,
                                 )
-                                if (network.status != ConnectionStatus.REGISTERED) {
-                                    Text(
-                                        text = if (network.status == ConnectionStatus.CONNECTING) "Connecting…" else "Offline",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
-                                }
                             }
                             if (entry.isCollapsed && entry.hasUnread) {
                                 val netBadgeText = if (entry.unreadCount > 99) "99+" else if (entry.unreadCount > 0) "${entry.unreadCount}" else "•"
@@ -1661,6 +1674,14 @@ public fun NetworkOverviewScreen(
                                 }
                             }
                         }
+                        dev.brentdevs.yardhal.ui.components.NetworkConnectionPanel(
+                            network = network,
+                            onConnect = { onConnectNetwork(network.id) },
+                            onDisconnect = { onDisconnectNetwork(network.id) },
+                            onEdit = { onEditNetwork(network.id) },
+                            onTrustCertificate = { inspection -> onTrustCertificate(network.id, inspection) },
+                            onRemoveCertificateTrust = { onRemoveCertificateTrust(network.id) },
+                        )
                     }
                     is OverviewEntry.ServerRow -> {
                         Row(

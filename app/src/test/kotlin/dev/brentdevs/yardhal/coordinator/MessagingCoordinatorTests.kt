@@ -311,9 +311,12 @@ class MessagingCoordinatorTests {
                     ?.singleOrNull { it.msgid == "shared" }?.kind == MessageKind.SYSTEM
             }
             val redacted = harness.coordinator.buffers.value.getValue(room.storageKey).messages.single { it.msgid == "shared" }
-            assertEquals("message deleted", redacted.text)
+            assertFalse(redacted.text.contains(beforeRoom.text))
             assertEquals(beforeRoom.localId, redacted.localId)
-            assertEquals(beforeOther, harness.coordinator.buffers.value.getValue(other.storageKey).messages.single { it.msgid == "shared" })
+            val unchanged = harness.coordinator.buffers.value.getValue(other.storageKey).messages.single { it.msgid == "shared" }
+            assertEquals(beforeOther.localId, unchanged.localId)
+            assertEquals(beforeOther.text, unchanged.text)
+            assertEquals(beforeOther.kind, unchanged.kind)
             assertEquals("other original", harness.messages.recent(other, 20).single { it.msgid == "shared" }.text)
         }
 

@@ -9,6 +9,8 @@ import dev.brentdevs.yardhal.coordinator.ConnectionStatus
 import dev.brentdevs.yardhal.coordinator.LiveCoordinator
 import dev.brentdevs.yardhal.core.client.IrcConnection
 import dev.brentdevs.yardhal.core.client.IrcConnectionConfig
+import dev.brentdevs.yardhal.core.client.Socks5Config
+import dev.brentdevs.yardhal.core.data.AndroidTlsIdentityProvider
 import dev.brentdevs.yardhal.core.data.ChannelOrderStore
 import dev.brentdevs.yardhal.core.data.ChatAppearanceStore
 import dev.brentdevs.yardhal.core.data.CredentialVault
@@ -21,6 +23,7 @@ import dev.brentdevs.yardhal.core.data.ReadMarkerStore
 import dev.brentdevs.yardhal.core.data.YardhalDatabase
 import dev.brentdevs.yardhal.service.ConnectionService
 import dev.brentdevs.yardhal.service.Notifications
+import dev.brentdevs.yardhal.service.keepsRecoveryService
 import dev.brentdevs.yardhal.ui.image.RemoteImageLoader
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -48,6 +51,8 @@ class YardhalApplication : Application() {
     lateinit var chatAppearanceStore: ChatAppearanceStore
         private set
 
+    private lateinit var connectivityObserver: AndroidConnectivityObserver
+
     val remoteImages: RemoteImageLoader by lazy { RemoteImageLoader(cacheDir) }
 
     override fun onCreate() {
@@ -61,6 +66,7 @@ class YardhalApplication : Application() {
         vault = AndroidCredentialVault(this)
         chatAppearanceStore = ChatAppearanceStore(dir)
         val stsPolicies = FileStsPolicyStore(dir)
+        val tlsIdentityProvider = AndroidTlsIdentityProvider(this)
         Notifications.ensureChannels(this)
         coordinator = LiveCoordinator(
             scope = appScope,
@@ -82,33 +88,62 @@ class YardhalApplication : Application() {
                         realName = config.realName,
                         saslAuthcid = config.saslAuthcid,
                         saslPassword = config.saslPassword,
-                        serverPassword = config.serverPasswordRef?.let { vault.readPassword(it) },
+                        serverPassword = config.serverPassword,
+                        alternateNicks = config.alternateNicks,
+                        saslMode = config.saslMode.name,
+                        proxy = config.proxy?.let {
+                            Socks5Config(it.host, it.port, it.username, config.proxyPassword)
+                        },
+                        tlsClientIdentity = config.tlsClientIdentity,
+                        trustedCertificateSha256 = config.certificatePin?.takeIf {
+                            config.tls && it.host.equals(config.host, ignoreCase = true) && it.port == config.port
+                        }?.sha256,
+                        nickServService = config.nickServService,
+                        knownSecrets = setOfNotNull(
+                            config.saslPassword,
+                            config.serverPassword,
+                            config.nickServPassword,
+                            config.proxyPassword,
+                        ),
                     ),
                     rawTap = { outbound, line -> coordinator.ingestRaw(config.id, outbound, line) },
                     stsPolicyStore = stsPolicies,
                     onStsUpgrade = onStsUpgrade,
                 )
             },
+            clientIdentityProvider = tlsIdentityProvider::resolve,
             stsPolicies = stsPolicies,
             notifier = LiveCoordinator.HighlightNotifier { networkName, sender, conversation, text ->
                 Notifications.highlight(this, networkName, sender, conversation, text)
             },
         )
         coordinator.attachIgnores(IgnoreStore(dir))
+        connectivityObserver = AndroidConnectivityObserver(this, coordinator::updateConnectivity)
+        connectivityObserver.start()
         coordinator.startAll()
         appScope.launch {
+            var serviceWanted = false
+            var foregroundCount = 0
             coordinator.networks.collect { networks ->
-                if (networks.all { it.status == ConnectionStatus.DISCONNECTED }) {
+                val wanted = networks.any { it.connectionPhase.keepsRecoveryService() }
+                val count = networks.count { it.status == ConnectionStatus.REGISTERED }
+                if (wanted) {
+                    if (!serviceWanted || count != foregroundCount) {
+                        ConnectionService.start(this@YardhalApplication, count)
+                    }
+                } else if (serviceWanted) {
                     ConnectionService.stop(this@YardhalApplication)
-                } else {
-                    ConnectionService.start(
-                        this@YardhalApplication,
-                        networks.count { it.status == ConnectionStatus.REGISTERED },
-                    )
                 }
+                serviceWanted = wanted
+                foregroundCount = count
             }
         }
         backfillSearchIndex()
+    }
+
+    override fun onTerminate() {
+        connectivityObserver.close()
+        super.onTerminate()
     }
 
     private fun backfillSearchIndex() {
@@ -120,3 +155,4 @@ class YardhalApplication : Application() {
         }
     }
 }
+

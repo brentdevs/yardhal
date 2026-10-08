@@ -22,6 +22,8 @@ public sealed interface InboundEffect {
 
     public data class StatusChanged(public val status: ConnectionStatus) : InboundEffect
 
+    public data class AuthenticationFailed(public val reason: String) : InboundEffect
+
     public data class OwnNickChanged(public val nick: String) : InboundEffect
 
     public data class EnsureBuffer(public val ref: ConversationRef) : InboundEffect

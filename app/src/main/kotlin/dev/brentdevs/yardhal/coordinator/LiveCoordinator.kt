@@ -1,5 +1,13 @@
 package dev.brentdevs.yardhal.coordinator
 
+import dev.brentdevs.yardhal.core.client.AuthenticationRejectedException
+import dev.brentdevs.yardhal.core.client.CertificateInspection
+import dev.brentdevs.yardhal.core.client.CertificateRejectedException
+import dev.brentdevs.yardhal.core.client.ReconnectState
+import dev.brentdevs.yardhal.core.client.ReconnectionEvent
+import dev.brentdevs.yardhal.core.client.Socks5Exception
+import dev.brentdevs.yardhal.core.client.TlsClientIdentity
+import dev.brentdevs.yardhal.core.client.TlsIdentityUnavailableException
 import dev.brentdevs.yardhal.core.client.IrcConnection
 import dev.brentdevs.yardhal.core.client.IrcEvent
 import dev.brentdevs.yardhal.core.client.IrcReconnector
@@ -10,6 +18,7 @@ import dev.brentdevs.yardhal.core.client.StsUpgradeDecision
 import dev.brentdevs.yardhal.core.data.ConversationKind
 import dev.brentdevs.yardhal.core.data.ConversationRef
 import dev.brentdevs.yardhal.core.data.CredentialVault
+import dev.brentdevs.yardhal.core.data.CertificatePin
 import dev.brentdevs.yardhal.core.data.MessageKind
 import dev.brentdevs.yardhal.core.data.MessageStore
 import dev.brentdevs.yardhal.core.data.MuteStore
@@ -17,6 +26,7 @@ import dev.brentdevs.yardhal.core.data.MentionMatcher
 import dev.brentdevs.yardhal.core.data.NetworkConfig
 import dev.brentdevs.yardhal.core.data.NetworkStore
 import dev.brentdevs.yardhal.core.data.ReadMarkerStore
+import dev.brentdevs.yardhal.core.data.SaslMode
 import dev.brentdevs.yardhal.core.data.SlashCommand
 import dev.brentdevs.yardhal.core.data.SlashCommandParser
 import dev.brentdevs.yardhal.core.data.StoredMessage
@@ -26,6 +36,11 @@ import dev.brentdevs.yardhal.core.protocol.IrcCtcp
 import dev.brentdevs.yardhal.core.protocol.IrcMessage
 import dev.brentdevs.yardhal.core.protocol.IrcMultiline
 import dev.brentdevs.yardhal.core.protocol.IrcMetadata
+import dev.brentdevs.yardhal.core.protocol.IrcPrefix
+import dev.brentdevs.yardhal.core.client.SaslOutcome
+import java.security.cert.CertificateException
+import java.security.cert.CertificateExpiredException
+import java.security.cert.CertificateNotYetValidException
 import dev.brentdevs.yardhal.ui.image.ImageUrlPolicy
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicLong
@@ -60,6 +75,9 @@ public class LiveCoordinator(
     private val notifier: HighlightNotifier = HighlightNotifier { _, _, _, _ -> },
     private val clock: () -> Long = System::currentTimeMillis,
     private val historyElapsedClock: () -> Long = { System.nanoTime() / 1_000_000 },
+    private val clientIdentityProvider: (String) -> TlsClientIdentity = {
+        throw TlsIdentityUnavailableException("The selected TLS client identity is unavailable. Select it again in network settings.")
+    },
 ) {
     public fun interface HighlightNotifier {
         public fun onHighlight(networkName: String, sender: String, conversationName: String, text: String)
@@ -79,6 +97,13 @@ public class LiveCoordinator(
     private val _whois = MutableStateFlow<dev.brentdevs.yardhal.core.data.WhoisInfo?>(null)
     public val whois: StateFlow<dev.brentdevs.yardhal.core.data.WhoisInfo?> = _whois.asStateFlow()
 
+    private val _operationError = MutableStateFlow<String?>(null)
+    public val operationError: StateFlow<String?> = _operationError.asStateFlow()
+
+    public fun dismissOperationError(expectedError: String) {
+        _operationError.compareAndSet(expectedError, null)
+    }
+
     public fun dismissWhois() {
         _whois.value = null
     }
@@ -91,6 +116,8 @@ public class LiveCoordinator(
 
     private val sessions = ConcurrentHashMap<String, Session>()
     private val sessionLifecycleLock = Any()
+    @Volatile private var networkAvailable = true
+    private var defaultNetworkHandle: Long? = null
     private val persistenceLock = Any()
     private var persistenceTail: Job? = null
 
@@ -108,17 +135,40 @@ public class LiveCoordinator(
         const val TYPING_SEND_INTERVAL_MS = 4_000L
     }
 
-    private inner class Session(@Volatile var config: NetworkConfig, casemapping: CaseMapping) {
+    private inner class Session(
+        @Volatile var config: NetworkConfig,
+        casemapping: CaseMapping,
+        manuallyWanted: Boolean = false,
+        allowStartup: Boolean = true,
+    ) {
         val state = PerNetworkState(config.id, config.nick, config.autojoin).also { it.casemapping = casemapping }
         val historyGeneration = idGenerator.getAndIncrement()
         var storedMappingKnown = _buffers.value.values.any { it.ref.networkId == config.id }
         val lifecycleJob = SupervisorJob(scope.coroutineContext[Job])
         val lifecycleScope = CoroutineScope(scope.coroutineContext + lifecycleJob)
-        val statusFlow = MutableStateFlow(ConnectionStatus.CONNECTING)
+        val recovery = ConnectionRecoveryPolicy(config.autoConnect && allowStartup, config.userDisconnected, networkAvailable).also {
+            if (manuallyWanted) it.handle(RecoverySignal.MANUAL_CONNECT)
+        }
+        val statusFlow = MutableStateFlow(ConnectionStatus.DISCONNECTED)
         var reconnector: IrcReconnector? = null
         var connection: IrcConnection? = null
+        var redactionConnection: IrcConnection? = null
         @Volatile var quitRequested: Boolean = false
         @Volatile var stsUpgradePort: Int? = null
+        var effective: NetworkConfig? = null
+        var presentationSecrets: Set<String> = emptySet()
+        var attemptToken = 0L
+        var acceptedEpoch: Long? = null
+        var connectionError: String? = null
+        var disconnectSavePending: Boolean = false
+        var authenticatedNick: String? = null
+        var authenticatedAccount: String? = null
+        var saslAuthenticated: Boolean = false
+        var rejectedCertificate: CertificateInspection? = null
+        var probeJob: Job? = null
+        var identificationGate: NickServIdentificationGate? = null
+        var identificationDeadline: Job? = null
+        var pendingRegistration: IrcEvent.Registered? = null
 
         init {
             lifecycleJob.invokeOnCompletion {
@@ -206,7 +256,7 @@ public class LiveCoordinator(
                                 is InboundEffect.RedactMessage -> effect.ref
                                 else -> null
                             }
-                            if (ref != null && ref.storageKey !in excludedKeys) effects.add(effect)
+                            if (ref != null && ref.storageKey !in excludedKeys) effects.add(redactEffect(session, effect))
                         }
                     }
                     beforeReplay(effects)
@@ -238,9 +288,7 @@ public class LiveCoordinator(
         }
 
         override fun reconnectHistory(networkId: String) {
-            val config = sessions[networkId]?.config ?: networkStore.byId(networkId) ?: return
-            disconnect(networkId, "Retrying history on a new connection")
-            connect(config)
+            connectNetwork(networkId)
         }
 
         override fun historySessionLock(networkId: String, generation: Long, epoch: Long): Any? =
@@ -260,28 +308,133 @@ public class LiveCoordinator(
     public fun connect(config: NetworkConfig) {
         synchronized(sessionLifecycleLock) {
             if (sessions.containsKey(config.id)) return
-            startSession(config)
+            val saved = networkStore.byId(config.id)
+            startSession(config.copy(
+                autoConnect = saved?.autoConnect ?: config.autoConnect,
+                userDisconnected = saved?.userDisconnected ?: config.userDisconnected,
+            ))
         }
     }
+
+    public fun connectNetwork(networkId: String) {
+        synchronized(sessionLifecycleLock) {
+            if (!saveDisconnectIntent(networkId, false)) {
+                showConnectionError(networkId, "Could not save Connect intent. Check device storage and retry; the saved disconnect preference is unchanged.")
+                return
+            }
+            val config = networkStore.byId(networkId) ?: return
+            val previous = sessions[networkId]
+            if (previous == null) {
+                startSession(config, manuallyWanted = true)
+            } else {
+                synchronized(previous.state) {
+                    val mapping = previous.state.casemapping
+                    stopSession(previous, "Connecting with current network settings")
+                    startSession(config, mapping, manuallyWanted = true)
+                }
+            }
+        }
+    }
+
+    public fun updateConnectivity(available: Boolean, networkHandle: Long? = null) {
+        synchronized(sessionLifecycleLock) {
+            val previouslyAvailable = networkAvailable
+            val changedRoute = defaultNetworkHandle != networkHandle
+            networkAvailable = available
+            defaultNetworkHandle = networkHandle
+            val signal = when {
+                !available -> RecoverySignal.NETWORK_LOST
+                !previouslyAvailable -> RecoverySignal.NETWORK_AVAILABLE
+                changedRoute || previouslyAvailable -> RecoverySignal.TRANSPORT_CHANGED
+                else -> RecoverySignal.NETWORK_AVAILABLE
+            }
+            for (session in sessions.values) {
+                synchronized(session.state) {
+                    session.reconnector?.setNetworkAvailable(available)
+                    recover(session, signal)
+                }
+            }
+            refreshNetworkStates()
+        }
+    }
+
+    public fun onForegroundResume() {
+        synchronized(sessionLifecycleLock) {
+            for (session in sessions.values) {
+                synchronized(session.state) { recover(session, RecoverySignal.RESUME) }
+            }
+            refreshNetworkStates()
+        }
+    }
+
+    public fun trustCertificate(networkId: String, expectedInspection: CertificateInspection? = null): Boolean =
+        synchronized(sessionLifecycleLock) trust@{
+            val session = sessions[networkId] ?: return@trust false
+            synchronized(session.state) {
+                val inspection = session.rejectedCertificate ?: return@trust false
+                if (expectedInspection != null && inspection != expectedInspection) return@trust false
+                val leaf = inspection.certificates.firstOrNull() ?: return@trust false
+                val effective = session.effective ?: return@trust false
+                if (clock() !in leaf.notBeforeMs..leaf.notAfterMs) {
+                    showConnectionError(networkId, "Certificate trust could not be applied because the certificate is expired or not yet valid. Check the server certificate and device clock.")
+                    return@trust false
+                }
+                if (!effective.tls || !effective.host.equals(inspection.host, ignoreCase = true) ||
+                    effective.port != inspection.port
+                ) return@trust false
+                val config = networkStore.byId(networkId) ?: return@trust false
+                val updated = config.copy(certificatePin = CertificatePin(inspection.host, inspection.port, leaf.sha256))
+                val persisted = try {
+                    networkStore.update(updated)
+                } catch (_: java.io.IOException) {
+                    false
+                }
+                if (!persisted) {
+                    showConnectionError(networkId, "Certificate trust was not saved. Check device storage and retry.")
+                    return@trust false
+                }
+                val wanted = session.recovery.desiredConnection
+                val mapping = session.state.casemapping
+                stopSession(session, "Certificate trust changed")
+                startSession(updated, mapping, manuallyWanted = wanted)
+                true
+            }
+        }
+
+    public fun removeCertificateTrust(networkId: String): Boolean =
+        synchronized(sessionLifecycleLock) remove@{
+            val saved = networkStore.byId(networkId) ?: return@remove false
+            if (saved.certificatePin == null) return@remove false
+            val removed = try {
+                updateNetwork(saved.copy(certificatePin = null))
+            } catch (_: java.io.IOException) {
+                false
+            }
+            if (!removed) showConnectionError(networkId, "Certificate trust removal was not saved. Check device storage and retry.")
+            removed
+        }
 
     public fun updateNetwork(config: NetworkConfig, credentialsChanged: Boolean = false): Boolean =
         synchronized(sessionLifecycleLock) update@{
             val saved = networkStore.byId(config.id) ?: return@update false
+            val updated = config.copy(userDisconnected = saved.userDisconnected)
             val session = sessions[config.id]
             if (session == null) {
-                if (!networkStore.update(config)) return@update false
-                clearNewAutojoins(saved, config, CaseMapping.RFC1459)
-                if (credentialsChanged || !saved.connectionSettingsMatch(config)) startSession(config) else refreshNetworkStates()
+                if (!networkStore.update(updated)) return@update false
+                clearNewAutojoins(saved, updated, CaseMapping.RFC1459)
+                refreshNetworkStates()
             } else {
                 synchronized(session.state) {
-                    if (!networkStore.update(config)) return@update false
-                    clearNewAutojoins(saved, config, session.state.casemapping)
-                    if (!credentialsChanged && session.config.connectionSettingsMatch(config)) {
-                        session.config = config
+                    if (!networkStore.update(updated)) return@update false
+                    clearNewAutojoins(saved, updated, session.state.casemapping)
+                    if (!credentialsChanged && session.config.connectionSettingsMatch(updated)) {
+                        session.config = updated
                         refreshNetworkStates()
                     } else {
+                        val wanted = session.recovery.desiredConnection && !updated.userDisconnected
+                        val mapping = session.state.casemapping
                         stopSession(session, "Network settings changed")
-                        startSession(config, session.state.casemapping)
+                        startSession(updated, mapping, manuallyWanted = wanted, allowStartup = false)
                     }
                 }
             }
@@ -300,7 +453,20 @@ public class LiveCoordinator(
             saslAuthcid == other.saslAuthcid &&
             saslPasswordRef == other.saslPasswordRef &&
             serverPasswordRef == other.serverPasswordRef &&
-            saslPassword == other.saslPassword
+            alternateNicks == other.alternateNicks &&
+            saslMode == other.saslMode &&
+            nickServAccount == other.nickServAccount &&
+            nickServPasswordRef == other.nickServPasswordRef &&
+            nickServService == other.nickServService &&
+            waitForNickServ == other.waitForNickServ &&
+            proxy == other.proxy &&
+            tlsClientAlias == other.tlsClientAlias &&
+            certificatePin == other.certificatePin &&
+            saslPassword == other.saslPassword &&
+            serverPassword == other.serverPassword &&
+            nickServPassword == other.nickServPassword &&
+            proxyPassword == other.proxyPassword &&
+            tlsClientIdentity === other.tlsClientIdentity
 
     private fun clearNewAutojoins(previous: NetworkConfig, updated: NetworkConfig, mapping: CaseMapping) {
         if (previous.autojoin == updated.autojoin) return
@@ -313,8 +479,14 @@ public class LiveCoordinator(
         _orderState.value = channelOrder.snapshot()
     }
 
-    private fun startSession(config: NetworkConfig, casemapping: CaseMapping = CaseMapping.RFC1459) {
-        val session = Session(config, casemapping)
+    private fun startSession(
+        config: NetworkConfig,
+        casemapping: CaseMapping = CaseMapping.RFC1459,
+        manuallyWanted: Boolean = false,
+        allowStartup: Boolean = true,
+    ) {
+        val session = Session(config, casemapping, manuallyWanted, allowStartup)
+        session.recovery.handle(RecoverySignal.START)
         sessions[config.id] = session
         _profiles.update { it - config.id }
         updateAllBuffersForNetwork(config.id) { buffer ->
@@ -325,13 +497,15 @@ public class LiveCoordinator(
                 typingUsers = emptyMap(),
                 joinState = if (buffer.ref.kind == ConversationKind.CHANNEL &&
                     !channelOrder.isParted(buffer.ref.storageKey)
-                ) JoinState.JOINING else buffer.joinState,
+                ) {
+                    if (session.recovery.desiredConnection) JoinState.JOINING else JoinState.IDLE
+                } else buffer.joinState,
             )
         }
         ensureBaseBuffers(session)
         restoreKnownConversations(session)
         refreshNetworkStates()
-        launchSession(session)
+        if (session.recovery.desiredConnection) launchSession(session)
     }
 
     private fun restoreKnownConversations(session: Session) {
@@ -356,7 +530,11 @@ public class LiveCoordinator(
                     if (channelOrder.isParted(ref.storageKey)) continue
                     val alreadyOpen = ref.storageKey in _buffers.value
                     if (!isAutojoined && !alreadyOpen) {
-                        if (ref.kind == ConversationKind.CHANNEL) markJoining(ref) else buffer(ref)
+                        if (ref.kind == ConversationKind.CHANNEL) {
+                            updateBuffer(ref) {
+                                it.copy(joinState = if (session.recovery.desiredConnection) JoinState.JOINING else JoinState.IDLE)
+                            }
+                        } else buffer(ref)
                     }
                     if (ref.kind == ConversationKind.CHANNEL &&
                         !isAutojoined && !alreadyOpen &&
@@ -371,19 +549,59 @@ public class LiveCoordinator(
 
     public fun disconnect(networkId: String, quitReason: String = "Yardhal") {
         synchronized(sessionLifecycleLock) {
-            val session = sessions[networkId] ?: return
+            val saved = networkStore.byId(networkId) ?: return
+            val session = sessions[networkId] ?: run {
+                startSession(saved, allowStartup = false)
+                sessions[networkId] ?: return
+            }
             synchronized(session.state) {
-                stopSession(session, quitReason)
+                val persisted = saveDisconnectIntent(networkId, true)
+                session.disconnectSavePending = !persisted
+                session.config = networkStore.byId(networkId) ?: saved
+                session.recovery.handle(RecoverySignal.USER_DISCONNECT)
+                retireTransport(session, quitReason)
+                session.connectionError = if (persisted) null else {
+                    "Disconnected for this session, but the restart disconnect preference was not saved. Check device storage and retry Disconnect."
+                }
+                session.connectionError?.let { ingestRaw(networkId, false, it) }
                 _profiles.update { it - networkId }
                 refreshNetworkStates()
             }
         }
     }
 
+    private fun saveDisconnectIntent(networkId: String, disconnected: Boolean): Boolean = try {
+        networkStore.setUserDisconnected(networkId, disconnected)
+    } catch (_: java.io.IOException) {
+        false
+    }
+
+    private fun showConnectionError(networkId: String, reason: String) {
+        val session = sessions[networkId] ?: networkStore.byId(networkId)?.let { config ->
+            startSession(config, allowStartup = false)
+            sessions[networkId]
+        } ?: return
+        synchronized(session.state) {
+            session.connectionError = redactPresentation(session, reason)
+            ingestRaw(networkId, false, reason)
+            refreshNetworkStates()
+        }
+    }
+
     private fun stopSession(session: Session, quitReason: String) {
+        retireTransport(session, quitReason)
+        sessions.remove(session.config.id, session)
+    }
+
+    private fun retireTransport(session: Session, quitReason: String) {
         session.quitRequested = true
         sendRaw(session, "QUIT :$quitReason")
-        sessions.remove(session.config.id, session)
+        session.acceptedEpoch = null
+        session.state.registered = false
+        session.statusFlow.value = ConnectionStatus.DISCONNECTED
+        clearIdentification(session)
+        session.probeJob?.cancel()
+        session.probeJob = null
         history.reset(session.config.id, quitReason)
         session.reconnector?.stop()
         session.connection?.disconnect()
@@ -391,33 +609,121 @@ public class LiveCoordinator(
     }
 
     public fun removeNetwork(networkId: String) {
-        disconnect(networkId)
-        networkStore.remove(networkId)
-        enqueuePersistence { messageStore.deleteNetwork(networkId) }
-        history.removeNetwork(networkId)
-        synchronized(selectionLock) {
-            if (selectedStorageKey?.substringBefore("|") == networkId) {
-                selectedStorageKey = null
-                pendingRenamedKey = null
+        synchronized(sessionLifecycleLock) {
+            val saved = networkStore.byId(networkId) ?: return
+            if (!networkStore.remove(networkId)) return
+            sessions[networkId]?.let { session ->
+                synchronized(session.state) { stopSession(session, "Network removed") }
             }
-            _buffers.update { buffers -> buffers.filterValues { it.ref.networkId != networkId } }
+            enqueuePersistence {
+                messageStore.deleteNetwork(networkId)
+                try {
+                    networkStore.deleteUnreferencedPasswords(
+                        listOfNotNull(saved.saslPasswordRef, saved.serverPasswordRef, saved.nickServPasswordRef, saved.proxy?.passwordRef),
+                        vault,
+                    )
+                } catch (_: java.io.IOException) {
+                    _operationError.value = "Network removed, but unused saved credentials could not be deleted. Check device storage and credential permissions."
+                }
+            }
+            history.removeNetwork(networkId)
+            synchronized(selectionLock) {
+                if (selectedStorageKey?.substringBefore("|") == networkId) {
+                    selectedStorageKey = null
+                    pendingRenamedKey = null
+                }
+                _buffers.update { buffers -> buffers.filterValues { it.ref.networkId != networkId } }
+            }
+            _profiles.update { it - networkId }
+            rawLogs.remove(networkId)
+            _rawLogVersion.update { it + 1 }
+            refreshNetworkStates()
         }
-        _profiles.update { it - networkId }
-        refreshNetworkStates()
+    }
+
+    private fun redactPresentation(session: Session, rawText: String): String {
+        session.redactionConnection?.let { return it.redactPresentation(rawText) }
+        val text = rawText
+        if (session.presentationSecrets.isEmpty()) return text
+        var output: StringBuilder? = null
+        var offset = 0
+        var unchangedFrom = 0
+        while (offset < text.length) {
+            var match: String? = null
+            for (secret in session.presentationSecrets) {
+                if (text.startsWith(secret, offset) && secret.length > (match?.length ?: 0)) match = secret
+            }
+            if (match == null) {
+                offset += if (text.startsWith("<redacted>", offset)) "<redacted>".length else 1
+                continue
+            }
+            val builder = output ?: StringBuilder(text.length).also { output = it }
+            builder.append(text, unchangedFrom, offset).append("<redacted>")
+            offset += match.length
+            unchangedFrom = offset
+        }
+        return output?.append(text, unchangedFrom, text.length)?.toString() ?: text
+    }
+
+    private fun redactEffect(session: Session, effect: InboundEffect): InboundEffect {
+        if (effect !is InboundEffect.AppendMessage) return effect
+        val text = redactPresentation(session, effect.text)
+        return if (text == effect.text) effect else effect.copy(text = text)
     }
 
     private fun launchSession(session: Session) {
+        if (session.reconnector != null) return
         val reconnector = IrcReconnector(
             scope = session.lifecycleScope,
             policy = ReconnectPolicy(initialDelayMillis = 1_000, maxDelayMillis = 30_000),
             connectionFactory = {
+                val config: NetworkConfig
+                val upgradePort: Int?
+                val token: Long
                 synchronized(session.state) {
                     session.lifecycleJob.ensureActive()
-                    connectionFactory.create(effectiveConfig(session.config, session.stsUpgradePort)) { port ->
-                        synchronized(session.state) {
-                            if (sessions[session.config.id] === session) session.stsUpgradePort = port
+                    if (sessions[session.config.id] !== session) throw kotlinx.coroutines.CancellationException()
+                    session.redactionConnection = null
+                    token = session.reconnector?.currentEpoch ?: throw kotlinx.coroutines.CancellationException()
+                    session.attemptToken = token
+                    session.recovery.handle(RecoverySignal.CONNECTING, token)
+                    session.acceptedEpoch = token.takeIf { networkAvailable && session.recovery.phase == RecoveryPhase.CONNECTING }
+                    session.statusFlow.value = ConnectionStatus.CONNECTING
+                    config = session.config
+                    upgradePort = session.stsUpgradePort
+                    refreshNetworkStates()
+                }
+                val effective = effectiveConfig(config, upgradePort)
+                synchronized(session.state) {
+                    session.lifecycleJob.ensureActive()
+                    if (sessions[config.id] !== session || session.reconnector?.currentEpoch != token) {
+                        throw kotlinx.coroutines.CancellationException()
+                    }
+                    session.effective = effective
+                    session.presentationSecrets = buildSet {
+                        effective.saslPassword?.takeIf(String::isNotEmpty)?.let { add(it) }
+                        effective.serverPassword?.takeIf(String::isNotEmpty)?.let { add(it) }
+                        effective.nickServPassword?.takeIf(String::isNotEmpty)?.let { add(it) }
+                        effective.proxyPassword?.takeIf(String::isNotEmpty)?.let { add(it) }
+                    }
+                }
+                connectionFactory.create(effective) { port ->
+                    synchronized(session.state) {
+                        if (sessions[config.id] === session && session.reconnector?.currentEpoch == token &&
+                            session.acceptedEpoch == token
+                        ) {
+                            session.stsUpgradePort = port
                         }
-                    }.also { session.connection = it }
+                    }
+                }.also { connection ->
+                    synchronized(session.state) {
+                        if (sessions[config.id] !== session || session.reconnector?.currentEpoch != token) {
+                            connection.disconnect()
+                            throw kotlinx.coroutines.CancellationException()
+                        }
+                        session.connection = connection
+                        session.redactionConnection = connection
+                    }
                 }
             },
         )
@@ -428,46 +734,188 @@ public class LiveCoordinator(
         session.lifecycleScope.launch(start = CoroutineStart.UNDISPATCHED) {
             reconnector.state.collect { state ->
                 synchronized(session.state) {
-                    if (state is dev.brentdevs.yardhal.core.client.ReconnectState.Stopped &&
-                        sessions[session.config.id] === session &&
-                        !session.quitRequested
-                    ) {
-                        session.statusFlow.value = ConnectionStatus.DISCONNECTED
-                        refreshNetworkStates()
-                    }
+                    if (sessions[session.config.id] !== session || session.quitRequested) return@collect
+                    if (state is ReconnectState.Stopped) session.statusFlow.value = ConnectionStatus.DISCONNECTED
+                    refreshNetworkStates()
                 }
             }
         }
+        reconnector.setNetworkAvailable(networkAvailable)
         reconnector.start()
     }
 
     private fun effectiveConfig(config: NetworkConfig, stsUpgradePort: Int? = null): NetworkConfig {
-        val password = config.saslPasswordRef?.let { vault.readPassword(it) }
+        val saslPassword = resolvePassword(config.saslPasswordRef, config.saslPassword, "SASL")
+        if ((config.saslMode == SaslMode.PLAIN || config.saslMode == SaslMode.SCRAM_SHA_256) &&
+            saslPassword.isNullOrEmpty()
+        ) throw AuthenticationRejectedException("The selected SASL mechanism requires a saved password. Replace it in network settings.")
+        val serverPassword = resolvePassword(config.serverPasswordRef, config.serverPassword, "server")
+        val nickServPassword = resolvePassword(config.nickServPasswordRef, config.nickServPassword, "NickServ")
+        val proxyPassword = resolvePassword(config.proxy?.passwordRef, config.proxyPassword, "proxy")
+        if (nickServPassword != null && (config.nickServService.isBlank() ||
+                config.nickServService.any { it.isWhitespace() || it in "\u0000\r\n:,#&*" || it == '$' } ||
+                config.nickServAccount?.let { it.isBlank() || it.any { character -> character.isWhitespace() || character in "\u0000\r\n" } } == true ||
+                nickServPassword.any { it in "\u0000\r\n" }
+            )
+        ) throw AuthenticationRejectedException("The NickServ service, account or password contains an invalid IRC command value. Correct network settings.")
+        if (config.proxy?.username != null && proxyPassword == null) {
+            throw AuthenticationRejectedException("The proxy password is missing. Replace it in network settings.")
+        }
+        if (config.proxy?.username == null && proxyPassword != null) {
+            throw AuthenticationRejectedException("The proxy username is missing. Correct it in network settings.")
+        }
+        if (saslPassword != null && config.saslAuthcid.isNullOrBlank() && config.saslMode != SaslMode.EXTERNAL) {
+            throw AuthenticationRejectedException("The SASL account is missing. Correct it in network settings.")
+        }
         val decision = StsResolver.decide(
-            stsPolicies,
-            config.host,
-            config.port,
-            config.tls,
-            clock() / 1000,
+            stsPolicies, config.host, config.port, config.tls, clock() / 1000,
         )
-        val policyPort = (decision as? StsUpgradeDecision.UpgradeRequired)?.port
-        val securePort = policyPort ?: stsUpgradePort
+        val securePort = (decision as? StsUpgradeDecision.UpgradeRequired)?.port ?: stsUpgradePort
+        val effectiveTls = config.tls || securePort != null
+        val effectivePort = securePort ?: config.port
+        if (config.saslMode == SaslMode.EXTERNAL && !effectiveTls) {
+            throw TlsIdentityUnavailableException("SASL EXTERNAL requires TLS. Enable TLS in network security settings.")
+        }
+        val identity = config.tlsClientAlias?.let(clientIdentityProvider) ?: config.tlsClientIdentity
+        if (config.saslMode == SaslMode.EXTERNAL && identity == null) {
+            throw TlsIdentityUnavailableException("SASL EXTERNAL requires TLS and a selected client certificate. Correct the network security settings.")
+        }
+        val pin = config.certificatePin?.takeIf {
+            effectiveTls && it.host.equals(config.host, ignoreCase = true) && it.port == effectivePort
+        }
         return config.copy(
-            port = securePort ?: config.port,
-            tls = config.tls || securePort != null,
-            saslAuthcid = config.saslAuthcid.takeIf { config.saslPasswordRef != null },
-            saslPassword = password,
+            port = effectivePort,
+            tls = effectiveTls,
+            saslAuthcid = config.saslAuthcid.takeIf { saslPassword != null || config.saslMode == SaslMode.EXTERNAL },
+            saslPassword = saslPassword,
+            serverPassword = serverPassword,
+            nickServPassword = nickServPassword,
+            proxyPassword = proxyPassword,
+            tlsClientIdentity = identity,
+            certificatePin = pin,
         )
     }
 
-    private fun routeEvent(session: Session, event: IrcEvent) {
+    private fun resolvePassword(reference: String?, transient: String?, role: String): String? {
+        if (reference == null) return transient
+        val password = try {
+            vault.readPassword(reference)
+        } catch (_: Exception) {
+            throw AuthenticationRejectedException("The saved $role password is unavailable. Replace it in network settings.")
+        }
+        return password ?: throw AuthenticationRejectedException(
+            "The saved $role password is missing. Replace it in network settings.",
+        )
+    }
+
+    private fun recover(session: Session, signal: RecoverySignal) {
+        when (session.recovery.handle(signal)) {
+            RecoveryAction.NONE -> Unit
+            RecoveryAction.START -> launchSession(session)
+            RecoveryAction.PAUSE -> {
+                session.probeJob = null
+                clearIdentification(session)
+                history.reset(session.config.id, "Network unavailable")
+                session.acceptedEpoch = null
+                session.state.connectionEpoch += 1
+                session.state.registered = false
+                session.statusFlow.value = ConnectionStatus.DISCONNECTED
+                session.reconnector?.setNetworkAvailable(false)
+            }
+            RecoveryAction.NUDGE -> {
+                if (session.reconnector == null) launchSession(session) else session.reconnector?.nudge()
+            }
+            RecoveryAction.PROBE -> probeSession(session)
+            RecoveryAction.STOP -> session.reconnector?.stop()
+        }
+    }
+
+    private fun probeSession(session: Session) {
+        if (session.probeJob?.isActive == true) return
+        val connection = session.connection ?: return
+        val epoch = session.state.connectionEpoch
+        val token = session.attemptToken
+        session.probeJob = session.lifecycleScope.launch {
+            val alive = connection.probe()
+            synchronized(session.state) {
+                if (sessions[session.config.id] !== session || session.connection !== connection ||
+                    session.state.connectionEpoch != epoch || session.attemptToken != token ||
+                    session.reconnector?.currentEpoch != token ||
+                    !session.state.registered || session.recovery.phase != RecoveryPhase.REGISTERED
+                ) return@launch
+                session.probeJob = null
+                if (alive) {
+                    session.recovery.handle(RecoverySignal.REGISTERED, token)
+                } else {
+                    session.connectionError = "The server did not respond to a connection check. Reconnecting."
+                    session.recovery.handle(RecoverySignal.SERVER_FAILED, token)
+                    session.state.registered = false
+                    session.acceptedEpoch = null
+                    session.state.connectionEpoch += 1
+                    session.statusFlow.value = ConnectionStatus.DISCONNECTED
+                    history.reset(session.config.id, "Connection check failed")
+                    connection.disconnect()
+                    session.reconnector?.nudge()
+                }
+                refreshNetworkStates()
+            }
+        }
+    }
+
+    private fun routeEvent(session: Session, envelope: ReconnectionEvent) {
+        val event = envelope.event
         synchronized(session.state) {
-            if (sessions[session.config.id] !== session) return
-            if (event is IrcEvent.MessageReceived &&
-                history.receive(session.config.id, session.historyGeneration, session.state.connectionEpoch.toLong(), event.message)
+            if (session.reconnector?.currentEpoch != envelope.epoch || session.attemptToken != envelope.epoch ||
+                envelope.connection != null && session.connection !== envelope.connection
             ) return
+            if (event !is IrcEvent.Disconnected && session.acceptedEpoch != envelope.epoch) return
+            if (sessions[session.config.id] !== session || session.quitRequested) return
+            if (!networkAvailable && event !is IrcEvent.Disconnected) return
+            if (session.recovery.phase == RecoveryPhase.AUTHENTICATION_REJECTED ||
+                session.recovery.phase == RecoveryPhase.CERTIFICATE_REJECTED
+            ) return
+            if (event is IrcEvent.Registered) {
+                if (session.state.registered || session.pendingRegistration != null) return
+                if (session.authenticatedNick == "*") {
+                    if (session.saslAuthenticated) session.authenticatedNick = event.nickname
+                    else {
+                        session.authenticatedNick = null
+                        session.authenticatedAccount = null
+                    }
+                }
+                if (session.effective?.nickServPassword != null) beginIdentification(session, event)
+                else releaseRegistration(session, event)
+                return
+            }
+            if (event is IrcEvent.MessageReceived) {
+                updateAuthenticatedIdentity(session, event.message)
+                val gate = session.identificationGate
+                if (gate != null && event.message.tags["batch"] == null) {
+                    val expired = gate.expire(historyElapsedClock())
+                    val outcome = if (expired == NickServOutcome.WAITING) gate.receive(event.message) else expired
+                    finishIdentification(session, outcome)
+                    if (session.recovery.phase == RecoveryPhase.AUTHENTICATION_REJECTED) return
+                }
+                if (history.receive(
+                        session.config.id, session.historyGeneration, session.state.connectionEpoch.toLong(), event.message,
+                    )
+                ) return
+            }
             if (event is IrcEvent.ConnectionOpened || event is IrcEvent.Disconnected) {
+                session.authenticatedNick = null
+                session.authenticatedAccount = null
+                session.saslAuthenticated = false
+                clearIdentification(session)
+                session.probeJob = null
                 history.reset(session.config.id, "Connection closed")
+            }
+            if (event is IrcEvent.SaslResult && event.outcome == SaslOutcome.Success) {
+                session.saslAuthenticated = true
+            }
+            val saslFailure = (event as? IrcEvent.SaslResult)?.outcome as? SaslOutcome.Failure
+            if (saslFailure != null && session.pendingRegistration != null) {
+                appendSystem(session, session.state.server, "SASL authentication failed: ${saslFailure.description}")
+                return
             }
             val previousMapping = session.state.casemapping
             val previousSupport = session.state.isupport
@@ -476,9 +924,8 @@ public class LiveCoordinator(
             val effects = session.state.apply(event, inboundContext(session))
             if (previousMapping != session.state.casemapping) reconcileCaseMapping(session)
             if (previousSupport !== session.state.isupport) session.storedMappingKnown = true
-            if (event !is IrcEvent.Registered &&
-                (previousSupport !== session.state.isupport || previousCapabilities != session.state.supportedCaps ||
-                    previousNick != session.state.ownNick)
+            if (previousSupport !== session.state.isupport || previousCapabilities != session.state.supportedCaps ||
+                previousNick != session.state.ownNick
             ) {
                 history.support(
                     session.config.id, session.historyGeneration, session.state.connectionEpoch.toLong(),
@@ -486,13 +933,224 @@ public class LiveCoordinator(
                 )
             }
             for (effect in effects) processEffect(session, effect)
-            if (event is IrcEvent.Registered) {
-                history.registered(
-                    session.config.id, session.historyGeneration, session.state.connectionEpoch.toLong(),
-                    session.state.casemapping, session.state.ownNick, session.state.isupport, session.state.supportedCaps,
-                )
+            when (event) {
+                is IrcEvent.ConnectionOpened -> {
+                    session.connectionError = null
+                    session.rejectedCertificate = null
+                    session.statusFlow.value = ConnectionStatus.CONNECTING
+                }
+                is IrcEvent.Disconnected -> {
+                    session.connection = null
+                    session.acceptedEpoch = null
+                    connectionFailed(session, event.cause)
+                }
+                else -> Unit
+            }
+            refreshNetworkStates()
+        }
+    }
+
+    private fun updateAuthenticatedIdentity(session: Session, message: IrcMessage) {
+        if ("batch" in message.tags || "draft/chathistory-context" in message.tags) return
+        val prefix = message.prefix
+        fun sameName(actual: String?, expected: String?): Boolean =
+            actual != null && expected != null && CaseMapping.ASCII.equal(actual, expected)
+        when {
+            message.command.equals("NICK", true) && prefix?.user != null && prefix.host != null &&
+                sameName(prefix.nick, session.state.ownNick) && sameName(prefix.nick, session.authenticatedNick) -> {
+                message.parameters.singleOrNull()?.let { session.authenticatedNick = it }
+            }
+            message.command.equals("ACCOUNT", true) && prefix?.user != null && prefix.host != null &&
+                (sameName(prefix.nick, session.state.ownNick) ||
+                    session.authenticatedNick == "*" && prefix.nick == "*" &&
+                    !session.state.registered && session.pendingRegistration == null) &&
+                message.parameters.size == 1 -> {
+                val account = message.parameters[0].takeIf { it.isNotEmpty() && it != "*" && it.none(Char::isWhitespace) }
+                session.authenticatedNick = prefix.nick.takeIf { account != null }
+                session.authenticatedAccount = account
+            }
+            (message.numeric == 900 || message.numeric == 901) && prefix?.isServer == true && message.parameters.size >= 3 -> {
+                val target = message.parameters[0]
+                val usermask = message.parameters[1]
+                val beforeRegistration = !session.state.registered && session.pendingRegistration == null
+                val loggedInNick = if (target == "*" && usermask == "*" && beforeRegistration) "*" else {
+                    val loggedInUser = IrcPrefix.parse(usermask)
+                    if (loggedInUser?.user == null || loggedInUser.host == null ||
+                        !sameName(target, loggedInUser.nick) ||
+                        loggedInUser.nick == "*" && !beforeRegistration ||
+                        session.state.registered && !sameName(loggedInUser.nick, session.state.ownNick)
+                    ) return
+                    loggedInUser.nick
+                }
+                val account = message.parameters[2].takeIf {
+                    message.numeric == 900 && it.isNotEmpty() && it != "*" && it.none(Char::isWhitespace)
+                }
+                session.authenticatedNick = loggedInNick.takeIf { account != null }
+                session.authenticatedAccount = account
             }
         }
+    }
+
+    private fun releaseRegistration(session: Session, event: IrcEvent.Registered) {
+        if (session.state.registered || session.state.authenticationRejected ||
+            !session.recovery.desiredConnection || !networkAvailable
+        ) return
+        session.pendingRegistration = null
+        session.connectionError = null
+        session.recovery.handle(RecoverySignal.REGISTERED, session.attemptToken)
+        if (session.recovery.phase != RecoveryPhase.REGISTERED) return
+        for (effect in session.state.apply(event, inboundContext(session))) processEffect(session, effect)
+        history.registered(
+            session.config.id, session.historyGeneration, session.state.connectionEpoch.toLong(),
+            session.state.casemapping, session.state.ownNick, session.state.isupport, session.state.supportedCaps,
+        )
+        refreshNetworkStates()
+    }
+
+    private fun beginIdentification(session: Session, event: IrcEvent.Registered) {
+        val effective = session.effective ?: return
+        val password = effective.nickServPassword ?: return
+        val intendedAccount = effective.nickServAccount ?: event.nickname
+        if (session.authenticatedNick?.let { CaseMapping.ASCII.equal(it, event.nickname) } == true &&
+            session.authenticatedAccount?.let { CaseMapping.ASCII.equal(it, intendedAccount) } == true
+        ) {
+            releaseRegistration(session, event)
+            return
+        }
+        session.recovery.handle(RecoverySignal.IDENTIFYING, session.attemptToken)
+        if (session.recovery.phase != RecoveryPhase.IDENTIFYING) return
+        session.state.ownNick = event.nickname
+        session.pendingRegistration = event
+        val gate = NickServIdentificationGate(
+            service = effective.nickServService,
+            ourNick = event.nickname,
+            account = effective.nickServAccount,
+            nowMillis = historyElapsedClock(),
+        )
+        session.identificationGate = gate
+        sendRaw(session, "PRIVMSG ${effective.nickServService} :IDENTIFY${effective.nickServAccount?.let { " $it" }.orEmpty()} $password")
+        val epoch = session.state.connectionEpoch
+        val token = session.attemptToken
+        session.identificationDeadline = session.lifecycleScope.launch {
+            delay((gate.deadlineMs - historyElapsedClock()).coerceAtLeast(0))
+            synchronized(session.state) {
+                if (sessions[session.config.id] !== session || session.identificationGate !== gate ||
+                    session.state.connectionEpoch != epoch || session.attemptToken != token ||
+                    session.reconnector?.currentEpoch != token
+                ) return@launch
+                finishIdentification(session, gate.expire(maxOf(historyElapsedClock(), gate.deadlineMs)))
+            }
+        }
+        if (!effective.waitForNickServ) releaseRegistration(session, event)
+        refreshNetworkStates()
+    }
+
+    private fun finishIdentification(session: Session, outcome: NickServOutcome) {
+        when (outcome) {
+            NickServOutcome.WAITING -> Unit
+            NickServOutcome.IDENTIFIED -> {
+                val gate = session.identificationGate ?: return
+                val registration = session.pendingRegistration?.copy(nickname = gate.currentNick)
+                clearIdentification(session)
+                if (registration != null) releaseRegistration(session, registration)
+            }
+            NickServOutcome.REJECTED -> {
+                clearIdentification(session)
+                authenticationFailed(session, "NickServ rejected identification. Check the service, account and password, then Connect to retry.")
+            }
+            NickServOutcome.TIMED_OUT -> {
+                clearIdentification(session)
+                val reason = "NickServ did not confirm identification within seven seconds. Check the service, account and password."
+                if (session.config.waitForNickServ) authenticationFailed(session, reason)
+                else {
+                    session.connectionError = reason
+                    appendSystem(session, session.state.server, reason)
+                    refreshNetworkStates()
+                }
+            }
+        }
+    }
+
+    private fun clearIdentification(session: Session) {
+        session.identificationDeadline?.cancel()
+        session.identificationDeadline = null
+        session.identificationGate = null
+        session.pendingRegistration = null
+    }
+
+    private fun authenticationFailed(session: Session, reason: String) {
+        session.state.authenticationRejected = true
+        session.state.registered = false
+        session.acceptedEpoch = null
+        session.connectionError = redactPresentation(session, reason)
+        session.statusFlow.value = ConnectionStatus.DISCONNECTED
+        clearIdentification(session)
+        session.probeJob?.cancel()
+        session.probeJob = null
+        history.reset(session.config.id, "Authentication failed")
+        session.recovery.handle(RecoverySignal.AUTH_REJECTED, session.attemptToken)
+        session.reconnector?.stop()
+        appendSystem(session, session.state.server, reason)
+        refreshNetworkStates()
+    }
+
+    private fun connectionFailed(session: Session, cause: Throwable?) {
+        var error = cause
+        var depth = 0
+        var certificateFailure: CertificateException? = null
+        while (error != null && depth < 32) {
+            when (error) {
+                is CertificateRejectedException -> {
+                    session.rejectedCertificate = error.inspection
+                    session.connectionError = "The server certificate was rejected. Inspect its details before deciding whether to trust it."
+                    session.recovery.handle(RecoverySignal.CERT_REJECTED, session.attemptToken)
+                    session.reconnector?.stop()
+                    return
+                }
+                is CertificateExpiredException -> {
+                    certificateFailed(session, "The server certificate has expired. Check the server certificate and device clock before reconnecting.")
+                    return
+                }
+                is CertificateNotYetValidException -> {
+                    certificateFailed(session, "The server certificate is not yet valid. Check the server certificate and device clock before reconnecting.")
+                    return
+                }
+                is CertificateException -> certificateFailure = error
+                is AuthenticationRejectedException -> {
+                    authenticationFailed(session, error.message ?: "Authentication was rejected. Correct the network credentials.")
+                    return
+                }
+                is TlsIdentityUnavailableException -> {
+                    authenticationFailed(session, error.message ?: "The TLS client identity is unavailable. Select it again in network settings.")
+                    return
+                }
+                is Socks5Exception -> {
+                    if (error.authenticationRejected) {
+                        authenticationFailed(session, "The proxy rejected authentication. Correct the proxy username and password.")
+                    } else {
+                        session.connectionError = redactPresentation(session, error.message ?: "The SOCKS proxy connection failed. Check the proxy endpoint.")
+                        session.recovery.handle(RecoverySignal.SERVER_FAILED, session.attemptToken)
+                    }
+                    return
+                }
+            }
+            error = error.cause
+            depth += 1
+        }
+        if (certificateFailure != null) {
+            certificateFailed(session, "The server certificate is not valid for this endpoint or could not be verified. Check the network hostname, server certificate and device clock before reconnecting.")
+            return
+        }
+        if (session.recovery.phase == RecoveryPhase.OFFLINE || !networkAvailable) return
+        session.connectionError = "Unable to reach ${session.config.host}:${session.effective?.port ?: session.config.port}. Check the endpoint and connectivity."
+        session.recovery.handle(RecoverySignal.SERVER_FAILED, session.attemptToken)
+    }
+
+    private fun certificateFailed(session: Session, reason: String) {
+        session.rejectedCertificate = null
+        session.connectionError = reason
+        session.recovery.handle(RecoverySignal.CERT_REJECTED, session.attemptToken)
+        session.reconnector?.stop()
     }
 
     private fun inboundContext(
@@ -522,12 +1180,14 @@ public class LiveCoordinator(
     private fun processEffect(session: Session, effect: InboundEffect) {
         when (effect) {
             is InboundEffect.SendRaw -> sendRaw(session, effect.line)
+            is InboundEffect.AuthenticationFailed -> authenticationFailed(session, effect.reason)
             is InboundEffect.RequestHistory -> history.bootstrap(session.config.id, effect.ref)
             is InboundEffect.ScheduleRaw -> session.lifecycleScope.launch {
                 delay(effect.delayMs)
                 synchronized(session.state) {
                     if (sessions[session.config.id] === session &&
-                        session.state.connectionEpoch == effect.connectionEpoch
+                        session.state.connectionEpoch == effect.connectionEpoch &&
+                        session.state.registered && session.statusFlow.value == ConnectionStatus.REGISTERED
                     ) {
                         sendRaw(session, effect.line)
                     }
@@ -828,7 +1488,11 @@ public class LiveCoordinator(
         buffer(ConversationRef.server(session.config.id))
         for (channel in session.config.autojoin) {
             val ref = ConversationRef.channel(session.config.id, channel, session.state.casemapping)
-            if (!channelOrder.isParted(ref.storageKey)) markJoining(ref)
+            if (!channelOrder.isParted(ref.storageKey)) {
+                updateBuffer(ref) {
+                    it.copy(joinState = if (session.recovery.desiredConnection) JoinState.JOINING else JoinState.IDLE)
+                }
+            }
         }
     }
 
@@ -901,21 +1565,27 @@ public class LiveCoordinator(
 
     public data class RawFrame(public val outbound: Boolean, public val line: String)
 
-    private val rawLogs = LinkedHashMap<String, ArrayDeque<RawFrame>>()
+    private val rawLogs = ConcurrentHashMap<String, ArrayDeque<RawFrame>>()
     private val _rawLogVersion = MutableStateFlow(0)
     public val rawLogVersion: StateFlow<Int> = _rawLogVersion.asStateFlow()
 
     public fun ingestRaw(networkId: String, outbound: Boolean, line: String) {
+        if (networkStore.byId(networkId) == null) return
+        val safeLine = sessions[networkId]?.let { redactPresentation(it, line) } ?: line
         val deque = rawLogs.getOrPut(networkId) { ArrayDeque() }
+        if (networkStore.byId(networkId) == null) {
+            rawLogs.remove(networkId, deque)
+            return
+        }
         synchronized(deque) {
-            deque.addLast(RawFrame(outbound, line))
+            deque.addLast(RawFrame(outbound, safeLine))
             while (deque.size > 400) deque.removeFirst()
         }
-        _rawLogVersion.value += 1
+        _rawLogVersion.update { it + 1 }
     }
 
     public fun rawLog(networkId: String): List<RawFrame> {
-        val deque = rawLogs.getOrPut(networkId) { ArrayDeque() }
+        val deque = rawLogs[networkId] ?: return emptyList()
         return synchronized(deque) { deque.toList() }
     }
 
@@ -1111,6 +1781,7 @@ public class LiveCoordinator(
 
     public fun retryJoin(networkId: String, storageKey: String) {
         val session = sessions[networkId] ?: return
+        if (session.statusFlow.value != ConnectionStatus.REGISTERED || !session.state.registered) return
         val buffer = _buffers.value[storageKey] ?: return
         if (buffer.ref.kind != ConversationKind.CHANNEL) return
         channelOrder.clearParted(storageKey)
@@ -1151,7 +1822,7 @@ public class LiveCoordinator(
             appendSystem(session, _buffers.value[storageKey]?.ref ?: ConversationRef.server(networkId), "This network does not advertise a filehost (soju.im/FILEHOST).")
             return
         }
-        val config = effectiveConfig(session.config, session.stsUpgradePort)
+        val config = session.effective ?: return
         scope.launch(kotlinx.coroutines.Dispatchers.IO) {
             val uploaded = try {
                 dev.brentdevs.yardhal.core.client.FilehostUploader.upload(
@@ -1211,6 +1882,7 @@ public class LiveCoordinator(
         historyContext: Boolean = false,
         optimistic: Boolean = false,
     ) {
+        val presentedText = redactPresentation(session, text)
         val newLocalId = idGenerator.getAndIncrement()
         val muted = mutes.isMuted(ref.storageKey)
         var appended = false
@@ -1219,13 +1891,13 @@ public class LiveCoordinator(
         updateBuffer(ref) { buffer ->
             appended = false
             if (reconcilePendingEcho && !playback) {
-                reconcileEcho(buffer, kind, text, echoLabel, msgid, timestampMs, attachmentUrl, senderAccount)?.let { return@updateBuffer it }
+                reconcileEcho(buffer, kind, presentedText, echoLabel, msgid, timestampMs, attachmentUrl, senderAccount)?.let { return@updateBuffer it }
             }
             val byMsgid = if (msgid == null) -1 else buffer.messages.indexOfFirst { it.msgid == msgid }
             val byContent = if (byMsgid >= 0 || !playback) -1 else {
                 buffer.messages.uniqueHistoryIndex { message ->
                     (msgid == null || message.msgid == null) && message.sender == sender &&
-                        message.kind == kind && message.text == text && message.timestampMs == timestampMs
+                        message.kind == kind && message.text == presentedText && message.timestampMs == timestampMs
                 }
             }
             val duplicateIndex = if (byMsgid >= 0) byMsgid else byContent
@@ -1249,7 +1921,7 @@ public class LiveCoordinator(
                 localId = newLocalId,
                 sender = sender,
                 kind = kind,
-                text = text,
+                text = presentedText,
                 timestampMs = timestampMs,
                 sentByUs = sentByUs,
                 highlightsMe = highlightsMe,
@@ -1285,10 +1957,10 @@ public class LiveCoordinator(
             } else {
                 _buffers.value[ref.storageKey]?.messages?.firstOrNull { it.msgid == msgid }?.localId ?: persistedLocalId
             }
-            persistAsync(session, ref, sender, kind, text, msgid, persistedTimestampMs, sentByUs, localId, channelContext, historyContext)
+            persistAsync(session, ref, sender, kind, presentedText, msgid, persistedTimestampMs, sentByUs, localId, channelContext, historyContext)
         }
         if (appended && highlightsMe && !sentByUs && !playback && !muted) {
-            notifier.onHighlight(session.config.name, sender, ConversationNames.forRef(ref), text)
+            notifier.onHighlight(session.config.name, sender, ConversationNames.forRef(ref), presentedText)
         }
     }
 
@@ -1431,15 +2103,25 @@ public class LiveCoordinator(
         _networkStates.update {
             networkStore.all().map { config ->
                 val session = sessions[config.id]
+                val live = session?.takeUnless { it.quitRequested }
                 UiNetwork(
                     id = config.id,
                     name = config.name,
                     host = config.host,
                     status = session?.statusFlow?.value ?: ConnectionStatus.DISCONNECTED,
-                    ownNick = session?.state?.ownNick ?: config.nick,
-                    hasBotMode = session?.state?.botModeLetter != null,
-                    accountBanAvailable = session?.state?.accountExtban != null,
-                    iconUrl = session?.state?.networkIconUrl,
+                    ownNick = live?.state?.ownNick ?: config.nick,
+                    hasBotMode = live?.state?.botModeLetter != null,
+                    accountBanAvailable = live?.state?.accountExtban != null,
+                    iconUrl = live?.state?.networkIconUrl,
+                    connectionPhase = session?.recovery?.phase ?: if (config.userDisconnected) {
+                        RecoveryPhase.USER_DISCONNECTED
+                    } else {
+                        RecoveryPhase.DISCONNECTED
+                    },
+                    connectionError = session?.connectionError,
+                    rejectedCertificate = session?.rejectedCertificate,
+                    hasCertificatePin = config.certificatePin != null,
+                    disconnectSavePending = session?.disconnectSavePending == true,
                 )
             }.sortedBy { it.name }
         }
