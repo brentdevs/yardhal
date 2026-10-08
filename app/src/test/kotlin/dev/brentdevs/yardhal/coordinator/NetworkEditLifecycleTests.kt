@@ -6,8 +6,13 @@ import dev.brentdevs.yardhal.core.client.InMemoryStsPolicyStore
 import dev.brentdevs.yardhal.core.client.IrcConnection
 import dev.brentdevs.yardhal.core.client.IrcConnectionConfig
 import dev.brentdevs.yardhal.core.client.StsPolicy
+import dev.brentdevs.yardhal.core.client.Socks5Config
+import dev.brentdevs.yardhal.core.client.TlsClientIdentity
+import dev.brentdevs.yardhal.core.client.TlsIdentityUnavailableException
 import dev.brentdevs.yardhal.core.data.ChannelOrderStore
 import dev.brentdevs.yardhal.core.data.ConversationRef
+import dev.brentdevs.yardhal.core.data.CertificatePin
+import dev.brentdevs.yardhal.core.data.CredentialVault
 import dev.brentdevs.yardhal.core.data.InMemoryCredentialVault
 import dev.brentdevs.yardhal.core.data.MessageDao
 import dev.brentdevs.yardhal.core.data.MessageKind
@@ -16,8 +21,12 @@ import dev.brentdevs.yardhal.core.data.MuteStore
 import dev.brentdevs.yardhal.core.data.NetworkConfig
 import dev.brentdevs.yardhal.core.data.NetworkStore
 import dev.brentdevs.yardhal.core.data.ReadMarkerStore
+import dev.brentdevs.yardhal.core.data.SaslMode
+import java.io.DataInputStream
+import dev.brentdevs.yardhal.core.data.SocksProxyConfig
 import dev.brentdevs.yardhal.core.data.StoredMessage
 import dev.brentdevs.yardhal.core.data.YardhalDatabase
+import dev.brentdevs.yardhal.core.protocol.IrcMessage
 import dev.brentdevs.yardhal.core.protocol.CaseMapping
 import java.io.BufferedReader
 import java.io.File
@@ -26,12 +35,21 @@ import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.nio.file.Files
+import java.security.KeyStore
+import java.security.MessageDigest
+import java.security.PrivateKey
+import java.security.cert.X509Certificate
 import java.util.Base64
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import kotlin.coroutines.CoroutineContext
 import kotlin.test.Test
+import javax.net.ssl.KeyManagerFactory
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLServerSocket
+import javax.net.ssl.SSLSocket
+import javax.net.ssl.TrustManagerFactory
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
@@ -40,6 +58,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.cancelAndJoin
@@ -63,13 +82,37 @@ class NetworkEditLifecycleTests {
         private val stsPort: Int? = null,
         private val casemapping: String? = null,
         private val acknowledgeParts: Boolean = true,
+        private val rejectSasl: Boolean = false,
+        private val rejectServerPassword: Boolean = false,
+        private val acknowledgeProbes: Boolean = true,
+        private val historyAvailable: Boolean = false,
+        tlsFixture: String? = null,
+        private val advertisedSasl: String = "PLAIN",
+        requireClientIdentity: Boolean = false,
     ) : AutoCloseable {
-        private val listener = ServerSocket(0, 10, InetAddress.getLoopbackAddress())
+        private val listener = if (tlsFixture == null) {
+            ServerSocket(0, 10, InetAddress.getLoopbackAddress())
+        } else {
+            val keys = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm()).apply {
+                init(tlsStore(tlsFixture), tlsPassword)
+            }
+            val trust = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm()).apply {
+                init(tlsStore("trusted"))
+            }
+            val context = SSLContext.getInstance("TLS").apply { init(keys.keyManagers, trust.trustManagers, null) }
+            (context.serverSocketFactory.createServerSocket(0, 10, InetAddress.getLoopbackAddress()) as SSLServerSocket).apply {
+                needClientAuth = requireClientIdentity
+            }
+        }
         private val executor = Executors.newCachedThreadPool()
         val clients: MutableList<Client> = CopyOnWriteArrayList()
         val port: Int get() = listener.localPort
 
         inner class Client(private val socket: Socket) : AutoCloseable {
+            var peerCertificates: List<X509Certificate> = emptyList()
+                private set
+            @Volatile var failure: Throwable? = null
+                private set
             val received: MutableList<String> = CopyOnWriteArrayList()
             @Volatile var nick: String = "*"
                 private set
@@ -79,19 +122,34 @@ class NetworkEditLifecycleTests {
             fun read() {
                 try {
                     if (dropOnAccept) return
+                    if (socket is SSLSocket) {
+                        val tlsSocket: SSLSocket = socket
+                        socket.soTimeout = 5_000
+                        socket.startHandshake()
+                        peerCertificates = runCatching {
+                            tlsSocket.session.peerCertificates.map { it as X509Certificate }
+                        }.getOrDefault(emptyList())
+                        socket.soTimeout = 0
+                    }
                     val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
                     while (!socket.isClosed) {
                         val line = reader.readLine() ?: break
                         received.add(line)
                         when {
                             line.startsWith("CAP LS") -> send(
-                                ":srv CAP * LS :server-time sasl=PLAIN draft/channel-rename away-notify" +
-                                    if (stsPort != null) " sts=port=$stsPort,duration=3600" else
-                                        if (publishProfiles) " draft/metadata-2=max-subs=10" else "",
+                                ":srv CAP * LS :server-time sasl=$advertisedSasl draft/channel-rename away-notify" +
+                                    (if (historyAvailable) " batch draft/chathistory" else "") +
+                                    (if (stsPort != null) " sts=port=$stsPort,duration=3600" else
+                                        if (publishProfiles) " draft/metadata-2=max-subs=10" else ""),
                             )
                             line.startsWith("CAP REQ :") -> send(":srv CAP * ACK :${line.substringAfter("CAP REQ :")}")
-                            line == "AUTHENTICATE PLAIN" -> send("AUTHENTICATE +")
-                            line.startsWith("AUTHENTICATE ") -> send(":srv 903 * :SASL authentication successful")
+                            line == "AUTHENTICATE PLAIN" || line == "AUTHENTICATE EXTERNAL" -> send("AUTHENTICATE +")
+                            line.startsWith("AUTHENTICATE ") -> send(
+                                if (rejectSasl) ":srv 904 * :SASL authentication failed" else
+                                    ":srv 903 * :SASL authentication successful",
+                            )
+                            line.startsWith("PASS ") && rejectServerPassword -> send(":srv 464 * :Password incorrect")
+                            line.startsWith("PING ") && acknowledgeProbes -> send(":srv PONG srv :${line.substringAfter(':')}")
                             line.startsWith("NICK ") -> nick = line.substringAfter("NICK ")
                             line.startsWith("USER ") && welcomeAutomatically -> welcome()
                             line.startsWith("JOIN ") -> {
@@ -108,9 +166,22 @@ class NetworkEditLifecycleTests {
                                 send(":$nick!u@h PART ${line.substringAfter("PART ").substringBefore(' ')}")
                         }
                     }
+                } catch (failure: Throwable) {
+                    this.failure = failure
+                    throw failure
                 } finally {
                     close()
                 }
+            }
+
+            fun parameters(command: String): List<String>? = received.firstNotNullOfOrNull {
+                IrcMessage.parse(it)?.takeIf { message -> message.command == command }?.parameters
+            }
+
+            fun renameOwnNick(newNick: String) {
+                val previous = nick
+                nick = newNick
+                send(":$previous!u@h NICK :$newNick")
             }
 
             fun welcome() {
@@ -140,7 +211,7 @@ class NetworkEditLifecycleTests {
                     val socket = runCatching { listener.accept() }.getOrNull() ?: break
                     val client = Client(socket)
                     clients.add(client)
-                    executor.submit { runCatching { client.read() } }
+                    executor.submit { client.read() }
                 }
             }
         }
@@ -148,6 +219,71 @@ class NetworkEditLifecycleTests {
         override fun close() {
             listener.close()
             clients.forEach { it.close() }
+            executor.shutdownNow()
+        }
+    }
+
+    private class Proxy(private val rejectAuthentication: Boolean = false) : AutoCloseable {
+        private val listener = ServerSocket(0, 10, InetAddress.getLoopbackAddress())
+        private val executor = Executors.newCachedThreadPool()
+        private val sockets = CopyOnWriteArrayList<Socket>()
+        val passwords = CopyOnWriteArrayList<String>()
+        val usernames = CopyOnWriteArrayList<String>()
+        val destinations = CopyOnWriteArrayList<Pair<String, Int>>()
+        val port: Int get() = listener.localPort
+
+        init {
+            executor.submit {
+                while (!listener.isClosed) {
+                    val socket = runCatching { listener.accept() }.getOrNull() ?: break
+                    sockets.add(socket)
+                    executor.submit { runCatching { tunnel(socket) } }
+                }
+            }
+        }
+
+        private fun tunnel(client: Socket) {
+            client.use {
+                client.soTimeout = 5_000
+                val input = DataInputStream(client.getInputStream())
+                val output = client.getOutputStream()
+                check(input.readUnsignedByte() == 5)
+                val methods = ByteArray(input.readUnsignedByte()).also(input::readFully)
+                check(2.toByte() in methods)
+                output.write(byteArrayOf(5, 2))
+                output.flush()
+                check(input.readUnsignedByte() == 1)
+                usernames.add(String(ByteArray(input.readUnsignedByte()).also(input::readFully), Charsets.UTF_8))
+                passwords.add(String(ByteArray(input.readUnsignedByte()).also(input::readFully), Charsets.UTF_8))
+                output.write(byteArrayOf(1, (if (rejectAuthentication) 1 else 0).toByte()))
+                output.flush()
+                if (rejectAuthentication) return
+                check(input.readUnsignedByte() == 5)
+                check(input.readUnsignedByte() == 1)
+                check(input.readUnsignedByte() == 0)
+                check(input.readUnsignedByte() == 3)
+                val host = String(ByteArray(input.readUnsignedByte()).also(input::readFully), Charsets.UTF_8)
+                val port = input.readUnsignedShort()
+                destinations.add(host to port)
+                Socket(host, port).use { destination ->
+                    sockets.add(destination)
+                    output.write(byteArrayOf(5, 0, 0, 1, 127, 0, 0, 1, 0, 0))
+                    output.flush()
+                    client.soTimeout = 0
+                    val inbound = executor.submit {
+                        runCatching { destination.getInputStream().copyTo(output) }
+                        client.close()
+                    }
+                    input.copyTo(destination.getOutputStream())
+                    destination.close()
+                    inbound.get()
+                }
+            }
+        }
+
+        override fun close() {
+            listener.close()
+            sockets.forEach { it.close() }
             executor.shutdownNow()
         }
     }
@@ -179,11 +315,65 @@ class NetworkEditLifecycleTests {
         }
     }
 
+    private class HoldingProbeDispatcher : CoroutineDispatcher() {
+        private val lock = Any()
+        private val queued = ConcurrentLinkedQueue<Pair<CoroutineContext, Runnable>>()
+        private var captureThread: Thread? = null
+        var heldJob: Job? = null
+            private set
+        val pending: Int get() = queued.size
+
+        fun captureNextLaunch() {
+            synchronized(lock) { captureThread = Thread.currentThread() }
+        }
+
+        override fun dispatch(context: CoroutineContext, block: Runnable) {
+            synchronized(lock) {
+                if (captureThread === Thread.currentThread()) {
+                    heldJob = context[Job]
+                    captureThread = null
+                }
+                val held = heldJob
+                val job = context[Job]
+                if (held != null && job != null && contains(held, job)) queued.add(context to block)
+                else Dispatchers.Default.dispatch(context, block)
+            }
+        }
+
+        private fun contains(root: Job, expected: Job): Boolean {
+            if (root === expected) return true
+            for (child in root.children) if (contains(child, expected)) return true
+            return false
+        }
+
+        fun startHeldLaunch() {
+            synchronized(lock) {
+                val initial = queued.poll() ?: error("No captured probe launch")
+                Dispatchers.Default.dispatch(initial.first, initial.second)
+            }
+        }
+
+        fun release() {
+            synchronized(lock) {
+                heldJob = null
+                captureThread = null
+                while (true) {
+                    val next = queued.poll() ?: break
+                    Dispatchers.Default.dispatch(next.first, next.second)
+                }
+            }
+        }
+    }
+
     private class Harness(
         val directory: File,
         val config: NetworkConfig,
         dispatcher: CoroutineDispatcher = Dispatchers.Default,
         afterDiscovery: (suspend () -> Unit)? = null,
+        private val identityProvider: (String) -> TlsClientIdentity = {
+            throw TlsIdentityUnavailableException("Selected TLS identity is unavailable.")
+        },
+        val vault: CredentialVault = InMemoryCredentialVault(),
     ) : AutoCloseable {
         private val scopeJob = SupervisorJob()
         private val scope = CoroutineScope(scopeJob + dispatcher)
@@ -198,15 +388,16 @@ class NetworkEditLifecycleTests {
                 }
             },
         )
-        val vault = InMemoryCredentialVault()
         val policies = InMemoryStsPolicyStore()
         val networks = NetworkStore(directory).also { it.add(config) }
         val readMarkers = ReadMarkerStore(directory)
         val mutes = MuteStore(directory)
         val channelOrder = ChannelOrderStore(directory)
         val createdConfigs: MutableList<NetworkConfig> = CopyOnWriteArrayList()
-        private val connectionFactory = ConnectionFactory { updated, onStsUpgrade ->
+        val stsCallbacks = CopyOnWriteArrayList<(Int) -> Unit>()
+        private val connectionFactory: ConnectionFactory = ConnectionFactory { updated, onStsUpgrade ->
             createdConfigs.add(updated)
+            stsCallbacks.add(onStsUpgrade)
             IrcConnection(
                 IrcConnectionConfig(
                     host = updated.host,
@@ -217,15 +408,23 @@ class NetworkEditLifecycleTests {
                     realName = updated.realName,
                     saslAuthcid = updated.saslAuthcid,
                     saslPassword = updated.saslPassword,
-                    serverPassword = updated.serverPasswordRef?.let(vault::readPassword),
-                    capabilities = setOf("server-time", "sasl", "draft/metadata-2", "draft/channel-rename", "away-notify"),
+                    serverPassword = updated.serverPassword,
+                    alternateNicks = updated.alternateNicks,
+                    saslMode = updated.saslMode.name,
+                    proxy = updated.proxy?.let { Socks5Config(it.host, it.port, it.username, updated.proxyPassword) },
+                    tlsClientIdentity = updated.tlsClientIdentity,
+                    trustedCertificateSha256 = updated.certificatePin?.sha256,
+                    knownSecrets = setOfNotNull(updated.saslPassword, updated.serverPassword, updated.nickServPassword, updated.proxyPassword),
+                    nickServService = updated.nickServService,
+                    capabilities = setOf("server-time", "sasl", "draft/metadata-2", "draft/channel-rename", "away-notify", "batch", "draft/chathistory"),
                     connectTimeoutMillis = 1_000,
                 ),
                 stsPolicyStore = policies,
+                rawTap = { outbound, line -> coordinator.ingestRaw(updated.id, outbound, line) },
                 onStsUpgrade = onStsUpgrade,
             )
         }
-        var coordinator = LiveCoordinator(
+        var coordinator: LiveCoordinator = LiveCoordinator(
             scope = scope,
             networkStore = networks,
             messageStore = messages,
@@ -236,11 +435,15 @@ class NetworkEditLifecycleTests {
             channelOrder = channelOrder,
             connectionFactory = connectionFactory,
             stsPolicies = policies,
+            clientIdentityProvider = identityProvider,
+            historyElapsedClock = { (dispatcher as? TestDispatcher)?.scheduler?.currentTime ?: System.nanoTime() / 1_000_000 },
         )
             private set
 
         fun reloadCoordinator(): LiveCoordinator {
+            val disconnected = coordinator.networkStore.byId(config.id)?.userDisconnected ?: false
             coordinator.disconnect(config.id)
+            coordinator.networkStore.setUserDisconnected(config.id, disconnected)
             coordinator = LiveCoordinator(
                 scope = scope,
                 networkStore = NetworkStore(directory),
@@ -252,6 +455,8 @@ class NetworkEditLifecycleTests {
                 channelOrder = ChannelOrderStore(directory),
                 connectionFactory = connectionFactory,
                 stsPolicies = policies,
+                clientIdentityProvider = identityProvider,
+                historyElapsedClock = { (scope.coroutineContext[kotlin.coroutines.ContinuationInterceptor] as? TestDispatcher)?.scheduler?.currentTime ?: System.nanoTime() / 1_000_000 },
             )
             return coordinator
         }
@@ -291,10 +496,14 @@ class NetworkEditLifecycleTests {
         config: NetworkConfig,
         dispatcher: CoroutineDispatcher? = null,
         afterDiscovery: (suspend () -> Unit)? = null,
+        identityProvider: (String) -> TlsClientIdentity = {
+            throw TlsIdentityUnavailableException("Selected TLS identity is unavailable.")
+        },
+        vault: CredentialVault = InMemoryCredentialVault(),
     ): Harness {
         val effectiveDispatcher = dispatcher ?: StandardTestDispatcher()
         scheduler = (effectiveDispatcher as? TestDispatcher)?.scheduler
-        return Harness(Files.createTempDirectory("yardhal-network-edit").toFile(), config, effectiveDispatcher, afterDiscovery)
+        return Harness(Files.createTempDirectory("yardhal-network-edit").toFile(), config, effectiveDispatcher, afterDiscovery, identityProvider, vault)
     }
 
     @Test
@@ -552,7 +761,7 @@ class NetworkEditLifecycleTests {
     }
 
     @Test
-    fun changingConnectionSettingsAfterDisconnectStartsTheSavedUpdatedConnection() = runBlocking {
+    fun changingConnectionSettingsAfterDisconnectPreservesOptOutUntilExplicitConnect() = runBlocking {
         Server().use { server ->
             harness(config(server)).use { harness ->
                 val coordinator = harness.coordinator
@@ -560,17 +769,22 @@ class NetworkEditLifecycleTests {
                 await { coordinator.networks.value.singleOrNull()?.status == ConnectionStatus.REGISTERED }
                 coordinator.disconnect(harness.config.id)
                 await { server.clients.single().closed }
-                val renamed = harness.config.copy(name = "Offline rename")
+                val renamed = harness.config.copy(name = "Offline rename", userDisconnected = true)
                 assertTrue(coordinator.updateNetwork(renamed))
                 assertEquals(1, server.clients.size)
 
                 val updated = renamed.copy(nick = "onlineAgain", username = "newUser", realName = "New Realname")
                 assertTrue(coordinator.updateNetwork(updated))
+                assertEquals(ConnectionStatus.DISCONNECTED, coordinator.networks.value.single().status)
+                assertEquals(RecoveryPhase.USER_DISCONNECTED, coordinator.networks.value.single().connectionPhase)
+                assertEquals(1, server.clients.size)
+                assertEquals(updated, NetworkStore(harness.directory).all().single())
+                coordinator.connectNetwork(updated.id)
                 await { coordinator.networks.value.singleOrNull()?.ownNick == "onlineAgain" &&
                     coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
                 assertEquals(2, server.clients.size)
                 assertTrue("USER newUser 0 * :New Realname" in server.clients.last().received)
-                assertEquals(updated, NetworkStore(harness.directory).all().single())
+                assertEquals(updated.copy(userDisconnected = false), NetworkStore(harness.directory).all().single())
             }
         }
     }
@@ -912,6 +1126,858 @@ class NetworkEditLifecycleTests {
         }
     }
 
+    @Test
+    fun disabledColdStartAndDisconnectedEditsNeverOpenASocketUntilManualConnect() = runBlocking {
+        Server().use { server ->
+            harness(config(server).copy(autoConnect = false)).use { harness ->
+                val coordinator = harness.coordinator
+                coordinator.startAll()
+                assertEquals(RecoveryPhase.DISCONNECTED, coordinator.networks.value.single().connectionPhase)
+                val room = ConversationRef.channel(harness.config.id, "#room")
+                assertEquals(JoinState.IDLE, coordinator.buffers.value[room.storageKey]?.joinState)
+                val edited = harness.config.copy(nick = "manualNick", serverPasswordRef = "pass")
+                harness.vault.storePassword("pass", "saved-pass")
+                assertTrue(coordinator.updateNetwork(edited, credentialsChanged = true))
+                assertNotNull(scheduler).advanceTimeBy(60_000)
+                assertNotNull(scheduler).runCurrent()
+                assertTrue(harness.createdConfigs.isEmpty())
+                assertTrue(server.clients.isEmpty())
+                coordinator.connectNetwork(edited.id)
+                await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                await { coordinator.buffers.value[room.storageKey]?.joinState == JoinState.JOINED }
+                assertFalse(NetworkStore(harness.directory).all().single().autoConnect)
+                assertFalse(NetworkStore(harness.directory).all().single().userDisconnected)
+                assertEquals(listOf("saved-pass"), server.clients.single().parameters("PASS"))
+                val reloaded = harness.reloadCoordinator()
+                reloaded.startAll()
+                assertNotNull(scheduler).advanceTimeBy(60_000)
+                assertNotNull(scheduler).runCurrent()
+                assertEquals(RecoveryPhase.DISCONNECTED, reloaded.networks.value.single().connectionPhase)
+                assertEquals(JoinState.IDLE, reloaded.buffers.value[room.storageKey]?.joinState)
+                assertEquals(1, server.clients.size)
+            }
+        }
+    }
+
+    @Test
+    fun disconnectWithoutASessionSurvivesColdStartAndStaleEditorSettings() = runBlocking {
+        Server().use { server ->
+            harness(config(server)).use { harness ->
+                harness.coordinator.disconnect(harness.config.id)
+                assertTrue(NetworkStore(harness.directory).all().single().userDisconnected)
+                assertTrue(harness.coordinator.updateNetwork(harness.config.copy(nick = "savedOffline")))
+                assertTrue(NetworkStore(harness.directory).all().single().userDisconnected)
+                val reloaded = harness.reloadCoordinator()
+                reloaded.startAll()
+                reloaded.updateConnectivity(true, 2)
+                reloaded.onForegroundResume()
+                assertNotNull(scheduler).advanceTimeBy(60_000)
+                assertNotNull(scheduler).runCurrent()
+                assertEquals(RecoveryPhase.USER_DISCONNECTED, reloaded.networks.value.single().connectionPhase)
+                assertTrue(server.clients.isEmpty())
+                val room = ConversationRef.channel(harness.config.id, "#room")
+                assertEquals(JoinState.IDLE, reloaded.buffers.value[room.storageKey]?.joinState)
+                reloaded.connectNetwork(harness.config.id)
+                await { reloaded.networks.value.single().status == ConnectionStatus.REGISTERED }
+                await { reloaded.buffers.value[room.storageKey]?.joinState == JoinState.JOINED }
+                assertTrue("NICK savedOffline" in server.clients.single().received)
+                assertFalse(NetworkStore(harness.directory).all().single().userDisconnected)
+            }
+        }
+    }
+
+    @Test
+    fun offlineStartupAndLostRoutesPauseSocketsAndOnlineWakeIsImmediate() = runBlocking {
+        Server().use { server ->
+            harness(config(server)).use { harness ->
+                val coordinator = harness.coordinator
+                coordinator.updateConnectivity(false)
+                coordinator.startAll()
+                assertNotNull(scheduler).advanceTimeBy(60_000)
+                assertNotNull(scheduler).runCurrent()
+                assertEquals(RecoveryPhase.OFFLINE, coordinator.networks.value.single().connectionPhase)
+                assertTrue(harness.createdConfigs.isEmpty())
+                assertTrue(server.clients.isEmpty())
+                coordinator.updateConnectivity(true, 1)
+                await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                val first = server.clients.single()
+                coordinator.updateConnectivity(false)
+                await { first.closed }
+                val count = harness.createdConfigs.size
+                coordinator.onForegroundResume()
+                assertNotNull(scheduler).advanceTimeBy(60_000)
+                assertNotNull(scheduler).runCurrent()
+                assertEquals(count, harness.createdConfigs.size)
+                assertEquals(RecoveryPhase.OFFLINE, coordinator.networks.value.single().connectionPhase)
+                coordinator.updateConnectivity(true, 2)
+                await { server.clients.size == 2 && coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                assertEquals(2, harness.createdConfigs.size)
+            }
+        }
+    }
+
+    @Test
+    fun foregroundAndRouteProbesCoalesceIgnoreUnrelatedPongsAndRearmAfterSuccess() = runBlocking {
+        Server(acknowledgeProbes = false).use { server ->
+            harness(config(server)).use { harness ->
+                val coordinator = harness.coordinator
+                coordinator.startAll()
+                await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                val client = server.clients.single()
+                coordinator.onForegroundResume()
+                coordinator.onForegroundResume()
+                coordinator.updateConnectivity(true, 3)
+                coordinator.updateConnectivity(true, 3)
+                await { client.received.count { it.startsWith("PING ") } == 1 }
+                client.send(":srv PONG srv :unrelated")
+                client.send(":srv 372 tester :probe-still-pending")
+                await { coordinator.buffers.value[ConversationRef.server(harness.config.id).storageKey]?.messages?.any { it.text == "probe-still-pending" } == true }
+                assertEquals(1, server.clients.size)
+                val token = client.received.single { it.startsWith("PING ") }.substringAfter(':')
+                client.send(":srv PONG srv :$token")
+                client.send(":srv 372 tester :probe-complete")
+                await { coordinator.buffers.value[ConversationRef.server(harness.config.id).storageKey]?.messages?.any { it.text == "probe-complete" } == true }
+                coordinator.onForegroundResume()
+                await { client.received.count { it.startsWith("PING ") } == 2 }
+                assertEquals(1, server.clients.size)
+            }
+        }
+    }
+
+    @Test
+    fun staleFailedProbeCannotCloseTheCredentialReplacementSocket() = runBlocking {
+        Server(acknowledgeProbes = false).use { oldServer ->
+            Server().use { replacement ->
+                harness(config(oldServer)).use { harness ->
+                    val coordinator = harness.coordinator
+                    coordinator.startAll()
+                    await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                    coordinator.onForegroundResume()
+                    await { oldServer.clients.single().received.any { it.startsWith("PING ") } }
+                    harness.vault.storePassword("replacement-pass", "new-password")
+                    assertTrue(coordinator.updateNetwork(harness.config.copy(
+                        port = replacement.port, serverPasswordRef = "replacement-pass",
+                    ), credentialsChanged = true))
+                    await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                    assertNotNull(scheduler).advanceTimeBy(5_001)
+                    assertNotNull(scheduler).runCurrent()
+                    val active = replacement.clients.single()
+                    assertFalse(active.closed)
+                    assertEquals(2, harness.createdConfigs.size)
+                    assertEquals(listOf("new-password"), active.parameters("PASS"))
+                    assertTrue(coordinator.sendText(harness.config.id, "network|#room", "new socket survived"))
+                    await { "PRIVMSG #room :new socket survived" in active.received }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun failedCurrentProbeRestartsOnceAndPreservesTheStoredTranscriptAnchor() = runBlocking {
+        Server(acknowledgeProbes = false).use { server ->
+            harness(config(server)).use { harness ->
+                val coordinator = harness.coordinator
+                val room = ConversationRef.channel(harness.config.id, "#room")
+                record(harness, room, "phase1-anchor", "Saved before the route changed", 1_000)
+                coordinator.ensureConversation(room.networkId, room.rawTarget)
+                assertTrue(coordinator.loadPersistedHistory(room.storageKey))
+                await { coordinator.buffers.value[room.storageKey]?.messages?.singleOrNull()?.msgid == "phase1-anchor" }
+                val identity = assertNotNull(coordinator.buffers.value[room.storageKey]).messages.single().localId
+                coordinator.startAll()
+                await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                coordinator.onForegroundResume()
+                await { server.clients.single().received.any { it.startsWith("PING ") } }
+                assertNotNull(scheduler).advanceTimeBy(5_001)
+                await { server.clients.size == 2 && coordinator.networks.value.single().status == ConnectionStatus.REGISTERED &&
+                    "JOIN #room" in server.clients.last().received }
+                assertEquals(identity, coordinator.buffers.value[room.storageKey]?.messages?.single()?.localId)
+                assertEquals("phase1-anchor", harness.messages.recent(room, 10).single().msgid)
+                assertEquals(2, harness.createdConfigs.size)
+                assertEquals(1, server.clients.last().received.count { it == "JOIN #room" })
+            }
+        }
+    }
+
+    @Test
+    fun saslAndServerPasswordRejectionsBlockAutjoinsHistoryAndRecoveryStorms() = runBlocking {
+        for (sasl in listOf(true, false)) {
+            Server(welcomeAutomatically = sasl, rejectSasl = sasl, rejectServerPassword = !sasl, historyAvailable = true).use { rejected ->
+                Server().use { corrected ->
+                    val config = if (sasl) config(rejected).copy(saslAuthcid = "account", saslPasswordRef = "auth")
+                    else config(rejected).copy(serverPasswordRef = "auth")
+                    harness(config).use { harness ->
+                        val coordinator = harness.coordinator
+                        harness.vault.storePassword("auth", "not-accepted")
+                        coordinator.startAll()
+                        await { coordinator.networks.value.single().connectionPhase == RecoveryPhase.AUTHENTICATION_REJECTED }
+                        assertNotNull(coordinator.networks.value.single().connectionError)
+                        assertEquals(ConnectionStatus.DISCONNECTED, coordinator.networks.value.single().status)
+                        assertTrue(rejected.clients.single().received.none { it.startsWith("JOIN ") || "CHATHISTORY" in it })
+                        coordinator.onForegroundResume()
+                        coordinator.updateConnectivity(false)
+                        coordinator.updateConnectivity(true, 5)
+                        assertNotNull(scheduler).advanceTimeBy(60_000)
+                        assertNotNull(scheduler).runCurrent()
+                        assertEquals(1, harness.createdConfigs.size)
+                        assertTrue(coordinator.updateNetwork(config.copy(port = corrected.port)))
+                        await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                        assertEquals(1, corrected.clients.size)
+                        assertEquals(2, harness.createdConfigs.size)
+                        assertEquals(null, coordinator.networks.value.single().connectionError)
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun everyReferencedSecretFailsClosedBeforeAnySocketIsCreated() = runBlocking {
+        Server().use { server ->
+            val base = config(server)
+            val missing = listOf(
+                base.copy(saslAuthcid = "account", saslPasswordRef = "missing"),
+                base.copy(serverPasswordRef = "missing"),
+                base.copy(nickServAccount = "account", nickServPasswordRef = "missing"),
+                base.copy(proxy = SocksProxyConfig("127.0.0.1", server.port, "proxyUser", "missing")),
+            )
+            for (config in missing) {
+                harness(config).use { harness ->
+                    val coordinator = harness.coordinator
+                    coordinator.startAll()
+                    await { coordinator.networks.value.single().connectionPhase == RecoveryPhase.AUTHENTICATION_REJECTED }
+                    assertTrue(assertNotNull(coordinator.networks.value.single().connectionError).contains("password"))
+                    coordinator.onForegroundResume()
+                    coordinator.updateConnectivity(true, 7)
+                    assertNotNull(scheduler).advanceTimeBy(60_000)
+                    assertNotNull(scheduler).runCurrent()
+                    assertTrue(harness.createdConfigs.isEmpty())
+                    assertTrue(server.clients.isEmpty())
+                }
+            }
+        }
+    }
+
+    @Test
+    fun nickServConfirmationReleasesRegistrationJoinsAndHistoryExactlyOnce() = runBlocking {
+        Server(historyAvailable = true).use { server ->
+            val config = config(server).copy(nickServAccount = "account", nickServPasswordRef = "nickserv")
+            harness(config).use { harness ->
+                val coordinator = harness.coordinator
+                harness.vault.storePassword("nickserv", "saved-nickserv-password")
+                val room = ConversationRef.channel(config.id, "#room")
+                record(harness, room, "anchor-before-identify", "Preserved phase one anchor", 1_000)
+                coordinator.startAll()
+                await { coordinator.networks.value.single().connectionPhase == RecoveryPhase.IDENTIFYING }
+                val client = server.clients.single()
+                await { "PRIVMSG NickServ :IDENTIFY account saved-nickserv-password" in client.received }
+                assertTrue(client.received.none { it.startsWith("JOIN ") || "CHATHISTORY" in it })
+                assertEquals(ConnectionStatus.CONNECTING, coordinator.networks.value.single().status)
+                client.send(":EvilNickServ!u@h NOTICE tester :You are now identified")
+                client.send("@batch=old :NickServ!u@h NOTICE tester :You are now identified")
+                client.send(":srv 372 tester :identity-still-pending")
+                await { coordinator.buffers.value[ConversationRef.server(config.id).storageKey]?.messages?.any { it.text == "identity-still-pending" } == true }
+                assertEquals(RecoveryPhase.IDENTIFYING, coordinator.networks.value.single().connectionPhase)
+                client.send(":srv 900 tester tester!u@h account :You are now logged in")
+                await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED && client.received.any { "CHATHISTORY" in it } }
+                client.send(":srv 900 tester tester!u@h account :Duplicate confirmation")
+                client.welcome()
+                client.send(":srv 372 tester :identity-complete")
+                await { coordinator.buffers.value[ConversationRef.server(config.id).storageKey]?.messages?.any { it.text == "identity-complete" } == true }
+                assertEquals(1, client.received.count { it == "JOIN #room" })
+                assertEquals(1, client.received.count { it.startsWith("PRIVMSG NickServ :IDENTIFY") })
+                assertEquals("anchor-before-identify", harness.messages.recent(room, 10).single().msgid)
+            }
+        }
+    }
+
+    @Test
+    fun nickServRejectionAndTimeoutBlockJoinsThenManualRetryUsesAFreshGate() = runBlocking {
+        for (reject in listOf(true, false)) {
+            Server(historyAvailable = true).use { server ->
+                val config = config(server).copy(nickServAccount = "account", nickServPasswordRef = "nickserv")
+                harness(config).use { harness ->
+                    val coordinator = harness.coordinator
+                    harness.vault.storePassword("nickserv", "secret")
+                    coordinator.startAll()
+                    await { server.clients.singleOrNull()?.received?.any { it.startsWith("PRIVMSG NickServ :IDENTIFY") } == true }
+                    val first = server.clients.single()
+                    if (reject) first.send(":NickServ!u@h NOTICE tester :Password incorrect")
+                    else assertNotNull(scheduler).advanceTimeBy(7_001)
+                    await { coordinator.networks.value.single().connectionPhase == RecoveryPhase.AUTHENTICATION_REJECTED }
+                    assertTrue(first.received.none { it.startsWith("JOIN ") || "CHATHISTORY" in it })
+                    assertTrue(assertNotNull(coordinator.networks.value.single().connectionError).contains(if (reject) "rejected" else "seven seconds"))
+                    coordinator.onForegroundResume()
+                    coordinator.updateConnectivity(true, 9)
+                    assertNotNull(scheduler).advanceTimeBy(60_000)
+                    assertNotNull(scheduler).runCurrent()
+                    assertEquals(1, server.clients.size)
+                    coordinator.connectNetwork(config.id)
+                    await { server.clients.size == 2 && server.clients.last().received.any { it.startsWith("PRIVMSG NickServ :IDENTIFY") } }
+                    val second = server.clients.last()
+                    second.send(":NickServ!u@h NOTICE tester :You are now identified")
+                    await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED && "JOIN #room" in second.received }
+                    assertEquals(1, second.received.count { it == "JOIN #room" })
+                    assertEquals(2, harness.createdConfigs.size)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun nonwaitingNickServJoinsImmediatelyButStillSurfacesARejection() = runBlocking {
+        Server().use { server ->
+            val config = config(server).copy(nickServPasswordRef = "nickserv", waitForNickServ = false)
+            harness(config).use { harness ->
+                harness.vault.storePassword("nickserv", "secret")
+                val coordinator = harness.coordinator
+                coordinator.startAll()
+                await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED && "JOIN #room" in server.clients.single().received }
+                server.clients.single().send(":NickServ!u@h NOTICE tester :Password incorrect")
+                await { coordinator.networks.value.single().connectionPhase == RecoveryPhase.AUTHENTICATION_REJECTED }
+                assertEquals(ConnectionStatus.DISCONNECTED, coordinator.networks.value.single().status)
+                assertFalse(coordinator.sendText(config.id, "network|#room", "not authenticated"))
+            }
+        }
+    }
+
+    @Test
+    fun rejectedCertificateRequiresMatchingConsentAndRemovalRestoresPlatformVerification() = runBlocking {
+        Server(tlsFixture = "private").use { server ->
+            val config = config(server).copy(tls = true)
+            harness(config).use { harness ->
+                val coordinator = harness.coordinator
+                coordinator.startAll()
+                await { coordinator.networks.value.single().connectionPhase == RecoveryPhase.CERTIFICATE_REJECTED }
+                val inspection = assertNotNull(coordinator.networks.value.single().rejectedCertificate)
+                assertEquals("127.0.0.1", inspection.host)
+                assertEquals(server.port, inspection.port)
+                assertEquals(tlsFingerprint("private"), inspection.certificates.first().sha256)
+                assertFalse(coordinator.trustCertificate(config.id, inspection.copy(port = server.port + 1)))
+                assertEquals(null, NetworkStore(harness.directory).all().single().certificatePin)
+                assertTrue(coordinator.trustCertificate(config.id, inspection))
+                awaitRegistered(harness, server)
+                val pin = assertNotNull(NetworkStore(harness.directory).all().single().certificatePin)
+                assertEquals(CertificatePin(inspection.host, inspection.port, inspection.certificates.first().sha256), pin)
+                assertTrue(coordinator.networks.value.single().hasCertificatePin)
+                assertEquals(2, harness.createdConfigs.size)
+                assertTrue(coordinator.removeCertificateTrust(config.id))
+                await { coordinator.networks.value.single().connectionPhase == RecoveryPhase.CERTIFICATE_REJECTED }
+                assertFalse(coordinator.networks.value.single().hasCertificatePin)
+                assertEquals(null, NetworkStore(harness.directory).all().single().certificatePin)
+                assertEquals(3, harness.createdConfigs.size)
+                coordinator.onForegroundResume()
+                coordinator.updateConnectivity(true, 10)
+                assertNotNull(scheduler).advanceTimeBy(60_000)
+                assertNotNull(scheduler).runCurrent()
+                assertEquals(3, harness.createdConfigs.size)
+            }
+        }
+    }
+
+    @Test
+    fun aSavedPinIsNotReusedForAnEditedOrStsUpgradedEndpoint() = runBlocking {
+        Server(tlsFixture = "private").use { first ->
+            Server(tlsFixture = "private").use { second ->
+                val config = config(first).copy(tls = true, certificatePin = CertificatePin("127.0.0.1", first.port, tlsFingerprint("private")))
+                harness(config).use { harness ->
+                    val coordinator = harness.coordinator
+                    coordinator.startAll()
+                    awaitRegistered(harness, first)
+                    assertTrue(coordinator.updateNetwork(config.copy(port = second.port)))
+                    await { coordinator.networks.value.single().connectionPhase == RecoveryPhase.CERTIFICATE_REJECTED }
+                    assertEquals(null, harness.createdConfigs.last().certificatePin)
+                    assertEquals(config.certificatePin, NetworkStore(harness.directory).all().single().certificatePin)
+                }
+                val upgraded = config.copy(tls = false)
+                harness(upgraded).use { harness ->
+                    harness.policies.save("127.0.0.1", StsPolicy(second.port, System.currentTimeMillis() / 1000 + 3_600))
+                    harness.coordinator.startAll()
+                    await { harness.coordinator.networks.value.single().connectionPhase == RecoveryPhase.CERTIFICATE_REJECTED }
+                    val effective = harness.createdConfigs.single()
+                    assertTrue(effective.tls)
+                    assertEquals(second.port, effective.port)
+                    assertEquals(null, effective.certificatePin)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun missingIdentityAndExternalWithoutTlsFailBeforeCreatingASocket() = runBlocking {
+        Server().use { server ->
+            for (config in listOf(
+                    config(server).copy(tlsClientAlias = "removed-alias"),
+                    config(server).copy(saslMode = SaslMode.EXTERNAL),
+                )
+            ) {
+                harness(config).use { harness ->
+                    harness.coordinator.startAll()
+                    await { harness.coordinator.networks.value.single().connectionPhase == RecoveryPhase.AUTHENTICATION_REJECTED }
+                    assertTrue(assertNotNull(harness.coordinator.networks.value.single().connectionError).contains("TLS"))
+                    assertTrue(harness.createdConfigs.isEmpty())
+                    assertTrue(server.clients.isEmpty())
+                }
+            }
+        }
+    }
+
+    @Test
+    fun clientAliasesResolvePerNetworkAndTheirActualChainsReachTheirOwnTlsEndpoints() = runBlocking {
+        Server(tlsFixture = "private", requireClientIdentity = true).use { first ->
+            Server(tlsFixture = "private", requireClientIdentity = true).use { second ->
+                val aliases = CopyOnWriteArrayList<String>()
+                val firstIdentity = tlsIdentity()
+                val secondIdentity = tlsIdentity()
+                val config = config(first).copy(
+                    tls = true, tlsClientAlias = "first-alias",
+                    certificatePin = CertificatePin("127.0.0.1", first.port, tlsFingerprint("private")),
+                )
+                harness(config, identityProvider = { alias ->
+                    aliases.add(alias)
+                    when (alias) {
+                        "first-alias" -> firstIdentity
+                        "second-alias" -> secondIdentity
+                        else -> throw TlsIdentityUnavailableException("Unknown TLS identity.")
+                    }
+                }).use { harness ->
+                    val secondConfig = config.copy(
+                        id = "second-network", port = second.port, tlsClientAlias = "second-alias",
+                        certificatePin = CertificatePin("127.0.0.1", second.port, tlsFingerprint("private")),
+                    )
+                    assertTrue(harness.networks.add(secondConfig))
+                    harness.coordinator.startAll()
+                    awaitRegistered(harness, first, second)
+                    assertEquals(setOf("first-alias", "second-alias"), aliases.toSet())
+                    assertTrue(harness.createdConfigs.single { it.id == config.id }.tlsClientIdentity === firstIdentity)
+                    assertTrue(harness.createdConfigs.single { it.id == secondConfig.id }.tlsClientIdentity === secondIdentity)
+                    assertEquals(firstIdentity.certificates.map { it.serialNumber }, first.clients.single().peerCertificates.map { it.serialNumber })
+                    assertEquals(secondIdentity.certificates.map { it.serialNumber }, second.clients.single().peerCertificates.map { it.serialNumber })
+                    assertEquals(config.username, harness.createdConfigs.first().username)
+                    harness.coordinator.disconnect(secondConfig.id)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun proxyAuthenticationFailureIsStructuredAndDoesNotRetryOrRegister() = runBlocking {
+        Server().use { destination ->
+            Proxy(rejectAuthentication = true).use { proxy ->
+                val config = config(destination).copy(proxy = SocksProxyConfig("127.0.0.1", proxy.port, "proxy-user", "proxy"))
+                harness(config).use { harness ->
+                    harness.vault.storePassword("proxy", "proxy-secret")
+                    val coordinator = harness.coordinator
+                    coordinator.startAll()
+                    await { coordinator.networks.value.single().connectionPhase == RecoveryPhase.AUTHENTICATION_REJECTED }
+                    assertTrue(assertNotNull(coordinator.networks.value.single().connectionError).contains("proxy"))
+                    assertEquals(listOf("proxy-user"), proxy.usernames)
+                    assertEquals(listOf("proxy-secret"), proxy.passwords)
+                    assertTrue(destination.clients.isEmpty())
+                    coordinator.onForegroundResume()
+                    coordinator.updateConnectivity(true, 11)
+                    assertNotNull(scheduler).advanceTimeBy(60_000)
+                    assertNotNull(scheduler).runCurrent()
+                    assertEquals(1, harness.createdConfigs.size)
+                    assertEquals(1, proxy.passwords.size)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun allResolvedCredentialsReachTheirIntendedLoginAndStayOutOfTranscriptsRoomAndRawLogs() = runBlocking {
+        Server().use { destination ->
+            Proxy().use { proxy ->
+                val secrets = listOf("sasl-secret", "server-secret", "nickserv-secret", "proxy-secret")
+                val config = config(destination).copy(
+                    host = "localhost", alternateNicks = listOf("alternate"), saslAuthcid = "account", saslPasswordRef = "sasl",
+                    serverPasswordRef = "server", nickServAccount = "account", nickServPasswordRef = "nickserv",
+                    proxy = SocksProxyConfig("127.0.0.1", proxy.port, "proxy-user", "proxy"),
+                )
+                harness(config).use { harness ->
+                    listOf("sasl", "server", "nickserv", "proxy").zip(secrets).forEach { (reference, password) ->
+                        harness.vault.storePassword(reference, password)
+                    }
+                    val coordinator = harness.coordinator
+                    coordinator.startAll()
+                    await { coordinator.networks.value.single().connectionPhase == RecoveryPhase.IDENTIFYING }
+                    val client = destination.clients.single()
+                    await { "PRIVMSG NickServ :IDENTIFY account nickserv-secret" in client.received }
+                    assertEquals(listOf("localhost" to destination.port), proxy.destinations)
+                    assertEquals(listOf("proxy-secret"), proxy.passwords)
+                    assertEquals("\u0000account\u0000sasl-secret", credentials(client))
+                    assertEquals(listOf("server-secret"), client.parameters("PASS"))
+                    client.send(":NickServ!u@h NOTICE tester :You are now identified")
+                    await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                    val room = ConversationRef.channel(config.id, "#room")
+                    val text = secrets.joinToString(" ")
+                    assertTrue(coordinator.sendText(config.id, room.storageKey, text))
+                    await { "PRIVMSG #room :$text" in client.received }
+                    client.send("@msgid=credential-echo :alice!u@h PRIVMSG #room :$text")
+                    await { harness.messages.recent(room, 10).size == 2 }
+                    assertTrue(assertNotNull(coordinator.buffers.value[room.storageKey]).messages.all { message ->
+                        secrets.none(message.text::contains)
+                    })
+                    assertTrue(harness.messages.recent(room, 10).all { message -> secrets.none(message.text::contains) })
+                    assertTrue(coordinator.rawLog(config.id).all { frame -> secrets.none(frame.line::contains) })
+                    val encoded = client.received.first { it.startsWith("AUTHENTICATE ") && it != "AUTHENTICATE PLAIN" }
+                        .substringAfter(' ')
+                    client.send("@msgid=encoded-credential-echo :alice!u@h PRIVMSG #room :$encoded")
+                    await { harness.messages.recent(room, 10).size == 3 }
+                    assertTrue(harness.messages.recent(room, 10).none { encoded in it.text })
+                    assertTrue(assertNotNull(coordinator.buffers.value[room.storageKey]).messages.none { encoded in it.text })
+                    assertTrue(coordinator.rawLog(config.id).none { encoded in it.line })
+                    assertTrue(harness.createdConfigs.single().alternateNicks == listOf("alternate"))
+                    val privateMessage = "IDENTIFY account nickserv-secret"
+                    val serviceLine = "PRIVMSG NickServ :$privateMessage"
+                    val sentServiceMessages = client.received.count { it == serviceLine }
+                    assertTrue(coordinator.sendText(config.id, room.storageKey, "/msg NickServ $privateMessage"))
+                    val service = ConversationRef.directMessage(config.id, "NickServ")
+                    await {
+                        client.received.count { it == serviceLine } == sentServiceMessages + 1 &&
+                            harness.messages.recent(service, 10).any { it.sentByUs }
+                    }
+                    val serviceMessages = harness.messages.recent(service, 10)
+                    assertTrue(serviceMessages.all { message -> secrets.none(message.text::contains) })
+                    val serviceBuffer = assertNotNull(coordinator.buffers.value[service.storageKey])
+                    assertTrue(serviceBuffer.messages.any { it.sentByUs })
+                    assertTrue(serviceBuffer.messages.all { message -> secrets.none(message.text::contains) })
+                    assertTrue(coordinator.rawLog(config.id).all { frame -> secrets.none(frame.line::contains) })
+                }
+            }
+        }
+    }
+
+    @Test
+    fun restoredMissingSecretCanBeManuallyRetriedOfflineWithoutOpeningASocketUntilOnline() = runBlocking {
+        Server().use { server ->
+            val config = config(server).copy(saslAuthcid = "account", saslPasswordRef = "missing")
+            harness(config).use { harness ->
+                val coordinator = harness.coordinator
+                coordinator.startAll()
+                await { coordinator.networks.value.single().connectionPhase == RecoveryPhase.AUTHENTICATION_REJECTED }
+                assertTrue(harness.createdConfigs.isEmpty())
+                harness.vault.storePassword("missing", "restored-secret")
+                coordinator.updateConnectivity(false)
+                coordinator.connectNetwork(config.id)
+                assertNotNull(scheduler).advanceTimeBy(60_000)
+                assertNotNull(scheduler).runCurrent()
+                assertEquals(RecoveryPhase.OFFLINE, coordinator.networks.value.single().connectionPhase)
+                assertTrue(harness.createdConfigs.isEmpty())
+                assertTrue(server.clients.isEmpty())
+                coordinator.updateConnectivity(true, 12)
+                await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                assertEquals("\u0000account\u0000restored-secret", credentials(server.clients.single()))
+                assertEquals(1, harness.createdConfigs.size)
+                assertEquals(null, coordinator.networks.value.single().connectionError)
+            }
+        }
+    }
+
+    @Test
+    fun nickServOwnNickChangeConfirmsTheFinalIdentityWithoutRevertingToTheWelcomeNickname() = runBlocking {
+        Server().use { server ->
+            val config = config(server).copy(nickServAccount = "accountName", nickServPasswordRef = "nickserv")
+            harness(config).use { harness ->
+                val coordinator = harness.coordinator
+                harness.vault.storePassword("nickserv", "secret")
+                coordinator.startAll()
+                await { server.clients.singleOrNull()?.received?.any { it.startsWith("PRIVMSG NickServ :IDENTIFY") } == true }
+                val client = server.clients.single()
+                client.renameOwnNick("accountName")
+                client.send(":NickServ!services@h NOTICE accountName :You're now logged in as accountName.")
+                await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED &&
+                    coordinator.buffers.value["network|#room"]?.joinState == JoinState.JOINED }
+                assertEquals("accountName", coordinator.networks.value.single().ownNick)
+                assertEquals(1, client.received.count { it == "JOIN #room" })
+                assertEquals(1, client.received.count { it.startsWith("PRIVMSG NickServ :IDENTIFY") })
+            }
+        }
+    }
+
+    @Test
+    fun nonwaitingNickServTimeoutSurfacesAnErrorWithoutDisconnectingOrJoiningAgain() = runBlocking {
+        Server().use { server ->
+            val config = config(server).copy(nickServPasswordRef = "nickserv", waitForNickServ = false)
+            harness(config).use { harness ->
+                val coordinator = harness.coordinator
+                harness.vault.storePassword("nickserv", "secret")
+                coordinator.startAll()
+                await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED && "JOIN #room" in server.clients.single().received }
+                assertNotNull(scheduler).advanceTimeBy(7_001)
+                await { coordinator.networks.value.single().connectionError?.contains("seven seconds") == true }
+                assertEquals(ConnectionStatus.REGISTERED, coordinator.networks.value.single().status)
+                assertEquals(RecoveryPhase.REGISTERED, coordinator.networks.value.single().connectionPhase)
+                assertFalse(server.clients.single().closed)
+                assertEquals(1, server.clients.single().received.count { it == "JOIN #room" })
+            }
+        }
+    }
+
+    @Test
+    fun externalUsesTheSelectedRealClientCertificateWithoutRequiringAPasswordReference() = runBlocking {
+        Server(tlsFixture = "private", requireClientIdentity = true, advertisedSasl = "EXTERNAL").use { server ->
+            val identity = tlsIdentity()
+            val config = config(server).copy(
+                tls = true, saslMode = SaslMode.EXTERNAL, saslAuthcid = "authorization", tlsClientAlias = "client",
+                certificatePin = CertificatePin("127.0.0.1", server.port, tlsFingerprint("private")),
+            )
+            harness(config, identityProvider = { alias ->
+                check(alias == "client")
+                identity
+            }).use { harness ->
+                harness.coordinator.startAll()
+                awaitRegistered(harness, server)
+                val client = server.clients.single()
+                assertTrue("AUTHENTICATE EXTERNAL" in client.received)
+                assertFalse("AUTHENTICATE PLAIN" in client.received)
+                assertEquals(identity.certificates.map { it.serialNumber }, client.peerCertificates.map { it.serialNumber })
+                assertEquals(null, harness.createdConfigs.single().saslPassword)
+                assertEquals(SaslMode.EXTERNAL, harness.createdConfigs.single().saslMode)
+                assertTrue(harness.createdConfigs.single().tlsClientIdentity === identity)
+            }
+        }
+    }
+
+    @Test
+    fun networkRemovalRetiresOnlyUnsharedSecretsAcrossEveryCredentialRole() = runBlocking {
+        Server().use { server ->
+            val config = config(server).copy(
+                autoConnect = false, saslAuthcid = "account", saslPasswordRef = "shared", serverPasswordRef = "owned-pass",
+                nickServPasswordRef = "shared-service", proxy = SocksProxyConfig("localhost", 1080, "proxy-user", "owned-proxy"),
+            )
+            harness(config).use { harness ->
+                for (reference in listOf("shared", "owned-pass", "shared-service", "owned-proxy")) {
+                    harness.vault.storePassword(reference, "secret-for-$reference")
+                }
+                val retained = config.copy(
+                    id = "retained", saslPasswordRef = null, serverPasswordRef = "shared",
+                    nickServPasswordRef = "shared-service", proxy = null,
+                )
+                assertTrue(harness.networks.add(retained))
+                harness.coordinator.startAll()
+                harness.coordinator.removeNetwork(config.id)
+                await { harness.vault.readPassword("owned-pass") == null && harness.vault.readPassword("owned-proxy") == null }
+                assertEquals(listOf(retained), NetworkStore(harness.directory).all())
+                assertEquals("secret-for-shared", harness.vault.readPassword("shared"))
+                assertEquals("secret-for-shared-service", harness.vault.readPassword("shared-service"))
+                assertTrue(harness.coordinator.buffers.value.values.none { it.ref.networkId == config.id })
+                assertTrue(harness.createdConfigs.isEmpty())
+            }
+        }
+    }
+
+    @Test
+    fun committedNetworkRemovalReportsVaultCleanupFailureWithoutUndoingTheRemoval() = runBlocking {
+        Server().use { server ->
+            val backing = InMemoryCredentialVault()
+            val vault = object : CredentialVault by backing {
+                override fun deletePassword(key: String) {
+                    throw java.io.IOException("must-not-be-logged-secret")
+                }
+            }
+            val config = config(server).copy(autoConnect = false, serverPasswordRef = "password")
+            harness(config, vault = vault).use { harness ->
+                harness.vault.storePassword("password", "secret")
+                harness.coordinator.startAll()
+                harness.coordinator.removeNetwork(config.id)
+                await { harness.coordinator.rawLog(config.id).any { "could not be deleted" in it.line } }
+                assertTrue(NetworkStore(harness.directory).all().isEmpty())
+                assertTrue(harness.coordinator.networks.value.isEmpty())
+                assertEquals("secret", backing.readPassword("password"))
+                assertTrue(harness.coordinator.rawLog(config.id).none { "must-not-be-logged-secret" in it.line })
+                assertTrue(harness.createdConfigs.isEmpty())
+            }
+        }
+    }
+
+    @Test
+    fun explicitPasswordSaslModesWithMissingOrEmptySecretsNeverDowngradeOrCreateASocket() = runBlocking {
+        Server(historyAvailable = true).use { server ->
+            for (mode in listOf(SaslMode.PLAIN, SaslMode.SCRAM_SHA_256)) {
+                for (reference in listOf(null, "empty")) {
+                    val config = config(server).copy(saslMode = mode, saslAuthcid = "account", saslPasswordRef = reference)
+                    harness(config).use { harness ->
+                        if (reference != null) harness.vault.storePassword(reference, "")
+                        val coordinator = harness.coordinator
+                        coordinator.startAll()
+                        await { coordinator.networks.value.single().connectionPhase == RecoveryPhase.AUTHENTICATION_REJECTED }
+                        assertTrue(assertNotNull(coordinator.networks.value.single().connectionError).contains("requires a saved password"))
+                        assertTrue(harness.createdConfigs.isEmpty())
+                        assertTrue(server.clients.isEmpty())
+                        coordinator.onForegroundResume()
+                        coordinator.updateConnectivity(true, 13)
+                        assertNotNull(scheduler).advanceTimeBy(60_000)
+                        assertNotNull(scheduler).runCurrent()
+                        assertTrue(harness.createdConfigs.isEmpty())
+                        assertEquals(mode, NetworkStore(harness.directory).all().single().saslMode)
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun lateFalseFromARetiredProbeCannotCloseANewConnectionWithinTheSameSession() = runBlocking {
+        Server(acknowledgeProbes = false).use { server ->
+            val dispatcher = HoldingProbeDispatcher()
+            harness(config(server), dispatcher).use { harness ->
+                val coordinator = harness.coordinator
+                try {
+                    coordinator.startAll()
+                    await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED &&
+                        coordinator.buffers.value["network|#room"]?.members?.isNotEmpty() == true }
+                    dispatcher.captureNextLaunch()
+                    coordinator.onForegroundResume()
+                    val probeJob = assertNotNull(dispatcher.heldJob)
+                    dispatcher.startHeldLaunch()
+                    await { server.clients.single().received.any { it.startsWith("PING ") } }
+                    server.clients.single().close()
+                    await { dispatcher.pending > 0 && server.clients.size == 2 &&
+                        coordinator.networks.value.single().status == ConnectionStatus.REGISTERED &&
+                        "JOIN #room" in server.clients.last().received }
+                    assertTrue(probeJob.isActive)
+                    val replacement = server.clients.last()
+                    dispatcher.release()
+                    await { probeJob.isCompleted }
+                    assertEquals(ConnectionStatus.REGISTERED, coordinator.networks.value.single().status)
+                    assertFalse(replacement.closed)
+                    assertEquals(2, harness.createdConfigs.size)
+                    assertTrue(coordinator.sendText(harness.config.id, "network|#room", "late false was rejected"))
+                    await { "PRIVMSG #room :late false was rejected" in replacement.received }
+                } finally {
+                    dispatcher.release()
+                }
+            }
+        }
+    }
+
+    @Test
+    fun anOfflineRetiredSameEpochStsCallbackCannotRetargetTheNextConnection() = runBlocking {
+        Server().use { original ->
+            Server().use { staleUpgrade ->
+                harness(config(original)).use { harness ->
+                    val coordinator = harness.coordinator
+                    coordinator.startAll()
+                    await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                    val callback = harness.stsCallbacks.single()
+                    coordinator.updateConnectivity(false)
+                    await { original.clients.single().closed }
+                    callback(staleUpgrade.port)
+                    coordinator.updateConnectivity(true, 14)
+                    await { original.clients.size == 2 && coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                    assertEquals(original.port, harness.createdConfigs.last().port)
+                    assertFalse(harness.createdConfigs.last().tls)
+                    assertTrue(staleUpgrade.clients.isEmpty())
+                    assertEquals(2, harness.createdConfigs.size)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun manualConnectDoesNotOpenTransportWhenClearingTheDurableOptOutCannotBeSaved() = runBlocking {
+        Server().use { server ->
+            val config = config(server).copy(userDisconnected = true)
+            harness(config).use { harness ->
+                val coordinator = harness.coordinator
+                coordinator.startAll()
+                withBlockedNetworkFile(harness) {
+                    coordinator.connectNetwork(config.id)
+                    assertTrue(assertNotNull(coordinator.networks.value.single().connectionError).contains("Could not save Connect intent"))
+                    assertEquals(RecoveryPhase.USER_DISCONNECTED, coordinator.networks.value.single().connectionPhase)
+                    assertTrue(harness.networks.all().single().userDisconnected)
+                    assertNotNull(scheduler).runCurrent()
+                    assertTrue(harness.createdConfigs.isEmpty())
+                    assertTrue(server.clients.isEmpty())
+                }
+                assertTrue(NetworkStore(harness.directory).all().single().userDisconnected)
+                coordinator.connectNetwork(config.id)
+                await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                assertFalse(NetworkStore(harness.directory).all().single().userDisconnected)
+                assertEquals(1, harness.createdConfigs.size)
+            }
+        }
+    }
+
+    @Test
+    fun disconnectStopsTheCurrentSocketWhenRestartOptOutCannotBeSavedAndExplainsTheFailure() = runBlocking {
+        Server().use { server ->
+            harness(config(server)).use { harness ->
+                val coordinator = harness.coordinator
+                coordinator.startAll()
+                await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                val client = server.clients.single()
+                withBlockedNetworkFile(harness) {
+                    coordinator.disconnect(harness.config.id)
+                    await { client.closed }
+                    assertEquals(ConnectionStatus.DISCONNECTED, coordinator.networks.value.single().status)
+                    assertEquals(RecoveryPhase.USER_DISCONNECTED, coordinator.networks.value.single().connectionPhase)
+                    assertTrue(assertNotNull(coordinator.networks.value.single().connectionError).contains("restart disconnect preference was not saved"))
+                    assertFalse(harness.networks.all().single().userDisconnected)
+                    coordinator.onForegroundResume()
+                    coordinator.updateConnectivity(true, 15)
+                    assertNotNull(scheduler).advanceTimeBy(60_000)
+                    assertNotNull(scheduler).runCurrent()
+                    assertEquals(1, harness.createdConfigs.size)
+                }
+                assertFalse(NetworkStore(harness.directory).all().single().userDisconnected)
+                val reloaded = harness.reloadCoordinator()
+                reloaded.startAll()
+                await { server.clients.size == 2 && reloaded.networks.value.single().status == ConnectionStatus.REGISTERED }
+            }
+        }
+    }
+
+    @Test
+    fun certificateTrustAndRemovalReturnFalseWithoutReplacingTransportWhenDurableSaveFails() = runBlocking {
+        Server(tlsFixture = "private").use { server ->
+            val config = config(server).copy(tls = true)
+            harness(config).use { harness ->
+                val coordinator = harness.coordinator
+                coordinator.startAll()
+                await { coordinator.networks.value.single().connectionPhase == RecoveryPhase.CERTIFICATE_REJECTED }
+                val inspection = assertNotNull(coordinator.networks.value.single().rejectedCertificate)
+                withBlockedNetworkFile(harness) {
+                    assertFalse(coordinator.trustCertificate(config.id, inspection))
+                    assertTrue(assertNotNull(coordinator.networks.value.single().connectionError).contains("not saved"))
+                    assertEquals(null, harness.networks.all().single().certificatePin)
+                    assertEquals(1, harness.createdConfigs.size)
+                    assertEquals(inspection, coordinator.networks.value.single().rejectedCertificate)
+                }
+                assertEquals(null, NetworkStore(harness.directory).all().single().certificatePin)
+                assertTrue(coordinator.trustCertificate(config.id, inspection))
+                awaitRegistered(harness, server)
+                val pin = assertNotNull(NetworkStore(harness.directory).all().single().certificatePin)
+                val client = server.clients.last()
+                withBlockedNetworkFile(harness) {
+                    assertFalse(coordinator.removeCertificateTrust(config.id))
+                    assertEquals(pin, harness.networks.all().single().certificatePin)
+                    assertEquals(ConnectionStatus.REGISTERED, coordinator.networks.value.single().status)
+                    assertFalse(client.closed)
+                    assertEquals(2, harness.createdConfigs.size)
+                }
+                assertEquals(pin, NetworkStore(harness.directory).all().single().certificatePin)
+                assertTrue(coordinator.removeCertificateTrust(config.id))
+                await { coordinator.networks.value.single().connectionPhase == RecoveryPhase.CERTIFICATE_REJECTED }
+                assertEquals(3, harness.createdConfigs.size)
+            }
+        }
+    }
+
+    private suspend fun withBlockedNetworkFile(harness: Harness, action: suspend () -> Unit) {
+        val file = File(harness.directory, "networks.json")
+        val original = file.readText()
+        assertTrue(file.delete())
+        assertTrue(file.mkdir())
+        try {
+            action()
+        } finally {
+            assertTrue(file.deleteRecursively())
+            file.writeText(original)
+        }
+    }
+
     private suspend fun record(harness: Harness, ref: ConversationRef, msgid: String?, text: String, timestampMs: Long) {
         harness.messages.record(
             StoredMessage(
@@ -935,6 +2001,29 @@ class NetworkEditLifecycleTests {
         return String(Base64.getDecoder().decode(encoded), Charsets.UTF_8)
     }
 
+    private suspend fun awaitRegistered(harness: Harness, vararg servers: Server) {
+        await {
+            val networks = harness.coordinator.networks.value
+            val failed = networks.filter {
+                it.connectionPhase == RecoveryPhase.AUTHENTICATION_REJECTED ||
+                    it.connectionPhase == RecoveryPhase.CERTIFICATE_REJECTED ||
+                    it.connectionPhase == RecoveryPhase.SERVER_UNREACHABLE
+            }
+            if (failed.isNotEmpty()) {
+                val states = failed.joinToString { "${it.id}: ${it.connectionPhase}: ${it.connectionError}" }
+                val transports = servers.joinToString { server ->
+                    val clients = server.clients.joinToString { client ->
+                        "closed=${client.closed}, peerCertificates=${client.peerCertificates.map { it.serialNumber }}, " +
+                            "failure=${client.failure?.stackTraceToString()}"
+                    }
+                    "${server.port}: [$clients]"
+                }
+                throw AssertionError("Registration failed: $states; TLS endpoints: $transports")
+            }
+            networks.size == harness.networks.all().size && networks.all { it.status == ConnectionStatus.REGISTERED }
+        }
+    }
+
     private suspend fun await(condition: suspend () -> Boolean) {
         withTimeout(5_000) {
             while (true) {
@@ -942,6 +2031,28 @@ class NetworkEditLifecycleTests {
                 if (condition()) break
                 delay(10)
             }
+        }
+    }
+
+    private companion object {
+        val tlsPassword = "fixture-password".toCharArray()
+
+        fun tlsStore(name: String): KeyStore = KeyStore.getInstance("PKCS12").apply {
+            val relative = "core/client/src/test/resources/tls/$name.p12"
+            val file = listOf(File(relative), File("../$relative")).first { it.isFile }
+            file.inputStream().use { load(it, tlsPassword) }
+        }
+
+        fun tlsFingerprint(name: String): String = MessageDigest.getInstance("SHA-256")
+            .digest(tlsStore(name).getCertificate("server").encoded)
+            .joinToString("") { "%02x".format(it.toInt() and 255) }
+
+        fun tlsIdentity(): TlsClientIdentity {
+            val store = tlsStore("client")
+            return TlsClientIdentity(
+                store.getKey("client", tlsPassword) as PrivateKey,
+                requireNotNull(store.getCertificateChain("client")).map { it as X509Certificate }.toTypedArray(),
+            )
         }
     }
 }

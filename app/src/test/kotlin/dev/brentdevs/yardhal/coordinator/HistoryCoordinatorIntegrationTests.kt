@@ -652,7 +652,7 @@ class HistoryCoordinatorIntegrationTests {
         assertEquals("primary", harness.buffer().messages.single { it.msgid == "related" }.replyToMsgid)
         val offset = server.queries.size
         harness.coordinator.disconnect(harness.config.id)
-        harness.coordinator.connect(harness.config)
+        harness.coordinator.connectNetwork(harness.config.id)
         val reconnected = query(server, "LATEST", "#room", offset)
         assertEquals("msgid=primary", reconnected.message.parameters[2])
         server.reply(reconnected, emptyList())
@@ -929,7 +929,7 @@ class HistoryCoordinatorIntegrationTests {
         var offset = 0
         repeat(3) { reconnect ->
             harness.time.set(NOW + reconnect * 24L * 60 * 60 * 1_000)
-            harness.coordinator.connect(harness.config)
+            harness.coordinator.connectNetwork(harness.config.id)
             query(server, "*playback", "PLAY", offset)
             val gaps = HistoryCoverageStore(harness.directory).gaps(ref.storageKey)
             assertEquals(1, gaps.size)
@@ -1200,7 +1200,7 @@ class HistoryCoordinatorIntegrationTests {
             harness.messages.recent(harness.channel, 10).any { it.msgid == "tied-gap-one" } }
         val offset = server.queries.size
         harness.coordinator.disconnect(harness.config.id)
-        harness.coordinator.connect(harness.config)
+        harness.coordinator.connectNetwork(harness.config.id)
         val next = query(server, "LATEST", "#room", offset)
         assertEquals("msgid=tied-gap-one", next.message.parameters[2])
         server.reply(next, listOf(WireRow("tied-gap-two", BASE)))

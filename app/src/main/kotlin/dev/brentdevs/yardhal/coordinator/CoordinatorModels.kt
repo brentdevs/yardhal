@@ -1,5 +1,6 @@
 package dev.brentdevs.yardhal.coordinator
 
+import dev.brentdevs.yardhal.core.client.CertificateInspection
 import dev.brentdevs.yardhal.core.data.ChannelMember
 import dev.brentdevs.yardhal.core.data.ConversationKind
 import dev.brentdevs.yardhal.core.data.ConversationRef
@@ -15,6 +16,14 @@ public data class UiNetwork(
     public val hasBotMode: Boolean = false,
     public val accountBanAvailable: Boolean = false,
     public val iconUrl: String? = null,
+    public val connectionPhase: RecoveryPhase = when (status) {
+        ConnectionStatus.DISCONNECTED -> RecoveryPhase.DISCONNECTED
+        ConnectionStatus.CONNECTING -> RecoveryPhase.CONNECTING
+        ConnectionStatus.REGISTERED -> RecoveryPhase.REGISTERED
+    },
+    public val connectionError: String? = null,
+    public val rejectedCertificate: CertificateInspection? = null,
+    public val hasCertificatePin: Boolean = false,
 ) {
     public val storagePrefix: String get() = id
 }

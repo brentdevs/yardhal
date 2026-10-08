@@ -1,24 +1,27 @@
 package dev.brentdevs.yardhal.core.client
 
+import dev.brentdevs.yardhal.core.protocol.CaseMapping
 import dev.brentdevs.yardhal.core.protocol.IrcMessage
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 import javax.net.SocketFactory
-import javax.net.ssl.SSLContext
+import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLSocket
 
 public data class IrcConnectionConfig(
@@ -34,17 +37,28 @@ public data class IrcConnectionConfig(
     public val capabilities: Set<String> = DEFAULT_CAPABILITIES,
     public val connectTimeoutMillis: Int = 10_000,
     public val initialAway: String? = null,
+    public val alternateNicks: List<String> = emptyList(),
+    public val saslMode: String = "AUTO",
+    public val proxy: Socks5Config? = null,
+    public val tlsClientIdentity: TlsClientIdentity? = null,
+    public val trustedCertificateSha256: String? = null,
+    public val knownSecrets: Set<String> = emptySet(),
+    public val nickServService: String = "NickServ",
 ) {
     init {
         require(nick.isNotBlank()) { "nick must not be blank" }
         require(port in 1..65535) { "port out of range" }
-        require((saslAuthcid == null) == (saslPassword == null)) {
-            "SASL requires both authcid and password"
+        require(saslMode.uppercase() in setOf("AUTO", "PLAIN", "SCRAM_SHA_256", "EXTERNAL")) { "unsupported SASL mode" }
+        require(alternateNicks.all { it.isNotBlank() && it.none { character -> character in " \r\n\u0000" } }) {
+            "alternate nicknames must be non-empty single tokens"
         }
         require(initialAway == null || (initialAway.isNotEmpty() && initialAway.none { it in "\r\n\u0000" })) {
             "initialAway must be a non-empty single line"
         }
     }
+
+    override fun toString(): String =
+        "IrcConnectionConfig(host=$host, port=$port, tls=$tls, nick=$nick, saslMode=$saslMode)"
 
     public companion object {
         public const val PRE_AWAY_CAP: String = "draft/pre-away"
@@ -103,6 +117,8 @@ public sealed interface IrcEvent {
     public data class Disconnected(public val cause: Throwable?) : IrcEvent
 }
 
+public class AuthenticationRejectedException(message: String) : IOException(message)
+
 public class IrcConnection(
     private val config: IrcConnectionConfig,
     private val keepAlive: KeepAliveConfig = KeepAliveConfig(),
@@ -117,6 +133,11 @@ public class IrcConnection(
     private val eventChannel = Channel<IrcEvent>(Channel.UNLIMITED)
     private val outbound = Channel<String>(Channel.UNLIMITED)
     private val closed = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val started = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val trafficRedactor = TrafficRedactor(
+        config.knownSecrets + listOfNotNull(config.serverPassword, config.saslPassword, config.proxy?.password),
+        config.nickServService,
+    )
 
     public val events: kotlinx.coroutines.flow.Flow<IrcEvent> = eventChannel.receiveAsFlow()
 
@@ -125,6 +146,8 @@ public class IrcConnection(
 
     private var connectedTls: Boolean = config.tls
     private var connectedPort: Int = config.port
+    @Volatile
+    private var trustedTlsTransport = false
 
     @Volatile
     private var lastInboundMillis: Long = 0
@@ -138,13 +161,27 @@ public class IrcConnection(
 
     private val stateLock = Any()
     private var nickUserSent: Boolean = false
-    private var nickCollisionAttempts: Int = 0
+    private var nextCollisionNickname: Int = 0
+    private var currentNickname: String = config.nick
+    private val collisionNicknames = (config.alternateNicks + (1..MAX_NICK_COLLISION_ATTEMPTS).map { config.nick + "_".repeat(it) })
+        .filter { it != config.nick }
+        .distinct()
     private var negotiator: CapabilityNegotiator? = null
     private var saslAuthenticator: SaslAuthenticator? = null
     private var awaySent: Boolean = false
+    private val saslRequired = config.saslMode.uppercase() != "AUTO" || config.saslAuthcid != null || config.saslPassword != null
+    private var saslSucceeded = false
+    private var pendingProbe: Probe? = null
+
+    private data class Probe(
+        val token: String,
+        val deadlineMillis: Long,
+        val result: CompletableDeferred<Boolean>,
+        var deadlineJob: Job? = null,
+    )
 
     public val isRegistered: Boolean
-        get() = registeredNickname != null
+        get() = registeredNickname != null && !closed.get()
 
     public fun reauthenticate(): Boolean = synchronized(stateLock) {
         val current = negotiator
@@ -157,85 +194,128 @@ public class IrcConnection(
     }
 
     internal fun start(socketOverride: Socket? = null): Job? {
+        if (closed.get() || !started.compareAndSet(false, true)) return null
         lastInboundMillis = nowMillis()
         scope.launch {
-            val connected =
-                if (socketOverride != null) {
-                    runCatching { adoptSocket(socketOverride) }.isSuccess
-                } else {
-                    runCatching { connect() }.isSuccess
-                }
-            if (!connected) {
-                emit(IrcEvent.Disconnected(IOException("connect failed")))
-                return@launch
+            try {
+                validateAuthentication()
+                if (socketOverride != null) adoptSocket(socketOverride) else connect()
+                if (closed.get()) return@launch
+                trustedTlsTransport = connectedTls
+                emit(IrcEvent.ConnectionOpened)
+                beginRegistration()
+                if (closed.get()) return@launch
+                launchReader()
+                launchWriter()
+                launchKeepalive()
+            } catch (error: CancellationException) {
+                shutdown(null)
+                throw error
+            } catch (error: Exception) {
+                shutdown(error)
             }
-            emit(IrcEvent.ConnectionOpened)
-            beginRegistration()
-            launchReader()
-            launchWriter()
-            launchKeepalive()
         }
         return job
     }
 
+    private fun validateAuthentication() {
+        if (config.serverPassword?.any { it in "\r\n\u0000" } == true) {
+            throw AuthenticationRejectedException("The saved server password contains an invalid IRC parameter. Replace it in network settings.")
+        }
+        if (!saslRequired) return
+        if (config.saslMode.equals("EXTERNAL", ignoreCase = true)) {
+            if (config.tlsClientIdentity == null) {
+                throw AuthenticationRejectedException("SASL EXTERNAL requires a usable TLS client identity; select a client certificate")
+            }
+            return
+        }
+        if (config.saslAuthcid.isNullOrBlank() || config.saslPassword == null) {
+            throw AuthenticationRejectedException("SASL credentials are missing; configure an account and password")
+        }
+    }
+
     private suspend fun connect() {
-        val created = withContext(Dispatchers.IO) {
+        withContext(Dispatchers.IO) {
             val decision = stsPolicyStore?.let { store ->
                 StsResolver.decide(store, config.host, config.port, config.tls, nowMillis() / 1000)
             }
             val port = (decision as? StsUpgradeDecision.UpgradeRequired)?.port ?: config.port
             val tls = config.tls || decision is StsUpgradeDecision.UpgradeRequired
-            val raw = (socketFactory ?: SocketFactory.getDefault()).createSocket()
+            if (config.saslMode.equals("EXTERNAL", ignoreCase = true) && !tls) {
+                throw AuthenticationRejectedException("SASL EXTERNAL requires TLS; enable TLS for this network")
+            }
+            val raw = config.proxy?.let {
+                Socks5Tunnel.connect(config.host, port, it, config.connectTimeoutMillis)
+            } ?: (socketFactory ?: SocketFactory.getDefault()).createSocket()
             try {
+                adoptSocket(raw)
                 raw.tcpNoDelay = true
-                raw.connect(InetSocketAddress(config.host, port), config.connectTimeoutMillis)
+                if (config.proxy == null) raw.connect(InetSocketAddress(config.host, port), config.connectTimeoutMillis)
+                raw.soTimeout = config.connectTimeoutMillis
                 val ready = if (tls) wrapTls(raw, config.host, port) else raw
+                ready.soTimeout = 0
                 connectedTls = tls
                 connectedPort = port
-                ready
+                adoptSocket(ready)
             } catch (error: Throwable) {
                 runCatching { raw.close() }
                 throw error
             }
         }
-        adoptSocket(created)
     }
 
     private fun wrapTls(raw: Socket, host: String, port: Int): SSLSocket {
-        val factory = SSLContext.getDefault().socketFactory
+        val pin = config.trustedCertificateSha256.takeIf { port == config.port }
+        val factory = createTlsSocketFactory(host, port, config.tlsClientIdentity, pin)
         val ssl = factory.createSocket(raw, host, port, true) as SSLSocket
-        ssl.startHandshake()
-        val verified = javax.net.ssl.HttpsURLConnection.getDefaultHostnameVerifier()
-            .verify(host, ssl.session)
-        if (!verified) {
+        try {
+            val parameters = ssl.sslParameters
+            parameters.endpointIdentificationAlgorithm = "HTTPS"
+            val serverName = runCatching { SNIHostName(host) }.getOrNull()
+            if (serverName != null && host.any { it.isLetter() }) parameters.serverNames = listOf(serverName)
+            ssl.sslParameters = parameters
+            ssl.startHandshake()
+            return ssl
+        } catch (error: Throwable) {
             runCatching { ssl.close() }
-            throw IOException("TLS hostname verification failed for $host")
+            throw error
         }
-        return ssl
     }
 
     private fun adoptSocket(adopted: Socket) {
-        socket = adopted
+        synchronized(stateLock) {
+            if (closed.get()) {
+                runCatching { adopted.close() }
+                throw IOException("Connection was closed")
+            }
+            socket = adopted
+        }
     }
 
     private fun beginRegistration() {
         synchronized(stateLock) {
-            if (config.capabilities.isEmpty()) {
+            if (config.capabilities.isEmpty() && !saslRequired) {
                 sendNickUser()
                 return
             }
             val effectiveWanted =
-                if (config.saslAuthcid != null) config.capabilities else config.capabilities - CapabilityNegotiator.SASL_CAP
+                if (saslRequired) config.capabilities + CapabilityNegotiator.SASL_CAP else config.capabilities - CapabilityNegotiator.SASL_CAP
             val created = CapabilityNegotiator(
                 wanted = effectiveWanted,
                 sendRaw = ::sendLine,
-                onSaslAcknowledged = { if (!startSasl()) negotiator?.saslFinished() },
+                onSaslAcknowledged = { startSasl() },
                 onFinished = {
-                    publishCapabilities()
-                    sendNickUser()
+                    if (!closed.get() && (!saslRequired || saslSucceeded)) {
+                        publishCapabilities()
+                        sendNickUser()
+                    }
                 },
                 beforeCapEnd = ::sendPreRegistrationRequests,
                 onDeleted = ::handleCapabilitiesDeleted,
+                required = if (saslRequired) setOf(CapabilityNegotiator.SASL_CAP) else emptySet(),
+                onRequiredUnavailable = {
+                    rejectAuthentication(SaslOutcome.Failure(0, "Server did not offer or accept required SASL authentication; check authentication settings"))
+                },
             )
             negotiator = created
             created.begin()
@@ -243,8 +323,9 @@ public class IrcConnection(
     }
 
     private fun startSasl(): Boolean {
-        val authcid = config.saslAuthcid ?: return false
-        val password = config.saslPassword ?: return false
+        if (!saslRequired || closed.get()) return false
+        val authcid = config.saslAuthcid ?: ""
+        val password = config.saslPassword ?: ""
         val authenticator = SaslAuthenticator(
             authcid = authcid,
             password = password,
@@ -253,13 +334,25 @@ public class IrcConnection(
             ),
             sendRaw = ::sendLine,
             onOutcome = { outcome ->
-                emit(IrcEvent.SaslResult(outcome))
-                negotiator?.saslFinished()
+                if (outcome == SaslOutcome.Success) {
+                    saslSucceeded = true
+                    emit(IrcEvent.SaslResult(outcome))
+                    negotiator?.saslFinished()
+                } else if (outcome is SaslOutcome.Failure) {
+                    rejectAuthentication(outcome)
+                }
             },
+            mode = config.saslMode,
         )
         saslAuthenticator = authenticator
         authenticator.start()
         return true
+    }
+
+    private fun rejectAuthentication(outcome: SaslOutcome.Failure) {
+        val safe = outcome.copy(description = trafficRedactor.redact(outcome.description))
+        emit(IrcEvent.SaslResult(safe))
+        shutdown(AuthenticationRejectedException(safe.description))
     }
 
     private fun sendPreRegistrationRequests() {
@@ -288,46 +381,75 @@ public class IrcConnection(
     }
 
     private fun sendNickUser() {
-        if (nickUserSent) return
+        if (nickUserSent || closed.get() || (saslRequired && !saslSucceeded)) return
         nickUserSent = true
-        config.serverPassword?.let { sendLine("PASS ${it}") }
+        config.serverPassword?.let { sendLine("PASS :$it") }
         sendLine("NICK ${config.nick}")
         sendLine("USER ${config.username} 0 * :${config.realName}")
     }
 
     private fun handleLine(line: String) {
+        if (closed.get()) return
         lastInboundMillis = nowMillis()
-        rawTap?.invoke(false, line)
+        rawTap?.invoke(false, trafficRedactor.redact(line))
         val message = IrcMessage.parse(line) ?: return
-        if (handleStsAdvertisement(message)) return
-        synchronized(stateLock) { applyToSession(message) }
-        emit(IrcEvent.MessageReceived(message))
+        synchronized(stateLock) {
+            if (closed.get()) return
+            if (handleStsAdvertisement(message)) return
+            applyToSession(message)
+            if (!closed.get()) emit(IrcEvent.MessageReceived(message))
+        }
     }
 
     private fun applyToSession(message: IrcMessage) {
         val numeric = message.numeric
+        if (numeric == 464 || (config.serverPassword != null &&
+                ((numeric == 461 && message.parameters.getOrNull(1).equals("PASS", ignoreCase = true)) ||
+                    (message.command.equals("FAIL", ignoreCase = true) && message.parameters.firstOrNull().equals("PASS", ignoreCase = true))))) {
+            shutdown(AuthenticationRejectedException("Server password was rejected; correct the saved server password"))
+            return
+        }
         saslAuthenticator?.let { authenticator ->
             if (numeric != null) authenticator.handleNumeric(numeric, message)
             authenticator.handleMessage(message)
         }
+        if (closed.get()) return
         negotiator?.handle(message)
+        if (closed.get()) return
 
         when {
             message.command == "PING" && message.parameters.isNotEmpty() ->
                 sendLine("PONG :${message.parameters.last()}")
+            message.command == "PONG" -> {
+                val probe = pendingProbe
+                if (probe != null && message.parameters.lastOrNull() == probe.token) {
+                    pendingProbe = null
+                    probe.deadlineJob?.cancel()
+                    probe.result.complete(System.nanoTime() / 1_000_000 < probe.deadlineMillis)
+                }
+            }
             numeric == 1 && registeredNickname == null -> {
+                if (saslRequired && !saslSucceeded) {
+                    rejectAuthentication(SaslOutcome.Failure(0, "Server completed registration without required SASL authentication"))
+                    return
+                }
                 val nickname = message.parameters.firstOrNull() ?: config.nick
                 registeredNickname = nickname
                 emit(IrcEvent.Registered(nickname, message.parameters.lastOrNull() ?: ""))
                 val away = config.initialAway
                 if (away != null && !awaySent) sendAway(away)
             }
-            (numeric == 432 || numeric == 433) &&
-                registeredNickname == null &&
-                nickCollisionAttempts < MAX_NICK_COLLISION_ATTEMPTS -> {
-                nickCollisionAttempts += 1
-                val retryNick = config.nick + "_".repeat(nickCollisionAttempts)
-                sendLine("NICK $retryNick")
+            (numeric == 432 || numeric == 433 || numeric == 436 || numeric == 437) && registeredNickname == null -> {
+                val rejectedNickname = message.parameters.getOrNull(1)
+                if (rejectedNickname != null && CaseMapping.RFC1459.fold(rejectedNickname) != CaseMapping.RFC1459.fold(currentNickname)) return
+                val retryNick = collisionNicknames.getOrNull(nextCollisionNickname)
+                if (retryNick == null) {
+                    shutdown(IOException("All configured and fallback nicknames are unavailable; choose another nickname"))
+                } else {
+                    nextCollisionNickname += 1
+                    currentNickname = retryNick
+                    sendLine("NICK $retryNick")
+                }
             }
         }
     }
@@ -367,7 +489,8 @@ public class IrcConnection(
                         framer.feed(chunk, read)
                     }
                 }
-            } catch (_: Throwable) {
+            } catch (error: Exception) {
+                shutdown(error)
             } finally {
                 shutdown(null)
             }
@@ -382,12 +505,13 @@ public class IrcConnection(
                     val stream: OutputStream = current.getOutputStream()
                     while (isActive) {
                         val line = outbound.receive()
-                        rawTap?.invoke(true, redactSensitiveOutbound(line))
+                        rawTap?.invoke(true, trafficRedactor.redact(line))
                         stream.write((line + "\r\n").toByteArray(Charsets.UTF_8))
                         stream.flush()
                     }
                 }
-            } catch (_: Throwable) {
+            } catch (error: Exception) {
+                shutdown(error)
             } finally {
                 shutdown(null)
             }
@@ -420,7 +544,43 @@ public class IrcConnection(
     }
 
     public fun sendLine(line: String) {
+        if (closed.get()) return
+        trafficRedactor.rememberOutbound(line)
         outbound.trySend(line)
+    }
+
+    public fun redactPresentation(text: String): String = trafficRedactor.redactPresentation(text)
+
+    public suspend fun probe(timeoutMillis: Long = 5_000): Boolean {
+        require(timeoutMillis > 0) { "probe timeout must be positive" }
+        val result = synchronized(stateLock) {
+            if (closed.get() || socket == null) return false
+            val monotonicNow = System.nanoTime() / 1_000_000
+            pendingProbe?.takeIf { it.deadlineMillis <= monotonicNow }?.let {
+                pendingProbe = null
+                it.deadlineJob?.cancel()
+                it.result.complete(false)
+            }
+            val existing = pendingProbe
+            if (existing != null) {
+                existing.result
+            } else {
+                val probe = Probe("yardhal-probe-${java.util.UUID.randomUUID()}", monotonicNow + timeoutMillis, CompletableDeferred())
+                pendingProbe = probe
+                probe.deadlineJob = scope.launch {
+                    delay(timeoutMillis)
+                    synchronized(stateLock) {
+                        if (pendingProbe === probe) {
+                            pendingProbe = null
+                            probe.result.complete(false)
+                        }
+                    }
+                }
+                sendLine("PING :${probe.token}")
+                probe.result
+            }
+        }
+        return withTimeoutOrNull(timeoutMillis) { result.await() } ?: false
     }
 
     public fun send(message: IrcMessage) {
@@ -429,40 +589,27 @@ public class IrcConnection(
 
     public fun disconnect() {
         shutdown(null)
-        runCatching { socket?.close() }
     }
 
     private fun emit(event: IrcEvent) {
-        eventChannel.trySend(event)
+        if (!closed.get()) eventChannel.trySend(event)
     }
 
     private fun shutdown(cause: Throwable?) {
         if (!closed.compareAndSet(false, true)) return
-        if (connectedTls && socket != null) {
+        synchronized(stateLock) {
+            pendingProbe?.result?.complete(false)
+            pendingProbe = null
+            registeredNickname = null
+        }
+        if (trustedTlsTransport && socket != null) {
             stsPolicyStore?.let { StsResolver.refreshOnDisconnect(it, config.host, nowMillis() / 1000) }
         }
-        job.cancelChildren()
+        runCatching { socket?.close() }
         eventChannel.trySend(IrcEvent.Disconnected(cause))
         eventChannel.close()
         outbound.close()
+        job.cancel()
     }
 }
 
-private val VISIBLE_AUTHENTICATE_ARGUMENTS: Set<String> =
-    SaslAuthenticator.PREFERRED_MECHANISMS.toSet() +
-        SaslAuthenticator.CONTINUATION_MARKER +
-        SaslAuthenticator.ABORT_MARKER
-
-internal fun redactSensitiveOutbound(line: String): String {
-    val command = line.substringBefore(' ').uppercase()
-    val argument = line.substringAfter(' ', "")
-    return when (command) {
-        "PASS" -> "PASS <redacted>"
-        "AUTHENTICATE" -> if (argument in VISIBLE_AUTHENTICATE_ARGUMENTS) line else "AUTHENTICATE <redacted>"
-        "REGISTER" -> {
-            val fields = argument.split(' ', limit = 3)
-            if (fields.size < 3) "REGISTER <redacted>" else "REGISTER ${fields[0]} ${fields[1]} <redacted>"
-        }
-        else -> line
-    }
-}

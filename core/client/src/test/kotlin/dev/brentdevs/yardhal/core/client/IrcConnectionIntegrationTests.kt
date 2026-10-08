@@ -7,6 +7,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -22,7 +23,7 @@ internal class EventCollector(
     private val channel = Channel<IrcEvent>(Channel.UNLIMITED)
 
     init {
-        scope.launch { events.collect { channel.trySend(it) } }
+        scope.launch(start = CoroutineStart.UNDISPATCHED) { events.collect { channel.trySend(it) } }
     }
 
     suspend fun await(timeoutMillis: Long = 5_000): IrcEvent = withTimeout(timeoutMillis) { channel.receive() }
@@ -46,6 +47,15 @@ internal class EventCollector(
                 }
                 else -> seen.add(event)
             }
+        }
+    }
+
+    suspend fun drainUntilDisconnected(): List<IrcEvent> {
+        val seen = ArrayList<IrcEvent>()
+        while (true) {
+            val event = await()
+            seen += event
+            if (event is IrcEvent.Disconnected) return seen
         }
     }
 
@@ -317,7 +327,7 @@ class IrcConnectionIntegrationTests {
                     val registered = CompletableDeferred<Unit>()
                     val watcher = scope.launch {
                         reconnector.events.collect { event ->
-                            if (event is IrcEvent.Registered) {
+                            if (event.event is IrcEvent.Registered) {
                                 registrations += 1
                                 registered.complete(Unit)
                             }
@@ -457,33 +467,33 @@ class IrcConnectionIntegrationTests {
     }
 
     @org.junit.jupiter.api.Test
-    fun saslPreparationFailureSurfacesAndRegistrationContinues() {
+    fun saslPreparationFailurePreventsRegistration() {
         withLoopback(
             config = { saslConfig(it).copy(saslPassword = "password\uD83D\uDE00") },
             respond = { line -> handleCapBasics(line, "sasl=PLAIN,SCRAM-SHA-256 cap-notify") },
         ) { _, collector, server ->
-            val events = collector.drainUntilRegistered()
+            val events = collector.drainUntilDisconnected()
             val failure = events.filterIsInstance<IrcEvent.SaslResult>().single().outcome
             assertTrue(failure is SaslOutcome.Failure && failure.description.contains("unassigned"))
-            assertTrue(events.any { it is IrcEvent.Registered })
-            assertTrue("CAP END" in server.receivedLines)
-            assertFalse(server.receivedLines.any { it.startsWith("AUTHENTICATE ") })
+            assertFalse(events.any { it is IrcEvent.Registered })
+            assertTrue((events.last() as IrcEvent.Disconnected).cause is AuthenticationRejectedException)
+            assertFalse(server.receivedLines.any { it == "CAP END" || it.startsWith("USER ") || it.startsWith("AUTHENTICATE ") })
         }
     }
 
     @org.junit.jupiter.api.Test
-    fun scramBadServerSignatureFailsClosedAndContinuesWithoutAccount() {
+    fun scramBadServerSignaturePreventsUnauthenticatedRegistration() {
         val fixture = ScramServerFixture(password = "sesame")
         withLoopback(
             config = { saslConfig(it) },
             respond = scramResponder(fixture, tamperSignature = true),
         ) { _, collector, server ->
-            val events = collector.drainUntilRegistered()
+            val events = collector.drainUntilDisconnected()
             val failure = events.filterIsInstance<IrcEvent.SaslResult>().single().outcome
             assertTrue(failure is SaslOutcome.Failure && failure.description.contains("signature"))
-            val lines = server.receivedLines.toList()
-            assertTrue(lines.indexOf("AUTHENTICATE *") in 0 until lines.indexOf("CAP END"))
-            assertFalse(lines.contains("AUTHENTICATE +"))
+            assertFalse(events.any { it is IrcEvent.Registered })
+            assertTrue((events.last() as IrcEvent.Disconnected).cause is AuthenticationRejectedException)
+            assertFalse(server.receivedLines.any { it == "CAP END" || it.startsWith("USER ") || it == "AUTHENTICATE PLAIN" })
         }
     }
 

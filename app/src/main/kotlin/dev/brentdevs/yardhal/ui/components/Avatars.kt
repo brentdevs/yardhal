@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.brentdevs.yardhal.coordinator.ConnectionStatus
+import dev.brentdevs.yardhal.coordinator.RecoveryPhase
 import dev.brentdevs.yardhal.ui.image.LocalRemoteImageLoader
 import dev.brentdevs.yardhal.ui.image.RemoteImageState
 import dev.brentdevs.yardhal.ui.image.rememberRemoteImage
@@ -71,7 +72,7 @@ public fun NickAvatar(
 
 @Composable
 public fun NetworkBadge(
-    status: ConnectionStatus,
+    phase: RecoveryPhase,
     iconUrl: String?,
     modifier: Modifier = Modifier,
     size: Dp = 22.dp,
@@ -79,7 +80,7 @@ public fun NetworkBadge(
     val image by rememberRemoteImage(LocalRemoteImageLoader.current, iconUrl, size.roundToPxInt())
     val loaded = (image as? RemoteImageState.Success)?.bitmap
     if (loaded == null) {
-        StatusDot(status, modifier)
+        RecoveryStatusDot(phase, modifier)
         return
     }
     Box(modifier = modifier.size(size)) {
@@ -91,8 +92,22 @@ public fun NetworkBadge(
                 .size(size)
                 .clip(RoundedCornerShape(size * 0.25f)),
         )
-        StatusDot(status, Modifier.align(Alignment.BottomEnd), size = size * 0.4f)
+        RecoveryStatusDot(phase, Modifier.align(Alignment.BottomEnd), size = size * 0.4f)
     }
+}
+
+@Composable
+private fun RecoveryStatusDot(phase: RecoveryPhase, modifier: Modifier, size: Dp = 10.dp) {
+    val color = when (phase) {
+        RecoveryPhase.REGISTERED -> Color(0xFF27AE60)
+        RecoveryPhase.CONNECTING, RecoveryPhase.IDENTIFYING -> Color(0xFFF1C40F)
+        RecoveryPhase.AUTHENTICATION_REJECTED, RecoveryPhase.CERTIFICATE_REJECTED -> MaterialTheme.colorScheme.error
+        RecoveryPhase.SERVER_UNREACHABLE -> Color(0xFFE67E22)
+        RecoveryPhase.DISCONNECTED, RecoveryPhase.USER_DISCONNECTED, RecoveryPhase.OFFLINE -> Color(0xFF6E7681)
+    }
+    Box(
+        modifier = modifier.size(size).clip(CircleShape).background(color),
+    )
 }
 
 @Composable

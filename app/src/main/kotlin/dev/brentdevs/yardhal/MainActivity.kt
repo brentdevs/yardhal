@@ -72,6 +72,11 @@ class MainActivity : ComponentActivity() {
         requestNotificationPermission()
     }
 
+    override fun onResume() {
+        super.onResume()
+        coordinator.onForegroundResume()
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         consumeShareIntent(intent)

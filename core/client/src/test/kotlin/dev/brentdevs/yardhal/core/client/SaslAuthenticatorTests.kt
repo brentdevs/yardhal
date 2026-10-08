@@ -15,14 +15,15 @@ class SaslAuthenticatorTests {
         authcid: String = "jilles",
         password: String = "sesame",
         createMechanism: ((String) -> SaslMechanism)? = null,
+        mode: String = "AUTO",
     ) {
         val sent = mutableListOf<String>()
         val outcomes = mutableListOf<SaslOutcome>()
 
         val authenticator = if (createMechanism == null) {
-            SaslAuthenticator(authcid, password, advertised, sent::add, outcomes::add)
+            SaslAuthenticator(authcid, password, advertised, sent::add, outcomes::add, mode = mode)
         } else {
-            SaslAuthenticator(authcid, password, advertised, sent::add, outcomes::add, createMechanism)
+            SaslAuthenticator(authcid, password, advertised, sent::add, outcomes::add, createMechanism, mode)
         }
 
         fun server(line: String) {
@@ -148,6 +149,51 @@ class SaslAuthenticatorTests {
         harness.server(":srv 904 jilles :SASL authentication failed")
         assertIs<SaslOutcome.Failure>(harness.outcomes.single())
         assertEquals(1, harness.sent.size)
+    }
+
+    @Test
+    fun configuredModeDoesNotSwitchToAnotherOfferedMechanism() {
+        val plain = Harness(advertised = setOf("PLAIN", "SCRAM-SHA-256"), mode = "PLAIN")
+        plain.authenticator.start()
+        assertEquals(listOf("AUTHENTICATE PLAIN"), plain.sent)
+        val scram = Harness(advertised = setOf("SCRAM-SHA-256", "PLAIN"), mode = "SCRAM_SHA_256")
+        scram.authenticator.start()
+        scram.server(":srv 908 jilles PLAIN :available mechanisms")
+        scram.server(":srv 904 jilles :rejected")
+        assertEquals(listOf("AUTHENTICATE SCRAM-SHA-256"), scram.sent)
+        assertIs<SaslOutcome.Failure>(scram.outcomes.single())
+        val unavailable = Harness(advertised = setOf("SCRAM-SHA-256"), mode = "PLAIN")
+        unavailable.authenticator.start()
+        assertTrue(unavailable.sent.isEmpty())
+        assertIs<SaslOutcome.Failure>(unavailable.outcomes.single())
+    }
+
+    @Test
+    fun externalEncodesOptionalAuthorizationIdentityWithoutPassword() {
+        for (authorizationIdentity in listOf("", "account")) {
+            val external = Harness(
+                advertised = setOf("EXTERNAL", "PLAIN", "SCRAM-SHA-256"),
+                authcid = authorizationIdentity,
+                password = "",
+                mode = "EXTERNAL",
+            )
+            external.authenticator.start()
+            assertEquals(listOf("AUTHENTICATE EXTERNAL"), external.sent)
+            external.server("AUTHENTICATE +")
+            val response = external.sent.last().substringAfter(' ')
+            assertEquals(authorizationIdentity, if (response == "+") "" else String(Base64.getDecoder().decode(response), Charsets.UTF_8))
+            external.server(":srv 903 * :Certificate authenticated")
+            assertEquals(listOf<SaslOutcome>(SaslOutcome.Success), external.outcomes)
+        }
+    }
+
+    @Test
+    fun serverFailureTextCannotExposeCredentials() {
+        val harness = Harness(advertised = setOf("PLAIN"))
+        harness.authenticator.start()
+        harness.server(":srv 904 jilles :Rejected sesame AGppbGxlcwBzZXNhbWU=")
+        val failure = assertIs<SaslOutcome.Failure>(harness.outcomes.single())
+        assertFalse("sesame" in failure.description || "AGppbGxlcwBzZXNhbWU=" in failure.description)
     }
 
     @Test

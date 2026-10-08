@@ -35,7 +35,8 @@ internal class PlainMechanism(
     private var credentialsSent = false
 
     override val name: String = SaslAuthenticator.PLAIN
-    override val serverVerified: Boolean = true
+    override val serverVerified: Boolean
+        get() = credentialsSent
 
     override fun respond(challenge: ByteArray): ByteArray {
         if (credentialsSent || challenge.isNotEmpty()) {
@@ -43,6 +44,23 @@ internal class PlainMechanism(
         }
         credentialsSent = true
         return "$authzid\u0000$authcid\u0000$password".toByteArray(Charsets.UTF_8)
+    }
+}
+
+internal class ExternalMechanism(private val authzid: String = "") : SaslMechanism {
+    private var responseSent = false
+
+    override val name: String = SaslAuthenticator.EXTERNAL
+    override val serverVerified: Boolean
+        get() = responseSent
+
+    override fun respond(challenge: ByteArray): ByteArray {
+        if (responseSent || challenge.isNotEmpty()) {
+            throw SaslMechanismException("unexpected EXTERNAL challenge from server")
+        }
+        if ('\u0000' in authzid) throw SaslMechanismException("invalid EXTERNAL authorization identity")
+        responseSent = true
+        return authzid.toByteArray(Charsets.UTF_8)
     }
 }
 
@@ -76,7 +94,7 @@ internal class ScramSha256Mechanism(
 
     private fun clientFinal(serverFirst: String): ByteArray {
         val attributes = parseAttributes(serverFirst)
-        attributes["e"]?.let { throw SaslMechanismException("server rejected SCRAM: $it") }
+        if ("e" in attributes) throw SaslMechanismException("server rejected SCRAM authentication")
         if (attributes.containsKey("m")) throw SaslMechanismException("unsupported mandatory SCRAM extension")
         val nonce = attributes["r"] ?: throw SaslMechanismException("SCRAM server-first lacks nonce")
         if (!nonce.startsWith(clientNonce) || nonce.length == clientNonce.length) {
@@ -104,7 +122,7 @@ internal class ScramSha256Mechanism(
 
     private fun verifyServerFinal(serverFinal: String): ByteArray {
         val attributes = parseAttributes(serverFinal)
-        attributes["e"]?.let { throw SaslMechanismException("server rejected SCRAM: $it") }
+        if ("e" in attributes) throw SaslMechanismException("server rejected SCRAM authentication")
         val signature = decodeBase64(attributes["v"] ?: throw SaslMechanismException("SCRAM server-final lacks verifier"))
         if (!MessageDigest.isEqual(signature, expectedServerSignature)) {
             throw SaslMechanismException("SCRAM server signature mismatch")

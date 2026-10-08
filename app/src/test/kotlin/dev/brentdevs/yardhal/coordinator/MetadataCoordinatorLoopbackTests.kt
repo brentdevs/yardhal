@@ -222,7 +222,8 @@ class MetadataCoordinatorLoopbackTests {
 
         Server(publishProfiles = false).use { replacement ->
             replacement.start()
-            coordinator.connect(harness.config.copy(port = replacement.port))
+            assertTrue(coordinator.updateNetwork(harness.config.copy(port = replacement.port)))
+            coordinator.connectNetwork(networkId)
             assertFalse(coordinator.profiles.value.containsKey(networkId))
             await { replacement.received.contains("JOIN #room") }
             await { coordinator.networks.value.singleOrNull()?.status == ConnectionStatus.REGISTERED }
@@ -245,7 +246,8 @@ class MetadataCoordinatorLoopbackTests {
 
         Server(metadataEnabled = false).use { replacement ->
             replacement.start()
-            coordinator.connect(harness.config.copy(port = replacement.port))
+            assertTrue(coordinator.updateNetwork(harness.config.copy(port = replacement.port)))
+            coordinator.connectNetwork(networkId)
             assertFalse(coordinator.profiles.value.containsKey(networkId))
             await { replacement.received.contains("JOIN #room") }
             await { coordinator.networks.value.singleOrNull()?.status == ConnectionStatus.REGISTERED }

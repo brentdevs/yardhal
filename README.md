@@ -7,9 +7,11 @@ architecture of the Halyard iOS client.
 
 ## Features
 
-- **Connections** — TLS with hostname verification, CAP LS 302 negotiation,
-  SASL PLAIN, persistent foreground service, exponential-backoff reconnect,
-  nick-collision auto-retry, STS policy handling
+- **Connections** — verified TLS, endpoint-specific certificate inspection and
+  fingerprint trust, Android KeyChain client identities, authenticated SOCKS5,
+  CAP LS 302, SASL PLAIN/SCRAM-SHA-256/EXTERNAL and saved NickServ identification;
+  connectivity/resume recovery, bounded probes, configured alternate nicknames,
+  durable auto-connect/disconnect intent and STS enforcement
 - **Chat** — server-time ordering, chathistory backfill, per-conversation
   Room-backed scrollback, message grouping, avatars, mIRC formatting
   (colors, bold/italic/underline/strike, hex), unread markers with a

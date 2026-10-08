@@ -1,6 +1,7 @@
 package dev.brentdevs.yardhal.coordinator
 
 import dev.brentdevs.yardhal.core.client.IrcEvent
+import dev.brentdevs.yardhal.core.client.SaslOutcome
 import dev.brentdevs.yardhal.core.data.BouncerNetworkStore
 import dev.brentdevs.yardhal.core.data.ChannelMember
 import dev.brentdevs.yardhal.core.data.ConversationKind
@@ -107,6 +108,7 @@ public class PerNetworkState(
     public var listingChannels: Boolean = false
     public var registered: Boolean = false
         internal set
+    internal var authenticationRejected: Boolean = false
     public var connectionEpoch: Int = 0
         internal set
     public var metadataCapability: MetadataCapability? = null
@@ -229,10 +231,21 @@ public class PerNetworkState(
         when (event) {
             is IrcEvent.ConnectionOpened -> resetConnectionScopedState(reduction)
             is IrcEvent.CapabilitiesNegotiated -> reduction.handleCapabilities(event.capabilities, event.values)
-            is IrcEvent.SaslResult -> Unit
+            is IrcEvent.SaslResult -> {
+                val outcome = event.outcome
+                if (outcome is SaslOutcome.Failure) {
+                    authenticationRejected = true
+                    registered = false
+                    reduction.emit(InboundEffect.AuthenticationFailed(outcome.description))
+                }
+            }
             is IrcEvent.Registered -> reduction.handleRegistered(event.nickname)
             is IrcEvent.MessageReceived -> reduction.handleMessage(event.message)
-            is IrcEvent.Disconnected -> reduction.emit(InboundEffect.StatusChanged(ConnectionStatus.CONNECTING))
+            is IrcEvent.Disconnected -> {
+                registered = false
+                connectionEpoch += 1
+                reduction.emit(InboundEffect.StatusChanged(ConnectionStatus.DISCONNECTED))
+            }
         }
         profileUpdate()?.let(reduction::emit)
         return reduction.effects
@@ -259,6 +272,7 @@ public class PerNetworkState(
         monitored.clear()
         multilineLimits = null
         registered = false
+        authenticationRejected = false
         connectionEpoch += 1
         metadataCapability = null
         metadataSubscriptions = emptySet()

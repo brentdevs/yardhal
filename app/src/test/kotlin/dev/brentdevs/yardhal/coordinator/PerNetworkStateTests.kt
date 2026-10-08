@@ -585,22 +585,21 @@ class PerNetworkStateTests {
     }
 
     @Test
-    fun saslResultsHaveNoReducerEffectsOrRegistrationStateChanges() {
+    fun saslFailurePreventsRegistrationAndJoinsUntilANewConnectionOpens() {
         val state = state(autojoin = listOf("#room"))
         val context = InboundContext(nowMs = now)
         val caps = setOf("batch", "sasl")
         state.apply(IrcEvent.CapabilitiesNegotiated(caps), context)
-        state.feed(":srv BATCH +history chathistory #room")
-        state.whoisExpected = true
-        for (outcome in listOf(SaslOutcome.Success, SaslOutcome.Failure(904, "SASL authentication failed"))) {
-            assertTrue(state.apply(IrcEvent.SaslResult(outcome), context).isEmpty())
-            assertFalse(state.registered)
-            assertEquals("me", state.ownNick)
-            assertEquals(caps, state.supportedCaps)
-            assertEquals("chathistory", state.batchType("history"))
-            assertTrue(state.whoisExpected)
-            assertEquals(0, state.connectionEpoch)
-        }
+        assertTrue(state.apply(IrcEvent.SaslResult(SaslOutcome.Success), context).isEmpty())
+        val effects = state.apply(IrcEvent.SaslResult(SaslOutcome.Failure(0, "Selected SASL mechanism is not available.")), context)
+        assertTrue(effects.only<InboundEffect.AuthenticationFailed>().reason.contains("SASL"))
+        assertTrue(effects.only<InboundEffect.AuthenticationFailed>().reason.contains("not available"))
+        assertTrue(state.apply(IrcEvent.Registered("me", "Welcome"), context).isEmpty())
+        assertFalse(state.registered)
+        assertEquals(caps, state.supportedCaps)
+        state.apply(IrcEvent.ConnectionOpened, context)
+        assertEquals(listOf("JOIN #room"), state.apply(IrcEvent.Registered("me", "Welcome"), context).sent())
+        assertTrue(state.registered)
     }
 
     @Test
@@ -612,12 +611,17 @@ class PerNetworkStateTests {
         assertTrue(InboundEffect.StatusChanged(ConnectionStatus.REGISTERED) in effects)
         assertEquals("me_", state.ownNick)
         assertEquals(3, effects.filterIsInstance<InboundEffect.SetJoinState>().count { it.state == JoinState.JOINING })
+        assertTrue(state.apply(IrcEvent.Registered("me_", "Duplicate welcome"), context).isEmpty())
     }
 
     @Test
-    fun disconnectReportsConnectingAndReconnectResetsConnectionState() {
+    fun disconnectReportsDisconnectedAndReconnectResetsConnectionState() {
         val state = state()
-        assertEquals(listOf<InboundEffect>(InboundEffect.StatusChanged(ConnectionStatus.CONNECTING)), state.apply(IrcEvent.Disconnected(null), InboundContext(nowMs = now)))
+        state.apply(IrcEvent.Registered("me", "Welcome"), InboundContext(nowMs = now))
+        val epoch = state.connectionEpoch
+        assertEquals(listOf<InboundEffect>(InboundEffect.StatusChanged(ConnectionStatus.DISCONNECTED)), state.apply(IrcEvent.Disconnected(null), InboundContext(nowMs = now)))
+        assertFalse(state.registered)
+        assertEquals(epoch + 1, state.connectionEpoch)
         state.feed(":srv BATCH +h chathistory #room")
         state.whoisExpected = true
         state.apply(IrcEvent.ConnectionOpened, InboundContext(nowMs = now))

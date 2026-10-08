@@ -15,6 +15,8 @@ Phase numbers refer to `docs/architecture.md`.
 
 - [x] sasl 3.1: AUTHENTICATE flow during negotiation (PLAIN) (P2)
 - [x] sasl 3.2: mechanism list parsing and server-driven post-registration re-auth (P2+) — SCRAM-SHA-256 preferred over PLAIN, 908 fallback, CAP NEW/DEL sasl. Manual `IrcConnection.reauthenticate()` is a connection-layer API only, not an app command; REGISTER SUCCESS and VERIFY SUCCESS already authenticate the account without a second SASL exchange.
+- [x] SASL EXTERNAL: real per-network Android KeyChain client certificate, TLS prerequisite, optional authorization identity, no password reference or guest fallback on failure (parity phase 2)
+- [x] Required authentication fails closed on unavailable/rejected SASL and missing configured secrets; mechanism selection supports AUTO, PLAIN, SCRAM-SHA-256 and EXTERNAL (parity phase 2)
 - [x] account-notify: ACCOUNT updates member account state (P5)
 - [x] account-tag: verified-account badge input; `account` tag updates sender presence and ✓ on message rows/member sheet (P5)
 - [x] extended-join: account + realname on JOIN (P5)
@@ -94,7 +96,8 @@ Ergo and runs all real-server tests without skips.
 | message-tags | `IrcTagsTests.serializeSectionRoundTrip`; `PerNetworkStateTests.inputTooLongSurfacesAsAnErrorLine` |
 | server-time | `PerNetworkStateTests.channelPrivmsgBecomesAChannelMessageWithServerTimeAndTags` |
 | sasl 3.1 | `IrcConnectionIntegrationTests.negotiatesCapabilitiesWithSaslPlainThenRegisters` |
-| sasl 3.2 / SCRAM | `ScramSha256MechanismTests.rfc7677TestVectorRoundTrip`; `ScramSha256MechanismTests.excessiveIterationCountsAreRejected`; `ScramSha256MechanismTests.maximumIterationCountAuthenticatesAgainstIndependentPbkdf2Server`; `SaslPrepTests.rfc4013Examples`; `SaslPrepTests.queryCombiningClassesRemainFrozenForCharactersAssignedAfterUnicode32`; `IrcConnectionIntegrationTests.reauthenticatesAfterRegistrationAndOnCapNew`; `IrcConnectionIntegrationTests.unicodeScramCredentialsAuthenticateAgainstPreparedLoopbackKeys`; `IrcConnectionIntegrationTests.saslPreparationFailureSurfacesAndRegistrationContinues`; `ErgoRoundTripTest.registersAccountThenAuthenticatesWithScramAndPreAway` |
+| sasl 3.2 / SCRAM | `ScramSha256MechanismTests.rfc7677TestVectorRoundTrip`; `ScramSha256MechanismTests.excessiveIterationCountsAreRejected`; `ScramSha256MechanismTests.maximumIterationCountAuthenticatesAgainstIndependentPbkdf2Server`; `SaslPrepTests.rfc4013Examples`; `SaslPrepTests.queryCombiningClassesRemainFrozenForCharactersAssignedAfterUnicode32`; `IrcConnectionIntegrationTests.reauthenticatesAfterRegistrationAndOnCapNew`; `IrcConnectionIntegrationTests.unicodeScramCredentialsAuthenticateAgainstPreparedLoopbackKeys`; `IrcConnectionIntegrationTests.saslPreparationFailurePreventsRegistration`; `ErgoRoundTripTest.registersAccountThenAuthenticatesWithScramAndPreAway` |
+| SASL EXTERNAL / required authentication | `IrcExternalIntegrationTests.externalUsesPresentedClientCertificateAndEmptyAuthorizationIdentityBeforeRegistration`; `IrcDriverRecoveryTests.absentDeclinedAndIncompatibleRequiredSaslAllFailClosed`; `NetworkEditLifecycleTests.externalUsesTheSelectedRealClientCertificateWithoutRequiringAPasswordReference` |
 | account-notify | `IdentityReducerTests.accountNotifyUpdatesAccount` |
 | account-tag | `IdentityReducerTests.accountTagFeedsSenderAccountAndPresence`; `IdentityReducerTests.knownAccountsSurviveUntaggedIdentityNotificationsAndRemainAvailableForAccountBans` |
 | extended-join | `IdentityReducerTests.extendedJoinCapturesAccountAndRealname` |
@@ -158,3 +161,21 @@ showed unchanged cached reading-anchor bounds through server and local prepends.
 Live notification controls were enabled; historical replay did not recreate them.
 The real native module omitted replay msgids and supplied no archive-end guarantee;
 those limitations remain explicit rather than being counted as protocol coverage.
+
+Parity phase 2 was exercised on Android 15 against Ergo 2.14.0 and microsocks
+1.0.5 with RFC 1929 authentication. Observed cases include cold disabled startup
+and durable explicit disconnect, manual opt-out clearing, airplane/Wi-Fi return,
+foreground matching-token probes without another transport, visible PASS/PLAIN
+rejection and corrected credentials, configured alternate-nickname collision
+recovery and editable realname, and explicit SCRAM on the wire.
+NickServ rejection blocked autojoin; successful identification renamed the client
+before confirmation and JOIN followed confirmation into an authenticated-only channel.
+The native document picker, PKCS#12 installer and KeyChain grant selected a real
+client identity; EXTERNAL authenticated through the SOCKS5 relay with no password
+reference. Clearing the identity and returning to password SASL also worked.
+Private-leaf inspection/trust, changed-leaf rejection, pin removal and endpoint
+scoping were checked against independently calculated fingerprints. Proxy-password
+rejection was actionable. Echoed credentials were redacted in the raw console and
+in the persisted Room transcript after restart; saved config and the encrypted vault
+contained no fixture plaintext passwords. These are connection/authentication
+proofs, not new IRCv3 capabilities or iOS background-hold/MPTCP claims.

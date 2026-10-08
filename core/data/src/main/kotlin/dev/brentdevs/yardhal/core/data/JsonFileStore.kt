@@ -1,6 +1,8 @@
 package dev.brentdevs.yardhal.core.data
 
 import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
@@ -26,14 +28,14 @@ public open class JsonFileStore<T>(
     }
 
     public fun save(value: T) {
-        cachedValue = value
         val parent = file.parentFile
         if (parent != null && !parent.exists()) parent.mkdirs()
         val tmp = File(file.parentFile, file.name + ".tmp")
-        tmp.writeText(json.encodeToString(serializer, value))
-        if (!tmp.renameTo(file)) {
-            file.writeText(tmp.readText())
-            tmp.delete()
+        FileOutputStream(tmp).use { output ->
+            output.write(json.encodeToString(serializer, value).toByteArray(Charsets.UTF_8))
+            output.fd.sync()
         }
+        if (!tmp.renameTo(file)) throw IOException("Unable to atomically replace persisted data")
+        cachedValue = value
     }
 }

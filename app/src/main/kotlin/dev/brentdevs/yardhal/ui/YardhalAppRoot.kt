@@ -219,6 +219,10 @@ public fun YardhalAppRoot(
             onEditNetwork = { networkId ->
                 if (coordinator.networkStore.byId(networkId) != null) openNetworkEditor(networkId = networkId)
             },
+            onConnectNetwork = coordinator::connectNetwork,
+            onDisconnectNetwork = { coordinator.disconnect(it) },
+            onTrustCertificate = coordinator::trustCertificate,
+            onRemoveCertificateTrust = coordinator::removeCertificateTrust,
             onJoinChannel = { networkId ->
                 joinNetworkId = networkId
                 joinSendFailed = false
@@ -261,6 +265,12 @@ public fun YardhalAppRoot(
                             it.ref.kind == dev.brentdevs.yardhal.core.data.ConversationKind.CHANNEL
                     }.map { it.ref.rawTarget },
                     connected = connected,
+                    network = networkFeatures,
+                    onConnectNetwork = { coordinator.connectNetwork(networkId) },
+                    onDisconnectNetwork = { coordinator.disconnect(networkId) },
+                    onEditNetwork = { openNetworkEditor(networkId = networkId) },
+                    onTrustCertificate = { inspection -> coordinator.trustCertificate(networkId, inspection) },
+                    onRemoveCertificateTrust = { coordinator.removeCertificateTrust(networkId) },
                     canSendOffline = { text -> coordinator.canSendOffline(networkId, key, text) },
                     onSend = { text ->
                         val sent = coordinator.sendText(networkId, key, text)
