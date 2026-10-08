@@ -12,6 +12,7 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
+import kotlin.test.assertSame
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -30,6 +31,7 @@ class AndroidTlsIdentityProviderTests {
         MissingIdentityKeyChainShadow.lookupOnWorker = false
         MissingIdentityKeyChainShadow.lookupCount = 0
         MissingIdentityKeyChainShadow.lookupFailure = false
+        MissingIdentityKeyChainShadow.lookupError = null
         provider = AndroidTlsIdentityProvider(ApplicationProvider.getApplicationContext())
     }
 
@@ -59,12 +61,42 @@ class AndroidTlsIdentityProviderTests {
         assertTrue(MissingIdentityKeyChainShadow.lookupOnWorker)
     }
 
+    @Test
+    fun frameworkBindingAssertionsFailClosedWithoutExposingTheirCause() {
+        for (message in listOf(
+            "could not resolve KeyChainService",
+            "could not bind to KeyChainService",
+            "binding to KeyChainService timeout",
+            "KeyChainService died while binding",
+        )) {
+            MissingIdentityKeyChainShadow.lookupError = AssertionError(message)
+            val failure = assertFailsWith<TlsIdentityUnavailableException> { provider.resolve("missing-alias") }
+            assertTrue(assertNotNull(failure.message).contains("credential storage could not be reached"))
+            assertEquals(null, failure.cause)
+        }
+    }
+
+    @Test
+    fun unrelatedAssertionsAreNotMisclassifiedAsMissingIdentities() {
+        val error = AssertionError("unrelated provider invariant")
+        MissingIdentityKeyChainShadow.lookupError = error
+        assertSame(error, assertFailsWith<AssertionError> { provider.resolve("missing-alias") })
+    }
+
+    @Test
+    fun fatalVirtualMachineErrorsAreNotCaught() {
+        val error = OutOfMemoryError("simulated")
+        MissingIdentityKeyChainShadow.lookupError = error
+        assertSame(error, assertFailsWith<OutOfMemoryError> { provider.resolve("missing-alias") })
+    }
+
     @Implements(KeyChain::class)
     class MissingIdentityKeyChainShadow {
         companion object {
             @Volatile var lookupOnWorker: Boolean = false
             @Volatile var lookupCount: Int = 0
             @Volatile var lookupFailure: Boolean = false
+            @Volatile var lookupError: Error? = null
 
             @JvmStatic
             @Implementation
@@ -74,6 +106,7 @@ class AndroidTlsIdentityProviderTests {
                 lookupOnWorker = Thread.currentThread() != Looper.getMainLooper().thread
                 lookupCount += 1
                 if (lookupFailure) throw KeyChainException("PRIVATE KEY material must not enter an error report")
+                lookupError?.let { throw it }
                 return null
             }
         }

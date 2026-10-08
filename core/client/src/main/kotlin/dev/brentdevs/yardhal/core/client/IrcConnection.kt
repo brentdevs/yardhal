@@ -21,7 +21,6 @@ import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 import javax.net.SocketFactory
-import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLSocket
 
 public data class IrcConnectionConfig(
@@ -48,6 +47,7 @@ public data class IrcConnectionConfig(
     init {
         require(nick.isNotBlank()) { "nick must not be blank" }
         require(port in 1..65535) { "port out of range" }
+        require(realName.none { it in "\r\n\u0000" }) { "realName must be a single line without NUL" }
         require(saslMode.uppercase() in setOf("AUTO", "PLAIN", "SCRAM_SHA_256", "EXTERNAL")) { "unsupported SASL mode" }
         require(alternateNicks.all { it.isNotBlank() && it.none { character -> character in " \r\n\u0000" } }) {
             "alternate nicknames must be non-empty single tokens"
@@ -269,11 +269,6 @@ public class IrcConnection(
         val factory = createTlsSocketFactory(host, port, config.tlsClientIdentity, pin)
         val ssl = factory.createSocket(raw, host, port, true) as SSLSocket
         try {
-            val parameters = ssl.sslParameters
-            parameters.endpointIdentificationAlgorithm = "HTTPS"
-            val serverName = runCatching { SNIHostName(host) }.getOrNull()
-            if (serverName != null && host.any { it.isLetter() }) parameters.serverNames = listOf(serverName)
-            ssl.sslParameters = parameters
             ssl.startHandshake()
             return ssl
         } catch (error: Throwable) {
@@ -314,7 +309,7 @@ public class IrcConnection(
                 onDeleted = ::handleCapabilitiesDeleted,
                 required = if (saslRequired) setOf(CapabilityNegotiator.SASL_CAP) else emptySet(),
                 onRequiredUnavailable = {
-                    rejectAuthentication(SaslOutcome.Failure(0, "Server did not offer or accept required SASL authentication; check authentication settings"))
+                    handleAuthenticationFailure(SaslOutcome.Failure(0, "Server did not offer or accept required SASL authentication; check authentication settings"))
                 },
             )
             negotiator = created
@@ -339,7 +334,7 @@ public class IrcConnection(
                     emit(IrcEvent.SaslResult(outcome))
                     negotiator?.saslFinished()
                 } else if (outcome is SaslOutcome.Failure) {
-                    rejectAuthentication(outcome)
+                    handleAuthenticationFailure(outcome)
                 }
             },
             mode = config.saslMode,
@@ -349,10 +344,14 @@ public class IrcConnection(
         return true
     }
 
-    private fun rejectAuthentication(outcome: SaslOutcome.Failure) {
+    private fun handleAuthenticationFailure(outcome: SaslOutcome.Failure) {
         val safe = outcome.copy(description = trafficRedactor.redact(outcome.description))
         emit(IrcEvent.SaslResult(safe))
-        shutdown(AuthenticationRejectedException(safe.description))
+        if (registeredNickname == null) {
+            shutdown(AuthenticationRejectedException(safe.description))
+        } else {
+            negotiator?.saslFinished()
+        }
     }
 
     private fun sendPreRegistrationRequests() {
@@ -403,9 +402,9 @@ public class IrcConnection(
 
     private fun applyToSession(message: IrcMessage) {
         val numeric = message.numeric
-        if (numeric == 464 || (config.serverPassword != null &&
+        if (registeredNickname == null && (numeric == 464 || (config.serverPassword != null &&
                 ((numeric == 461 && message.parameters.getOrNull(1).equals("PASS", ignoreCase = true)) ||
-                    (message.command.equals("FAIL", ignoreCase = true) && message.parameters.firstOrNull().equals("PASS", ignoreCase = true))))) {
+                    (message.command.equals("FAIL", ignoreCase = true) && message.parameters.firstOrNull().equals("PASS", ignoreCase = true)))))) {
             shutdown(AuthenticationRejectedException("Server password was rejected; correct the saved server password"))
             return
         }
@@ -430,7 +429,7 @@ public class IrcConnection(
             }
             numeric == 1 && registeredNickname == null -> {
                 if (saslRequired && !saslSucceeded) {
-                    rejectAuthentication(SaslOutcome.Failure(0, "Server completed registration without required SASL authentication"))
+                    handleAuthenticationFailure(SaslOutcome.Failure(0, "Server completed registration without required SASL authentication"))
                     return
                 }
                 val nickname = message.parameters.firstOrNull() ?: config.nick

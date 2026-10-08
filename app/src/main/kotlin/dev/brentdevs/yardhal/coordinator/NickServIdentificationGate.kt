@@ -73,7 +73,7 @@ class NickServIdentificationGate(
                     NickServOutcome.WAITING
                 }
             }
-            464, 902, 904, 905, 906 -> NickServOutcome.REJECTED
+            464 -> NickServOutcome.REJECTED
             401 -> {
                 if (message.parameters.size >= 3 && sameName(message.parameters[1], service)) {
                     NickServOutcome.REJECTED
@@ -99,14 +99,22 @@ class NickServIdentificationGate(
         val rawBody = message.parameters[1]
         val body = if (rawBody.any { it < ' ' }) IrcFormatting.plainText(IrcFormatting.parse(rawBody)).trim() else rawBody.trim()
         if ('?' in body) return NickServOutcome.WAITING
+        var languageBody: StringBuilder? = null
+        var validatedAccountReferenceEnd = -1
         for (reference in ACCOUNT_REFERENCE.findAll(body)) {
             val quotedAccount = reference.groups[1]?.value
             val namedAccount = quotedAccount ?: reference.groups[2]?.value?.trimEnd('.', '!', ':')
             if (namedAccount == null || !matchesAccount(namedAccount)) return NickServOutcome.WAITING
+            validatedAccountReferenceEnd = reference.range.last
+            val accountGroup = reference.groups[1] ?: reference.groups[2] ?: return NickServOutcome.WAITING
+            val language = languageBody ?: StringBuilder(body).also { languageBody = it }
+            for (index in accountGroup.range) language.setCharAt(index, ' ')
         }
-        if (DANGLING_ACCOUNT_REFERENCE.containsMatchIn(body)) return NickServOutcome.WAITING
+        val danglingReference = DANGLING_ACCOUNT_REFERENCE.find(body)
+        if (danglingReference != null && danglingReference.range.last > validatedAccountReferenceEnd) return NickServOutcome.WAITING
         if (REJECTION.containsMatchIn(body)) return NickServOutcome.REJECTED
-        if (NEGATIVE.containsMatchIn(body) || NON_CONFIRMATION.containsMatchIn(body)) return NickServOutcome.WAITING
+        val language = languageBody?.toString() ?: body
+        if (NEGATIVE.containsMatchIn(language) || NON_CONFIRMATION.containsMatchIn(language)) return NickServOutcome.WAITING
         return if (CONFIRMATION.containsMatchIn(body)) NickServOutcome.IDENTIFIED else NickServOutcome.WAITING
     }
 

@@ -19,6 +19,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import dev.brentdevs.yardhal.coordinator.RecoveryPhase
 import dev.brentdevs.yardhal.coordinator.UiNetwork
@@ -33,7 +35,7 @@ public fun connectionPhaseLabel(phase: RecoveryPhase): String = when (phase) {
     RecoveryPhase.REGISTERED -> "Connected"
     RecoveryPhase.SERVER_UNREACHABLE -> "Server unreachable · waiting to retry"
     RecoveryPhase.AUTHENTICATION_REJECTED -> "Authentication or client identity rejected · correct settings to reconnect"
-    RecoveryPhase.CERTIFICATE_REJECTED -> "Server certificate rejected · inspect before trusting"
+    RecoveryPhase.CERTIFICATE_REJECTED -> "Server certificate rejected · automatic recovery paused"
     RecoveryPhase.IDENTIFYING -> "Waiting for NickServ identification…"
 }
 
@@ -64,8 +66,10 @@ public fun NetworkConnectionPanel(
             ) {
                 TextButton(onClick = onConnect) { Text("Connect") }
             }
-            if (network.connectionPhase != RecoveryPhase.USER_DISCONNECTED) {
-                TextButton(onClick = onDisconnect) { Text("Disconnect") }
+            if (network.connectionPhase != RecoveryPhase.USER_DISCONNECTED || network.disconnectSavePending) {
+                TextButton(onClick = onDisconnect) {
+                    Text(if (network.disconnectSavePending) "Retry saving Disconnect" else "Disconnect")
+                }
             }
             TextButton(onClick = onEdit) { Text("Edit network") }
             network.rejectedCertificate?.let { certificate ->
@@ -85,7 +89,11 @@ public fun NetworkConnectionPanel(
                 if (network.rejectedCertificate == certificate && onTrustCertificate(certificate)) {
                     inspected = null
                 } else {
-                    actionError = "Certificate changed or trust could not be saved. Inspect the current certificate again."
+                    actionError = if (network.rejectedCertificate != certificate) {
+                        "This rejection is no longer current. Inspect the current certificate."
+                    } else {
+                        "Certificate trust could not be applied. Check the current rejection details and certificate validity."
+                    }
                     inspected = null
                 }
             },
@@ -134,8 +142,14 @@ private fun CertificateInspectionDialog(
                     }
                 }
                 if (!current) Text("This rejection is no longer current. Close and inspect the current certificate.", color = MaterialTheme.colorScheme.error)
-                Checkbox(checked = confirmed, onCheckedChange = { confirmed = it }, enabled = current)
-                Text("I independently verified this fingerprint and trust this certificate for ${inspection.host}:${inspection.port}.")
+                val consentLabel = "I independently verified this fingerprint and trust this certificate for ${inspection.host}:${inspection.port}."
+                Checkbox(
+                    checked = confirmed,
+                    onCheckedChange = { confirmed = it },
+                    enabled = current,
+                    modifier = Modifier.semantics { contentDescription = consentLabel },
+                )
+                Text(consentLabel)
             }
         },
         confirmButton = {

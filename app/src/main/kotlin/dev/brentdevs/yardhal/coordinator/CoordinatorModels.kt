@@ -22,6 +22,7 @@ public data class UiNetwork(
         ConnectionStatus.REGISTERED -> RecoveryPhase.REGISTERED
     },
     public val connectionError: String? = null,
+    public val disconnectSavePending: Boolean = false,
     public val rejectedCertificate: CertificateInspection? = null,
     public val hasCertificatePin: Boolean = false,
 ) {

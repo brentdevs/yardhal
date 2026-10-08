@@ -36,6 +36,11 @@ import dev.brentdevs.yardhal.core.protocol.IrcCtcp
 import dev.brentdevs.yardhal.core.protocol.IrcMessage
 import dev.brentdevs.yardhal.core.protocol.IrcMultiline
 import dev.brentdevs.yardhal.core.protocol.IrcMetadata
+import dev.brentdevs.yardhal.core.protocol.IrcPrefix
+import dev.brentdevs.yardhal.core.client.SaslOutcome
+import java.security.cert.CertificateException
+import java.security.cert.CertificateExpiredException
+import java.security.cert.CertificateNotYetValidException
 import dev.brentdevs.yardhal.ui.image.ImageUrlPolicy
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicLong
@@ -91,6 +96,13 @@ public class LiveCoordinator(
 
     private val _whois = MutableStateFlow<dev.brentdevs.yardhal.core.data.WhoisInfo?>(null)
     public val whois: StateFlow<dev.brentdevs.yardhal.core.data.WhoisInfo?> = _whois.asStateFlow()
+
+    private val _operationError = MutableStateFlow<String?>(null)
+    public val operationError: StateFlow<String?> = _operationError.asStateFlow()
+
+    public fun dismissOperationError(expectedError: String) {
+        _operationError.compareAndSet(expectedError, null)
+    }
 
     public fun dismissWhois() {
         _whois.value = null
@@ -148,6 +160,10 @@ public class LiveCoordinator(
         var attemptToken = 0L
         var acceptedEpoch: Long? = null
         var connectionError: String? = null
+        var disconnectSavePending: Boolean = false
+        var authenticatedNick: String? = null
+        var authenticatedAccount: String? = null
+        var saslAuthenticated: Boolean = false
         var rejectedCertificate: CertificateInspection? = null
         var probeJob: Job? = null
         var identificationGate: NickServIdentificationGate? = null
@@ -359,8 +375,12 @@ public class LiveCoordinator(
                 if (expectedInspection != null && inspection != expectedInspection) return@trust false
                 val leaf = inspection.certificates.firstOrNull() ?: return@trust false
                 val effective = session.effective ?: return@trust false
+                if (clock() !in leaf.notBeforeMs..leaf.notAfterMs) {
+                    showConnectionError(networkId, "Certificate trust could not be applied because the certificate is expired or not yet valid. Check the server certificate and device clock.")
+                    return@trust false
+                }
                 if (!effective.tls || !effective.host.equals(inspection.host, ignoreCase = true) ||
-                    effective.port != inspection.port || clock() !in leaf.notBeforeMs..leaf.notAfterMs
+                    effective.port != inspection.port
                 ) return@trust false
                 val config = networkStore.byId(networkId) ?: return@trust false
                 val updated = config.copy(certificatePin = CertificatePin(inspection.host, inspection.port, leaf.sha256))
@@ -536,6 +556,7 @@ public class LiveCoordinator(
             }
             synchronized(session.state) {
                 val persisted = saveDisconnectIntent(networkId, true)
+                session.disconnectSavePending = !persisted
                 session.config = networkStore.byId(networkId) ?: saved
                 session.recovery.handle(RecoverySignal.USER_DISCONNECT)
                 retireTransport(session, quitReason)
@@ -602,7 +623,7 @@ public class LiveCoordinator(
                         vault,
                     )
                 } catch (_: java.io.IOException) {
-                    ingestRaw(networkId, false, "Network removed, but unused saved credentials could not be deleted. Check device storage and credential permissions.")
+                    _operationError.value = "Network removed, but unused saved credentials could not be deleted. Check device storage and credential permissions."
                 }
             }
             history.removeNetwork(networkId)
@@ -614,6 +635,8 @@ public class LiveCoordinator(
                 _buffers.update { buffers -> buffers.filterValues { it.ref.networkId != networkId } }
             }
             _profiles.update { it - networkId }
+            rawLogs.remove(networkId)
+            _rawLogVersion.update { it + 1 }
             refreshNetworkStates()
         }
     }
@@ -626,16 +649,12 @@ public class LiveCoordinator(
         var offset = 0
         var unchangedFrom = 0
         while (offset < text.length) {
-            if (text.startsWith("<redacted>", offset)) {
-                offset += "<redacted>".length
-                continue
-            }
             var match: String? = null
             for (secret in session.presentationSecrets) {
                 if (text.startsWith(secret, offset) && secret.length > (match?.length ?: 0)) match = secret
             }
             if (match == null) {
-                offset += 1
+                offset += if (text.startsWith("<redacted>", offset)) "<redacted>".length else 1
                 continue
             }
             val builder = output ?: StringBuilder(text.length).also { output = it }
@@ -857,11 +876,19 @@ public class LiveCoordinator(
             ) return
             if (event is IrcEvent.Registered) {
                 if (session.state.registered || session.pendingRegistration != null) return
+                if (session.authenticatedNick == "*") {
+                    if (session.saslAuthenticated) session.authenticatedNick = event.nickname
+                    else {
+                        session.authenticatedNick = null
+                        session.authenticatedAccount = null
+                    }
+                }
                 if (session.effective?.nickServPassword != null) beginIdentification(session, event)
                 else releaseRegistration(session, event)
                 return
             }
             if (event is IrcEvent.MessageReceived) {
+                updateAuthenticatedIdentity(session, event.message)
                 val gate = session.identificationGate
                 if (gate != null && event.message.tags["batch"] == null) {
                     val expired = gate.expire(historyElapsedClock())
@@ -875,9 +902,20 @@ public class LiveCoordinator(
                 ) return
             }
             if (event is IrcEvent.ConnectionOpened || event is IrcEvent.Disconnected) {
+                session.authenticatedNick = null
+                session.authenticatedAccount = null
+                session.saslAuthenticated = false
                 clearIdentification(session)
                 session.probeJob = null
                 history.reset(session.config.id, "Connection closed")
+            }
+            if (event is IrcEvent.SaslResult && event.outcome == SaslOutcome.Success) {
+                session.saslAuthenticated = true
+            }
+            val saslFailure = (event as? IrcEvent.SaslResult)?.outcome as? SaslOutcome.Failure
+            if (saslFailure != null && session.pendingRegistration != null) {
+                appendSystem(session, session.state.server, "SASL authentication failed: ${saslFailure.description}")
+                return
             }
             val previousMapping = session.state.casemapping
             val previousSupport = session.state.isupport
@@ -912,6 +950,47 @@ public class LiveCoordinator(
         }
     }
 
+    private fun updateAuthenticatedIdentity(session: Session, message: IrcMessage) {
+        if ("batch" in message.tags || "draft/chathistory-context" in message.tags) return
+        val prefix = message.prefix
+        fun sameName(actual: String?, expected: String?): Boolean =
+            actual != null && expected != null && CaseMapping.ASCII.equal(actual, expected)
+        when {
+            message.command.equals("NICK", true) && prefix?.user != null && prefix.host != null &&
+                sameName(prefix.nick, session.state.ownNick) && sameName(prefix.nick, session.authenticatedNick) -> {
+                message.parameters.singleOrNull()?.let { session.authenticatedNick = it }
+            }
+            message.command.equals("ACCOUNT", true) && prefix?.user != null && prefix.host != null &&
+                (sameName(prefix.nick, session.state.ownNick) ||
+                    session.authenticatedNick == "*" && prefix.nick == "*" &&
+                    !session.state.registered && session.pendingRegistration == null) &&
+                message.parameters.size == 1 -> {
+                val account = message.parameters[0].takeIf { it.isNotEmpty() && it != "*" && it.none(Char::isWhitespace) }
+                session.authenticatedNick = prefix.nick.takeIf { account != null }
+                session.authenticatedAccount = account
+            }
+            (message.numeric == 900 || message.numeric == 901) && prefix?.isServer == true && message.parameters.size >= 3 -> {
+                val target = message.parameters[0]
+                val usermask = message.parameters[1]
+                val beforeRegistration = !session.state.registered && session.pendingRegistration == null
+                val loggedInNick = if (target == "*" && usermask == "*" && beforeRegistration) "*" else {
+                    val loggedInUser = IrcPrefix.parse(usermask)
+                    if (loggedInUser?.user == null || loggedInUser.host == null ||
+                        !sameName(target, loggedInUser.nick) ||
+                        loggedInUser.nick == "*" && !beforeRegistration ||
+                        session.state.registered && !sameName(loggedInUser.nick, session.state.ownNick)
+                    ) return
+                    loggedInUser.nick
+                }
+                val account = message.parameters[2].takeIf {
+                    message.numeric == 900 && it.isNotEmpty() && it != "*" && it.none(Char::isWhitespace)
+                }
+                session.authenticatedNick = loggedInNick.takeIf { account != null }
+                session.authenticatedAccount = account
+            }
+        }
+    }
+
     private fun releaseRegistration(session: Session, event: IrcEvent.Registered) {
         if (session.state.registered || session.state.authenticationRejected ||
             !session.recovery.desiredConnection || !networkAvailable
@@ -931,6 +1010,13 @@ public class LiveCoordinator(
     private fun beginIdentification(session: Session, event: IrcEvent.Registered) {
         val effective = session.effective ?: return
         val password = effective.nickServPassword ?: return
+        val intendedAccount = effective.nickServAccount ?: event.nickname
+        if (session.authenticatedNick?.let { CaseMapping.ASCII.equal(it, event.nickname) } == true &&
+            session.authenticatedAccount?.let { CaseMapping.ASCII.equal(it, intendedAccount) } == true
+        ) {
+            releaseRegistration(session, event)
+            return
+        }
         session.recovery.handle(RecoverySignal.IDENTIFYING, session.attemptToken)
         if (session.recovery.phase != RecoveryPhase.IDENTIFYING) return
         session.state.ownNick = event.nickname
@@ -1011,6 +1097,7 @@ public class LiveCoordinator(
     private fun connectionFailed(session: Session, cause: Throwable?) {
         var error = cause
         var depth = 0
+        var certificateFailure: CertificateException? = null
         while (error != null && depth < 32) {
             when (error) {
                 is CertificateRejectedException -> {
@@ -1020,6 +1107,15 @@ public class LiveCoordinator(
                     session.reconnector?.stop()
                     return
                 }
+                is CertificateExpiredException -> {
+                    certificateFailed(session, "The server certificate has expired. Check the server certificate and device clock before reconnecting.")
+                    return
+                }
+                is CertificateNotYetValidException -> {
+                    certificateFailed(session, "The server certificate is not yet valid. Check the server certificate and device clock before reconnecting.")
+                    return
+                }
+                is CertificateException -> certificateFailure = error
                 is AuthenticationRejectedException -> {
                     authenticationFailed(session, error.message ?: "Authentication was rejected. Correct the network credentials.")
                     return
@@ -1041,9 +1137,20 @@ public class LiveCoordinator(
             error = error.cause
             depth += 1
         }
+        if (certificateFailure != null) {
+            certificateFailed(session, "The server certificate is not valid for this endpoint or could not be verified. Check the network hostname, server certificate and device clock before reconnecting.")
+            return
+        }
         if (session.recovery.phase == RecoveryPhase.OFFLINE || !networkAvailable) return
         session.connectionError = "Unable to reach ${session.config.host}:${session.effective?.port ?: session.config.port}. Check the endpoint and connectivity."
         session.recovery.handle(RecoverySignal.SERVER_FAILED, session.attemptToken)
+    }
+
+    private fun certificateFailed(session: Session, reason: String) {
+        session.rejectedCertificate = null
+        session.connectionError = reason
+        session.recovery.handle(RecoverySignal.CERT_REJECTED, session.attemptToken)
+        session.reconnector?.stop()
     }
 
     private fun inboundContext(
@@ -1463,8 +1570,13 @@ public class LiveCoordinator(
     public val rawLogVersion: StateFlow<Int> = _rawLogVersion.asStateFlow()
 
     public fun ingestRaw(networkId: String, outbound: Boolean, line: String) {
+        if (networkStore.byId(networkId) == null) return
         val safeLine = sessions[networkId]?.let { redactPresentation(it, line) } ?: line
         val deque = rawLogs.getOrPut(networkId) { ArrayDeque() }
+        if (networkStore.byId(networkId) == null) {
+            rawLogs.remove(networkId, deque)
+            return
+        }
         synchronized(deque) {
             deque.addLast(RawFrame(outbound, safeLine))
             while (deque.size > 400) deque.removeFirst()
@@ -1473,7 +1585,7 @@ public class LiveCoordinator(
     }
 
     public fun rawLog(networkId: String): List<RawFrame> {
-        val deque = rawLogs.getOrPut(networkId) { ArrayDeque() }
+        val deque = rawLogs[networkId] ?: return emptyList()
         return synchronized(deque) { deque.toList() }
     }
 
@@ -2009,6 +2121,7 @@ public class LiveCoordinator(
                     connectionError = session?.connectionError,
                     rejectedCertificate = session?.rejectedCertificate,
                     hasCertificatePin = config.certificatePin != null,
+                    disconnectSavePending = session?.disconnectSavePending == true,
                 )
             }.sortedBy { it.name }
         }

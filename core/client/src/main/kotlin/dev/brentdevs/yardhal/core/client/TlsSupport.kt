@@ -113,6 +113,21 @@ public fun createTlsSocketFactory(
     return EndpointSocketFactory(host, port, context.socketFactory, trust)
 }
 
+private fun normalizedEndpointHost(host: String): String =
+    if (':' in host || host.length == 1) host else host.removeSuffix(".")
+
+private fun sameEndpointHost(expected: String, actual: String): Boolean {
+    val normalizedExpected = normalizedEndpointHost(expected)
+    val normalizedActual = normalizedEndpointHost(actual)
+    if (normalizedExpected.equals(normalizedActual, ignoreCase = true)) return true
+    if (':' !in normalizedExpected || ':' !in normalizedActual) return false
+    return try {
+        InetAddress.getByName(normalizedExpected).address.contentEquals(InetAddress.getByName(normalizedActual).address)
+    } catch (failure: IOException) {
+        false
+    }
+}
+
 private fun platformTrustManager(store: KeyStore?): X509ExtendedTrustManager {
     val factory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
     factory.init(store)
@@ -179,27 +194,27 @@ private class EndpointTrustManager(
         layeredTransportPort: Int? = null,
         check: (X509ExtendedTrustManager) -> Unit,
     ) {
+        if (peerHost == null || !sameEndpointHost(host, peerHost) ||
+            peerPort == null || (peerPort != port && peerPort != layeredTransportPort)) {
+            throw CertificateException("TLS verification endpoint does not match the configured endpoint.")
+        }
+        if (endpointIdentificationAlgorithm != "HTTPS") {
+            throw CertificateException("Secure TLS endpoint identification is required.")
+        }
+        val leaf = chain.firstOrNull() ?: throw CertificateException("The server supplied no certificate.")
+        leaf.checkValidity()
+        if (pin != null && pin.equals(fingerprint(leaf), ignoreCase = true)) {
+            val store = KeyStore.getInstance(KeyStore.getDefaultType())
+            store.load(null, null)
+            store.setCertificateEntry("explicit-leaf", leaf)
+            check(platformTrustManager(store))
+            return
+        }
         try {
-            if (peerHost == null || !host.equals(peerHost, ignoreCase = true) ||
-                peerPort == null || (peerPort != port && peerPort != layeredTransportPort)) {
-                throw CertificateException("TLS verification endpoint does not match the configured endpoint.")
+            if (pin != null) {
+                throw CertificateException("The server certificate has changed since it was explicitly trusted.")
             }
-            if (endpointIdentificationAlgorithm != "HTTPS") {
-                throw CertificateException("Secure TLS endpoint identification is required.")
-            }
-            val leaf = chain.firstOrNull() ?: throw CertificateException("The server supplied no certificate.")
-            if (pin == null) {
-                check(platform)
-            } else {
-                if (!pin.equals(fingerprint(leaf), ignoreCase = true)) {
-                    throw CertificateException("The server certificate has changed since it was explicitly trusted.")
-                }
-                leaf.checkValidity()
-                val store = KeyStore.getInstance(KeyStore.getDefaultType())
-                store.load(null, null)
-                store.setCertificateEntry("explicit-leaf", leaf)
-                check(platformTrustManager(store))
-            }
+            check(platform)
         } catch (failure: CertificateException) {
             throw CertificateRejectedException(inspect(host, port, chain), failure)
         }
@@ -273,19 +288,37 @@ private class EndpointSocketFactory(
     private val delegate: SSLSocketFactory,
     private val trust: EndpointTrustManager,
 ) : SSLSocketFactory() {
-    private fun configure(socket: Socket): Socket {
-        val tls = socket as SSLSocket
-        val parameters = tls.sslParameters
-        parameters.endpointIdentificationAlgorithm = "HTTPS"
-        if (':' !in host && !host.matches(Regex("[0-9.]+"))) {
-            parameters.serverNames = listOf(SNIHostName(host))
+    private val endpointHost = normalizedEndpointHost(host)
+    private val serverNames = if (':' in endpointHost || endpointHost.all { it in '0'..'9' || it == '.' }) {
+        emptyList()
+    } else {
+        try {
+            listOf(SNIHostName(endpointHost))
+        } catch (failure: IllegalArgumentException) {
+            emptyList()
         }
-        tls.sslParameters = parameters
-        return tls
+    }
+
+    private fun configure(socket: Socket): Socket {
+        try {
+            val tls = socket as SSLSocket
+            val parameters = tls.sslParameters
+            parameters.endpointIdentificationAlgorithm = "HTTPS"
+            parameters.serverNames = serverNames
+            tls.sslParameters = parameters
+            return tls
+        } catch (failure: Exception) {
+            try {
+                socket.close()
+            } catch (closeFailure: IOException) {
+                failure.addSuppressed(closeFailure)
+            }
+            throw failure
+        }
     }
 
     private fun endpoint(host: String, port: Int) {
-        if (!this.host.equals(host, ignoreCase = true) || this.port != port) {
+        if (!sameEndpointHost(this.host, host) || this.port != port) {
             throw IOException("The TLS socket factory is scoped to a different server endpoint.")
         }
     }
@@ -296,28 +329,28 @@ private class EndpointSocketFactory(
 
     override fun createSocket(socket: Socket, host: String, port: Int, autoClose: Boolean): Socket {
         endpoint(host, port)
-        val tls = configure(delegate.createSocket(socket, host, port, autoClose))
+        val tls = configure(delegate.createSocket(socket, endpointHost, port, autoClose))
         trust.bindLayeredSocket(tls, socket.port)
         return tls
     }
 
     override fun createSocket(host: String, port: Int): Socket {
         endpoint(host, port)
-        return configure(delegate.createSocket(host, port))
+        return configure(delegate.createSocket(endpointHost, port))
     }
 
     override fun createSocket(host: String, port: Int, localHost: InetAddress, localPort: Int): Socket {
         endpoint(host, port)
-        return configure(delegate.createSocket(host, port, localHost, localPort))
+        return configure(delegate.createSocket(endpointHost, port, localHost, localPort))
     }
 
     override fun createSocket(host: InetAddress, port: Int): Socket {
         endpoint(host.hostAddress, port)
-        return configure(delegate.createSocket(host, port))
+        return configure(delegate.createSocket(endpointHost, port))
     }
 
     override fun createSocket(address: InetAddress, port: Int, localAddress: InetAddress, localPort: Int): Socket {
         endpoint(address.hostAddress, port)
-        return configure(delegate.createSocket(address, port, localAddress, localPort))
+        return configure(delegate.createSocket(endpointHost, port, localAddress, localPort))
     }
 }

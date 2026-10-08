@@ -7,7 +7,6 @@ import androidx.compose.runtime.setValue
 import dev.brentdevs.yardhal.coordinator.ConnectionFactory
 import dev.brentdevs.yardhal.coordinator.ConnectionStatus
 import dev.brentdevs.yardhal.coordinator.LiveCoordinator
-import dev.brentdevs.yardhal.coordinator.RecoveryPhase
 import dev.brentdevs.yardhal.core.client.IrcConnection
 import dev.brentdevs.yardhal.core.client.IrcConnectionConfig
 import dev.brentdevs.yardhal.core.client.Socks5Config
@@ -24,6 +23,7 @@ import dev.brentdevs.yardhal.core.data.ReadMarkerStore
 import dev.brentdevs.yardhal.core.data.YardhalDatabase
 import dev.brentdevs.yardhal.service.ConnectionService
 import dev.brentdevs.yardhal.service.Notifications
+import dev.brentdevs.yardhal.service.keepsRecoveryService
 import dev.brentdevs.yardhal.ui.image.RemoteImageLoader
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -122,15 +122,20 @@ class YardhalApplication : Application() {
         connectivityObserver.start()
         coordinator.startAll()
         appScope.launch {
+            var serviceWanted = false
+            var foregroundCount = 0
             coordinator.networks.collect { networks ->
-                if (networks.none { it.connectionPhase.keepsRecoveryService() }) {
+                val wanted = networks.any { it.connectionPhase.keepsRecoveryService() }
+                val count = networks.count { it.status == ConnectionStatus.REGISTERED }
+                if (wanted) {
+                    if (!serviceWanted || count != foregroundCount) {
+                        ConnectionService.start(this@YardhalApplication, count)
+                    }
+                } else if (serviceWanted) {
                     ConnectionService.stop(this@YardhalApplication)
-                } else {
-                    ConnectionService.start(
-                        this@YardhalApplication,
-                        networks.count { it.status == ConnectionStatus.REGISTERED },
-                    )
                 }
+                serviceWanted = wanted
+                foregroundCount = count
             }
         }
         backfillSearchIndex()
@@ -151,9 +156,3 @@ class YardhalApplication : Application() {
     }
 }
 
-private fun RecoveryPhase.keepsRecoveryService(): Boolean = when (this) {
-    RecoveryPhase.CONNECTING, RecoveryPhase.REGISTERED, RecoveryPhase.IDENTIFYING,
-    RecoveryPhase.OFFLINE, RecoveryPhase.SERVER_UNREACHABLE -> true
-    RecoveryPhase.DISCONNECTED, RecoveryPhase.USER_DISCONNECTED,
-    RecoveryPhase.AUTHENTICATION_REJECTED, RecoveryPhase.CERTIFICATE_REJECTED -> false
-}

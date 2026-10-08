@@ -1,11 +1,20 @@
 package dev.brentdevs.yardhal.core.client
 
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.io.InputStream
 import java.net.IDN
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.FutureTask
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 
 public data class Socks5Config(
     public val host: String,
@@ -23,11 +32,31 @@ public class Socks5Exception(
 ) : IOException(message)
 
 public object Socks5Tunnel {
+    private val nanoTime: () -> Long = System::nanoTime
+    private val lookupHost: (String) -> InetAddress = InetAddress::getByName
+    private val resolverExecutor = ThreadPoolExecutor(
+        2,
+        2,
+        60,
+        TimeUnit.SECONDS,
+        ArrayBlockingQueue(16),
+        { task -> Thread(task, "yardhal-proxy-dns").apply { isDaemon = true } },
+    ).apply { allowCoreThreadTimeOut(true) }
+
     public fun connect(
         destinationHost: String,
         destinationPort: Int,
         proxy: Socks5Config,
         timeoutMillis: Int,
+    ): Socket = connect(destinationHost, destinationPort, proxy, timeoutMillis, lookupHost, nanoTime)
+
+    internal fun connect(
+        destinationHost: String,
+        destinationPort: Int,
+        proxy: Socks5Config,
+        timeoutMillis: Int,
+        lookupHost: (String) -> InetAddress,
+        nanoTime: () -> Long,
     ): Socket {
         require(timeoutMillis > 0) { "SOCKS5 timeout must be positive" }
         require(proxy.host.isNotBlank()) { "SOCKS5 proxy host must not be blank" }
@@ -41,19 +70,19 @@ public object Socks5Tunnel {
             if (authenticated && (username == null || password == null || username.size !in 1..255 || password.size !in 1..255)) {
                 throw Socks5Exception(true, "SOCKS5 authentication requires a username and password of 1 to 255 bytes each")
             }
-            val deadlineNanos = System.nanoTime() + timeoutMillis.toLong() * 1_000_000
+            val deadlineNanos = nanoTime() + timeoutMillis.toLong() * 1_000_000
+            val endpoint = InetSocketAddress(resolveProxyHost(proxy.host, deadlineNanos, lookupHost, nanoTime), proxy.port)
             val socket = Socket()
             var connected = false
             try {
-                val endpoint = InetSocketAddress(proxy.host, proxy.port)
-                socket.connect(endpoint, remainingMillis(deadlineNanos))
+                socket.connect(endpoint, remainingMillis(deadlineNanos, nanoTime))
                 val input = socket.getInputStream()
                 val output = socket.getOutputStream()
                 val reply = ByteArray(255)
                 val method = if (authenticated) 2 else 0
                 output.write(byteArrayOf(5, 1, method.toByte()))
                 output.flush()
-                readExactly(socket, input, reply, 2, deadlineNanos)
+                readExactly(socket, input, reply, 2, deadlineNanos, nanoTime)
                 if (reply[0].toInt() != 5) {
                     throw Socks5Exception(false, "SOCKS5 proxy returned an invalid negotiation version")
                 }
@@ -77,7 +106,7 @@ public object Socks5Tunnel {
                     } finally {
                         request.fill(0)
                     }
-                    readExactly(socket, input, reply, 2, deadlineNanos)
+                    readExactly(socket, input, reply, 2, deadlineNanos, nanoTime)
                     if (reply[0].toInt() != 1) {
                         throw Socks5Exception(true, "SOCKS5 proxy returned an invalid authentication version")
                     }
@@ -97,7 +126,7 @@ public object Socks5Tunnel {
                 request[6 + destination.length] = destinationPort.toByte()
                 output.write(request)
                 output.flush()
-                readExactly(socket, input, reply, 4, deadlineNanos)
+                readExactly(socket, input, reply, 4, deadlineNanos, nanoTime)
                 if (reply[0].toInt() != 5) {
                     throw Socks5Exception(false, "SOCKS5 proxy returned an invalid connection reply version")
                 }
@@ -108,7 +137,7 @@ public object Socks5Tunnel {
                 val addressLength = when (reply[3].toInt() and 0xff) {
                     1 -> 4
                     3 -> {
-                        readExactly(socket, input, reply, 1, deadlineNanos)
+                        readExactly(socket, input, reply, 1, deadlineNanos, nanoTime)
                         val length = reply[0].toInt() and 0xff
                         if (length == 0) {
                             throw Socks5Exception(false, "SOCKS5 proxy returned an empty bound hostname")
@@ -118,12 +147,12 @@ public object Socks5Tunnel {
                     4 -> 16
                     else -> throw Socks5Exception(false, "SOCKS5 proxy returned an unsupported reply address type")
                 }
-                readExactly(socket, input, reply, addressLength, deadlineNanos)
-                readExactly(socket, input, reply, 2, deadlineNanos)
+                readExactly(socket, input, reply, addressLength, deadlineNanos, nanoTime)
+                readExactly(socket, input, reply, 2, deadlineNanos, nanoTime)
                 if (result != 0) {
                     throw Socks5Exception(false, replyFailure(result))
                 }
-                remainingMillis(deadlineNanos)
+                remainingMillis(deadlineNanos, nanoTime)
                 socket.soTimeout = 0
                 connected = true
                 return socket
@@ -135,6 +164,41 @@ public object Socks5Tunnel {
         } finally {
             username?.fill(0)
             password?.fill(0)
+        }
+    }
+
+    private fun resolveProxyHost(
+        host: String,
+        deadlineNanos: Long,
+        lookupHost: (String) -> InetAddress,
+        nanoTime: () -> Long,
+    ): InetAddress {
+        val task = FutureTask { lookupHost(host) }
+        try {
+            remainingMillis(deadlineNanos, nanoTime)
+            try {
+                resolverExecutor.execute(task)
+            } catch (error: RejectedExecutionException) {
+                throw IOException("SOCKS5 proxy name resolver is busy", error)
+            }
+            return try {
+                task.get(remainingMillis(deadlineNanos, nanoTime).toLong(), TimeUnit.MILLISECONDS)
+            } catch (_: TimeoutException) {
+                throw SocketTimeoutException("SOCKS5 proxy resolution timed out")
+            } catch (error: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw InterruptedIOException("SOCKS5 proxy resolution was interrupted").apply { initCause(error) }
+            } catch (error: ExecutionException) {
+                val cause = error.cause
+                when (cause) {
+                    is IOException -> throw cause
+                    is Error -> throw cause
+                    else -> throw IOException("SOCKS5 proxy name resolution failed", cause)
+                }
+            }
+        } finally {
+            task.cancel(true)
+            resolverExecutor.remove(task)
         }
     }
 
@@ -153,8 +217,8 @@ public object Socks5Tunnel {
         return ascii
     }
 
-    private fun remainingMillis(deadlineNanos: Long): Int {
-        val remainingNanos = deadlineNanos - System.nanoTime()
+    private fun remainingMillis(deadlineNanos: Long, nanoTime: () -> Long): Int {
+        val remainingNanos = deadlineNanos - nanoTime()
         if (remainingNanos <= 0) {
             throw SocketTimeoutException("SOCKS5 proxy negotiation timed out")
         }
@@ -167,10 +231,11 @@ public object Socks5Tunnel {
         buffer: ByteArray,
         length: Int,
         deadlineNanos: Long,
+        nanoTime: () -> Long,
     ) {
         var offset = 0
         while (offset < length) {
-            socket.soTimeout = remainingMillis(deadlineNanos)
+            socket.soTimeout = remainingMillis(deadlineNanos, nanoTime)
             val count = input.read(buffer, offset, length - offset)
             if (count < 0) {
                 throw Socks5Exception(false, "SOCKS5 proxy closed the connection during negotiation")

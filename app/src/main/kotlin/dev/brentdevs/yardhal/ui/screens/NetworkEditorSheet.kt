@@ -6,6 +6,7 @@ import android.content.ContextWrapper
 import android.net.Uri
 import android.security.KeyChain
 import androidx.activity.compose.BackHandler
+import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -36,6 +37,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -50,9 +52,13 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dev.brentdevs.yardhal.NetworkIdentitySelectionModel
 import dev.brentdevs.yardhal.core.data.NetworkConfig
 import dev.brentdevs.yardhal.core.data.SaslMode
 import java.io.IOException
+import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -143,6 +149,8 @@ public fun NetworkEditorSheet(
     BackHandler(onBack = onDismiss)
     key(initialConfig?.id, initialPreset?.id) {
         val editing = initialConfig != null
+        val editorId = rememberSaveable { UUID.randomUUID().toString() }
+        val suggestedIdentityName = suggestedTlsIdentityName(initialConfig?.id, editorId)
         val hasSavedPassword = initialConfig?.saslPasswordRef != null
         var presetId by rememberSaveable { mutableStateOf(initialPreset?.id) }
         var host by rememberSaveable { mutableStateOf(initialConfig?.host ?: initialPreset?.host ?: "") }
@@ -177,35 +185,41 @@ public fun NetworkEditorSheet(
         var tlsClientAlias by rememberSaveable { mutableStateOf(initialConfig?.tlsClientAlias) }
         var clearTlsClientAlias by rememberSaveable { mutableStateOf(false) }
         var identityError by rememberSaveable { mutableStateOf<String?>(null) }
-        var identityBusy by remember { mutableStateOf(false) }
+        var identityImportBusy by remember { mutableStateOf(false) }
         val context = LocalContext.current
-        val activity = remember(context) { context.findActivity() }
+        val activity = remember(context) { context.findActivity() as? ComponentActivity }
+        val identityModel = remember(activity) {
+            activity?.let { ViewModelProvider(it)[NetworkIdentitySelectionModel::class.java] }
+        }
+        val selection = identityModel?.selection?.collectAsStateWithLifecycle()?.value
+        val identityBusy = identityImportBusy || selection?.let { it.editorId == editorId && it.busy } == true
         val scope = rememberCoroutineScope()
+
+        LaunchedEffect(selection, editorId) {
+            val result = selection ?: return@LaunchedEffect
+            val requestId = result.requestId ?: return@LaunchedEffect
+            if (result.editorId != editorId || result.busy) return@LaunchedEffect
+            result.alias?.let {
+                tlsClientAlias = it
+                clearTlsClientAlias = false
+            }
+            identityError = result.error
+            identityModel?.consume(requestId)
+        }
 
         fun chooseIdentity() {
             val owner = activity
-            if (owner == null) {
+            val model = identityModel
+            if (owner == null || model == null) {
                 identityError = "Certificate selection requires an Android activity. Reopen the editor and try again."
-                identityBusy = false
                 return
             }
-            identityBusy = true
+            val requestId = model.begin(editorId)
             identityError = null
             try {
                 KeyChain.choosePrivateKeyAlias(
                     owner,
-                    { selected ->
-                        scope.launch {
-                            identityBusy = false
-                            if (selected == null) {
-                                identityError = "No identity was selected. Choose an installed identity or import a PKCS#12 (.p12 or .pfx) file."
-                            } else {
-                                tlsClientAlias = selected
-                                clearTlsClientAlias = false
-                                identityError = null
-                            }
-                        }
-                    },
+                    { selected -> model.complete(requestId, selected) },
                     null,
                     null,
                     host.trim().takeIf(String::isNotEmpty),
@@ -213,13 +227,12 @@ public fun NetworkEditorSheet(
                     tlsClientAlias,
                 )
             } catch (_: Exception) {
-                identityBusy = false
-                identityError = "Android couldn't open identity selection. Check that a certificate with a private key is installed, then try again."
+                model.fail(requestId)
             }
         }
 
         val installIdentity = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-            identityBusy = false
+            identityImportBusy = false
             if (result.resultCode == Activity.RESULT_OK) {
                 chooseIdentity()
             } else {
@@ -229,19 +242,20 @@ public fun NetworkEditorSheet(
         val importIdentity = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
             if (uri != null) {
                 scope.launch {
-                    identityBusy = true
+                    identityImportBusy = true
                     identityError = null
                     try {
                         val bytes = withContext(Dispatchers.IO) { readPkcs12(context, uri) }
                         installIdentity.launch(
                             KeyChain.createInstallIntent()
                                 .putExtra(KeyChain.EXTRA_PKCS12, bytes)
-                                .putExtra(KeyChain.EXTRA_NAME, "Yardhal IRC identity"),
+                                .putExtra(KeyChain.EXTRA_NAME, suggestedIdentityName),
                         )
                     } catch (error: CancellationException) {
+                        identityImportBusy = false
                         throw error
                     } catch (_: Exception) {
-                        identityBusy = false
+                        identityImportBusy = false
                         identityError = "Couldn't import the identity. Choose a readable PKCS#12 (.p12 or .pfx) file smaller than 512 KiB, then enter its password in Android's installer."
                     }
                 }
@@ -255,6 +269,39 @@ public fun NetworkEditorSheet(
             tls = selected.tls
             if (name.isBlank()) name = selected.name
         }
+
+        val draft = NetworkDraft(
+            host = host.trim(),
+            port = port.toIntOrNull() ?: 0,
+            tls = tls,
+            nick = nick.trim(),
+            saslPassword = if (clearPassword) null else password.takeIf(String::isNotEmpty),
+            autojoin = channels.split(',').mapNotNull { it.trim().takeIf(String::isNotEmpty) },
+            displayName = name.trim().ifBlank { host.trim() },
+            networkId = initialConfig?.id,
+            saslAuthcid = account.trim().takeIf(String::isNotEmpty),
+            clearSaslPassword = clearPassword,
+            realName = realName,
+            alternateNicks = parseAlternateNicknames(alternateNicks),
+            autoConnect = autoConnect,
+            saslMode = saslMode,
+            serverPassword = if (clearServerPassword) null else serverPassword.takeIf(String::isNotEmpty),
+            clearServerPassword = clearServerPassword,
+            nickServAccount = nickServAccount.trim(),
+            nickServService = nickServService.trim(),
+            nickServPassword = if (clearNickServPassword) null else nickServPassword.takeIf(String::isNotEmpty),
+            clearNickServPassword = clearNickServPassword,
+            waitForNickServ = waitForNickServ,
+            proxyEnabled = proxyEnabled,
+            proxyHost = proxyHost.trim(),
+            proxyPort = proxyPort.toIntOrNull(),
+            proxyUsername = proxyUsername,
+            proxyPassword = if (!proxyEnabled || clearProxyPassword) null else proxyPassword.takeIf(String::isNotEmpty),
+            clearProxyPassword = clearProxyPassword,
+            tlsClientAlias = tlsClientAlias,
+            clearTlsClientAlias = clearTlsClientAlias,
+        )
+        val validationErrors = networkEditorErrors(draft, initialConfig)
 
         Column(
             modifier = modifier
@@ -323,7 +370,7 @@ public fun NetworkEditorSheet(
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
-            EditorTextField("Alternate nicknames (comma-separated)", alternateNicks) { alternateNicks = it }
+            EditorTextField("Alternate nicknames (commas or whitespace)", alternateNicks) { alternateNicks = it }
             EditorTextField("Real name", realName) { realName = it }
             Text("SASL authentication", style = MaterialTheme.typography.titleSmall)
             Row(
@@ -422,54 +469,12 @@ public fun NetworkEditorSheet(
                     color = MaterialTheme.colorScheme.error,
                 )
             }
-            val portValid = port.toIntOrNull()?.let { it in 1..65535 } == true
-            val proxyValid = !proxyEnabled || (
-                proxyHost.isNotBlank() && proxyPort.toIntOrNull()?.let { it in 1..65535 } == true
-            )
-            val externalValid = saslMode != SaslMode.EXTERNAL || (tls && tlsClientAlias != null)
-            if (!externalValid) {
-                Text("Choose a TLS client identity and enable TLS to use SASL EXTERNAL.", color = MaterialTheme.colorScheme.error)
-            }
+            validationErrors.forEach { Text(it, color = MaterialTheme.colorScheme.error) }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.align(Alignment.End)) {
                 OutlinedButton(onClick = onDismiss) { Text("Cancel") }
                 Button(
-                    enabled = host.isNotBlank() && nick.isNotBlank() && portValid && proxyValid && externalValid &&
-                        nickServService.isNotBlank() && !identityBusy,
-                    onClick = {
-                        saveFailed = !onSave(
-                            NetworkDraft(
-                                host = host.trim(),
-                                port = port.toInt(),
-                                tls = tls,
-                                nick = nick.trim(),
-                                saslPassword = if (clearPassword) null else password.takeIf { it.isNotEmpty() },
-                                autojoin = channels.split(',').mapNotNull { it.trim().takeIf(String::isNotEmpty) },
-                                displayName = name.trim().ifBlank { host.trim() },
-                                networkId = initialConfig?.id,
-                                saslAuthcid = account.trim().takeIf(String::isNotEmpty),
-                                clearSaslPassword = clearPassword,
-                                realName = realName,
-                                alternateNicks = alternateNicks.split(',').mapNotNull { it.trim().takeIf(String::isNotEmpty) },
-                                autoConnect = autoConnect,
-                                saslMode = saslMode,
-                                serverPassword = if (clearServerPassword) null else serverPassword.takeIf(String::isNotEmpty),
-                                clearServerPassword = clearServerPassword,
-                                nickServAccount = nickServAccount.trim(),
-                                nickServService = nickServService.trim(),
-                                nickServPassword = if (clearNickServPassword) null else nickServPassword.takeIf(String::isNotEmpty),
-                                clearNickServPassword = clearNickServPassword,
-                                waitForNickServ = waitForNickServ,
-                                proxyEnabled = proxyEnabled,
-                                proxyHost = proxyHost.trim(),
-                                proxyPort = proxyPort.toIntOrNull(),
-                                proxyUsername = proxyUsername,
-                                proxyPassword = if (!proxyEnabled || clearProxyPassword) null else proxyPassword.takeIf(String::isNotEmpty),
-                                clearProxyPassword = clearProxyPassword,
-                                tlsClientAlias = tlsClientAlias,
-                                clearTlsClientAlias = clearTlsClientAlias,
-                            ),
-                        )
-                    },
+                    enabled = validationErrors.isEmpty() && !identityBusy,
+                    onClick = { saveFailed = !onSave(draft) },
                 ) { Text(if (editing) "Save changes" else if (autoConnect) "Connect" else "Add network") }
             }
         }

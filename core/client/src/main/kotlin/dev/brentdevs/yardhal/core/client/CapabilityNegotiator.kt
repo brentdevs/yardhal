@@ -140,6 +140,7 @@ public class CapabilityNegotiator(
     }
 
     private fun rejectMissingRequired(offered: Set<String>): Boolean {
+        if (!registrationHandshake || capEndSent) return false
         val missing = required - offered
         if (missing.isEmpty()) return false
         phase = Phase.FINISHED

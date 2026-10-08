@@ -6,6 +6,8 @@ import java.nio.file.Path
 import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.PrivateKey
+import java.security.cert.CertificateException
+import java.security.cert.CertificateExpiredException
 import java.security.cert.X509Certificate
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
@@ -19,6 +21,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
@@ -52,6 +55,39 @@ class TlsSupportTests {
         TlsLoopback("server").use { server ->
             connect(server)
             assertTrue(server.result().isSuccess)
+        }
+    }
+
+    @Test
+    fun absoluteDnsEndpointNormalizesSniAndStillPassesPlatformVerification() {
+        TlsLoopback("server").use { server ->
+            connect(server, host = "localhost.")
+            assertTrue(server.result().isSuccess)
+        }
+    }
+
+    @Test
+    fun absoluteDnsEndpointStillEnforcesItsPinnedCertificateHostname() {
+        TlsLoopback("private").use { server ->
+            connect(server, host = "localhost.", pin = sha256(certificate("private")))
+            assertTrue(server.result().isSuccess)
+        }
+        TlsLoopback("private").use { server ->
+            val failure = nonInspectableFailure {
+                connect(server, host = "wrong-host.invalid.", pin = sha256(certificate("private")))
+            }
+            assertTrue(assertNotNull(failure.message).contains("wrong-host.invalid"))
+            assertTrue(server.result().isFailure)
+        }
+    }
+
+    @Test
+    fun invalidSniDoesNotAbortSocketConfigurationOrBypassPinnedHostnameChecks() {
+        TlsLoopback("private").use { server ->
+            nonInspectableFailure {
+                connect(server, host = "irc_bad.invalid", pin = sha256(certificate("private")))
+            }
+            assertTrue(server.result().isFailure)
         }
     }
 
@@ -110,11 +146,10 @@ class TlsSupportTests {
     @Test
     fun aMatchingPrivateLeafPinDoesNotBypassDestinationHostnameVerification() {
         TlsLoopback("private").use { server ->
-            val rejected = rejection {
+            val failure = nonInspectableFailure {
                 connect(server, host = "wrong-host.invalid", pin = sha256(certificate("private")))
             }
-            assertEquals("wrong-host.invalid", rejected.inspection.host)
-            assertEquals(sha256(certificate("private")), rejected.inspection.certificates.first().sha256)
+            assertTrue(assertNotNull(failure.message).contains("wrong-host.invalid"))
             assertTrue(server.result().isFailure)
         }
     }
@@ -130,8 +165,20 @@ class TlsSupportTests {
     @Test
     fun aMatchingPinDoesNotAcceptAnExpiredLeaf() {
         TlsLoopback("expired").use { server ->
-            rejection { connect(server, pin = sha256(certificate("expired"))) }
+            val failure = nonInspectableFailure { connect(server, pin = sha256(certificate("expired"))) }
+            assertTrue(failure is CertificateExpiredException)
             assertTrue(server.result().isFailure)
+        }
+    }
+
+    @Test
+    fun anExpiredChangedOrUnpinnedLeafReportsValidityInsteadOfOfferingTrust() {
+        for (pin in listOf(null, sha256(certificate("private")))) {
+            TlsLoopback("expired").use { server ->
+                val failure = nonInspectableFailure { connect(server, host = "localhost.", pin = pin) }
+                assertTrue(failure is CertificateExpiredException)
+                assertTrue(server.result().isFailure)
+            }
         }
     }
 
@@ -146,6 +193,20 @@ class TlsSupportTests {
         }
         assertFalse(identity.toString().contains("PRIVATE"))
         assertEquals("TlsClientIdentity(certificates=2)", identity.toString())
+    }
+
+    @Test
+    fun distinctClientIdentitiesPresentTheirOwnKeysAndCertificatesToTheServer() {
+        val first = identity()
+        val second = identity("client-other")
+        assertFalse(sha256(first.certificates.first()) == sha256(second.certificates.first()))
+        assertFalse(first.privateKey.encoded.contentEquals(second.privateKey.encoded))
+        for (selected in listOf(first, second)) {
+            TlsLoopback("server", requireClientCertificate = true).use { server ->
+                connect(server, identity = selected)
+                assertEquals(selected.certificates.map(::sha256), server.result().getOrThrow().map(::sha256))
+            }
+        }
     }
 
     @Test
@@ -191,17 +252,70 @@ class TlsSupportTests {
         TlsLoopback("private").use { server ->
             val scopedPort = if (server.port == 6697) 6698 else 6697
             val factory = createTlsSocketFactory("localhost", scopedPort, pinnedFingerprintSha256 = sha256(certificate("private")))
-            val rejected = rejection {
+            val failure = nonInspectableFailure {
                 (factory.createSocket() as SSLSocket).use { socket ->
                     socket.soTimeout = 5_000
                     socket.connect(java.net.InetSocketAddress(InetAddress.getLoopbackAddress(), server.port), 5_000)
                     socket.startHandshake()
                 }
             }
-            assertEquals(scopedPort, rejected.inspection.port)
-            assertEquals("localhost", rejected.inspection.host)
-            assertEquals(sha256(certificate("private")), rejected.inspection.certificates.single().sha256)
+            assertTrue(assertNotNull(failure.message).contains("endpoint does not match"))
             assertTrue(server.result().isFailure)
+        }
+    }
+
+    @Test
+    fun numericIpv6EndpointsAcceptEquivalentSpellingsWithBothInetAddressOverloads() {
+        val loopback = InetAddress.getByName("::1")
+        for (bindLocal in listOf(false, true)) {
+            TlsLoopback("private-v6", bindAddress = loopback).use { server ->
+                val factory = createTlsSocketFactory("::1", server.port, pinnedFingerprintSha256 = sha256(certificate("private-v6")))
+                val created = if (bindLocal) {
+                    factory.createSocket(loopback, server.port, loopback, 0)
+                } else {
+                    factory.createSocket(loopback, server.port)
+                }
+                (created as SSLSocket).use { socket ->
+                    socket.soTimeout = 5_000
+                    socket.startHandshake()
+                    socket.getOutputStream().write(7)
+                    socket.getOutputStream().flush()
+                }
+                assertTrue(server.result().isSuccess)
+            }
+        }
+    }
+
+    @Test
+    fun anUnconnectedNumericSocketCannotReuseItsPinForAnotherIpv6Host() {
+        val loopback = InetAddress.getByName("::1")
+        TlsLoopback("private-v6", bindAddress = loopback).use { server ->
+            val factory = createTlsSocketFactory("::2", server.port, pinnedFingerprintSha256 = sha256(certificate("private-v6")))
+            val failure = nonInspectableFailure {
+                (factory.createSocket() as SSLSocket).use { socket ->
+                    socket.soTimeout = 5_000
+                    socket.connect(java.net.InetSocketAddress(loopback, server.port), 5_000)
+                    socket.startHandshake()
+                }
+            }
+            assertTrue(assertNotNull(failure.message).contains("endpoint does not match"))
+            assertTrue(server.result().isFailure)
+        }
+    }
+
+    @Test
+    fun numericEndpointNormalizationDoesNotBroadenHostOrPortPinScope() {
+        val factory = createTlsSocketFactory("::1", 6697, pinnedFingerprintSha256 = sha256(certificate("private")))
+        val loopback = InetAddress.getByName("::1")
+        assertFailsWith<java.io.IOException> { factory.createSocket(InetAddress.getByName("::2"), 6697) }
+        assertFailsWith<java.io.IOException> { factory.createSocket(loopback, 6698, loopback, 0) }
+        assertFailsWith<java.io.IOException> { factory.createSocket(InetAddress.getByName("::2"), 6697, loopback, 0) }
+        assertFailsWith<java.io.IOException> { factory.createSocket(loopback, 6698) }
+        Socket().use { raw ->
+            assertFailsWith<java.io.IOException> { factory.createSocket(raw, "localhost", 6697, false) }
+            assertFailsWith<java.io.IOException> { factory.createSocket(raw, "127.0.0.1", 6697, false) }
+            val dnsFactory = createTlsSocketFactory("localhost", 6697, pinnedFingerprintSha256 = sha256(certificate("private")))
+            assertFailsWith<java.io.IOException> { dnsFactory.createSocket(raw, "127.0.0.1", 6697, false) }
         }
     }
 
@@ -225,8 +339,15 @@ class TlsSupportTests {
             .filterIsInstance<CertificateRejectedException>().firstOrNull())
     }
 
-    private fun identity(): TlsClientIdentity {
-        val store = store("client")
+    private fun nonInspectableFailure(block: () -> Unit): CertificateException {
+        val failure = assertFailsWith<javax.net.ssl.SSLException>(block = block)
+        val causes = generateSequence<Throwable>(failure) { it.cause }.toList()
+        assertNull(causes.filterIsInstance<CertificateRejectedException>().firstOrNull())
+        return assertNotNull(causes.filterIsInstance<CertificateException>().firstOrNull())
+    }
+
+    private fun identity(name: String = "client"): TlsClientIdentity {
+        val store = store(name)
         val key = store.getKey("client", password) as PrivateKey
         val chain = requireNotNull(store.getCertificateChain("client")).map { it as X509Certificate }.toTypedArray()
         return TlsClientIdentity(key, chain)
@@ -241,7 +362,11 @@ class TlsSupportTests {
     private fun sha256(certificate: X509Certificate): String =
         MessageDigest.getInstance("SHA-256").digest(certificate.encoded).joinToString("") { "%02x".format(it.toInt() and 255) }
 
-    private inner class TlsLoopback(name: String, requireClientCertificate: Boolean = false) : AutoCloseable {
+    private inner class TlsLoopback(
+        name: String,
+        requireClientCertificate: Boolean = false,
+        bindAddress: InetAddress = InetAddress.getLoopbackAddress(),
+    ) : AutoCloseable {
         private val listener: SSLServerSocket
         private val completed = CompletableFuture<Result<List<X509Certificate>>>()
         private val worker: Thread
@@ -251,11 +376,14 @@ class TlsSupportTests {
             val keys = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm()).apply {
                 init(store(name), password)
             }
+            val serverTrust = store("trusted").apply {
+                setCertificateEntry("other-client", store("client-other").getCertificate("client"))
+            }
             val trust = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm()).apply {
-                init(store("trusted"))
+                init(serverTrust)
             }
             val context = SSLContext.getInstance("TLS").apply { init(keys.keyManagers, trust.trustManagers, null) }
-            listener = context.serverSocketFactory.createServerSocket(0, 1, InetAddress.getLoopbackAddress()) as SSLServerSocket
+            listener = context.serverSocketFactory.createServerSocket(0, 1, bindAddress) as SSLServerSocket
             listener.soTimeout = 5_000
             listener.needClientAuth = requireClientCertificate
             worker = thread(name = "tls-loopback", isDaemon = true) {

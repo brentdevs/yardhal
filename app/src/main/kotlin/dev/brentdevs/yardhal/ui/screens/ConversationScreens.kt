@@ -1623,11 +1623,6 @@ public fun NetworkOverviewScreen(
                                     style = MaterialTheme.typography.titleMedium,
                                     fontWeight = FontWeight.Bold,
                                 )
-                                Text(
-                                    text = dev.brentdevs.yardhal.ui.components.connectionPhaseLabel(network.connectionPhase),
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
                             }
                             if (entry.isCollapsed && entry.hasUnread) {
                                 val netBadgeText = if (entry.unreadCount > 99) "99+" else if (entry.unreadCount > 0) "${entry.unreadCount}" else "•"

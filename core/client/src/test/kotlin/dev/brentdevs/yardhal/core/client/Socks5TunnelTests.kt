@@ -1,19 +1,24 @@
 package dev.brentdevs.yardhal.core.client
 
 import java.io.InputStream
+import java.io.InterruptedIOException
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
 import java.net.SocketTimeoutException
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.FutureTask
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertTrue
 import org.junit.jupiter.api.Test
 
@@ -187,16 +192,165 @@ class Socks5TunnelTests {
 
     @Test
     fun fragmentedReadsShareOneDeadlineAcrossHandshakeStages() {
-        assertNegotiationTimeout(timeoutMillis = 200) { socket ->
+        val clock = AtomicLong()
+        TcpFixture { socket ->
+            expectGreeting(socket, 2)
             write(socket, byteArrayOf(5))
-            Thread.sleep(120)
+            clock.set(TimeUnit.SECONDS.toNanos(8))
+            write(socket, byteArrayOf(2))
+            expectCredentials(socket, PROXY_USERNAME, PROXY_PASSWORD)
+            write(socket, byteArrayOf(1))
+            clock.set(TimeUnit.SECONDS.toNanos(16))
             write(socket, byteArrayOf(0))
             expectDestination(socket, DESTINATION_HOST)
             val reply = successReply(1)
             write(socket, reply.copyOf(1))
-            Thread.sleep(120)
+            clock.set(TimeUnit.SECONDS.toNanos(22))
             runCatching { write(socket, reply.copyOfRange(1, reply.size)) }
             assertClientClosed(socket)
+        }.use { proxy ->
+            assertFailsWith<SocketTimeoutException> {
+                Socks5Tunnel.connect(
+                    DESTINATION_HOST,
+                    6667,
+                    proxy.config(authenticated = true),
+                    20_000,
+                    lookupHost = { host ->
+                        InetAddress.getByName(host).also { clock.set(TimeUnit.SECONDS.toNanos(4)) }
+                    },
+                    nanoTime = clock::get,
+                ).close()
+            }
+            proxy.await()
+        }
+    }
+
+    @Test
+    fun stalledProxyResolutionTimesOutWithoutGrowingWorkersOrRetainingCancelledLookups() {
+        val started = CountDownLatch(2)
+        val release = CountDownLatch(1)
+        val finished = CountDownLatch(2)
+        val lookups = AtomicInteger()
+        val interrupted = AtomicInteger()
+        val resolver: (String) -> InetAddress = { host ->
+            assertEquals("stalled.proxy.invalid", host)
+            lookups.incrementAndGet()
+            started.countDown()
+            try {
+                var released = false
+                while (!released) {
+                    try {
+                        release.await()
+                        released = true
+                    } catch (_: InterruptedException) {
+                        interrupted.incrementAndGet()
+                    }
+                }
+                InetAddress.getLoopbackAddress()
+            } finally {
+                finished.countDown()
+            }
+        }
+        val clients = List(2) {
+            FutureTask {
+                val startNanos = System.nanoTime()
+                val failure = runCatching {
+                    Socks5Tunnel.connect(
+                        DESTINATION_HOST,
+                        6667,
+                        Socks5Config("stalled.proxy.invalid", 1080),
+                        1_000,
+                        resolver,
+                        System::nanoTime,
+                    ).close()
+                }.exceptionOrNull()
+                failure to (System.nanoTime() - startNanos)
+            }.also { task ->
+                thread(isDaemon = true, name = "socks-test-dns-client") { task.run() }
+            }
+        }
+        try {
+            assertTrue(started.await(5, TimeUnit.SECONDS))
+            repeat(6) {
+                assertFailsWith<SocketTimeoutException> {
+                    Socks5Tunnel.connect(
+                        DESTINATION_HOST,
+                        6667,
+                        Socks5Config("stalled.proxy.invalid", 1080),
+                        100,
+                        resolver,
+                        System::nanoTime,
+                    )
+                }
+            }
+            for (client in clients) {
+                val (failure, elapsedNanos) = client.get(5, TimeUnit.SECONDS)
+                assertIs<SocketTimeoutException>(failure)
+                assertTrue(elapsedNanos < TimeUnit.SECONDS.toNanos(5))
+            }
+            assertEquals(2, lookups.get())
+        } finally {
+            release.countDown()
+            clients.forEach { it.cancel(true) }
+        }
+        assertTrue(finished.await(5, TimeUnit.SECONDS))
+        assertTrue(interrupted.get() >= 2)
+        TcpFixture { socket ->
+            expectGreeting(socket, 0)
+            acceptAnonymousConnect(socket)
+            write(socket, successReply(1))
+        }.use { proxy ->
+            Socks5Tunnel.connect(
+                DESTINATION_HOST,
+                6667,
+                proxy.config(authenticated = false),
+                3_000,
+                lookupHost = { InetAddress.getLoopbackAddress() },
+                nanoTime = System::nanoTime,
+            ).use { tunnel -> assertTrue(tunnel.isConnected) }
+            proxy.await()
+        }
+        assertEquals(2, lookups.get())
+    }
+
+    @Test
+    fun interruptingProxyResolutionCancelsTheLookupAndPreservesCallerInterruption() {
+        val started = CountDownLatch(1)
+        val cancelled = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val client = FutureTask {
+            val failure = runCatching {
+                Socks5Tunnel.connect(
+                    DESTINATION_HOST,
+                    6667,
+                    Socks5Config("cancelled.proxy.invalid", 1080),
+                    20_000,
+                    lookupHost = {
+                        started.countDown()
+                        try {
+                            release.await()
+                        } catch (_: InterruptedException) {
+                            cancelled.countDown()
+                        }
+                        InetAddress.getLoopbackAddress()
+                    },
+                    nanoTime = System::nanoTime,
+                ).close()
+            }.exceptionOrNull()
+            failure to Thread.currentThread().isInterrupted
+        }
+        val caller = thread(isDaemon = true, name = "socks-test-interrupted-dns-client") { client.run() }
+        try {
+            assertTrue(started.await(5, TimeUnit.SECONDS))
+            caller.interrupt()
+            val (failure, wasInterrupted) = client.get(5, TimeUnit.SECONDS)
+            assertIs<InterruptedIOException>(failure)
+            assertTrue(wasInterrupted)
+            assertTrue(cancelled.await(5, TimeUnit.SECONDS))
+        } finally {
+            release.countDown()
+            client.cancel(true)
+            caller.join(1_000)
         }
     }
 

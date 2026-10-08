@@ -27,6 +27,15 @@ public class AndroidTlsIdentityProvider(context: Context) {
             throw TlsIdentityUnavailableException("Access to the selected client identity was revoked. Select it again in network settings.")
         } catch (failure: IllegalStateException) {
             throw TlsIdentityUnavailableException("Android credential storage is unavailable. Unlock the device and try again.")
+        } catch (failure: AssertionError) {
+            when (failure.message) {
+                "could not resolve KeyChainService",
+                "could not bind to KeyChainService",
+                "binding to KeyChainService timeout",
+                "KeyChainService died while binding",
+                -> throw TlsIdentityUnavailableException("Android credential storage could not be reached. Unlock the device and select the identity again.")
+                else -> throw failure
+            }
         } catch (failure: InterruptedException) {
             Thread.currentThread().interrupt()
             throw TlsIdentityUnavailableException("Client identity lookup was interrupted. Try connecting again.")

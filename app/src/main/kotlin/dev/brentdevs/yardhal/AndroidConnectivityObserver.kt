@@ -82,7 +82,6 @@ class AndroidConnectivityObserver(
         val currentCapabilities = capabilities
         val available = network != null && !blocked && currentCapabilities != null &&
             currentCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
-            currentCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) &&
             currentCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_SUSPENDED)
         val handle = network?.networkHandle
         var transportMask = 0

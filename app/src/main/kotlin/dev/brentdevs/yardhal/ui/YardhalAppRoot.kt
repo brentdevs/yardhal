@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -30,6 +31,9 @@ import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -95,6 +99,13 @@ public fun YardhalAppRoot(
     val mutedKeys by coordinator.mutedState.collectAsStateWithLifecycle()
     val orderState by coordinator.orderState.collectAsStateWithLifecycle()
     val profiles by coordinator.profiles.collectAsStateWithLifecycle()
+    val operationError by coordinator.operationError.collectAsStateWithLifecycle()
+    val operationSnackbarState = remember { SnackbarHostState() }
+    LaunchedEffect(operationError) {
+        val error = operationError ?: return@LaunchedEffect
+        operationSnackbarState.showSnackbar(error, withDismissAction = true)
+        coordinator.dismissOperationError(error)
+    }
 
     var networkEditorVisible by rememberSaveable { mutableStateOf(false) }
     var editingNetworkId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -367,7 +378,7 @@ public fun YardhalAppRoot(
         LaunchedEffect(editingNetworkId) { dismissNetworkEditor() }
     }
 
-    Surface(modifier = modifier.fillMaxSize()) {
+    val mainContent: @Composable () -> Unit = content@{
         if (networkEditorVisible && !missingEditTarget) {
             NetworkEditorSheet(
                 presets = presets,
@@ -450,7 +461,7 @@ public fun YardhalAppRoot(
         } else {
             when {
                 selectedKey != null -> {
-                    val key = selectedKey ?: return@Surface
+                    val key = selectedKey ?: return@content
                     val buffer = conversationBufferFor(key)
                     val networkId = key.substringBefore("|")
                     val network = networks.firstOrNull { it.id == networkId }
@@ -494,6 +505,16 @@ public fun YardhalAppRoot(
                     }
                 }
             }
+        }
+    }
+
+    Scaffold(
+        modifier = modifier.fillMaxSize(),
+        containerColor = MaterialTheme.colorScheme.surface,
+        snackbarHost = { SnackbarHost(operationSnackbarState) },
+    ) { contentPadding ->
+        Box(Modifier.fillMaxSize().padding(contentPadding).consumeWindowInsets(contentPadding)) {
+            mainContent()
         }
     }
 

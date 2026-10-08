@@ -603,6 +603,24 @@ class PerNetworkStateTests {
     }
 
     @Test
+    fun postregistrationSaslFailurePreservesEstablishedChannelsAndAllowsLiveTraffic() {
+        val state = state(autojoin = listOf("#room"))
+        val context = InboundContext(nowMs = now)
+        state.apply(IrcEvent.Registered("me", "Welcome"), context)
+        state.joinChannelWith("#room", "me", "alice")
+        val epoch = state.connectionEpoch
+        val effects = state.apply(IrcEvent.SaslResult(SaslOutcome.Failure(904, "Password rejected.")), context)
+        assertTrue(state.registered)
+        assertFalse(state.authenticationRejected)
+        assertEquals(epoch, state.connectionEpoch)
+        assertEquals(listOf("alice", "me"), state.channel(channel("#room").storageKey)?.memberList()?.map { it.nick })
+        assertTrue(effects.filterIsInstance<InboundEffect.AuthenticationFailed>().isEmpty())
+        assertTrue(effects.appended().single().text.contains("Password rejected."))
+        assertEquals("still live", state.feed(":alice!u@h PRIVMSG #room :still live").appended().single().text)
+        assertTrue(state.apply(IrcEvent.Registered("me", "Duplicate welcome"), context).sent().isEmpty())
+    }
+
+    @Test
     fun registrationJoinsAutojoinAndOpenChannelsOnce() {
         val state = state(autojoin = listOf("#a", "#b"))
         val context = InboundContext(nowMs = now, openChannels = { listOf("#b", "#c") })

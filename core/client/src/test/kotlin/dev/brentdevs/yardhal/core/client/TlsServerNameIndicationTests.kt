@@ -8,6 +8,7 @@ import java.net.SocketAddress
 import javax.net.SocketFactory
 import kotlin.concurrent.thread
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.runBlocking
@@ -35,6 +36,28 @@ class TlsServerNameIndicationTests {
 
     @org.junit.jupiter.api.Test
     fun clientHelloNamesTheConfiguredHost() = runBlocking {
+        val hello = captureClientHello("irc.sni.invalid")
+        assertEquals(0x16, hello.first().toInt())
+        assertTrue(String(hello, Charsets.ISO_8859_1).contains("irc.sni.invalid"))
+    }
+
+    @org.junit.jupiter.api.Test
+    fun absoluteDnsEndpointUsesNormalizedSniInTheActualClientHello() = runBlocking {
+        val hello = captureClientHello("irc.sni.invalid.")
+        val text = String(hello, Charsets.ISO_8859_1)
+        assertEquals(0x16, hello.first().toInt())
+        assertTrue(text.contains("irc.sni.invalid"))
+        assertFalse(text.contains("irc.sni.invalid."))
+    }
+
+    @org.junit.jupiter.api.Test
+    fun invalidSniEndpointStillSendsAClientHelloWithoutAnInvalidServerName() = runBlocking {
+        val hello = captureClientHello("irc_sni.invalid")
+        assertEquals(0x16, hello.first().toInt())
+        assertFalse(String(hello, Charsets.ISO_8859_1).contains("irc_sni.invalid"))
+    }
+
+    private suspend fun captureClientHello(host: String): ByteArray {
         ServerSocket(0, 1, InetAddress.getLoopbackAddress()).use { listener ->
             val captured = CompletableDeferred<ByteArray>()
             thread(isDaemon = true) {
@@ -49,7 +72,7 @@ class TlsServerNameIndicationTests {
             }
             val connection = IrcConnection(
                 config = IrcConnectionConfig(
-                    host = "irc.sni.invalid",
+                    host = host,
                     port = 6697,
                     tls = true,
                     nick = "sni-test",
@@ -61,8 +84,7 @@ class TlsServerNameIndicationTests {
             connection.start()
             val hello = withTimeout(5_000) { captured.await() }
             connection.disconnect()
-            assertEquals(0x16, hello.first().toInt())
-            assertTrue(String(hello, Charsets.ISO_8859_1).contains("irc.sni.invalid"))
+            return hello
         }
     }
 }

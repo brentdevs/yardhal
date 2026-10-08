@@ -41,6 +41,10 @@ import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -51,6 +55,7 @@ import kotlinx.coroutines.withTimeout
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 
+@OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
 class NetworkSaverTests {
     private class Server : AutoCloseable {
@@ -157,14 +162,15 @@ class NetworkSaverTests {
         }
     }
 
-    private class Harness : AutoCloseable {
+    private class Harness(private val dispatcher: CoroutineDispatcher = Dispatchers.Default) : AutoCloseable {
         val directory = Files.createTempDirectory("yardhal-network-save").toFile()
         private val job = SupervisorJob()
-        private val scope = CoroutineScope(job + Dispatchers.Default)
+        private val scope = CoroutineScope(job + dispatcher)
         private val database = YardhalDatabase.inMemory(ApplicationProvider.getApplicationContext<Context>())
         val vault = ObservedVault()
         val networks = NetworkStore(directory)
         private val policies = InMemoryStsPolicyStore()
+        val attemptedConnections = CopyOnWriteArrayList<NetworkConfig>()
         val coordinator = LiveCoordinator(
             scope = scope,
             networkStore = networks,
@@ -175,6 +181,7 @@ class NetworkSaverTests {
             vault = vault,
             channelOrder = ChannelOrderStore(directory),
             connectionFactory = ConnectionFactory { config, onStsUpgrade ->
+                attemptedConnections.add(config)
                 IrcConnection(
                     IrcConnectionConfig(
                         host = config.host,
@@ -208,6 +215,7 @@ class NetworkSaverTests {
         suspend fun registered(id: String) {
             withTimeout(5_000) {
                 while (coordinator.networks.value.none { it.id == id && it.status == ConnectionStatus.REGISTERED }) {
+                    (dispatcher as? TestDispatcher)?.scheduler?.runCurrent()
                     delay(10)
                 }
             }
@@ -234,7 +242,19 @@ class NetworkSaverTests {
 
         override fun close() {
             coordinator.networks.value.forEach { coordinator.disconnect(it.id) }
-            runBlocking { job.cancelAndJoin() }
+            if (dispatcher is TestDispatcher) {
+                job.cancel()
+                runBlocking {
+                    withTimeout(5_000) {
+                        while (!job.isCompleted) {
+                            dispatcher.scheduler.runCurrent()
+                            delay(10)
+                        }
+                    }
+                }
+            } else {
+                runBlocking { job.cancelAndJoin() }
+            }
             database.close()
             directory.deleteRecursively()
         }
@@ -652,24 +672,39 @@ class NetworkSaverTests {
     }
 
     @Test
-    fun disabledStartupAddPersistsWithoutAttemptingAConnection() {
-        Harness().use { harness ->
-            val input = draft(offlineConfig()).copy(
-                networkId = null,
-                saslAuthcid = null,
-                autoConnect = false,
-                realName = "Saved realname",
-                alternateNicks = listOf("alternate"),
-                saslMode = SaslMode.PLAIN,
-            )
-            assertTrue(harness.saver.save(input))
-            val saved = harness.saved()
-            assertFalse(saved.autoConnect)
-            assertFalse(saved.userDisconnected)
-            assertEquals("Saved realname", saved.realName)
-            assertEquals(listOf("alternate"), saved.alternateNicks)
-            assertEquals(SaslMode.PLAIN, saved.saslMode)
-            assertEquals(ConnectionStatus.DISCONNECTED, harness.coordinator.networks.value.single().status)
+    fun disabledStartupAddPersistsWithoutAttemptingAConnection() = runBlocking {
+        Server().use { server ->
+            val dispatcher = StandardTestDispatcher()
+            Harness(dispatcher).use { harness ->
+                val input = draft(config(server)).copy(
+                    networkId = null,
+                    saslAuthcid = null,
+                    autoConnect = false,
+                    realName = "Saved realname",
+                    alternateNicks = listOf("alternate"),
+                    saslMode = SaslMode.AUTO,
+                )
+                harness.coordinator.startAll()
+                assertTrue(harness.saver.save(input))
+                harness.coordinator.startAll()
+                harness.coordinator.onForegroundResume()
+                dispatcher.scheduler.advanceTimeBy(60_000)
+                dispatcher.scheduler.runCurrent()
+                val saved = harness.saved()
+                assertFalse(saved.autoConnect)
+                assertFalse(saved.userDisconnected)
+                assertEquals("Saved realname", saved.realName)
+                assertEquals(listOf("alternate"), saved.alternateNicks)
+                assertEquals(SaslMode.AUTO, saved.saslMode)
+                assertEquals(ConnectionStatus.DISCONNECTED, harness.coordinator.networks.value.single().status)
+                assertTrue(harness.attemptedConnections.isEmpty())
+                assertTrue(server.clients.isEmpty())
+                harness.coordinator.connectNetwork(saved.id)
+                harness.registered(saved.id)
+                assertEquals(1, harness.attemptedConnections.size)
+                assertEquals(1, server.clients.size)
+                assertEquals("Saved realname", server.clients.single().parameters("USER")?.last())
+            }
         }
     }
 

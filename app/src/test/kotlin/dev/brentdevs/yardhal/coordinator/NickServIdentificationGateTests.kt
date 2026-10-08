@@ -156,6 +156,42 @@ class NickServIdentificationGateTests {
     }
 
     @Test
+    fun validAccountNamesAreExcludedFromLanguageFiltersButNotNegativeStatusText() {
+        for (account in listOf("will", "not-me", "failed", "cannot", "would", "account")) {
+            for (body in listOf(
+                "You're now logged in as $account.",
+                "You are now identified for '$account'.",
+                "Password accepted for account: $account.",
+            )) {
+                assertEquals(NickServOutcome.IDENTIFIED, gate(account).feed(":NickServ!s@h NOTICE OurNick :$body"), body)
+                assertEquals(NickServOutcome.WAITING, gate(account).feed(":EvilNickServ!s@h NOTICE OurNick :$body"), body)
+                assertEquals(NickServOutcome.WAITING, gate("someone-else").feed(":NickServ!s@h NOTICE OurNick :$body"), body)
+            }
+            for (body in listOf(
+                "You're now logged in as $account, but authentication failed.",
+                "You are now identified for '$account' if your password is correct.",
+                "You are now identified for $account but are not recognized.",
+                "You are now identified for $account when login finishes.",
+            )) {
+                assertEquals(NickServOutcome.WAITING, gate(account).feed(":NickServ!s@h NOTICE OurNick :$body"), body)
+            }
+        }
+    }
+
+    @Test
+    fun validatedAccountNamedAccountDoesNotHideAnAdditionalIncompleteReference() {
+        assertEquals(NickServOutcome.IDENTIFIED,
+            gate("account").feed(":NickServ!s@h NOTICE OurNick :You're now logged in as account."))
+        for (body in listOf(
+            "You're now logged in as account, but now identified for",
+            "You're now logged in as account, and now identified to.",
+            "You're now logged in as account, but not identified.",
+        )) {
+            assertEquals(NickServOutcome.WAITING, gate("account").feed(":NickServ!s@h NOTICE OurNick :$body"), body)
+        }
+    }
+
+    @Test
     fun negativePhrasesNeverBecomePositiveBySubstringMatching() {
         for (body in listOf(
             "You are not identified.",
@@ -283,13 +319,11 @@ class NickServIdentificationGateTests {
     }
 
     @Test
-    fun explicitAuthenticationFailureNumericsRequireServerSenderAndOwnTarget() {
-        for (numeric in listOf(464, 902, 904, 905, 906)) {
-            val gate = gate()
-            assertEquals(NickServOutcome.WAITING, gate.feed(":server $numeric SomeoneElse :Authentication failed"))
-            assertEquals(NickServOutcome.WAITING, gate.feed(":attacker!u@h $numeric OurNick :Authentication failed"))
-            assertEquals(NickServOutcome.REJECTED, gate.feed(":server $numeric OurNick :Authentication failed"))
-        }
+    fun serverPasswordFailureNumericRequiresServerSenderAndOwnTarget() {
+        val gate = gate()
+        assertEquals(NickServOutcome.WAITING, gate.feed(":server 464 SomeoneElse :Authentication failed"))
+        assertEquals(NickServOutcome.WAITING, gate.feed(":attacker!u@h 464 OurNick :Authentication failed"))
+        assertEquals(NickServOutcome.REJECTED, gate.feed(":server 464 OurNick :Authentication failed"))
     }
 
     @Test
@@ -316,6 +350,10 @@ class NickServIdentificationGateTests {
         for (line in listOf(
             ":server 903 OurNick :SASL authentication successful",
             ":server 907 OurNick :You have already authenticated",
+            ":server 902 OurNick :Nickname is locked",
+            ":server 904 OurNick :SASL authentication failed",
+            ":server 905 OurNick :SASL message too long",
+            ":server 906 OurNick :SASL authentication aborted",
             ":server 908 OurNick PLAIN :Available SASL mechanisms",
             ":server 901 OurNick OurNick!u@h our-account :You are now logged out",
             ":OurNick!u@h ACCOUNT *",

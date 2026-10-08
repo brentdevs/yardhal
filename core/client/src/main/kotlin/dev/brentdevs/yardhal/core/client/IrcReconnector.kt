@@ -5,6 +5,7 @@ import java.security.cert.CertificateException
 import javax.net.ssl.SSLPeerUnverifiedException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -56,12 +57,19 @@ public data class ReconnectionEvent(
     public val event: IrcEvent,
 )
 
-public class IrcReconnector(
+public class IrcReconnector internal constructor(
     private val scope: CoroutineScope,
-    private val policy: ReconnectPolicy = ReconnectPolicy(),
+    private val policy: ReconnectPolicy,
     private val connectionFactory: () -> IrcConnection,
-    private val random: Random = Random.Default,
+    private val random: Random,
+    private val factoryDispatcher: CoroutineDispatcher,
 ) {
+    public constructor(
+        scope: CoroutineScope,
+        policy: ReconnectPolicy = ReconnectPolicy(),
+        connectionFactory: () -> IrcConnection,
+        random: Random = Random.Default,
+    ) : this(scope, policy, connectionFactory, random, Dispatchers.IO)
     private val stateFlow = MutableStateFlow<ReconnectState>(ReconnectState.Idle)
     public val state: StateFlow<ReconnectState> = stateFlow.asStateFlow()
 
@@ -94,6 +102,7 @@ public class IrcReconnector(
             hardBlocked = false
             consecutiveFailures = 0
             controlRevision += 1
+            wakeups.trySend(Unit)
             if (loopJob == null) {
                 scope.launch(start = CoroutineStart.LAZY) { runLoop() }.also { loopJob = it }
             } else {
@@ -101,7 +110,6 @@ public class IrcReconnector(
             }
         }
         loop?.start()
-        wakeups.trySend(Unit)
     }
 
     public fun stop() {
@@ -226,7 +234,7 @@ public class IrcReconnector(
             attemptEpoch
         }
         val connection = try {
-            withContext(Dispatchers.IO) { connectionFactory() }
+            withContext(factoryDispatcher) { connectionFactory() }
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {

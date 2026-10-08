@@ -234,9 +234,12 @@ public class PerNetworkState(
             is IrcEvent.SaslResult -> {
                 val outcome = event.outcome
                 if (outcome is SaslOutcome.Failure) {
-                    authenticationRejected = true
-                    registered = false
-                    reduction.emit(InboundEffect.AuthenticationFailed(outcome.description))
+                    if (registered) {
+                        reduction.system(server, "SASL authentication failed: ${outcome.description}")
+                    } else {
+                        authenticationRejected = true
+                        reduction.emit(InboundEffect.AuthenticationFailed(outcome.description))
+                    }
                 }
             }
             is IrcEvent.Registered -> reduction.handleRegistered(event.nickname)

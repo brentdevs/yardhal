@@ -212,8 +212,9 @@ stored IDs are retained through canonical matching, not invented from wire data.
 
 [Halyard parity phase 2 / issue 13](https://github.com/brentdevs/yardhal/issues/13)
 keeps Android connectivity and lifecycle handling outside the pure-JVM client.
-`AndroidConnectivityObserver` publishes validated, unblocked default-network
-availability and route changes; `MainActivity.onResume` requests validation.
+`AndroidConnectivityObserver` publishes Internet-capable, unblocked, nonsuspended
+default-network availability and route changes; public Internet validation is not
+a prerequisite for private IRC routes. `MainActivity.onResume` requests validation.
 `ConnectionRecoveryPolicy` distinguishes offline, connecting, registered,
 server-unreachable, explicit disconnect, identification and blocked auth/cert states.
 One `IrcReconnector` loop pauses offline retries and wakes eligible recovery immediately.
@@ -226,26 +227,51 @@ retirement remain actionable. Reconnects retain transcripts and history anchors.
 `autoConnect` controls cold startup, not an active manually connected session.
 Explicit Disconnect persists opt-out; Connect durably clears it. Dormant channels
 are idle, not falsely joining. Persistence failures do not claim saved intent or trust.
+An unsaved Disconnect remains locally stopped and offers **Retry saving Disconnect**
+without opening another transport. Foreground-service stop commands run after
+foreground promotion so an immediate authentication or certificate rejection cannot
+cancel a pending foreground start and trigger Android's startup watchdog.
 
-Required SASL, PASS, proxy or client-identity failures stop automatic retries;
-missing referenced secrets never fall back to guest registration. Explicit
-PLAIN/SCRAM requires a password; EXTERNAL requires TLS and an accessible Android
-KeyChain identity. The optional NickServ gate holds registration, autojoin and
-history until identity-specific confirmation, rejection or a seven-second deadline.
-Own nickname changes retarget confirmation without extending that deadline.
-Disabling the wait explicitly allows earlier joins but still surfaces service failures.
+Initial required SASL, PASS, proxy or client-identity failures stop automatic retries;
+missing referenced secrets never fall back to guest registration. Post-registration
+OPER/PASS errors and unsuccessful SASL reauthentication do not tear down a healthy
+session or enforce an initial required-capability gate again. Explicit PLAIN/SCRAM
+requires a password; EXTERNAL requires TLS and an accessible Android KeyChain identity.
+The optional NickServ gate holds registration, autojoin and history until
+identity-specific confirmation or a seven-second deadline. A confirmed live own
+account matching the intended identity skips IDENTIFY; pre-NICK account numerics
+require successful SASL in the same accepted transport epoch before binding to the
+welcome nickname. Unknown, different, logged-out or historical accounts do not bypass
+the gate. Own nickname changes retarget confirmation without extending its deadline.
+A service rejection disconnects and blocks automatic retries whether or not waiting
+was enabled. A waiting timeout does the same; a nonwaiting timeout reports a diagnostic
+without disconnecting or repeating joins and history requests. Validated account
+references are excluded from language filters, not negative status text elsewhere.
 
 SOCKS5 implements RFC 1928/1929, authenticated-method negotiation, proxy-side
-destination resolution and a shared I/O deadline. TLS verifies the logical IRC
-destination, not the proxy. Factory-proven layered socket provenance accounts
-for providers reporting the physical proxy port without weakening endpoint checks.
-Rejected certificates expose endpoint, chain identity, validity, SAN and SHA-256.
-Explicit consent pins only the inspected endpoint and leaf; changed leaves fail,
-hostname/validity checks and STS remain enabled, and removal restores platform trust.
-Client identity import uses Android's PKCS#12 installer and private-key grant flow.
+destination resolution and a shared deadline that also bounds proxy-host DNS for
+the caller. DNS work uses a bounded executor; a noninterruptible platform lookup
+may retain a worker until the OS returns. TLS verifies the logical IRC destination,
+not the proxy. Absolute DNS endpoints normalize their trailing dot for SNI and
+verification; invalid SNI is omitted without disabling hostname verification.
+Equivalent numeric IPv6 spellings share only the same endpoint and port.
+Factory-proven layered socket provenance accounts for providers reporting the
+physical proxy port without weakening endpoint checks. Inspectable trust failures
+expose endpoint, chain identity, validity, SAN and SHA-256. Explicit consent pins
+only the inspected endpoint and leaf; changed leaves fail, hostname/validity checks
+and STS remain enabled, and removal restores platform trust. An expired leaf reports
+validity instead of a changed fingerprint; matching-pin hostname or validity failures
+are terminal, not another pin-replacement prompt.
+Client identity import uses Android's PKCS#12 installer, a unique network/draft name
+suggestion and private-key grant flow. Activity-owned chooser state retains results
+through configuration recreation and rejects superseded editor requests. Binder
+callbacks cannot survive process death; a restored editor is idle and can retry.
 
 Configured secrets and encoded authentication echoes are masked before console,
-transcript, Room and notification publication. Config diagnostics omit secret
+transcript, Room and notification publication. Manual service password commands,
+qualified service names, space/tab-separated credential components and secrets
+beginning with the redaction marker are covered; account names and unrelated chat
+remain visible while the socket receives unchanged wire commands. Config diagnostics omit secret
 fields. Native Android 15 smoke exercised these paths against Ergo 2.14.0 and an
 authenticated microsocks relay, including changed certificates and real KeyChain
 EXTERNAL. Real TLS/mTLS JVM regressions use PKCS#12 fixtures. Robolectric's
@@ -290,12 +316,19 @@ saved secrets; nonempty replacements, including only spaces, use fresh vault key
 the draft with an error. After durable configuration publication, old keys are
 retired only when no SASL, server, NickServ or proxy role on any saved network
 references them. Clear actions remove individual references without deleting
-shared credentials. Vault mutations use checked commits; JSON stores sync an
-atomic replacement before publishing immutable cached state.
+shared credentials. Vault mutations use checked commits; JSON stores sync the
+replacement file and containing directories before publishing immutable cached state.
+Failure cleanup removes owned temporary files. A post-rename directory-sync failure
+retains the prior cache and reports failure without destructively rolling the disk
+back; retry completes publication. Removed-network vault-cleanup failures surface in
+the root snackbar, including after the last network disappears.
 The SASL account is independent of nickname and can remain saved without a
 password: AUTO then disables password SASL, while explicit PLAIN/SCRAM fails
 closed and EXTERNAL uses its selected identity. Nonsecret drafts survive rotation;
 plaintext password drafts do not.
+The editor validates explicit password SASL, paired proxy credentials, alternate
+nicknames separated by commas or whitespace, and realnames without wire delimiters
+before saving or attempting a connection.
 Cancel and Android Back discard edits. A restored, missing edit target falls
 through to normal content while its stale editor state is dismissed.
 
