@@ -2,6 +2,9 @@ package dev.brentdevs.yardhal.coordinator
 
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
+import androidx.room.Room
+import androidx.room.RoomDatabase
+import androidx.sqlite.db.SupportSQLiteDatabase
 import dev.brentdevs.yardhal.core.client.InMemoryStsPolicyStore
 import dev.brentdevs.yardhal.core.client.IrcConnection
 import dev.brentdevs.yardhal.core.client.IrcConnectionConfig
@@ -15,6 +18,9 @@ import dev.brentdevs.yardhal.core.data.InMemoryCredentialVault
 import dev.brentdevs.yardhal.core.data.MessageDao
 import dev.brentdevs.yardhal.core.data.MessageKind
 import dev.brentdevs.yardhal.core.data.MessageRow
+import dev.brentdevs.yardhal.core.data.MessageReactionRow
+import dev.brentdevs.yardhal.core.data.UnreadCounts
+import dev.brentdevs.yardhal.core.data.ConversationMerge
 import dev.brentdevs.yardhal.core.data.MessageStore
 import dev.brentdevs.yardhal.core.data.MuteStore
 import dev.brentdevs.yardhal.core.data.NetworkConfig
@@ -34,6 +40,9 @@ import java.io.InputStreamReader
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.nio.file.Files
 import java.time.Instant
 import java.util.concurrent.CopyOnWriteArrayList
@@ -98,9 +107,9 @@ class OfflineCoordinatorTests {
             }
         }
 
-        fun register(socket: Socket? = current) {
-            send(":srv 001 tester :Welcome", socket)
-            send(":srv 005 tester CASEMAPPING=rfc1459 CHANMODES=b,k,l,imnst WHOX :are supported", socket)
+        fun register(socket: Socket? = current, nickname: String = "tester") {
+            send(":srv 001 $nickname :Welcome", socket)
+            send(":srv 005 $nickname CASEMAPPING=rfc1459 CHANMODES=b,k,l,imnst WHOX :are supported", socket)
         }
 
         fun send(line: String, socket: Socket? = current) {
@@ -124,9 +133,10 @@ class OfflineCoordinatorTests {
         daoFactory: (MessageDao) -> MessageDao = { it },
         serverPassword: String? = null,
         onCreate: (LiveCoordinator) -> Unit = {},
+        databaseFactory: (Context) -> YardhalDatabase = YardhalDatabase::inMemory,
     ) : AutoCloseable {
         private val directory = Files.createTempDirectory("yardhal-offline-coordinator").toFile()
-        val database = YardhalDatabase.inMemory(ApplicationProvider.getApplicationContext<Context>())
+        val database = databaseFactory(ApplicationProvider.getApplicationContext<Context>())
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val now = AtomicLong(1_800_000_000_000L)
         val vault = InMemoryCredentialVault().also { if (serverPassword != null) it.storePassword("offline-password", serverPassword) }
@@ -154,7 +164,8 @@ class OfflineCoordinatorTests {
                     onCreate(coordinator)
                     IrcConnection(IrcConnectionConfig(host = config.host, port = config.port, tls = false, nick = config.nick,
                         serverPassword = config.serverPassword,
-                        capabilities = setOf("server-time", "draft/read-marker", "echo-message", "draft/channel-rename", IrcMetadata.CAPABILITY)),
+                        capabilities = setOf("server-time", "draft/read-marker", "echo-message", "draft/channel-rename",
+                            "draft/message-redaction", "soju.im/filehost", IrcMetadata.CAPABILITY)),
                         onStsUpgrade = onStsUpgrade)
                 },
                 stsPolicies = InMemoryStsPolicyStore(),
@@ -183,6 +194,18 @@ class OfflineCoordinatorTests {
             directory.deleteRecursively()
         }
     }
+
+    private fun queryDatabase(observer: (String, List<Any?>) -> Unit): YardhalDatabase =
+        Room.inMemoryDatabaseBuilder(ApplicationProvider.getApplicationContext<Context>(), YardhalDatabase::class.java)
+            .addCallback(object : RoomDatabase.Callback() {
+                override fun onCreate(db: SupportSQLiteDatabase) {
+                    db.execSQL("CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts4(sender, body, tokenize=unicode61)")
+                }
+            })
+            .allowMainThreadQueries()
+            .setQueryExecutor { it.run() }
+            .setQueryCallback({ query, arguments -> observer(query, arguments) }, { it.run() })
+            .build()
 
     private suspend fun await(condition: suspend () -> Boolean) {
         withTimeout(10_000) {
@@ -385,6 +408,10 @@ class OfflineCoordinatorTests {
                 assertEquals("live-account", harness.coordinator.whoisPresentation.value?.info?.account)
                 assertTrue(harness.coordinator.sendText(harness.config.id, harness.room.storageKey, "/whois alice"))
                 await { server.received.count { it == "WHOIS alice alice" } == 2 }
+                val refreshing = assertNotNull(harness.coordinator.whoisPresentation.value)
+                assertEquals("Live Alice", refreshing.info.realName)
+                assertTrue(refreshing.refreshing)
+                assertEquals("Live Alice", harness.coordinator.whois.value?.realName)
                 harness.coordinator.trackSelection(harness.coordinator.ensureConversation(harness.config.id, "bob"))
                 server.send(":srv 311 tester alice user host * :Late Alice")
                 server.send(":srv 318 tester alice :End of WHOIS")
@@ -907,6 +934,657 @@ class OfflineCoordinatorTests {
                 val attachment = harness.messages.recent(harness.room, 20).first { it.msgid == "attachment" }
                 assertFalse(attachment.attachmentUrl.orEmpty().contains(secret))
                 assertTrue(harness.coordinator.buffers.value.getValue(harness.room.storageKey).messages.none { it.text.contains(secret) })
+            }
+        }
+    }
+
+    @Test
+    fun reopenedPartedConversationsAndSelectedPartedChannelSurviveRuntimeMaintenance() = runBlocking {
+        Server().use { server ->
+            Harness(server).use { harness ->
+                harness.record()
+                val dm = ConversationRef.directMessage(harness.config.id, "bob")
+                harness.record(dm, "dm", text = "retained DM")
+                harness.coordinator.startAll()
+                await { harness.coordinator.restorationReady.value }
+                harness.coordinator.leaveConversation(harness.config.id, dm.storageKey)
+                val reopened = harness.coordinator.ensureConversation(harness.config.id, "bob")
+                harness.coordinator.trackSelection(reopened)
+                harness.coordinator.loadPersistedHistory(reopened)
+                await { harness.coordinator.buffers.value[reopened]?.messages?.any { it.msgid == "dm" } == true }
+                harness.now.addAndGet(300_001)
+                harness.coordinator.onForegroundResume()
+                val dmBarrier = ConversationRef.directMessage(harness.config.id, "dm-maintenance-barrier")
+                harness.coordinator.ensureConversation(harness.config.id, dmBarrier.rawTarget)
+                await { harness.offline.shell(dmBarrier) != null }
+                await { harness.offline.selection()?.storageKey == reopened }
+                assertEquals("retained DM", harness.coordinator.buffers.value.getValue(reopened).messages.single().text)
+                harness.coordinator.connectNetwork(harness.config.id)
+                await { harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                assertTrue(harness.coordinator.sendText(harness.config.id, harness.room.storageKey, "/part #room"))
+                harness.coordinator.trackSelection(harness.room.storageKey)
+                harness.now.addAndGet(300_001)
+                harness.coordinator.onForegroundResume()
+                val channelBarrier = ConversationRef.directMessage(harness.config.id, "channel-maintenance-barrier")
+                harness.coordinator.ensureConversation(harness.config.id, channelBarrier.rawTarget)
+                await { harness.offline.shell(channelBarrier) != null }
+                await { harness.offline.selection()?.storageKey == harness.room.storageKey }
+                assertEquals(JoinState.IDLE, harness.coordinator.buffers.value.getValue(harness.room.storageKey).joinState)
+                assertTrue(harness.coordinator.buffers.value.containsKey(reopened))
+            }
+        }
+    }
+
+    @Test
+    fun deleteFailurePreservesContentUntilAuthoritativeInboundRedaction() = runBlocking {
+        Server("server-time echo-message draft/message-redaction").use { server ->
+            Harness(server).use { harness ->
+                val row = harness.record(text = "content that must survive FAIL")
+                harness.offline.select(harness.room, harness.now.get())
+                harness.coordinator.startAll()
+                await { harness.coordinator.restorationReady.value }
+                harness.coordinator.connectNetwork(harness.config.id)
+                await { harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                harness.coordinator.deleteMessage(harness.config.id, harness.room.storageKey, "message")
+                await { server.received.any { IrcMessage.parse(it)?.command == "REDACT" } }
+                server.send(":srv FAIL REDACT FORBIDDEN #room message :Not permitted")
+                server.send("@msgid=fail-boundary :alice!u@h PRIVMSG #room :after failure")
+                await { harness.messages.recent(harness.room, 20).any { it.msgid == "fail-boundary" } }
+                val durable = assertNotNull(harness.messages.byRowId(harness.room, row))
+                assertFalse(durable.redacted)
+                assertEquals("content that must survive FAIL", durable.text)
+                assertFalse(harness.coordinator.buffers.value.getValue(harness.room.storageKey).messages.first { it.msgid == "message" }.redacted)
+                assertTrue(harness.database.messageDao().tombstones(harness.config.id, "#room").isEmpty())
+                server.send(":tester!u@h REDACT #room message :Removed")
+                await { harness.messages.byRowId(harness.room, row)?.redacted == true }
+                assertTrue(harness.coordinator.buffers.value.getValue(harness.room.storageKey).messages.first { it.msgid == "message" }.redacted)
+            }
+        }
+    }
+
+    @Test
+    fun staleHistoryAndSearchReactionSnapshotsCannotOverwritePendingMembership() = runBlocking {
+        for (search in listOf(false, true)) Server().use { server ->
+            val armed = AtomicBoolean(false)
+            val entered = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            val mutationEntered = CompletableDeferred<Unit>()
+            val mutationRelease = CompletableDeferred<Unit>()
+            Harness(server, daoFactory = { delegate ->
+                object : MessageDao by delegate {
+                    override suspend fun visibleReactions(networkId: String, conversation: String): List<MessageReactionRow> {
+                        val snapshot = delegate.visibleReactions(networkId, conversation)
+                        if (conversation == "#room" && armed.compareAndSet(true, false)) {
+                            entered.complete(Unit)
+                            release.await()
+                        }
+                        return snapshot
+                    }
+                    override suspend fun applyReactionAtomic(row: MessageReactionRow, added: Boolean,
+                        perParentLimit: Int, networkLimit: Int): Set<Long> {
+                        mutationEntered.complete(Unit)
+                        mutationRelease.await()
+                        return delegate.applyReactionAtomic(row, added, perParentLimit, networkLimit)
+                    }
+                }
+            }).use { harness ->
+                val row = harness.record()
+                harness.coordinator.connectNetwork(harness.config.id)
+                await { harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                armed.set(true)
+                if (search) {
+                    harness.coordinator.openSearchHit(dev.brentdevs.yardhal.core.data.FtsHit(row, harness.config.id,
+                        "#room", "alice", harness.now.get(), "hello"))
+                } else harness.coordinator.loadPersistedHistory(harness.room.storageKey)
+                withTimeout(10_000) { entered.await() }
+                server.send("@+draft/react=👍;+draft/refs=message :bob!u@h TAGMSG #room")
+                await { harness.coordinator.buffers.value[harness.room.storageKey]?.reactions?.get("message")?.get("👍") == setOf("bob") }
+                release.complete(Unit)
+                withTimeout(10_000) { mutationEntered.await() }
+                val visible = harness.coordinator.buffers.value.getValue(harness.room.storageKey)
+                assertTrue(visible.messages.any { it.msgid == "message" })
+                assertEquals(setOf("bob"), visible.reactions["message"]?.get("👍"))
+                mutationRelease.complete(Unit)
+                await { harness.messages.reactions(harness.room, "message")["👍"] == setOf("bob") }
+            }
+        }
+    }
+
+    @Test
+    fun quotedParentIsResolvedAfterQueuedRenameCollisionAndPendingStateHydratesTruthfully() = runBlocking {
+        Server().use { server ->
+            val entered = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            Harness(server, daoFactory = { delegate ->
+                object : MessageDao by delegate {
+                    override suspend fun renameAtomic(networkId: String, from: String, to: String): ConversationMerge {
+                        entered.complete(Unit)
+                        release.await()
+                        return delegate.renameAtomic(networkId, from, to)
+                    }
+                }
+            }).use { harness ->
+                val target = ConversationRef.channel(harness.config.id, "#destination")
+                harness.record(msgid = "shared", text = "source quote")
+                val canonical = harness.record(target, "shared", text = "canonical quote")
+                harness.offline.select(harness.room, harness.now.get())
+                harness.coordinator.startAll()
+                await { harness.coordinator.restorationReady.value }
+                harness.coordinator.connectNetwork(harness.config.id)
+                await { harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                server.send(":srv RENAME #room #destination :Moved")
+                withTimeout(10_000) { entered.await() }
+                val quoted = harness.coordinator.buffers.value.getValue(target.storageKey).messages.first { it.msgid == "shared" }
+                harness.coordinator.setReplyDraft(harness.config.id, target.storageKey, quoted)
+                assertTrue(harness.coordinator.sendText(harness.config.id, target.storageKey, "queued quoted reply"))
+                release.complete(Unit)
+                await { harness.messages.recent(target, 20).any { it.sentByUs && it.text == "queued quoted reply" } }
+                val stored = harness.messages.recent(target, 20).first { it.sentByUs }
+                assertEquals(canonical, stored.replyParentRowId)
+                assertTrue(stored.pendingEcho)
+                harness.coordinator.leaveConversation(harness.config.id, target.storageKey)
+                harness.coordinator.ensureConversation(harness.config.id, target.rawTarget)
+                harness.coordinator.loadPersistedHistory(target.storageKey)
+                await { harness.coordinator.buffers.value[target.storageKey]?.messages?.any { it.text == "queued quoted reply" } == true }
+                val hydrated = harness.coordinator.buffers.value.getValue(target.storageKey).messages.first { it.text == "queued quoted reply" }
+                assertTrue(hydrated.pendingEcho)
+                assertEquals(canonical, hydrated.localReplyParentRowId)
+                assertEquals("canonical quote", hydrated.replyPreview?.text)
+            }
+        }
+    }
+
+    @Test
+    fun completedUploadUsesReplacementVisibleIdentityAndDisconnectedCompletionRetainsUrl() = runBlocking {
+        for (disconnect in listOf(false, true)) Server("server-time echo-message soju.im/filehost").use { server ->
+            val entered = CountDownLatch(1)
+            val release = CountDownLatch(1)
+            val http = ServerSocket(0, 1, InetAddress.getLoopbackAddress())
+            val httpWorker = Executors.newSingleThreadExecutor()
+            val response = httpWorker.submit {
+                http.accept().use { socket ->
+                    socket.soTimeout = 10_000
+                    val input = socket.getInputStream().buffered()
+                    val headers = StringBuilder()
+                    var tail = 0
+                    while (tail != 0x0d0a0d0a) {
+                        val byte = input.read()
+                        check(byte >= 0)
+                        headers.append(byte.toChar())
+                        tail = (tail shl 8) or byte
+                    }
+                    val contentLength = Regex("(?i)content-length: (\\d+)").find(headers)?.groupValues?.get(1)?.toInt()
+                        ?: error("Upload must declare its body length")
+                    repeat(contentLength) { check(input.read() >= 0) }
+                    entered.countDown()
+                    check(release.await(10, TimeUnit.SECONDS))
+                    socket.getOutputStream().write(
+                        "HTTP/1.1 201 Created\r\nLocation: /file.png\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray(),
+                    )
+                }
+            }
+            try {
+                Harness(server).use { harness ->
+                    harness.coordinator.connectNetwork(harness.config.id)
+                    await { harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                    val endpoint = "http://127.0.0.1:${http.localPort}/upload"
+                    val url = "http://127.0.0.1:${http.localPort}/file.png"
+                    server.send(":srv 005 tester soju.im/FILEHOST=$endpoint :are supported")
+                    server.send("@msgid=filehost-ready :alice!u@h PRIVMSG #room :filehost ready")
+                    await { harness.coordinator.buffers.value[harness.room.storageKey]?.messages?.any { it.msgid == "filehost-ready" } == true }
+                    harness.coordinator.uploadAndShare(harness.config.id, harness.room.storageKey, "file.png", "image/png", byteArrayOf(1, 2, 3))
+                    assertTrue(entered.await(10, TimeUnit.SECONDS))
+                    if (disconnect) harness.coordinator.disconnect(harness.config.id) else {
+                        server.holdRegistration = true
+                        assertTrue(harness.coordinator.updateNetwork(harness.config.copy(nick = "replacement")))
+                        await { server.received.any { it == "NICK replacement" } && server.received.count { it.startsWith("USER ") } == 2 }
+                        server.register(nickname = "replacement")
+                        await { harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED &&
+                            harness.coordinator.networks.value.single().ownNick == "replacement" }
+                    }
+                    release.countDown()
+                    if (disconnect) {
+                        await { harness.coordinator.operationError.value?.contains(url) == true }
+                        assertTrue(harness.coordinator.operationError.value.orEmpty().contains("Upload completed"))
+                        assertTrue(server.received.none { it == "PRIVMSG #room :$url" })
+                    } else {
+                        await { server.received.any { IrcMessage.parse(it)?.let { message ->
+                            message.command == "PRIVMSG" && message.parameters == listOf("#room", url)
+                        } == true } }
+                        val sent = harness.coordinator.buffers.value.getValue(harness.room.storageKey).messages.first { it.attachmentUrl == url }
+                        assertEquals("replacement", sent.sender)
+                        assertEquals("file.png", sent.attachmentName)
+                        assertTrue(sent.pendingEcho)
+                    }
+                }
+                response.get(10, TimeUnit.SECONDS)
+            } finally {
+                release.countDown()
+                http.close()
+                httpWorker.shutdownNow()
+                check(httpWorker.awaitTermination(10, TimeUnit.SECONDS))
+            }
+        }
+    }
+
+    @Test
+    fun rosterStormAndMessageBurstCoalesceDurableRefreshAndSnapshotWrites() = runBlocking {
+        Server().use { server ->
+            val calls = AtomicLong()
+            val unreadQueries = AtomicLong()
+            val entered = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            Harness(server, daoFactory = { delegate ->
+                object : MessageDao by delegate {
+                    override suspend fun maintainNetworkAtomic(networkId: String, keepMessages: Int, keepConversations: Int,
+                        protectedConversations: List<String>, nowMs: Long) {
+                        if (calls.incrementAndGet() == 2L) {
+                            entered.complete(Unit)
+                            release.await()
+                        }
+                        delegate.maintainNetworkAtomic(networkId, keepMessages, keepConversations, protectedConversations, nowMs)
+                    }
+                    override suspend fun unreadCounts(networkId: String, conversation: String, timestampMs: Long, rowId: Long): UnreadCounts {
+                        if (conversation == "#room") unreadQueries.incrementAndGet()
+                        return delegate.unreadCounts(networkId, conversation, timestampMs, rowId)
+                    }
+                }
+            }).use { harness ->
+                harness.coordinator.startAll()
+                await { harness.coordinator.restorationReady.value }
+                harness.coordinator.connectNetwork(harness.config.id)
+                await { harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                server.send(":tester!u@h JOIN #room")
+                server.send(":srv 353 tester = #room :tester")
+                server.send(":srv 366 tester #room :End of NAMES")
+                await { harness.offline.roster(harness.room)?.completeAtObservation == true }
+                harness.database.openHelper.writableDatabase.execSQL("CREATE TABLE snapshot_writes(value INTEGER NOT NULL)")
+                harness.database.openHelper.writableDatabase.execSQL(
+                    "CREATE TRIGGER count_snapshot AFTER INSERT ON offline_conversations WHEN NEW.conversation = '#room' " +
+                        "BEGIN INSERT INTO snapshot_writes VALUES (1); END")
+                harness.now.addAndGet(300_001)
+                harness.coordinator.onForegroundResume()
+                withTimeout(10_000) { entered.await() }
+                val baseline = unreadQueries.get()
+                repeat(30) { server.send(":user$it!u@h JOIN #room") }
+                repeat(30) { server.send("@msgid=burst-$it :user$it!u@h PRIVMSG #room :burst $it") }
+                await { harness.coordinator.buffers.value.getValue(harness.room.storageKey).messages.count { it.msgid?.startsWith("burst-") == true } == 30 }
+                release.complete(Unit)
+                await { harness.messages.recent(harness.room, 100).count { it.msgid?.startsWith("burst-") == true } == 30 &&
+                    harness.offline.roster(harness.room)?.members?.size == 31 &&
+                    harness.coordinator.buffers.value.getValue(harness.room.storageKey).unreadCount == 30 }
+                assertTrue(unreadQueries.get() - baseline <= 3)
+                harness.database.openHelper.readableDatabase.query("SELECT COUNT(*) FROM snapshot_writes").use { cursor ->
+                    assertTrue(cursor.moveToFirst())
+                    assertTrue(cursor.getInt(0) <= 3)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun suspendedRosterAndUserLoadsDoNotPoisonReloadGuardsAfterSessionReplacement() = runBlocking {
+        for (users in listOf(false, true)) Server().use { server ->
+            val armed = AtomicBoolean(false)
+            val entered = CountDownLatch(1)
+            val release = CountDownLatch(1)
+            Harness(server, databaseFactory = {
+                queryDatabase { query, arguments ->
+                    val matches = if (users) query.contains("whois_cache") && "alice" in arguments
+                        else query.startsWith("SELECT * FROM offline_conversations") && "#cached" in arguments
+                    if (matches && armed.compareAndSet(true, false)) {
+                        entered.countDown()
+                        assertTrue(release.await(10, TimeUnit.SECONDS))
+                    }
+                }
+            }).use { harness ->
+                val cached = ConversationRef.channel(harness.config.id, "#cached")
+                harness.seedShell(cached, OfflineRoster(listOf(ChannelMember("alice", '@')),
+                    observedAtMs = harness.now.get(), completeAtObservation = true))
+                harness.offline.saveUser(harness.config.id, CachedUser("alice",
+                    metadata = mapOf(IrcMetadata.KEY_DISPLAY_NAME to "Saved Alice"), observedAtMs = harness.now.get()))
+                harness.coordinator.startAll()
+                await { harness.coordinator.restorationReady.value }
+                armed.set(true)
+                harness.coordinator.ensureMembers(harness.config.id, cached.storageKey)
+                assertTrue(entered.await(10, TimeUnit.SECONDS))
+                harness.coordinator.connectNetwork(harness.config.id)
+                await { harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                release.countDown()
+                val barrier = ConversationRef.directMessage(harness.config.id, "load-barrier")
+                harness.coordinator.trackSelection(harness.coordinator.ensureConversation(harness.config.id, barrier.rawTarget))
+                await { harness.offline.selection()?.storageKey == barrier.storageKey }
+                assertNull(harness.coordinator.profiles.value[harness.config.id]?.forNick("alice"))
+                if (!users) assertFalse(harness.coordinator.buffers.value.getValue(cached.storageKey).cachedRoster)
+                harness.coordinator.ensureMembers(harness.config.id, cached.storageKey)
+                await { harness.coordinator.buffers.value[cached.storageKey]?.cachedRoster == true &&
+                    harness.coordinator.profiles.value[harness.config.id]?.forNick("alice")?.displayName == "Saved Alice" }
+                harness.coordinator.disconnect(harness.config.id)
+                val profile = assertNotNull(harness.coordinator.profiles.value[harness.config.id]?.forNick("alice"))
+                assertEquals("Saved Alice", profile.displayName)
+                assertTrue(profile.cached)
+            }
+        }
+    }
+
+    @Test
+    fun startupCannotLaunchRetiredSessionAfterConfiguredIdentityReplacesSuspendedFactory() = runBlocking {
+        Server().use { server ->
+            server.holdRegistration = true
+            val entered = CountDownLatch(1)
+            val release = CountDownLatch(1)
+            val factories = AtomicLong()
+            Harness(server, autoConnect = true, onCreate = {
+                if (factories.incrementAndGet() == 1L) {
+                    entered.countDown()
+                    assertTrue(release.await(10, TimeUnit.SECONDS))
+                }
+            }).use { harness ->
+                harness.coordinator.startAll()
+                assertTrue(entered.await(10, TimeUnit.SECONDS))
+                assertTrue(harness.coordinator.updateNetwork(harness.config.copy(nick = "current")))
+                await { server.received.any { it == "NICK current" } && server.received.count { it.startsWith("USER ") } == 1 }
+                release.countDown()
+                server.register(nickname = "current")
+                await { harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                assertEquals(2L, factories.get())
+                assertEquals(1, server.received.count { it.startsWith("USER ") })
+                assertTrue(server.received.none { it == "NICK tester" })
+                assertEquals("current", harness.coordinator.networks.value.single().ownNick)
+            }
+        }
+    }
+
+    @Test
+    fun emptyNamesNeverJoinsIdleOrJoiningChannelsAndCannotUndoKick() = runBlocking {
+        Server().use { server ->
+            Harness(server).use { harness ->
+                harness.coordinator.connectNetwork(harness.config.id)
+                await { harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                val idle = ConversationRef.channel(harness.config.id, "#idle")
+                harness.coordinator.ensureConversation(harness.config.id, idle.rawTarget)
+                assertEquals(JoinState.IDLE, harness.coordinator.buffers.value.getValue(idle.storageKey).joinState)
+                assertEquals(JoinState.JOINING, harness.coordinator.buffers.value.getValue(harness.room.storageKey).joinState)
+                server.send(":srv 366 tester #idle :End of NAMES")
+                server.send(":srv 366 tester #room :End of NAMES")
+                server.send("@msgid=names-boundary :alice!u@h PRIVMSG #room :after empty names")
+                await { harness.messages.recent(harness.room, 20).any { it.msgid == "names-boundary" } }
+                assertEquals(JoinState.IDLE, harness.coordinator.buffers.value.getValue(idle.storageKey).joinState)
+                assertEquals(JoinState.JOINING, harness.coordinator.buffers.value.getValue(harness.room.storageKey).joinState)
+                server.send(":tester!u@h JOIN #room")
+                server.send(":srv 366 tester #room :End of NAMES")
+                await { harness.coordinator.buffers.value.getValue(harness.room.storageKey).joinState == JoinState.JOINED }
+                server.send(":op!u@h KICK #room tester :removed")
+                server.send(":srv 366 tester #room :Late end of NAMES")
+                server.send("@msgid=kick-boundary :alice!u@h PRIVMSG #room :after kick")
+                await { harness.messages.recent(harness.room, 20).any { it.msgid == "kick-boundary" } }
+                assertEquals(JoinState.FAILED, harness.coordinator.buffers.value.getValue(harness.room.storageKey).joinState)
+            }
+        }
+    }
+
+    @Test
+    fun queuedReactionUsesOriginalStorageOrderAndAbandonedMigratedRevisionCannotMaskDurableState() = runBlocking {
+        Server().use { server ->
+            val calls = AtomicLong()
+            val entered = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            Harness(server, daoFactory = { delegate ->
+                object : MessageDao by delegate {
+                    override suspend fun maintainNetworkAtomic(networkId: String, keepMessages: Int, keepConversations: Int,
+                        protectedConversations: List<String>, nowMs: Long) {
+                        if (calls.incrementAndGet() == 2L) {
+                            entered.complete(Unit)
+                            release.await()
+                        }
+                        delegate.maintainNetworkAtomic(networkId, keepMessages, keepConversations, protectedConversations, nowMs)
+                    }
+                }
+            }).use { harness ->
+                val source = ConversationRef.channel(harness.config.id, "#room[one]")
+                val target = ConversationRef.channel(harness.config.id, source.rawTarget, dev.brentdevs.yardhal.core.protocol.CaseMapping.ASCII)
+                val row = harness.record(source)
+                harness.offline.select(source, harness.now.get())
+                harness.coordinator.startAll()
+                await { harness.coordinator.restorationReady.value }
+                harness.coordinator.connectNetwork(harness.config.id)
+                await { harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                harness.now.addAndGet(300_001)
+                harness.coordinator.onForegroundResume()
+                withTimeout(10_000) { entered.await() }
+                val parent = harness.coordinator.buffers.value.getValue(source.storageKey).messages.first { it.msgid == "message" }
+                harness.coordinator.setReplyDraft(harness.config.id, source.storageKey, parent)
+                assertTrue(harness.coordinator.sendText(harness.config.id, source.storageKey, "quote queued before migration"))
+                harness.coordinator.react(harness.config.id, source.storageKey, "message", "👍")
+                server.send(":srv 005 tester CASEMAPPING=ascii :are supported")
+                await { harness.coordinator.buffers.value.containsKey(target.storageKey) }
+                assertEquals(setOf("tester"), harness.coordinator.buffers.value.getValue(target.storageKey).reactions["message"]?.get("👍"))
+                server.holdRegistration = true
+                harness.coordinator.connectNetwork(harness.config.id)
+                release.complete(Unit)
+                await { harness.offline.selection()?.storageKey == target.storageKey &&
+                    harness.coordinator.buffers.value[target.storageKey]?.reactions?.get("message").isNullOrEmpty() &&
+                    harness.messages.recent(target, 20).any { it.text == "quote queued before migration" } }
+                assertEquals(row, harness.messages.recent(target, 20).first { it.text == "quote queued before migration" }.replyParentRowId)
+                harness.messages.applyReaction(target, "message", "bob", "👋", true, harness.now.get())
+                harness.coordinator.openSearchHit(dev.brentdevs.yardhal.core.data.FtsHit(row, harness.config.id,
+                    target.normalizedTarget, "alice", harness.now.get(), "hello"))
+                await { harness.coordinator.buffers.value[target.storageKey]?.reactions?.get("message")?.get("👋") == setOf("bob") }
+                assertTrue(harness.coordinator.buffers.value[target.storageKey]?.reactions?.get("message")?.get("👍").isNullOrEmpty())
+                assertFalse(harness.coordinator.buffers.value.containsKey(source.storageKey))
+            }
+        }
+    }
+
+    @Test
+    fun suspendedSearchReplaysAgainstCompletedCaseMappingInsteadOfMixingOldAndNewIdentities() = runBlocking {
+        Server().use { server ->
+            val armed = AtomicBoolean(false)
+            val entered = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            Harness(server, daoFactory = { delegate ->
+                object : MessageDao by delegate {
+                    override suspend fun visibleReactions(networkId: String, conversation: String): List<MessageReactionRow> {
+                        val snapshot = delegate.visibleReactions(networkId, conversation)
+                        if (armed.compareAndSet(true, false)) {
+                            entered.complete(Unit)
+                            release.await()
+                        }
+                        return snapshot
+                    }
+                }
+            }).use { harness ->
+                val source = ConversationRef.channel(harness.config.id, "#room[one]")
+                val target = ConversationRef.channel(harness.config.id, source.rawTarget, dev.brentdevs.yardhal.core.protocol.CaseMapping.ASCII)
+                val row = harness.record(source)
+                harness.messages.applyReaction(source, "message", "bob", "👍", true, harness.now.get())
+                harness.offline.select(source, harness.now.get())
+                harness.coordinator.startAll()
+                await { harness.coordinator.restorationReady.value }
+                harness.coordinator.connectNetwork(harness.config.id)
+                await { harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                armed.set(true)
+                harness.coordinator.openSearchHit(dev.brentdevs.yardhal.core.data.FtsHit(row, harness.config.id,
+                    source.normalizedTarget, "alice", harness.now.get(), "hello"))
+                withTimeout(10_000) { entered.await() }
+                harness.coordinator.trackSelection(ConversationRef.server(harness.config.id).storageKey)
+                server.send(":srv 005 tester CASEMAPPING=ascii :are supported")
+                await { harness.coordinator.buffers.value.containsKey(target.storageKey) }
+                assertEquals(target.storageKey, harness.coordinator.followRenamedSelection(source.storageKey,
+                    harness.coordinator.buffers.value.keys))
+                release.complete(Unit)
+                await { harness.offline.selection()?.storageKey == target.storageKey &&
+                    harness.coordinator.buffers.value[target.storageKey]?.messages?.firstOrNull { it.msgid == "message" }?.storedRowId == row }
+                val visible = harness.coordinator.buffers.value.getValue(target.storageKey)
+                assertEquals(source.rawTarget, visible.ref.rawTarget)
+                assertEquals(setOf("bob"), visible.reactions["message"]?.get("👍"))
+                assertFalse(harness.coordinator.buffers.value.containsKey(source.storageKey))
+            }
+        }
+    }
+
+    @Test
+    fun staleDurablePendingSnapshotCannotUndoAlreadyConfirmedAnonymousEcho() = runBlocking {
+        Server().use { server ->
+            val armed = AtomicBoolean(false)
+            val readEntered = CompletableDeferred<Unit>()
+            val readRelease = CompletableDeferred<Unit>()
+            val healEntered = CompletableDeferred<Unit>()
+            val healRelease = CompletableDeferred<Unit>()
+            Harness(server, daoFactory = { delegate ->
+                object : MessageDao by delegate {
+                    override suspend fun byRowIds(networkId: String, conversation: String, rowIds: List<Long>): List<MessageRow> {
+                        val snapshot = delegate.byRowIds(networkId, conversation, rowIds)
+                        if (snapshot.any { it.pendingEcho && it.text == "anonymous race" } && armed.compareAndSet(true, false)) {
+                            readEntered.complete(Unit)
+                            readRelease.await()
+                        }
+                        return snapshot
+                    }
+                    override suspend fun recordAtomic(incoming: MessageRow, echoRowId: Long?, freshLocal: Boolean): Long? {
+                        if (incoming.text == "anonymous race" && echoRowId != null) {
+                            healEntered.complete(Unit)
+                            healRelease.await()
+                        }
+                        return delegate.recordAtomic(incoming, echoRowId, freshLocal)
+                    }
+                }
+            }).use { harness ->
+                harness.coordinator.connectNetwork(harness.config.id)
+                await { harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                armed.set(true)
+                assertTrue(harness.coordinator.sendText(harness.config.id, harness.room.storageKey, "anonymous race"))
+                withTimeout(10_000) { readEntered.await() }
+                server.send(":tester!u@h PRIVMSG #room :anonymous race")
+                await { harness.coordinator.buffers.value[harness.room.storageKey]?.messages?.firstOrNull { it.text == "anonymous race" }?.pendingEcho == false }
+                readRelease.complete(Unit)
+                withTimeout(10_000) { healEntered.await() }
+                assertFalse(harness.coordinator.buffers.value.getValue(harness.room.storageKey).messages.first { it.text == "anonymous race" }.pendingEcho)
+                healRelease.complete(Unit)
+                await { harness.messages.recent(harness.room, 20).firstOrNull { it.text == "anonymous race" }?.pendingEcho == false }
+                assertEquals(1, harness.messages.recent(harness.room, 20).count { it.text == "anonymous race" })
+            }
+        }
+    }
+
+    @Test
+    fun unpersistedPendingSendDoesNotCollapseIntoStaleSameContentOwnHistory() = runBlocking {
+        Server().use { server ->
+            val armed = AtomicBoolean(false)
+            val readEntered = CompletableDeferred<Unit>()
+            val readRelease = CompletableDeferred<Unit>()
+            val writeEntered = CompletableDeferred<Unit>()
+            val writeRelease = CompletableDeferred<Unit>()
+            Harness(server, daoFactory = { delegate ->
+                object : MessageDao by delegate {
+                    override suspend fun visibleReactions(networkId: String, conversation: String): List<MessageReactionRow> {
+                        val snapshot = delegate.visibleReactions(networkId, conversation)
+                        if (conversation == "#room" && armed.compareAndSet(true, false)) {
+                            readEntered.complete(Unit)
+                            readRelease.await()
+                        }
+                        return snapshot
+                    }
+                    override suspend fun recordAtomic(incoming: MessageRow, echoRowId: Long?, freshLocal: Boolean): Long? {
+                        if (freshLocal && incoming.text == "same content") {
+                            writeEntered.complete(Unit)
+                            writeRelease.await()
+                        }
+                        return delegate.recordAtomic(incoming, echoRowId, freshLocal)
+                    }
+                }
+            }).use { harness ->
+                harness.messages.record(StoredMessage(networkId = harness.config.id, conversation = harness.room,
+                    msgid = "old-canonical", senderNick = "tester", senderUser = null, senderHost = null,
+                    kind = MessageKind.PRIVMSG, text = "same content", sentByUs = true, timestampMs = harness.now.get()))
+                harness.coordinator.connectNetwork(harness.config.id)
+                await { harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                armed.set(true)
+                harness.coordinator.loadPersistedHistory(harness.room.storageKey)
+                withTimeout(10_000) { readEntered.await() }
+                assertTrue(harness.coordinator.sendText(harness.config.id, harness.room.storageKey, "same content"))
+                readRelease.complete(Unit)
+                withTimeout(10_000) { writeEntered.await() }
+                val visible = harness.coordinator.buffers.value.getValue(harness.room.storageKey).messages.filter { it.text == "same content" }
+                assertEquals(2, visible.size)
+                assertEquals(1, visible.count { it.pendingEcho && it.msgid == null })
+                assertEquals(1, visible.count { it.msgid == "old-canonical" && !it.pendingEcho })
+                writeRelease.complete(Unit)
+                await { harness.messages.recent(harness.room, 20).count { it.text == "same content" } == 2 }
+            }
+        }
+    }
+
+    @Test
+    fun suspendedLocalHistoryAndSearchPublishFreshDurablePageAfterSessionReplacement() = runBlocking {
+        for (search in listOf(false, true)) Server().use { server ->
+            val armed = AtomicBoolean(false)
+            val entered = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            Harness(server, daoFactory = { delegate ->
+                object : MessageDao by delegate {
+                    override suspend fun visibleReactions(networkId: String, conversation: String): List<MessageReactionRow> {
+                        val snapshot = delegate.visibleReactions(networkId, conversation)
+                        if (conversation == "#room" && armed.compareAndSet(true, false)) {
+                            entered.complete(Unit)
+                            release.await()
+                        }
+                        return snapshot
+                    }
+                }
+            }).use { harness ->
+                val row = harness.record(text = "page retained across replacement")
+                harness.messages.applyReaction(harness.room, "message", "bob", "👍", true, harness.now.get())
+                harness.coordinator.connectNetwork(harness.config.id)
+                await { harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                armed.set(true)
+                if (search) {
+                    harness.coordinator.openSearchHit(dev.brentdevs.yardhal.core.data.FtsHit(row, harness.config.id,
+                        "#room", "alice", harness.now.get(), "page retained across replacement"))
+                } else harness.coordinator.loadPersistedHistory(harness.room.storageKey)
+                withTimeout(10_000) { entered.await() }
+                server.holdRegistration = true
+                harness.coordinator.connectNetwork(harness.config.id)
+                release.complete(Unit)
+                await { harness.coordinator.buffers.value[harness.room.storageKey]?.messages?.firstOrNull { it.msgid == "message" }?.storedRowId == row }
+                val visible = harness.coordinator.buffers.value.getValue(harness.room.storageKey)
+                assertEquals(1, visible.messages.count { it.msgid == "message" })
+                assertEquals("page retained across replacement", visible.messages.first { it.msgid == "message" }.text)
+                assertEquals(setOf("bob"), visible.reactions["message"]?.get("👍"))
+            }
+        }
+    }
+
+    @Test
+    fun canonicalStoredHistoryConfirmsDistinctPendingSendsWithoutLosingDurableIdentityOrServerTime() = runBlocking {
+        Server().use { server ->
+            Harness(server).use { harness ->
+                harness.coordinator.connectNetwork(harness.config.id)
+                await { harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                repeat(2) {
+                    assertTrue(harness.coordinator.sendText(harness.config.id, harness.room.storageKey, "repeated pending send"))
+                }
+                await { harness.messages.recent(harness.room, 20).count { it.text == "repeated pending send" && it.pendingEcho } == 2 }
+                val originalRows = harness.messages.recent(harness.room, 20).filter { it.text == "repeated pending send" }
+                repeat(2) { index ->
+                    harness.messages.record(StoredMessage(networkId = harness.config.id, conversation = harness.room,
+                        msgid = "canonical-$index", senderNick = "tester", senderUser = null, senderHost = null,
+                        kind = MessageKind.PRIVMSG, text = "repeated pending send", sentByUs = true,
+                        timestampMs = harness.now.get() + index + 1, playback = true, historyContext = true))
+                }
+                val canonicalRows = harness.messages.recent(harness.room, 20).filter { it.text == "repeated pending send" }
+                assertEquals(originalRows.map { it.rowId }.sorted(), canonicalRows.map { it.rowId }.sorted())
+                assertTrue(canonicalRows.all { it.msgid != null && !it.pendingEcho })
+                val hit = canonicalRows.first()
+                harness.coordinator.openSearchHit(dev.brentdevs.yardhal.core.data.FtsHit(hit.rowId, harness.config.id,
+                    "#room", "tester", hit.timestampMs, "repeated pending send"))
+                await {
+                    val visible = harness.coordinator.buffers.value.getValue(harness.room.storageKey).messages.filter { it.text == "repeated pending send" }
+                    visible.size == 2 && visible.all { it.msgid != null && !it.pendingEcho }
+                }
+                val visible = harness.coordinator.buffers.value.getValue(harness.room.storageKey).messages.filter { it.text == "repeated pending send" }
+                assertEquals(originalRows.map { it.rowId }.sorted(), visible.mapNotNull { it.storedRowId }.sorted())
+                assertEquals(listOf(harness.now.get() + 1, harness.now.get() + 2), visible.map { it.timestampMs }.sorted())
             }
         }
     }

@@ -1,6 +1,9 @@
 package dev.brentdevs.yardhal.core.data
 
 import java.io.File
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
@@ -47,6 +50,11 @@ internal object ReadMarkerSerializer : KSerializer<Map<String, ReadMarkerState>>
     }
 }
 
+public enum class ReadMarkerPersistence {
+    DURABLE,
+    VOLATILE,
+}
+
 public class ReadMarkerStore internal constructor(private val store: JsonFileStore<Map<String, ReadMarkerState>>) {
     public constructor(directory: File) : this(
         JsonFileStore(File(directory, "read-markers.json"), ReadMarkerSerializer),
@@ -54,6 +62,10 @@ public class ReadMarkerStore internal constructor(private val store: JsonFileSto
 
     private val lock = Any()
     private var markers: Map<String, ReadMarkerState> = store.loadOrDefault(emptyMap())
+    private val mutablePersistence = MutableStateFlow(
+        if (store.persistenceBlocked) ReadMarkerPersistence.VOLATILE else ReadMarkerPersistence.DURABLE,
+    )
+    public val persistence: StateFlow<ReadMarkerPersistence> = mutablePersistence.asStateFlow()
 
     public fun marker(storageKey: String): Long = cursor(storageKey).timestampMs
 
@@ -130,7 +142,11 @@ public class ReadMarkerStore internal constructor(private val store: JsonFileSto
     public fun all(): Map<String, Long> = synchronized(lock) { markers.mapValues { it.value.cursor.timestampMs } }
 
     private fun commit(next: Map<String, ReadMarkerState>) {
-        store.save(next)
+        try {
+            store.save(next)
+        } catch (failure: StorageWriteBlockedException) {
+            mutablePersistence.value = ReadMarkerPersistence.VOLATILE
+        }
         markers = next
     }
 }

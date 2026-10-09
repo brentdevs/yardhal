@@ -12,6 +12,8 @@ import androidx.sqlite.db.SupportSQLiteOpenHelper
     entities = [
         MessageRow::class,
         MessageReactionRow::class,
+        MessageReactionCountRow::class,
+        MessageOrphanReactionCountRow::class,
         MessageTombstoneRow::class,
         MessageRetentionRow::class,
         OfflineConversationRow::class,
@@ -49,7 +51,7 @@ public abstract class YardhalDatabase : RoomDatabase() {
 
         private val migration3To4 = object : Migration(3, 4) {
             override fun migrate(db: SupportSQLiteDatabase) {
-                for (column in listOf("highlightsMe", "playback", "redacted", "reactionsTruncated")) {
+                for (column in listOf("highlightsMe", "playback", "redacted", "reactionsTruncated", "pendingEcho")) {
                     db.execSQL("ALTER TABLE messages ADD COLUMN $column INTEGER NOT NULL DEFAULT 0")
                 }
                 db.execSQL("ALTER TABLE messages ADD COLUMN highlightsKnown INTEGER NOT NULL DEFAULT 1")
@@ -60,6 +62,15 @@ public abstract class YardhalDatabase : RoomDatabase() {
                 for (column in listOf("replyParentRowId", "attachmentSizeBytes", "attachmentWidth", "attachmentHeight")) {
                     db.execSQL("ALTER TABLE messages ADD COLUMN $column INTEGER")
                 }
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_messages_replyParentRowId ON messages(replyParentRowId)")
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_messages_networkId_conversation_replyToMsgid " +
+                        "ON messages(networkId, conversation, replyToMsgid)",
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_messages_networkId_conversation_pendingEcho_timestampMs " +
+                        "ON messages(networkId, conversation, pendingEcho, timestampMs)",
+                )
                 createInteractionTables(db)
                 createOfflineTables(db)
                 ensureFts(db)
@@ -76,9 +87,15 @@ public abstract class YardhalDatabase : RoomDatabase() {
         }
 
         private val callback = object : Callback() {
-            override fun onCreate(db: SupportSQLiteDatabase) = ensureFts(db)
+            override fun onCreate(db: SupportSQLiteDatabase) {
+                ensureFts(db)
+                createReactionCountTriggers(db)
+            }
 
-            override fun onOpen(db: SupportSQLiteDatabase) = ensureFts(db)
+            override fun onOpen(db: SupportSQLiteDatabase) {
+                ensureFts(db)
+                createReactionCountTriggers(db)
+            }
         }
 
         public fun build(

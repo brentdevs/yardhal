@@ -37,6 +37,12 @@ public abstract class OfflineDao {
     @Query("SELECT * FROM offline_conversations WHERE networkId = :networkId ORDER BY conversation")
     public abstract suspend fun conversationRows(networkId: String): List<OfflineConversationRow>
 
+    @Query("SELECT conversation, rosterJson FROM offline_conversations WHERE networkId = :networkId AND rosterJson IS NOT NULL ORDER BY conversation")
+    public abstract suspend fun rosterRows(networkId: String): List<OfflineRosterRow>
+
+    @Query("UPDATE offline_conversations SET rosterJson = :rosterJson WHERE networkId = :networkId AND conversation = :conversation")
+    public abstract suspend fun updateRoster(networkId: String, conversation: String, rosterJson: String)
+
     @Query("SELECT * FROM whois_cache WHERE networkId = :networkId AND nick = :nick")
     public abstract suspend fun cachedUser(networkId: String, nick: String): WhoisCacheRow?
 
@@ -61,7 +67,7 @@ public abstract class OfflineDao {
     @Query("SELECT * FROM offline_quarantine ORDER BY evidenceId")
     public abstract suspend fun evidence(): List<OfflineQuarantineRow>
 
-    @Query("SELECT DISTINCT networkId, kind, identity FROM offline_quarantine")
+    @Query("SELECT evidenceId, networkId, kind, identity FROM offline_quarantine ORDER BY evidenceId")
     public abstract suspend fun evidenceNotices(): List<OfflineEvidenceNoticeRow>
 
     @Query("DELETE FROM launch_selection")
@@ -78,6 +84,9 @@ public abstract class OfflineDao {
 
     @Query("DELETE FROM whois_cache WHERE networkId = :networkId")
     public abstract suspend fun removeUsers(networkId: String)
+
+    @Query("DELETE FROM offline_quarantine WHERE networkId = :networkId")
+    public abstract suspend fun removeEvidence(networkId: String)
 
     @Query("SELECT DISTINCT networkId FROM offline_conversations UNION SELECT DISTINCT networkId FROM whois_cache")
     public abstract suspend fun networks(): List<String>
@@ -121,12 +130,14 @@ public abstract class OfflineDao {
     @Query(
         "DELETE FROM launch_selection WHERE NOT EXISTS " +
             "(SELECT 1 FROM offline_conversations WHERE offline_conversations.networkId = launch_selection.networkId " +
-            "AND offline_conversations.conversation = launch_selection.conversation)",
+            "AND offline_conversations.conversation = launch_selection.conversation) AND NOT EXISTS " +
+            "(SELECT 1 FROM messages WHERE messages.networkId = launch_selection.networkId " +
+            "AND messages.conversation = launch_selection.conversation)",
     )
     public abstract suspend fun removeMissingSelection()
 
     public open suspend fun restoreNotices() {
-        for (row in evidenceNotices()) OfflineCodec.notice("${row.networkId}|${row.identity}")
+        for (row in evidenceNotices()) OfflineCodec.notice(row.networkId, row.identity, row.evidenceId)
     }
 
     private suspend fun quarantine(networkId: String, kind: String, identity: String, payloadJson: String, noticedAtMs: Long) {
@@ -141,7 +152,7 @@ public abstract class OfflineDao {
             }
         }
         putEvidence(OfflineQuarantineRow(evidenceId, networkId, kind, identity, payloadJson, noticedAtMs))
-        OfflineCodec.notice("$networkId|$identity")
+        OfflineCodec.notice(networkId, identity, evidenceId)
     }
 
     private suspend fun recoverConversation(row: OfflineConversationRow, noticedAtMs: Long): OfflineConversationRow? {
@@ -263,13 +274,15 @@ public abstract class OfflineDao {
     @Transaction
     public open suspend fun deleteConversation(networkId: String, conversation: String) {
         removeConversation(networkId, conversation)
-        removeMissingSelection()
+        val selected = selection()
+        if (selected?.networkId == networkId && selected.conversation == conversation) clearSelection()
     }
 
     @Transaction
     public open suspend fun deleteNetwork(networkId: String) {
         removeConversations(networkId)
         removeUsers(networkId)
+        removeEvidence(networkId)
         if (selection()?.networkId == networkId) clearSelection()
     }
 
@@ -313,11 +326,13 @@ public abstract class OfflineDao {
             removeUser(networkId, oldKey)
             putUser(OfflineCodec.renameUser(merged, newNick, mapping))
         }
-        for (original in conversationRows(networkId)) {
-            val row = recoverConversation(original, System.currentTimeMillis()) ?: continue
-            val json = row.rosterJson ?: continue
-            val roster = OfflineCodec.decodeRoster(json)
-            putConversation(row.copy(rosterJson = OfflineCodec.encodeRoster(OfflineCodec.renameRoster(roster, oldNick, newNick, mapping))))
+        for (row in rosterRows(networkId)) {
+            val roster = OfflineCodec.decodeOrNull { OfflineCodec.decodeRoster(row.rosterJson) }
+                ?: conversation(networkId, row.conversation)?.let {
+                    recoverConversation(it, System.currentTimeMillis())?.rosterJson?.let(OfflineCodec::decodeRoster)
+                } ?: continue
+            val renamed = OfflineCodec.renameRoster(roster, oldNick, newNick, mapping)
+            if (renamed !== roster) updateRoster(networkId, row.conversation, OfflineCodec.encodeRoster(renamed))
         }
     }
 
@@ -345,9 +360,13 @@ public abstract class OfflineDao {
             mergedUsers[rekeyed.nick] = mergedUsers[rekeyed.nick]?.let { OfflineCodec.mergeUser(it, rekeyed) } ?: rekeyed
         }
         for (row in mergedUsers.values) putUser(row)
-        if (selected?.networkId == networkId && conversations.any { it.conversation == selected.conversation }) {
-            val key = if (selected.kind == ConversationKind.SERVER.name) ConversationRef.SERVER_TARGET else mapping.fold(selected.rawTarget)
-            putSelection(selected.copy(conversation = key))
+        if (selected?.networkId == networkId) {
+            val source = conversations.firstOrNull { it.conversation == selected.conversation }
+            val rawTarget = source?.rawTarget ?: selected.rawTarget
+            val key = if (selected.kind == ConversationKind.SERVER.name) ConversationRef.SERVER_TARGET else mapping.fold(rawTarget)
+            val surviving = mergedConversations[key]
+            putSelection(selected.copy(conversation = key, rawTarget = surviving?.rawTarget ?: rawTarget,
+                kind = surviving?.kind ?: selected.kind))
         }
         removeMissingSelection()
     }

@@ -15,14 +15,15 @@ internal fun mergeSearchContext(
             message.storedRowId == row.rowId || (row.msgid != null && message.msgid == row.msgid)
         }
         val anonymous = if (identified >= 0) -1 else merged.uniqueHistoryIndex { message ->
-            message.storedRowId == null && (message.msgid == null || row.msgid == null) &&
+            !message.pendingEcho && message.storedRowId == null && (message.msgid == null || row.msgid == null) &&
                 message.sender == row.senderNick && message.kind == row.kind &&
                 message.text == row.text && message.timestampMs == row.timestampMs
         }
         val index = if (identified >= 0) identified else anonymous
         if (index >= 0) {
             val existing = merged[index]
-            merged[index] = mergeChatMessageMetadata(existing, row.toChatMessage(existing.localId)).copy(
+            merged[index] = mergeChatMessageMetadata(existing, row.toChatMessage(existing.localId),
+                incomingCanonical = existing.pendingEcho && !row.pendingEcho).copy(
                 storedRowId = row.rowId,
             )
         } else {

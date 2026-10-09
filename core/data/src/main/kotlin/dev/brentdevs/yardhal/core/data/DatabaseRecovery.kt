@@ -34,12 +34,13 @@ public object DatabaseRecovery {
             preserveStorageEvidence(file, files, retireFiles = originals)
         },
     ): YardhalDatabase {
+        StorageRecovery.configure(source)
         try {
-            if (StorageRecovery.announceRetained(source)) {
+            if (StorageRecovery.announceRetained(source, databaseFiles(source))) {
                 return temporarySession(
                     temporary,
-                    "Storage retirement was interrupted. Preserved evidence and any remaining originals were left " +
-                        "untouched; the failed database was not opened again. This session is temporary and its " +
+                    "Storage retirement could not finish. Preserved evidence and any remaining originals remain " +
+                        "protected; the failed database was not opened again. This session is temporary and its " +
                         "messages will not survive restart.",
                     StorageRecovery.retainedEvidence(source).lastOrNull()?.absolutePath,
                 )
@@ -219,11 +220,31 @@ public object DatabaseRecovery {
                 throw SQLiteDatabaseCorruptException("Corrupt database retained for storage recovery")
             },
         ).use { sqlite ->
-            sqlite.rawQuery("SELECT name FROM sqlite_master WHERE type='table' AND rootpage>0", null).use { tables ->
-                while (tables.moveToNext()) {
-                    val name = tables.getString(0).replace("\"", "\"\"")
-                    sqlite.rawQuery("PRAGMA quick_check(\"$name\")", null).use(::validateIntegrity)
-                }
+            validateReadOnly(sqlite)
+        }
+    }
+
+    internal fun validateReadOnly(
+        sqlite: SQLiteDatabase,
+        version: String = sqlite.rawQuery("SELECT sqlite_version()", null).use { result ->
+            if (!result.moveToFirst()) throw SQLiteDatabaseCorruptException("SQLite version returned no result")
+            result.getString(0)
+        },
+        checked: () -> Unit = {},
+    ) {
+        val parts = version.split('.').map { it.toIntOrNull() ?: 0 }
+        val tableChecksSupported = parts.firstOrNull().let { it != null && it >= 3 } &&
+            (parts[0] > 3 || (parts.getOrNull(1) ?: 0) >= 33)
+        if (!tableChecksSupported) {
+            sqlite.rawQuery("PRAGMA quick_check", null).use(::validateIntegrity)
+            checked()
+            return
+        }
+        sqlite.rawQuery("SELECT name FROM sqlite_master WHERE type='table' AND rootpage>0", null).use { tables ->
+            while (tables.moveToNext()) {
+                val name = tables.getString(0).replace("\"", "\"\"")
+                sqlite.rawQuery("PRAGMA quick_check(\"$name\")", null).use(::validateIntegrity)
+                checked()
             }
         }
     }
@@ -246,7 +267,7 @@ public object DatabaseRecovery {
         try {
             val sqlite = database.openHelper.writableDatabase
             if (checkIntegrity) sqlite.query("PRAGMA quick_check").use(::validateIntegrity)
-            else sqlite.execSQL("INSERT INTO message_fts(message_fts) VALUES('integrity-check')")
+            sqlite.execSQL("INSERT INTO message_fts(message_fts) VALUES('integrity-check')")
             sqlite.query("PRAGMA foreign_key_check").use { result ->
                 if (result.moveToFirst()) throw SQLiteConstraintException("Database foreign key integrity check failed")
             }

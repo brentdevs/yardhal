@@ -21,4 +21,5 @@ public data class OfflineEvidenceNoticeRow(
     public val networkId: String,
     public val kind: String,
     public val identity: String,
+    public val evidenceId: String,
 )

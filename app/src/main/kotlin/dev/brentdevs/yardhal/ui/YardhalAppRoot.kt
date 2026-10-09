@@ -57,6 +57,8 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.brentdevs.yardhal.coordinator.ConnectionStatus
 import dev.brentdevs.yardhal.coordinator.ConversationBuffer
@@ -98,6 +100,11 @@ public fun YardhalAppRoot(
     val restorationReady by coordinator.restorationReady.collectAsStateWithLifecycle()
     val recoveryNotices by StorageRecovery.notices.collectAsStateWithLifecycle()
     var recoveryDetailsVisible by rememberSaveable { mutableStateOf(false) }
+    var recoveryAcknowledging by remember { mutableStateOf(false) }
+    val recoveryBanner = storageRecoveryBanner(recoveryNotices)
+    LaunchedEffect(recoveryNotices) {
+        if (recoveryNotices.isEmpty()) recoveryDetailsVisible = false
+    }
     val channelList by coordinator.channelList.collectAsStateWithLifecycle()
     val rawLogVersion by coordinator.rawLogVersion.collectAsStateWithLifecycle()
     val bouncerVersion by coordinator.bouncerVersion.collectAsStateWithLifecycle()
@@ -541,15 +548,17 @@ public fun YardhalAppRoot(
         snackbarHost = { SnackbarHost(operationSnackbarState) },
     ) { contentPadding ->
         Column(Modifier.fillMaxSize().padding(contentPadding).consumeWindowInsets(contentPadding)) {
-            if (recoveryNotices.isNotEmpty()) {
+            if (recoveryBanner != null) {
                 Surface(color = MaterialTheme.colorScheme.errorContainer) {
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text(
-                            if (recoveryNotices.any { it.temporary }) "Storage warning · temporary session"
-                            else "Storage recovery warning · evidence is not restored messages",
+                            when (recoveryBanner) {
+                                StorageRecoveryBanner.TEMPORARY_SESSION -> "Storage warning · temporary session"
+                                StorageRecoveryBanner.WARNING -> "Storage recovery warning · evidence is not restored messages"
+                            },
                             style = MaterialTheme.typography.labelMedium,
                             modifier = Modifier.weight(1f),
                         )
@@ -570,6 +579,27 @@ public fun YardhalAppRoot(
                 Text("Storage recovery", style = MaterialTheme.typography.titleLarge)
                 recoveryNotices.forEach { notice ->
                     Text(storageRecoveryExplanation(notice), style = MaterialTheme.typography.bodyMedium)
+                    if (StorageRecovery.canAcknowledge(notice)) {
+                        TextButton(
+                            enabled = !recoveryAcknowledging,
+                            onClick = {
+                                recoveryAcknowledging = true
+                                drawerScope.launch {
+                                    val acknowledged = try {
+                                        withContext(Dispatchers.IO) { StorageRecovery.acknowledge(notice) }
+                                    } finally {
+                                        recoveryAcknowledging = false
+                                    }
+                                    if (!acknowledged) {
+                                        operationSnackbarState.showSnackbar(
+                                            "Could not save acknowledgement. The storage warning remains active.",
+                                            withDismissAction = true,
+                                        )
+                                    }
+                                }
+                            },
+                        ) { Text("Acknowledge · keep evidence") }
+                    }
                 }
             }
         }

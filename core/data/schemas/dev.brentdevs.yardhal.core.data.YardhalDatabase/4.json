@@ -6,7 +6,7 @@
     "entities": [
       {
         "tableName": "messages",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`rowId` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `networkId` TEXT NOT NULL, `conversation` TEXT NOT NULL, `msgid` TEXT, `contentHash` TEXT NOT NULL, `senderNick` TEXT NOT NULL, `senderUser` TEXT, `senderHost` TEXT, `kind` TEXT NOT NULL, `text` TEXT NOT NULL, `sentByUs` INTEGER NOT NULL, `timestampMs` INTEGER NOT NULL, `channelContext` TEXT, `historyContext` INTEGER NOT NULL DEFAULT 0, `highlightsMe` INTEGER NOT NULL DEFAULT 0, `playback` INTEGER NOT NULL DEFAULT 0, `replyToMsgid` TEXT, `replyParentRowId` INTEGER, `attachmentUrl` TEXT, `attachmentName` TEXT, `attachmentMimeType` TEXT, `attachmentSizeBytes` INTEGER, `attachmentWidth` INTEGER, `attachmentHeight` INTEGER, `senderAccount` TEXT, `redacted` INTEGER NOT NULL DEFAULT 0, `highlightsKnown` INTEGER NOT NULL DEFAULT 1, `originalIdentityHash` TEXT, `reactionsTruncated` INTEGER NOT NULL DEFAULT 0)",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`rowId` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `networkId` TEXT NOT NULL, `conversation` TEXT NOT NULL, `msgid` TEXT, `contentHash` TEXT NOT NULL, `senderNick` TEXT NOT NULL, `senderUser` TEXT, `senderHost` TEXT, `kind` TEXT NOT NULL, `text` TEXT NOT NULL, `sentByUs` INTEGER NOT NULL, `timestampMs` INTEGER NOT NULL, `channelContext` TEXT, `historyContext` INTEGER NOT NULL DEFAULT 0, `highlightsMe` INTEGER NOT NULL DEFAULT 0, `playback` INTEGER NOT NULL DEFAULT 0, `replyToMsgid` TEXT, `replyParentRowId` INTEGER, `attachmentUrl` TEXT, `attachmentName` TEXT, `attachmentMimeType` TEXT, `attachmentSizeBytes` INTEGER, `attachmentWidth` INTEGER, `attachmentHeight` INTEGER, `senderAccount` TEXT, `redacted` INTEGER NOT NULL DEFAULT 0, `highlightsKnown` INTEGER NOT NULL DEFAULT 1, `originalIdentityHash` TEXT, `reactionsTruncated` INTEGER NOT NULL DEFAULT 0, `pendingEcho` INTEGER NOT NULL DEFAULT 0)",
         "fields": [
           {
             "fieldPath": "rowId",
@@ -187,6 +187,13 @@
             "affinity": "INTEGER",
             "notNull": true,
             "defaultValue": "0"
+          },
+          {
+            "fieldPath": "pendingEcho",
+            "columnName": "pendingEcho",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "0"
           }
         ],
         "primaryKey": {
@@ -226,13 +233,45 @@
             ],
             "orders": [],
             "createSql": "CREATE INDEX IF NOT EXISTS `index_messages_contentHash` ON `${TABLE_NAME}` (`contentHash`)"
+          },
+          {
+            "name": "index_messages_replyParentRowId",
+            "unique": false,
+            "columnNames": [
+              "replyParentRowId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_messages_replyParentRowId` ON `${TABLE_NAME}` (`replyParentRowId`)"
+          },
+          {
+            "name": "index_messages_networkId_conversation_replyToMsgid",
+            "unique": false,
+            "columnNames": [
+              "networkId",
+              "conversation",
+              "replyToMsgid"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_messages_networkId_conversation_replyToMsgid` ON `${TABLE_NAME}` (`networkId`, `conversation`, `replyToMsgid`)"
+          },
+          {
+            "name": "index_messages_networkId_conversation_pendingEcho_timestampMs",
+            "unique": false,
+            "columnNames": [
+              "networkId",
+              "conversation",
+              "pendingEcho",
+              "timestampMs"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_messages_networkId_conversation_pendingEcho_timestampMs` ON `${TABLE_NAME}` (`networkId`, `conversation`, `pendingEcho`, `timestampMs`)"
           }
         ],
         "foreignKeys": []
       },
       {
         "tableName": "message_reactions",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`networkId` TEXT NOT NULL, `conversation` TEXT NOT NULL, `msgid` TEXT NOT NULL, `emoji` TEXT NOT NULL, `sender` TEXT NOT NULL, `observedAtMs` INTEGER NOT NULL, PRIMARY KEY(`networkId`, `conversation`, `msgid`, `emoji`, `sender`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`networkId` TEXT NOT NULL, `conversation` TEXT NOT NULL, `msgid` TEXT NOT NULL, `emoji` TEXT NOT NULL, `sender` TEXT NOT NULL, `observedAtMs` INTEGER NOT NULL, `orphan` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(`networkId`, `conversation`, `msgid`, `emoji`, `sender`))",
         "fields": [
           {
             "fieldPath": "networkId",
@@ -269,6 +308,13 @@
             "columnName": "observedAtMs",
             "affinity": "INTEGER",
             "notNull": true
+          },
+          {
+            "fieldPath": "orphan",
+            "columnName": "orphan",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "0"
           }
         ],
         "primaryKey": {
@@ -283,32 +329,117 @@
         },
         "indices": [
           {
-            "name": "index_message_reactions_networkId_conversation_observedAtMs",
+            "name": "index_message_reactions_networkId_conversation_msgid_observedAtMs_emoji_sender",
             "unique": false,
             "columnNames": [
               "networkId",
               "conversation",
-              "observedAtMs"
+              "msgid",
+              "observedAtMs",
+              "emoji",
+              "sender"
             ],
-            "orders": [],
-            "createSql": "CREATE INDEX IF NOT EXISTS `index_message_reactions_networkId_conversation_observedAtMs` ON `${TABLE_NAME}` (`networkId`, `conversation`, `observedAtMs`)"
+            "orders": [
+              "ASC",
+              "ASC",
+              "ASC",
+              "DESC",
+              "ASC",
+              "ASC"
+            ],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_message_reactions_networkId_conversation_msgid_observedAtMs_emoji_sender` ON `${TABLE_NAME}` (`networkId` ASC, `conversation` ASC, `msgid` ASC, `observedAtMs` DESC, `emoji` ASC, `sender` ASC)"
           },
           {
-            "name": "index_message_reactions_networkId_observedAtMs",
+            "name": "index_message_reactions_networkId_observedAtMs_conversation_msgid_emoji_sender",
             "unique": false,
             "columnNames": [
               "networkId",
+              "observedAtMs",
+              "conversation",
+              "msgid",
+              "emoji",
+              "sender"
+            ],
+            "orders": [
+              "ASC",
+              "DESC",
+              "ASC",
+              "ASC",
+              "ASC",
+              "ASC"
+            ],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_message_reactions_networkId_observedAtMs_conversation_msgid_emoji_sender` ON `${TABLE_NAME}` (`networkId` ASC, `observedAtMs` DESC, `conversation` ASC, `msgid` ASC, `emoji` ASC, `sender` ASC)"
+          },
+          {
+            "name": "index_message_reactions_orphan_observedAtMs",
+            "unique": false,
+            "columnNames": [
+              "orphan",
               "observedAtMs"
             ],
             "orders": [],
-            "createSql": "CREATE INDEX IF NOT EXISTS `index_message_reactions_networkId_observedAtMs` ON `${TABLE_NAME}` (`networkId`, `observedAtMs`)"
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_message_reactions_orphan_observedAtMs` ON `${TABLE_NAME}` (`orphan`, `observedAtMs`)"
           }
         ],
         "foreignKeys": []
       },
       {
+        "tableName": "message_reaction_counts",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`networkId` TEXT NOT NULL, `membershipCount` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(`networkId`))",
+        "fields": [
+          {
+            "fieldPath": "networkId",
+            "columnName": "networkId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "membershipCount",
+            "columnName": "membershipCount",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "0"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "networkId"
+          ]
+        },
+        "indices": [],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "message_orphan_reaction_count",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`singletonId` INTEGER NOT NULL, `membershipCount` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(`singletonId`))",
+        "fields": [
+          {
+            "fieldPath": "singletonId",
+            "columnName": "singletonId",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "membershipCount",
+            "columnName": "membershipCount",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "0"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "singletonId"
+          ]
+        },
+        "indices": [],
+        "foreignKeys": []
+      },
+      {
         "tableName": "message_tombstones",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`networkId` TEXT NOT NULL, `conversation` TEXT NOT NULL, `identity` TEXT NOT NULL, `timestampMs` INTEGER NOT NULL, `observedAtMs` INTEGER NOT NULL, PRIMARY KEY(`networkId`, `conversation`, `identity`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`networkId` TEXT NOT NULL, `conversation` TEXT NOT NULL, `identity` TEXT NOT NULL, `timestampMs` INTEGER NOT NULL, `observedAtMs` INTEGER NOT NULL, `privacyDeletion` INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(`networkId`, `conversation`, `identity`))",
         "fields": [
           {
             "fieldPath": "networkId",
@@ -339,6 +470,13 @@
             "columnName": "observedAtMs",
             "affinity": "INTEGER",
             "notNull": true
+          },
+          {
+            "fieldPath": "privacyDeletion",
+            "columnName": "privacyDeletion",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "1"
           }
         ],
         "primaryKey": {

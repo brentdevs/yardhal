@@ -17,6 +17,7 @@ internal fun StoredMessage.toChatMessage(localId: Long): ChatMessage {
         replyToMsgid = replyToMsgid,
         attachmentUrl = attachmentUrl,
         playback = playback,
+        pendingEcho = pendingEcho,
         storedRowId = rowId,
         senderAccount = senderAccount,
         channelContext = channelContext,

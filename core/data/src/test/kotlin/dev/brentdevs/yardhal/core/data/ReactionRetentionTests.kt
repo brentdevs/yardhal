@@ -6,6 +6,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.runBlocking
 import org.junit.runner.RunWith
@@ -78,6 +79,27 @@ class ReactionRetentionTests {
             for (sender in listOf("z", "a", "m")) store.applyReaction(ref(), "p", sender, "heart", true, 100, 2, 10)
             assertEquals(mapOf("heart" to setOf("a", "m")), store.reactions(ref(), "p"))
             assertTrue(store.recent(ref(), 1).single().reactionsTruncated)
+        }
+    }
+
+    @Test
+    fun networkOverflowRetainsPreferredConversationAndSenderIdentitiesAtEqualObservationTimes() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        YardhalDatabase.inMemory(context).use { db ->
+            val store = MessageStore(db.messageDao())
+            val other = ref("#other")
+            store.record(message("p"))
+            store.record(message("q").copy(conversation = other))
+            for (sender in listOf("alice", "bob")) {
+                store.applyReaction(ref(), "p", sender, "heart", true, 100, perParentLimit = 10, networkLimit = 2)
+            }
+            for (sender in listOf("z", "a", "m")) {
+                store.applyReaction(other, "q", sender, "heart", true, 100, perParentLimit = 10, networkLimit = 2)
+            }
+            assertTrue(store.reactions(ref(), "p").isEmpty())
+            assertEquals(mapOf("heart" to setOf("a", "m")), store.reactions(other, "q"))
+            assertTrue(store.recent(ref(), 1).single().reactionsTruncated)
+            assertTrue(store.recent(other, 1).single().reactionsTruncated)
         }
     }
 
@@ -175,6 +197,280 @@ class ReactionRetentionTests {
     }
 
     @Test
+    fun networkOverflowAcrossMultipleVictimBatchesPublishesEveryAffectedParent() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        YardhalDatabase.inMemory(context).use { db ->
+            val store = MessageStore(db.messageDao())
+            val first = assertNotNull(store.recordWithRowId(message("p")))
+            val second = assertNotNull(store.recordWithRowId(message("q", "#other")))
+            store.record(message("foreign", networkId = "n2"))
+            db.messageDao().putReaction(MessageReactionRow("n2", "#room", "foreign", "heart", "untouched", 1))
+            repeat(1200) { index ->
+                val target = if (index % 2 == 0) "#room" else "#other"
+                val msgid = if (index % 2 == 0) "p" else "q"
+                db.messageDao().putReaction(MessageReactionRow("n1", target, msgid, "heart", "sender-$index", index.toLong()))
+            }
+            val changed = mutableSetOf<Long>()
+            store.applyReaction(ref(), "p", "newest", "heart", true, 2000, perParentLimit = 2000, networkLimit = 100) {
+                assertFalse(db.openHelper.writableDatabase.inTransaction())
+                changed.addAll(it)
+            }
+            assertEquals(setOf(first, second), changed)
+            assertEquals(100, db.messageDao().reactions("n1", "#room").size + db.messageDao().reactions("n1", "#other").size)
+            assertEquals(100L, db.messageDao().reactionMembershipCount("n1"))
+            assertEquals(1L, db.messageDao().reactionMembershipCount("n2"))
+            assertTrue(assertNotNull(store.byRowId(ref(), first)).reactionsTruncated)
+            assertTrue(assertNotNull(store.byRowId(ref("#other"), second)).reactionsTruncated)
+            assertEquals((1101..1199).map { "sender-$it" }.toSet() + "newest",
+                (store.reactions(ref(), "p")["heart"].orEmpty() + store.reactions(ref("#other"), "q")["heart"].orEmpty()))
+            assertEquals(mapOf("heart" to setOf("untouched")), store.reactions(ref(networkId = "n2"), "foreign"))
+        }
+    }
+
+    @Test
+    fun parentOverflowAcrossMultipleBatchesKeepsOnlyNewestMemberships() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        YardhalDatabase.inMemory(context).use { db ->
+            val store = MessageStore(db.messageDao())
+            val parent = assertNotNull(store.recordWithRowId(message("p")))
+            repeat(1200) { index ->
+                db.messageDao().putReaction(MessageReactionRow("n1", "#room", "p", "heart", "sender-$index", index.toLong()))
+            }
+            store.applyReaction(ref(), "p", "newest", "heart", true, 2000, perParentLimit = 3, networkLimit = 5000)
+            assertEquals(mapOf("heart" to setOf("sender-1198", "sender-1199", "newest")), store.reactions(ref(), "p"))
+            assertEquals(3L, db.messageDao().reactionMembershipCount("n1"))
+            assertTrue(assertNotNull(store.byRowId(ref(), parent)).reactionsTruncated)
+        }
+    }
+
+    @Test
+    fun individualReactionEventsDoNotRunGlobalOrphanAgeMaintenance() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        YardhalDatabase.inMemory(context).use { db ->
+            val store = MessageStore(db.messageDao())
+            val orphan = MessageReactionRow("n2", "#room", "future", "heart", "bob", 1)
+            db.messageDao().putReaction(orphan)
+            store.record(message("p"))
+            store.applyReaction(ref(), "p", "alice", "heart", true, MESSAGE_INTERACTION_RETENTION_MS + 2)
+            assertEquals(listOf(orphan.copy(orphan = true)), db.messageDao().reactions("n2", "#room"))
+            store.maintain(MESSAGE_INTERACTION_RETENTION_MS + 2)
+            assertTrue(db.messageDao().reactions("n2", "#room").isEmpty())
+            assertEquals(mapOf("heart" to setOf("alice")), store.reactions(ref(), "p"))
+        }
+    }
+
+    @Test
+    fun membershipCountsTrackDuplicateReplaceNetworkMoveRemovalAndDeletion() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        YardhalDatabase.inMemory(context).use { db ->
+            val store = MessageStore(db.messageDao())
+            val dao = db.messageDao()
+            store.record(message("p"))
+            store.record(message("p", networkId = "n2"))
+            store.applyReaction(ref(), "p", "a", "heart", true, 1)
+            store.applyReaction(ref(), "p", "b", "heart", true, 2)
+            store.applyReaction(ref(networkId = "n2"), "p", "foreign", "heart", true, 1)
+            assertEquals(2L, dao.reactionMembershipCount("n1"))
+            assertEquals(1L, dao.reactionMembershipCount("n2"))
+            store.applyReaction(ref(), "p", "a", "heart", true, 3)
+            assertEquals(2L, dao.reactionMembershipCount("n1"))
+            db.openHelper.writableDatabase.execSQL(
+                "INSERT OR REPLACE INTO message_reactions(networkId, conversation, msgid, emoji, sender, observedAtMs) " +
+                    "VALUES('n1', '#room', 'p', 'heart', 'a', 4)",
+            )
+            assertEquals(2L, dao.reactionMembershipCount("n1"))
+            assertEquals(mapOf("heart" to setOf("a", "b")), store.reactions(ref(), "p"))
+            db.openHelper.writableDatabase.execSQL(
+                "UPDATE message_reactions SET networkId = 'n2' WHERE networkId = 'n1' AND sender = 'b'",
+            )
+            assertEquals(1L, dao.reactionMembershipCount("n1"))
+            assertEquals(2L, dao.reactionMembershipCount("n2"))
+            store.applyReaction(ref(), "p", "a", "heart", false, 5)
+            assertNull(dao.reactionMembershipCount("n1"))
+            assertEquals(mapOf("heart" to setOf("b", "foreign")), store.reactions(ref(networkId = "n2"), "p"))
+            store.applyReaction(ref(networkId = "n2"), "p", "newest", "heart", true, 6, networkLimit = 1)
+            assertEquals(1L, dao.reactionMembershipCount("n2"))
+            assertEquals(mapOf("heart" to setOf("newest")), store.reactions(ref(networkId = "n2"), "p"))
+            store.applyReaction(ref(), "p", "retained", "heart", true, 7)
+            store.deleteNetwork("n2")
+            assertNull(dao.reactionMembershipCount("n2"))
+            assertEquals(1L, dao.reactionMembershipCount("n1"))
+            assertEquals(mapOf("heart" to setOf("retained")), store.reactions(ref(), "p"))
+        }
+    }
+
+    @Test
+    fun membershipCountsTrackRenameUnionAttachmentRedactionRetentionAndOrphanMaintenance() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        YardhalDatabase.inMemory(context).use { db ->
+            val store = MessageStore(db.messageDao())
+            val dao = db.messageDao()
+            val target = ref("#renamed")
+            store.record(message("p"))
+            store.record(message("p").copy(conversation = target))
+            for (sender in listOf("shared", "old-only")) store.applyReaction(ref(), "p", sender, "heart", true, 1)
+            for (sender in listOf("shared", "new-only")) store.applyReaction(target, "p", sender, "heart", true, 2)
+            store.applyReaction(ref(), "future", "orphan", "heart", true, 3)
+            assertEquals(5L, dao.reactionMembershipCount("n1"))
+            assertEquals(1L, dao.orphanReactionCount())
+            store.renameConversation(ref(), target)
+            assertEquals(4L, dao.reactionMembershipCount("n1"))
+            assertEquals(1L, dao.orphanReactionCount())
+            assertEquals(mapOf("heart" to setOf("shared", "old-only", "new-only")), store.reactions(target, "p"))
+            store.record(message("future").copy(conversation = target))
+            assertEquals(4L, dao.reactionMembershipCount("n1"))
+            assertEquals(0L, dao.orphanReactionCount())
+            assertEquals(mapOf("heart" to setOf("orphan")), store.reactions(target, "future"))
+            store.redact(target, "p", 4)
+            assertEquals(1L, dao.reactionMembershipCount("n1"))
+            store.trimTo(target, 0, 5)
+            assertNull(dao.reactionMembershipCount("n1"))
+            assertEquals(0L, dao.orphanReactionCount())
+            store.applyReaction(target, "orphan-later", "orphan", "heart", true, 10)
+            assertEquals(1L, dao.reactionMembershipCount("n1"))
+            assertEquals(1L, dao.orphanReactionCount())
+            store.maintain(MESSAGE_INTERACTION_RETENTION_MS + 11)
+            assertNull(dao.reactionMembershipCount("n1"))
+            assertEquals(0L, dao.orphanReactionCount())
+            assertTrue(dao.reactions("n1", "#renamed").isEmpty())
+        }
+    }
+
+    @Test
+    fun reopenedMembershipCountsRemainAccurateWhenReplaceAndCapRemoveExistingMemberships() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val name = "reaction-counts-reopen-test.db"
+        context.deleteDatabase(name)
+        try {
+            YardhalDatabase.build(context, name).use { db ->
+                val store = MessageStore(db.messageDao())
+                store.record(message("p"))
+                for ((index, sender) in listOf("a", "b", "c").withIndex()) {
+                    store.applyReaction(ref(), "p", sender, "heart", true, index + 1L)
+                }
+                assertEquals(3L, db.messageDao().reactionMembershipCount("n1"))
+            }
+            YardhalDatabase.build(context, name).use { db ->
+                val store = MessageStore(db.messageDao())
+                assertEquals(3L, db.messageDao().reactionMembershipCount("n1"))
+                db.openHelper.writableDatabase.execSQL(
+                    "INSERT OR REPLACE INTO message_reactions(networkId, conversation, msgid, emoji, sender, observedAtMs) " +
+                        "VALUES('n1', '#room', 'p', 'heart', 'a', 1)",
+                )
+                assertEquals(3L, db.messageDao().reactionMembershipCount("n1"))
+                store.applyReaction(ref(), "p", "newest", "heart", true, 4, networkLimit = 3)
+                assertEquals(3L, db.messageDao().reactionMembershipCount("n1"))
+                assertEquals(mapOf("heart" to setOf("b", "c", "newest")), store.reactions(ref(), "p"))
+                store.trimTo(ref(), 0, 5)
+                assertNull(db.messageDao().reactionMembershipCount("n1"))
+                store.applyReaction(ref(), "future", "orphan", "heart", true, 6)
+            }
+            YardhalDatabase.build(context, name).use { db ->
+                assertEquals(1L, db.messageDao().reactionMembershipCount("n1"))
+                assertEquals(1L, db.messageDao().orphanReactionCount())
+                MessageStore(db.messageDao()).deleteNetwork("n1")
+                assertNull(db.messageDao().reactionMembershipCount("n1"))
+                assertEquals(0L, db.messageDao().orphanReactionCount())
+            }
+        } finally {
+            context.deleteDatabase(name)
+        }
+    }
+
+    @Test
+    fun eventPublicationCapsGlobalOrphansAcrossNetworksAndMultipleVictimBatches() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        YardhalDatabase.inMemory(context).use { db ->
+            val store = MessageStore(db.messageDao())
+            val dao = db.messageDao()
+            repeat(2200) { index ->
+                val network = if (index % 2 == 0) "n1" else "n2"
+                dao.putReaction(MessageReactionRow(network, "#room", "future-$index", "heart", "bob", index.toLong()))
+            }
+            store.record(message("attached", networkId = "n3"))
+            store.applyReaction(ref(networkId = "n3"), "attached", "bob", "heart", true, 3000)
+            assertEquals(1000L, dao.orphanReactionCount())
+            assertEquals(500L, dao.reactionMembershipCount("n1"))
+            assertEquals(500L, dao.reactionMembershipCount("n2"))
+            assertEquals(1L, dao.reactionMembershipCount("n3"))
+            val remaining = dao.reactions("n1", "#room") + dao.reactions("n2", "#room")
+            assertEquals((1200..2199).map { "future-$it" }.toSet(), remaining.map { it.msgid }.toSet())
+            assertTrue(remaining.all { it.orphan })
+            store.record(message("future-2198"))
+            store.record(message("future-2199", networkId = "n2"))
+            assertEquals(998L, dao.orphanReactionCount())
+            store.maintain(MESSAGE_INTERACTION_RETENTION_MS + 3001)
+            assertEquals(0L, dao.orphanReactionCount())
+            for (network in listOf("n1", "n2", "n3")) assertEquals(1L, dao.reactionMembershipCount(network))
+            assertEquals(mapOf("heart" to setOf("bob")), store.reactions(ref(), "future-2198"))
+            assertEquals(mapOf("heart" to setOf("bob")), store.reactions(ref(networkId = "n2"), "future-2199"))
+        }
+    }
+
+    @Test
+    fun orphanCountersFollowCanonicalPromotionConversationMovesAndParentDeletion() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        YardhalDatabase.inMemory(context).use { db ->
+            val store = MessageStore(db.messageDao())
+            val dao = db.messageDao()
+            store.applyReaction(ref(), "p", "bob", "heart", true, 1)
+            store.applyReaction(ref(), "q", "bob", "heart", true, 2)
+            assertEquals(2L, dao.orphanReactionCount())
+            val outgoing = message("optimistic").copy(msgid = null, sentByUs = true, pendingEcho = true)
+            val echoId = assertNotNull(store.recordLocalEcho(outgoing))
+            store.healEcho(ref(), echoId, outgoing.copy(msgid = "p", pendingEcho = false))
+            assertEquals(1L, dao.orphanReactionCount())
+            val target = ref("#renamed")
+            store.renameConversation(ref(), target)
+            assertEquals(1L, dao.orphanReactionCount())
+            assertEquals(2L, dao.reactionMembershipCount("n1"))
+            assertEquals(mapOf("heart" to setOf("bob")), store.reactions(target, "p"))
+            val qId = assertNotNull(store.recordWithRowId(message("q").copy(conversation = target)))
+            assertEquals(0L, dao.orphanReactionCount())
+            dao.deleteRow(qId)
+            assertEquals(1L, dao.orphanReactionCount())
+            assertTrue(store.reactions(target, "q").isEmpty())
+            store.record(message("q").copy(conversation = target))
+            assertEquals(0L, dao.orphanReactionCount())
+            store.redact(target, "p", 3)
+            assertEquals(1L, dao.reactionMembershipCount("n1"))
+            store.trimTo(target, 0, 4)
+            assertNull(dao.reactionMembershipCount("n1"))
+            assertEquals(0L, dao.orphanReactionCount())
+        }
+    }
+
+    @Test
+    fun orphanReplacementAndReactionIdentityMovesDoNotDriftGlobalCounter() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        YardhalDatabase.inMemory(context).use { db ->
+            val store = MessageStore(db.messageDao())
+            val dao = db.messageDao()
+            store.applyReaction(ref(), "future", "bob", "heart", true, 1)
+            db.openHelper.writableDatabase.execSQL(
+                "INSERT OR REPLACE INTO message_reactions(networkId, conversation, msgid, emoji, sender, observedAtMs) " +
+                    "VALUES('n1', '#room', 'future', 'heart', 'bob', 2)",
+            )
+            assertEquals(1L, dao.orphanReactionCount())
+            assertEquals(1L, dao.reactionMembershipCount("n1"))
+            store.record(message("future", networkId = "n2"))
+            db.openHelper.writableDatabase.execSQL(
+                "UPDATE message_reactions SET networkId = 'n2' WHERE networkId = 'n1'",
+            )
+            assertEquals(0L, dao.orphanReactionCount())
+            assertNull(dao.reactionMembershipCount("n1"))
+            assertEquals(1L, dao.reactionMembershipCount("n2"))
+            assertEquals(mapOf("heart" to setOf("bob")), store.reactions(ref(networkId = "n2"), "future"))
+            db.openHelper.writableDatabase.execSQL(
+                "UPDATE message_reactions SET conversation = '#missing' WHERE networkId = 'n2'",
+            )
+            assertEquals(1L, dao.orphanReactionCount())
+            store.deleteNetwork("n2")
+            assertEquals(0L, dao.orphanReactionCount())
+        }
+    }
+
+    @Test
     fun failedEvictionDoesNotPublishMembershipOrTruncationFlag() = runBlocking {
         val context = ApplicationProvider.getApplicationContext<Context>()
         YardhalDatabase.inMemory(context).use { db ->
@@ -190,6 +486,7 @@ class ReactionRetentionTests {
             }.isFailure)
             assertFalse(notified)
             assertEquals(mapOf("heart" to setOf("old")), store.reactions(ref(), "p"))
+            assertEquals(1L, db.messageDao().reactionMembershipCount("n1"))
             assertFalse(assertNotNull(store.byRowId(ref(), rowId)).reactionsTruncated)
         }
     }

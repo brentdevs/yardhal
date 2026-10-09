@@ -113,7 +113,7 @@ public class LiveCoordinator(
     public val restoredSelection: StateFlow<String?> = _restoredSelection.asStateFlow()
     private val _restorationReady = MutableStateFlow(false)
     public val restorationReady: StateFlow<Boolean> = _restorationReady.asStateFlow()
-    private var startupRequested = false
+    @Volatile private var startupRequested = false
     private var maintenanceJob: Job? = null
     private var lastMaintenanceAtMs: Long? = null
     private val writesSinceTrim = ConcurrentHashMap<String, Int>()
@@ -132,6 +132,8 @@ public class LiveCoordinator(
 
     private val _operationError = MutableStateFlow<String?>(null)
     public val operationError: StateFlow<String?> = _operationError.asStateFlow()
+    public val readMarkerPersistence: StateFlow<dev.brentdevs.yardhal.core.data.ReadMarkerPersistence>
+        get() = readMarkers.persistence
 
     public fun dismissOperationError(expectedError: String) {
         _operationError.compareAndSet(expectedError, null)
@@ -155,12 +157,28 @@ public class LiveCoordinator(
 
     private val sessions = ConcurrentHashMap<String, Session>()
     private val pendingStorageMigrations = ConcurrentHashMap<String, Int>()
+    private val deferredStorageReads = mutableMapOf<String, MutableList<suspend () -> Unit>>()
+    private val renamedConversations = ConcurrentHashMap<String, ConversationRef>()
     private val deferredMaintenanceNetworks = ConcurrentHashMap.newKeySet<String>()
     private val sessionLifecycleLock = Any()
     @Volatile private var networkAvailable = true
     private var defaultNetworkHandle: Long? = null
     private val persistenceLock = Any()
     private var persistenceTail: Job? = null
+    private val coalescedPersistence = mutableMapOf<String, suspend () -> Unit>()
+    private var persistenceBatch = 0L
+
+    private fun enqueueCoalescedPersistence(key: String, operation: suspend () -> Unit) {
+        synchronized(persistenceLock) {
+            val batchKey = "$persistenceBatch|$key"
+            val pending = coalescedPersistence.put(batchKey, operation) != null
+            if (pending) return
+            enqueuePersistence {
+                val latest = synchronized(persistenceLock) { coalescedPersistence.remove(batchKey) }
+                latest?.invoke()
+            }
+        }
+    }
 
     private fun enqueuePersistence(operation: suspend () -> Unit) {
         synchronized(persistenceLock) {
@@ -242,20 +260,7 @@ public class LiveCoordinator(
         }
 
         override suspend fun mergeStoredHistory(ref: ConversationRef, messages: List<StoredMessage>) {
-            val target = currentRef(ref)
-            if (networkStore.byId(target.networkId) == null) return
-            val session = sessions[target.networkId]
-            val parents = messageStore.replyParents(target, messages)
-            val reactions = messageStore.reactions(target)
-            if (networkStore.byId(target.networkId) == null || sessions[target.networkId] !== session) return
-            updateBufferKey(target.storageKey) { current ->
-                val merged = mergeSearchContext(current.messages, messages, prependEqualTimestamp = true) { idGenerator.getAndIncrement() }
-                val hydrated = hydrateReplyPreviews(merged, parents)
-                val redacted = hydrated.asSequence().filter { it.redacted }.mapNotNull { it.msgid }.toSet()
-                current.copy(messages = hydrated, reactions = reactions - redacted)
-            }
-            refreshUnread(target)
-            loadCachedUsers(target, messages.map { it.senderNick })
+            mergeDurableContext(ref, messages, prependEqualTimestamp = true)
         }
 
         override fun replayHistory(
@@ -359,7 +364,7 @@ public class LiveCoordinator(
         enqueuePersistence {
             try {
                 val selected = offlineStore?.selection()?.takeIf {
-                    networkStore.byId(it.networkId) != null && !channelOrder.isParted(it.storageKey)
+                    networkStore.byId(it.networkId) != null
                 }
                 startupSelection = selected
                 val now = clock()
@@ -382,7 +387,7 @@ public class LiveCoordinator(
                 synchronized(persistenceLock) { lastMaintenanceAtMs = now }
                 val restored = synchronized(selectionLock) {
                     if (selectionRevision != initialSelectionRevision) selectedStorageKey?.let { _buffers.value[it]?.ref }
-                    else selected?.takeIf { networkStore.byId(it.networkId) != null && !channelOrder.isParted(it.storageKey) }?.let {
+                    else selected?.takeIf { networkStore.byId(it.networkId) != null }?.let {
                         buffer(it)
                         selectedStorageKey = it.storageKey
                         _restoredSelection.value = it.storageKey
@@ -447,10 +452,13 @@ public class LiveCoordinator(
         val candidates = known + cached.map { it.ref }
         val selected = selectedStorageKey?.let { key -> _buffers.value[key]?.ref ?: candidates.firstOrNull { it.storageKey == key } }
         fun retain(ref: ConversationRef?) {
-            if (ref != null && ref.networkId == networkId && !channelOrder.isParted(ref.storageKey) &&
+            if (ref != null && ref.networkId == networkId &&
+                (!channelOrder.isParted(ref.storageKey) || ref.storageKey in _buffers.value ||
+                    ref.storageKey == lastSelected?.storageKey) &&
                 refs.size < MESSAGE_CONVERSATION_LIMIT) refs.putIfAbsent(ref.storageKey, ref)
         }
         retain(selected)
+        retain(pendingRenamedKey?.let { _buffers.value[it]?.ref })
         retain(lastSelected)
         retain(ConversationRef.server(networkId))
         for (ref in known) retain(ref)
@@ -463,8 +471,13 @@ public class LiveCoordinator(
             buffer(ref)
             if (absent || restoreExisting) shells[ref.storageKey]?.let(::restoreShell)
         }
-        val dropped = _buffers.value.values.filter { it.ref.networkId == networkId && it.key !in refs }.map { it.key }
-        if (dropped.isNotEmpty()) _buffers.update { buffers -> buffers - dropped.toSet() }
+        val droppedBuffers = _buffers.value.values.filter { it.ref.networkId == networkId && it.key !in refs }
+        val dropped = droppedBuffers.map { it.key }
+        if (dropped.isNotEmpty()) {
+            val droppedKeys = dropped.toSet()
+            _buffers.update { buffers -> buffers - droppedKeys }
+            renamedConversations.entries.removeAll { it.key in droppedKeys || it.value.storageKey in droppedKeys }
+        }
         for (key in dropped) {
             history.remove(key)
             loadedRosters.remove(key)
@@ -472,6 +485,10 @@ public class LiveCoordinator(
             rosterObservedAt.remove(key)
             modesObservedAt.remove(key)
             metadataRequests.remove(key)
+            reactionRevisions.keys.removeAll { it.startsWith("$key|") }
+        }
+        for (droppedBuffer in droppedBuffers) {
+            for (message in droppedBuffer.messages) persistedRowsByLocalId.remove("$networkId|${message.localId}")
         }
         refs.keys.toSet()
     }
@@ -516,49 +533,67 @@ public class LiveCoordinator(
     }
 
     private suspend fun loadCachedRoster(ref: ConversationRef) {
-        if (pendingStorageMigrations.containsKey(ref.networkId)) return
-        if (ref.kind != ConversationKind.CHANNEL) return
+        if (pendingStorageMigrations.containsKey(ref.networkId) || ref.kind != ConversationKind.CHANNEL) return
         val store = offlineStore ?: return
         val session = sessions[ref.networkId]
-        if (!loadedRosters.add(ref.storageKey)) return
+        val epoch = session?.state?.connectionEpoch
+        if (ref.storageKey in loadedRosters) return
+        val registered = session?.state?.registered
         val roster = store.roster(ref) ?: return
-        if (networkStore.byId(ref.networkId) == null || sessions[ref.networkId] !== session || pendingStorageMigrations.containsKey(ref.networkId)) return
-        updateBufferKey(ref.storageKey) { current ->
-            if (pendingStorageMigrations.containsKey(ref.networkId) || sessions[ref.networkId] !== session) return@updateBufferKey current
-            if (current.ref != ref || rosterObservedAt.containsKey(ref.storageKey) && !current.cachedRoster) current else {
-                rosterObservedAt[ref.storageKey] = roster.observedAtMs
-                current.copy(
-                    members = roster.members,
-                    memberPresence = roster.presence.mapValues { (_, value) -> value.toPresenceState() },
-                    cachedRoster = true,
-                    rosterTruncated = roster.truncated,
-                    cachedStateAtMs = maxOf(current.cachedStateAtMs ?: 0L, roster.observedAtMs),
-                )
+        var applied = false
+        withNetworkState(ref.networkId) {
+            if (networkStore.byId(ref.networkId) == null || sessions[ref.networkId] !== session ||
+                session?.state?.connectionEpoch != epoch || session?.state?.registered != registered ||
+                pendingStorageMigrations.containsKey(ref.networkId)
+            ) return@withNetworkState
+            updateBufferKey(ref.storageKey) { current ->
+                if (current.ref != ref || rosterObservedAt.containsKey(ref.storageKey) && !current.cachedRoster) current else {
+                    rosterObservedAt[ref.storageKey] = roster.observedAtMs
+                    current.copy(
+                        members = roster.members,
+                        memberPresence = roster.presence.mapValues { (_, value) -> value.toPresenceState() },
+                        cachedRoster = true,
+                        rosterTruncated = roster.truncated,
+                        cachedStateAtMs = maxOf(current.cachedStateAtMs ?: 0L, roster.observedAtMs),
+                    )
+                }
+            }
+            if (ref.storageKey in _buffers.value) {
+                loadedRosters.add(ref.storageKey)
+                applied = true
             }
         }
-        loadCachedUsers(ref, roster.members.map { it.nick })
+        if (applied) loadCachedUsers(ref, roster.members.map { it.nick })
     }
 
     private suspend fun loadCachedUsers(ref: ConversationRef, nicks: List<String>) {
         val store = offlineStore ?: return
         if (pendingStorageMigrations.containsKey(ref.networkId)) return
         val session = sessions[ref.networkId]
+        val epoch = session?.state?.connectionEpoch
+        val registered = session?.state?.registered
         val mapping = session?.state?.casemapping ?: restoredCasemapping[ref.networkId] ?: CaseMapping.RFC1459
         for (nick in nicks.distinctBy(mapping::fold)) {
-            if (nick.isBlank() || !loadedUsers.add("${ref.networkId}|${mapping.fold(nick)}")) continue
+            val loadedKey = "${ref.networkId}|${mapping.fold(nick)}"
+            if (nick.isBlank() || loadedKey in loadedUsers) continue
             val cached = store.user(ref.networkId, nick, mapping) ?: continue
-            if (networkStore.byId(ref.networkId) == null || sessions[ref.networkId] !== session || pendingStorageMigrations.containsKey(ref.networkId)) return
-            val cachedProfile = UserProfile.from(cached.metadata)?.copy(cached = true, observedAtMs = cached.observedAtMs)
-            val live = session?.state?.users?.get(mapping.fold(nick))
-            val profile = if (live?.metadataObservedAtMs != null) mergeObservedProfile(cachedProfile, live) { value ->
-                session?.let { redactPresentation(it, value) } ?: value
-            } else cachedProfile
-            if (profile == null) continue
-            _profiles.update { profiles ->
-                val current = profiles[ref.networkId] ?: NetworkProfiles(mapping, emptyMap())
-                val key = mapping.fold(cached.nick)
-                if (pendingStorageMigrations.containsKey(ref.networkId)) profiles else
+            withNetworkState(ref.networkId) {
+                if (networkStore.byId(ref.networkId) == null || sessions[ref.networkId] !== session ||
+                    session?.state?.connectionEpoch != epoch || session?.state?.registered != registered ||
+                    session != null && session.state.casemapping != mapping ||
+                    pendingStorageMigrations.containsKey(ref.networkId)
+                ) return@withNetworkState
+                val cachedProfile = UserProfile.from(cached.metadata)?.copy(cached = true, observedAtMs = cached.observedAtMs)
+                val live = session?.takeIf { it.state.registered }?.state?.users?.get(mapping.fold(nick))
+                val profile = if (live?.metadataObservedAtMs != null) mergeObservedProfile(cachedProfile, live) { value ->
+                    session?.let { redactPresentation(it, value) } ?: value
+                } else cachedProfile
+                if (profile != null) _profiles.update { profiles ->
+                    val current = profiles[ref.networkId] ?: NetworkProfiles(mapping, emptyMap())
+                    val key = mapping.fold(cached.nick)
                     profiles + (ref.networkId to current.copy(byFoldedNick = current.byFoldedNick + (key to profile)))
+                }
+                loadedUsers.add(loadedKey)
             }
         }
     }
@@ -625,9 +660,12 @@ public class LiveCoordinator(
                 val stored = authoritative[rowId]
                 if (rowId in inspected && stored == null) return null
                 if (stored == null) return message
+                if (stored.pendingEcho && !message.pendingEcho) return message.copy(storedRowId = stored.rowId)
                 return mergeChatMessageMetadata(message, stored.toChatMessage(message.localId), incomingCanonical = true).copy(
                     replyToMsgid = stored.replyToMsgid,
                     localReplyParentRowId = stored.replyParentRowId,
+                    pendingEcho = stored.pendingEcho,
+                    echoLabel = message.echoLabel.takeIf { stored.pendingEcho },
                     replyPreview = message.replyPreview.takeIf { rowId in parents },
                 )
             }
@@ -648,37 +686,40 @@ public class LiveCoordinator(
         }
     }
 
-    private fun persistSnapshot(session: Session, ref: ConversationRef, roster: OfflineRoster? = null) {
+    private fun persistSnapshot(session: Session, ref: ConversationRef, saveRoster: Boolean = false) {
+        val store = offlineStore ?: return
         val current = _buffers.value[ref.storageKey] ?: return
         val now = clock()
-        val shell = OfflineConversationShell(
-            ref = ref,
-            displayName = current.displayName,
-            observedAtMs = now,
-            caseMapping = session.state.casemapping,
-            topic = current.topic,
-            topicObservedAtMs = topicObservedAt[ref.storageKey],
-            modes = current.channelModes,
-            modesObservedAtMs = modesObservedAt[ref.storageKey],
-        )
-        enqueuePersistence {
-            if (sessions[ref.networkId] !== session || networkStore.byId(ref.networkId) == null) return@enqueuePersistence
-            if (ref.storageKey !in _buffers.value || channelOrder.isParted(ref.storageKey)) return@enqueuePersistence
-            offlineStore?.saveConversation(shell, roster)
+        val mapping = session.state.casemapping
+        val topicTime = topicObservedAt[ref.storageKey]
+        val modesTime = modesObservedAt[ref.storageKey]
+        val rosterTime = rosterObservedAt[ref.storageKey]
+        enqueueCoalescedPersistence("snapshot:${session.historyGeneration}|${ref.storageKey}") {
+            if (networkStore.byId(ref.networkId) == null) return@enqueueCoalescedPersistence
+            val shell = OfflineConversationShell(ref, current.displayName, now, mapping,
+                current.topic, topicTime, current.channelModes, modesTime)
+            val roster = if ((saveRoster || rosterTime != null) && !current.cachedRoster) {
+                OfflineRoster(current.members, current.memberPresence.mapValues { (_, value) ->
+                    value.toCachedPresence { redactPresentation(session, it) }
+                }, rosterTime ?: now, completeAtObservation = true)
+            } else null
+            store.saveConversation(shell, roster)
         }
     }
 
     private fun persistOpenedShell(ref: ConversationRef) {
-        enqueuePersistence {
-            val current = _buffers.value[ref.storageKey] ?: return@enqueuePersistence
-            if (networkStore.byId(ref.networkId) == null || channelOrder.isParted(ref.storageKey)) return@enqueuePersistence
-            val mapping = sessions[ref.networkId]?.state?.casemapping ?: restoredCasemapping[ref.networkId] ?: CaseMapping.RFC1459
-            offlineStore?.saveConversation(OfflineConversationShell(current.ref, current.displayName, clock(), mapping))
+        val current = _buffers.value[ref.storageKey] ?: return
+        val mapping = sessions[ref.networkId]?.state?.casemapping ?: restoredCasemapping[ref.networkId] ?: CaseMapping.RFC1459
+        val shell = OfflineConversationShell(current.ref, current.displayName, clock(), mapping)
+        enqueueCoalescedPersistence("shell:${ref.storageKey}") {
+            if (networkStore.byId(ref.networkId) != null) offlineStore?.saveConversation(shell)
         }
     }
 
     private fun markNetworkCached(networkId: String) {
         sessions[networkId]?.publishedProfileKeys = emptySet()
+        loadedRosters.removeAll { it.substringBefore("|") == networkId }
+        loadedUsers.removeAll { it.substringBefore("|") == networkId }
         updateAllBuffersForNetwork(networkId) { current ->
             current.copy(
                 cachedTopic = current.cachedTopic || topicObservedAt.containsKey(current.key),
@@ -755,13 +796,101 @@ public class LiveCoordinator(
         }
     }
 
+    private fun deferStorageRead(networkId: String, operation: suspend () -> Unit): Boolean = synchronized(selectionLock) {
+        if (!pendingStorageMigrations.containsKey(networkId)) return@synchronized false
+        deferredStorageReads.getOrPut(networkId) { mutableListOf() }.add(operation)
+        true
+    }
+
+    private fun clearReactionRevision(ref: ConversationRef, msgid: String, revision: Long) {
+        reactionRevisions.remove("${ref.storageKey}|$msgid", revision)
+        val current = currentRef(ref)
+        if (current.storageKey != ref.storageKey) reactionRevisions.remove("${current.storageKey}|$msgid", revision)
+        renamedConversations[ref.storageKey]?.let { renamed ->
+            val migrated = currentRef(renamed)
+            if (migrated.storageKey != current.storageKey) reactionRevisions.remove("${migrated.storageKey}|$msgid", revision)
+        }
+    }
+
+    private fun durableReactions(
+        key: String,
+        visible: Map<String, Map<String, Set<String>>>,
+        stored: Map<String, Map<String, Set<String>>>,
+        redacted: Set<String>,
+    ): Map<String, Map<String, Set<String>>> {
+        var merged = stored
+        for (msgid in stored.keys + visible.keys) {
+            if (reactionRevisions["$key|$msgid"] != null) {
+                val optimistic = visible[msgid]
+                merged = if (optimistic == null) merged - msgid else merged + (msgid to optimistic)
+            }
+        }
+        return merged - redacted
+    }
+
+    private suspend fun mergeDurableContext(
+        ref: ConversationRef,
+        messages: List<StoredMessage>,
+        prependEqualTimestamp: Boolean = false,
+    ) {
+        if (deferStorageRead(ref.networkId) { mergeDurableContext(ref, messages, prependEqualTimestamp) }) return
+        val target = currentRef(ref)
+        if (networkStore.byId(target.networkId) == null) return
+        val session = sessions[target.networkId]
+        val epoch = session?.state?.connectionEpoch
+        val context = if (messages.any { it.conversation.storageKey != target.storageKey }) {
+            messageStore.byRowIds(target, messages.map { it.rowId }.toSet())
+        } else messages
+        val parents = messageStore.replyParents(target, context)
+        val reactions = messageStore.reactions(target)
+        if (deferStorageRead(ref.networkId) { mergeDurableContext(ref, messages, prependEqualTimestamp) }) return
+        var reload = false
+        withNetworkState(target.networkId) {
+            if (networkStore.byId(target.networkId) == null) return@withNetworkState
+            if (sessions[target.networkId] !== session || session?.state?.connectionEpoch != epoch || currentRef(ref) != target) {
+                reload = true
+                return@withNetworkState
+            }
+            updateBufferKey(target.storageKey) { current ->
+                val merged = mergeSearchContext(current.messages, context, prependEqualTimestamp) { idGenerator.getAndIncrement() }
+                val hydrated = hydrateReplyPreviews(merged, parents)
+                val redacted = hydrated.asSequence().filter { it.redacted }.mapNotNull { it.msgid }.toSet()
+                current.copy(messages = hydrated, reactions = durableReactions(current.key, current.reactions, reactions, redacted))
+            }
+        }
+        if (networkStore.byId(target.networkId) == null) return
+        if (reload) {
+            enqueuePersistence {
+                val current = currentRef(ref)
+                mergeDurableContext(ref, messageStore.byRowIds(current, messages.map { it.rowId }.toSet()), prependEqualTimestamp)
+            }
+            return
+        }
+        refreshUnread(target)
+        loadCachedUsers(target, context.map { it.senderNick })
+    }
+
+    private suspend fun refreshAfterWrite(ref: ConversationRef) {
+        if (deferStorageRead(ref.networkId) { refreshAfterWrite(ref) }) return
+        val target = currentRef(ref)
+        refreshVisibleDurableState(target)
+        refreshUnread(target)
+        if (deferStorageRead(ref.networkId) { refreshAfterWrite(ref) }) return
+        persistOpenedShell(currentRef(ref))
+    }
+
     private fun beginStorageMigration(networkId: String) {
         pendingStorageMigrations.merge(networkId, 1, Int::plus)
+        synchronized(persistenceLock) { persistenceBatch += 1 }
     }
 
     private suspend fun finishStorageMigration(networkId: String, completed: Boolean) {
-        if (pendingStorageMigrations.computeIfPresent(networkId) { _, count -> (count - 1).takeIf { it > 0 } } != null) return
+        val deferred = synchronized(selectionLock) {
+            if (pendingStorageMigrations.computeIfPresent(networkId) { _, count -> (count - 1).takeIf { it > 0 } } != null) return
+            deferredStorageReads.remove(networkId).orEmpty()
+        }
         if (!completed || networkStore.byId(networkId) == null) return
+        for (operation in deferred) enqueuePersistence(operation)
         val shells = offlineStore?.shells(networkId).orEmpty().associateBy { it.ref.storageKey }
         for (buffer in _buffers.value.values.filter { it.ref.networkId == networkId }) {
             shells[buffer.key]?.let { loadCachedShell(buffer.ref, it) }
@@ -798,14 +927,24 @@ public class LiveCoordinator(
             requestedWhoisOrigin = selectedStorageKey
             whoisRequestToken
         }
-        _whois.value = null
-        _whoisPresentation.value = null
+        val existing = _whoisPresentation.value?.takeIf {
+            explicitRefresh && it.networkId == session.config.id && session.state.casemapping.equal(it.info.nick, nick)
+        }
+        if (existing == null) {
+            _whois.value = null
+            _whoisPresentation.value = null
+        } else {
+            _whoisPresentation.value = existing.copy(refreshing = true)
+        }
         enqueuePersistence {
             loadCachedUsers(origin, listOf(nick))
             val cached = offlineStore?.whois(session.config.id, nick, session.state.casemapping)
             synchronized(session.state) {
                 if (!whoisRequestCurrent(session, nick, token)) return@enqueuePersistence
-                if (_whoisPresentation.value?.cached == false) return@enqueuePersistence
+                if (_whoisPresentation.value?.cached == false) {
+                    if (explicitRefresh) sendWhoisRefresh(session, origin, nick)
+                    return@enqueuePersistence
+                }
                 val online = session.state.registered && session.statusFlow.value == ConnectionStatus.REGISTERED &&
                     session.recovery.phase == RecoveryPhase.REGISTERED && networkAvailable
                 val refresh = online && (explicitRefresh || cached?.isFresh(clock()) != true)
@@ -1146,7 +1285,6 @@ public class LiveCoordinator(
                     "Disconnected for this session, but the restart disconnect preference was not saved. Check device storage and retry Disconnect."
                 }
                 session.connectionError?.let { ingestRaw(networkId, false, it) }
-                _profiles.update { it - networkId }
                 refreshNetworkStates()
             }
         }
@@ -1195,6 +1333,7 @@ public class LiveCoordinator(
         synchronized(sessionLifecycleLock) {
             val saved = networkStore.byId(networkId) ?: return
             if (!networkStore.remove(networkId)) return
+            synchronized(persistenceLock) { persistenceBatch += 1 }
             sessions[networkId]?.let { session ->
                 synchronized(session.state) { stopSession(session, "Network removed") }
             }
@@ -1228,6 +1367,8 @@ public class LiveCoordinator(
             modesObservedAt.keys.removeAll { it.substringBefore("|") == networkId }
             restoredCasemapping.remove(networkId)
             pendingStorageMigrations.remove(networkId)
+            renamedConversations.keys.removeAll { it.startsWith("$networkId|") }
+            synchronized(selectionLock) { deferredStorageReads.remove(networkId) }
             deferredMaintenanceNetworks.remove(networkId)
             writesSinceTrim.keys.removeAll { it.substringBefore("|") == networkId }
             persistedRowsByLocalId.keys.removeAll { it.substringBefore("|") == networkId }
@@ -1270,9 +1411,11 @@ public class LiveCoordinator(
         return if (text == effect.text) effect else effect.copy(text = text)
     }
 
-    private fun launchSession(session: Session) {
-        if (session.reconnector != null) return
-        if (startupRequested && !_restorationReady.value) return
+    private fun launchSession(session: Session) = synchronized(session.state) {
+        if (sessions[session.config.id] !== session || session.quitRequested || !session.lifecycleJob.isActive ||
+            !session.recovery.desiredConnection || session.reconnector != null
+        ) return@synchronized
+        if (startupRequested && !_restorationReady.value) return@synchronized
         val reconnector = IrcReconnector(
             scope = session.lifecycleScope,
             policy = ReconnectPolicy(initialDelayMillis = 1_000, maxDelayMillis = 30_000),
@@ -1912,10 +2055,7 @@ public class LiveCoordinator(
                 }
                 if (effect.complete) {
                     loadedRosters.add(effect.ref.storageKey)
-                    val redact: (String) -> String = { redactPresentation(session, it) }
-                    val roster = OfflineRoster(effect.members, effect.presence.mapValues { (_, value) -> value.toCachedPresence(redact) },
-                        now, completeAtObservation = true)
-                    persistSnapshot(session, effect.ref, roster)
+                    persistSnapshot(session, effect.ref, saveRoster = true)
                 }
             }
             is InboundEffect.SetModes -> {
@@ -1952,20 +2092,23 @@ public class LiveCoordinator(
                     current.copy(reactions = applyReaction(current.reactions, effect.copy(msgids = accepted)))
                 }
                 enqueuePersistence {
-                    if (sessions[session.config.id] !== session || networkStore.byId(session.config.id) == null) return@enqueuePersistence
                     val affectedRows = mutableSetOf<Long>()
-                    for (msgid in effect.msgids) {
-                        messageStore.applyReaction(effect.ref, msgid, effect.sender, effect.emoji, effect.added, clock(),
-                            onRetentionChanged = { affectedRows.addAll(it) })
-                        revisions[msgid]?.let { reactionRevisions.remove("${effect.ref.storageKey}|$msgid", it) }
+                    try {
+                        if (sessions[session.config.id] !== session || networkStore.byId(session.config.id) == null) return@enqueuePersistence
+                        for (msgid in effect.msgids) {
+                            messageStore.applyReaction(effect.ref, msgid, effect.sender, effect.emoji, effect.added, clock(),
+                                onRetentionChanged = { affectedRows.addAll(it) })
+                        }
+                    } finally {
+                        for ((msgid, revision) in revisions) clearReactionRevision(effect.ref, msgid, revision)
+                        refreshReactionRetention(session.config.id, affectedRows, currentRef(effect.ref), effect.msgids.toSet())
                     }
-                    refreshReactionRetention(session.config.id, affectedRows, effect.ref, effect.msgids.toSet())
                 }
             }
             is InboundEffect.RedactMessage -> {
                 updateBufferKey(effect.ref.storageKey) { current -> redactInBuffer(current, effect.msgid) }
                 enqueuePersistence {
-                    if (sessions[session.config.id] !== session || networkStore.byId(session.config.id) == null) return@enqueuePersistence
+                    if (networkStore.byId(session.config.id) == null) return@enqueuePersistence
                     messageStore.redact(effect.ref, effect.msgid, clock())
                     refreshVisibleDurableState(effect.ref)
                     refreshUnread(effect.ref)
@@ -2015,11 +2158,14 @@ public class LiveCoordinator(
 
     public fun followRenamedSelection(storageKey: String?, bufferKeys: Set<String>): String? =
         synchronized(selectionLock) {
+            if (pendingRenamedKey == null && selectedStorageKey != null && storageKey != null &&
+                renamedConversations[storageKey]?.storageKey == selectedStorageKey
+            ) return@synchronized null
             if (selectedStorageKey != storageKey) {
                 selectedStorageKey = storageKey
                 pendingRenamedKey = null
             }
-            val renamed = pendingRenamedKey
+            val renamed = pendingRenamedKey ?: storageKey?.let { renamedConversations[it]?.storageKey }
             if (renamed == null || (storageKey != null && storageKey in bufferKeys) || renamed !in bufferKeys) {
                 return@synchronized null
             }
@@ -2035,6 +2181,10 @@ public class LiveCoordinator(
 
     private fun removeBuffer(storageKey: String) = withNetworkState(storageKey.substringBefore("|")) {
         history.remove(storageKey)
+        synchronized(persistenceLock) { persistenceBatch += 1 }
+        loadedRosters.remove(storageKey)
+        reactionRevisions.keys.removeAll { it.startsWith("$storageKey|") }
+        renamedConversations.entries.removeAll { it.key == storageKey || it.value.storageKey == storageKey }
         val ref = _buffers.value[storageKey]?.ref
         if (ref != null) enqueuePersistence { offlineStore?.deleteConversation(ref) }
         synchronized(selectionLock) {
@@ -2048,11 +2198,21 @@ public class LiveCoordinator(
         if (state == null) operation() else synchronized(state) { operation() }
     }
 
+    private fun rememberConversationRename(from: ConversationRef, to: ConversationRef) {
+        if (from.storageKey == to.storageKey) return
+        for ((key, destination) in renamedConversations) {
+            if (destination.storageKey == from.storageKey) renamedConversations[key] = to
+        }
+        renamedConversations.remove(to.storageKey)
+        renamedConversations[from.storageKey] = to
+    }
+
     private fun renameConversation(session: Session, from: ConversationRef, to: ConversationRef) {
         val fromKey = from.storageKey
         val toKey = to.storageKey
         synchronized(selectionLock) {
             if (fromKey != toKey) beginStorageMigration(from.networkId)
+            rememberConversationRename(from, to)
             if (fromKey != toKey && fromKey in _buffers.value &&
                 (selectedStorageKey == fromKey || pendingRenamedKey == fromKey)
             ) {
@@ -2128,9 +2288,12 @@ public class LiveCoordinator(
     }
 
     private fun currentRef(ref: ConversationRef): ConversationRef {
-        val mapping = sessions[ref.networkId]?.state?.casemapping ?: return ref
-        val folded = mapping.fold(ref.rawTarget)
-        return if (ref.normalizedTarget == folded) ref else ref.copy(normalizedTarget = folded)
+        _buffers.value[ref.storageKey]?.ref?.let { return it }
+        val renamed = renamedConversations[ref.storageKey] ?: ref
+        val mapping = sessions[ref.networkId]?.state?.casemapping ?: restoredCasemapping[ref.networkId] ?: return renamed
+        val folded = mapping.fold(renamed.rawTarget)
+        val current = if (renamed.normalizedTarget == folded) renamed else renamed.copy(normalizedTarget = folded)
+        return _buffers.value[current.storageKey]?.ref ?: current
     }
 
     private fun migrateConversationMetadata(fromKey: String, toKey: String, preserveReadReplay: Boolean = false) {
@@ -2150,6 +2313,11 @@ public class LiveCoordinator(
             }
         }
         if (loadedRosters.remove(fromKey)) loadedRosters.add(toKey)
+        for ((key, revision) in reactionRevisions) {
+            if (!key.startsWith("$fromKey|")) continue
+            reactionRevisions.remove(key, revision)
+            reactionRevisions.merge("$toKey|${key.removePrefix("$fromKey|")}", revision, ::maxOf)
+        }
         metadataRequests.remove(fromKey)
         sessions[toKey.substringBefore("|")]?.replayedReadCursors?.let { cursors ->
             val previous = cursors.remove(fromKey)
@@ -2283,6 +2451,10 @@ public class LiveCoordinator(
         selected?.let { refs[it] }?.let { ref ->
             val key = "${ref.networkId}|${mapping.fold(ref.rawTarget)}"
             if (selected != key) pendingRenamedKey = key
+        }
+        for (previous in existing) {
+            val destination = replacement["${session.config.id}|${mapping.fold(previous.ref.rawTarget)}"]?.ref ?: continue
+            rememberConversationRename(previous.ref, destination)
         }
         _buffers.update { current -> current - refs.keys + replacement }
         restoreKnownConversations(session)
@@ -2429,10 +2601,13 @@ public class LiveCoordinator(
 
     public fun deleteMessage(networkId: String, storageKey: String, msgid: String) {
         val session = sessions[networkId] ?: return
-        if (!session.state.registered || session.statusFlow.value != ConnectionStatus.REGISTERED) return
-        val buffer = _buffers.value[storageKey] ?: return
-        sendRaw(session, "REDACT ${buffer.ref.rawTarget} $msgid")
-        processEffect(session, InboundEffect.RedactMessage(buffer.ref, msgid))
+        synchronized(session.state) {
+            if (sessions[networkId] !== session || !session.state.registered ||
+                session.statusFlow.value != ConnectionStatus.REGISTERED
+            ) return
+            val buffer = _buffers.value[storageKey]?.takeIf { it.ref.networkId == networkId } ?: return
+            sendLabeled(session, buffer.ref, LabeledCommand.RAW, "REDACT ${buffer.ref.rawTarget} $msgid")
+        }
     }
 
     private fun updateAllBuffersForNetwork(networkId: String, transform: (ConversationBuffer) -> ConversationBuffer) {
@@ -2469,10 +2644,10 @@ public class LiveCoordinator(
         }
     }
 
-    public fun react(networkId: String, storageKey: String, msgid: String, emoji: String) {
-        val session = sessions[networkId] ?: return
-        if (!session.state.registered || session.statusFlow.value != ConnectionStatus.REGISTERED) return
-        val buffer = _buffers.value[storageKey] ?: return
+    public fun react(networkId: String, storageKey: String, msgid: String, emoji: String): Unit = withNetworkState(networkId) {
+        val session = sessions[networkId] ?: return@withNetworkState
+        if (!session.state.registered || session.statusFlow.value != ConnectionStatus.REGISTERED) return@withNetworkState
+        val buffer = _buffers.value[storageKey]?.takeIf { it.ref.networkId == networkId } ?: return@withNetworkState
         val own = session.state.ownNick
         var reactionVerb: String? = null
         var reactionRevision: Long? = null
@@ -2499,12 +2674,15 @@ public class LiveCoordinator(
         reactionVerb?.let { verb ->
             sendRaw(session, "@+draft/$verb=$emoji;+draft/refs=$msgid TAGMSG ${buffer.ref.rawTarget}")
             enqueuePersistence {
-                if (sessions[networkId] !== session || networkStore.byId(networkId) == null) return@enqueuePersistence
                 var affectedRows: Set<Long> = emptySet()
-                messageStore.applyReaction(buffer.ref, msgid, own, emoji, verb == "react", clock(),
-                    onRetentionChanged = { affectedRows = it })
-                reactionRevision?.let { reactionRevisions.remove("${buffer.ref.storageKey}|$msgid", it) }
-                refreshReactionRetention(networkId, affectedRows, buffer.ref, setOf(msgid))
+                try {
+                    if (sessions[networkId] !== session || networkStore.byId(networkId) == null) return@enqueuePersistence
+                    messageStore.applyReaction(buffer.ref, msgid, own, emoji, verb == "react", clock(),
+                        onRetentionChanged = { affectedRows = it })
+                } finally {
+                    reactionRevision?.let { clearReactionRevision(buffer.ref, msgid, it) }
+                    refreshReactionRetention(networkId, affectedRows, currentRef(buffer.ref), setOf(msgid))
+                }
             }
         }
     }
@@ -2513,27 +2691,41 @@ public class LiveCoordinator(
         updateBufferKey(storageKey) { it.copy(replyDraft = message) }
     }
 
-    public fun directMessageKey(networkId: String, fromKey: String, nick: String): String {
+    public fun directMessageKey(networkId: String, fromKey: String, nick: String): String = synchronized(sessionLifecycleLock) {
         val session = sessions[networkId]
-        val casemapping = session?.state?.casemapping ?: restoredCasemapping[networkId] ?: CaseMapping.RFC1459
-        val ref = ConversationRef.directMessage(networkId, nick, casemapping)
-        if (networkStore.byId(networkId) != null) buffer(ref)
-        persistOpenedShell(ref)
-        return ref.storageKey
+        synchronized(session?.state ?: selectionLock) {
+            val casemapping = session?.state?.casemapping ?: restoredCasemapping[networkId] ?: CaseMapping.RFC1459
+            val ref = ConversationRef.directMessage(networkId, nick, casemapping)
+            if (networkStore.byId(networkId) != null) {
+                channelOrder.clearParted(ref.storageKey)
+                _orderState.value = channelOrder.snapshot()
+                buffer(ref)
+            }
+            persistOpenedShell(ref)
+            ref.storageKey
+        }
     }
 
-    public fun ensureConversation(networkId: String, conversation: String): String {
+    public fun ensureConversation(networkId: String, conversation: String): String = synchronized(sessionLifecycleLock) {
         val session = sessions[networkId]
-        val casemapping = session?.state?.casemapping ?: restoredCasemapping[networkId] ?: CaseMapping.RFC1459
-        val ref = when {
-            conversation == ConversationRef.SERVER_TARGET -> ConversationRef.server(networkId)
-            conversation.firstOrNull()?.let { it in "#&" } == true ->
-                ConversationRef.channel(networkId, conversation, casemapping)
-            else -> ConversationRef.directMessage(networkId, conversation, casemapping)
+        synchronized(session?.state ?: selectionLock) {
+            val casemapping = session?.state?.casemapping ?: restoredCasemapping[networkId] ?: CaseMapping.RFC1459
+            val ref = when {
+                conversation == ConversationRef.SERVER_TARGET -> ConversationRef.server(networkId)
+                conversation.firstOrNull()?.let { it in "#&" } == true ->
+                    ConversationRef.channel(networkId, conversation, casemapping)
+                else -> ConversationRef.directMessage(networkId, conversation, casemapping)
+            }
+            if (networkStore.byId(networkId) != null) {
+                if (ref.kind == ConversationKind.DIRECT_MESSAGE) {
+                    channelOrder.clearParted(ref.storageKey)
+                    _orderState.value = channelOrder.snapshot()
+                }
+                buffer(ref)
+            }
+            persistOpenedShell(ref)
+            ref.storageKey
         }
-        if (networkStore.byId(networkId) != null) buffer(ref)
-        persistOpenedShell(ref)
-        return ref.storageKey
     }
 
     public fun openChannel(networkId: String, channel: String): String? {
@@ -2583,28 +2775,28 @@ public class LiveCoordinator(
     ): List<dev.brentdevs.yardhal.core.data.FtsHit> =
         messageStore.search(raw, networkId = networkId, conversation = conversation)
 
-    public fun openSearchHit(hit: dev.brentdevs.yardhal.core.data.FtsHit): String {
-        val storageKey = ensureConversation(hit.networkId, hit.conversation)
-        val ref = _buffers.value[storageKey]?.ref ?: return storageKey
-        enqueuePersistence {
-            if (networkStore.byId(ref.networkId) == null) return@enqueuePersistence
-            val session = sessions[ref.networkId]
-            val context = messageStore.around(ref, hit.rowId, hit.timestampMs)
-            if (networkStore.byId(ref.networkId) == null || sessions[ref.networkId] !== session) return@enqueuePersistence
-            val target = currentRef(ref)
-            val parents = messageStore.replyParents(target, context)
-            val reactions = messageStore.reactions(target)
-            if (networkStore.byId(ref.networkId) == null || sessions[ref.networkId] !== session) return@enqueuePersistence
-            updateBufferKey(target.storageKey) { current ->
-                val messages = hydrateReplyPreviews(
-                    mergeSearchContext(current.messages, context, nextLocalId = idGenerator::getAndIncrement), parents)
-                val redacted = messages.asSequence().filter { it.redacted }.mapNotNull { it.msgid }.toSet()
-                current.copy(messages = messages, reactions = reactions - redacted)
-            }
-            refreshUnread(target)
-            loadCachedUsers(target, context.map { it.senderNick })
+    public fun openSearchHit(hit: dev.brentdevs.yardhal.core.data.FtsHit): String = synchronized(sessionLifecycleLock) {
+        synchronized(sessions[hit.networkId]?.state ?: selectionLock) {
+            val storageKey = ensureConversation(hit.networkId, hit.conversation)
+            val ref = _buffers.value[storageKey]?.ref
+            if (ref != null) enqueuePersistence { loadSearchContext(ref, hit) }
+            storageKey
         }
-        return storageKey
+    }
+
+    private suspend fun loadSearchContext(ref: ConversationRef, hit: dev.brentdevs.yardhal.core.data.FtsHit) {
+        if (deferStorageRead(ref.networkId) { loadSearchContext(ref, hit) }) return
+        val target = currentRef(ref)
+        if (networkStore.byId(target.networkId) == null) return
+        val session = sessions[target.networkId]
+        val context = messageStore.around(target, hit.rowId, hit.timestampMs)
+        if (deferStorageRead(ref.networkId) { loadSearchContext(ref, hit) }) return
+        if (networkStore.byId(target.networkId) == null) return
+        if (sessions[target.networkId] !== session) {
+            enqueuePersistence { loadSearchContext(ref, hit) }
+            return
+        }
+        mergeDurableContext(target, context)
     }
 
     private val _orderState = MutableStateFlow(channelOrder.snapshot())
@@ -2682,8 +2874,9 @@ public class LiveCoordinator(
         bytes: ByteArray,
     ) {
         val session = sessions[networkId] ?: return
+        val originalRef = _buffers.value[storageKey]?.ref?.takeIf { it.networkId == networkId } ?: return
         val endpoint = session.state.filehostEndpoint ?: run {
-            appendSystem(session, _buffers.value[storageKey]?.ref ?: ConversationRef.server(networkId), "This network does not advertise a filehost (soju.im/FILEHOST).")
+            appendSystem(session, originalRef, "This network does not advertise a filehost (soju.im/FILEHOST).")
             return
         }
         val config = session.effective ?: return
@@ -2697,22 +2890,35 @@ public class LiveCoordinator(
                     saslPassword = config.saslPassword,
                 )
             } catch (error: dev.brentdevs.yardhal.core.client.FilehostException) {
-                appendSystem(session, _buffers.value[storageKey]?.ref ?: ConversationRef.server(networkId), "Upload failed: ${error.message}")
+                _operationError.value = redactPresentation(session, "Upload failed: ${error.message}")
                 return@launch
             }
-            if (sessions[networkId] !== session || networkStore.byId(networkId) == null ||
-                !session.state.registered || session.statusFlow.value != ConnectionStatus.REGISTERED
-            ) return@launch
-            sendMessage(
-                session = session,
-                ref = _buffers.value[storageKey]?.ref ?: return@launch,
-                wireText = uploaded.url,
-                optimisticText = uploaded.url,
-                attachmentUrl = uploaded.url,
-                attachmentName = fileName,
-                attachmentMimeType = mimeType,
-                attachmentSizeBytes = bytes.size.toLong(),
-            )
+            synchronized(sessionLifecycleLock) {
+                val current = sessions[networkId]
+                val target = currentRef(originalRef)
+                if (current == null || networkStore.byId(networkId) == null || target.storageKey !in _buffers.value) {
+                    _operationError.value = redactPresentation(session,
+                        "Upload completed, but the conversation is no longer open. Save or share this URL: ${uploaded.url}")
+                    return@synchronized
+                }
+                synchronized(current.state) share@{
+                    if (!current.state.registered || current.statusFlow.value != ConnectionStatus.REGISTERED || current.quitRequested) {
+                        _operationError.value = redactPresentation(current, redactPresentation(session,
+                            "Upload completed, but the network is disconnected. Save or share this URL after reconnecting: ${uploaded.url}"))
+                        return@share
+                    }
+                    sendMessage(
+                        session = current,
+                        ref = target,
+                        wireText = uploaded.url,
+                        optimisticText = uploaded.url,
+                        attachmentUrl = uploaded.url,
+                        attachmentName = fileName,
+                        attachmentMimeType = mimeType,
+                        attachmentSizeBytes = bytes.size.toLong(),
+                    )
+                }
+            }
         }
     }
 
@@ -2804,7 +3010,7 @@ public class LiveCoordinator(
             val byMsgid = if (msgid == null) -1 else buffer.messages.indexOfFirst { it.msgid == msgid }
             val byContent = if (byMsgid >= 0 || !playback) -1 else {
                 buffer.messages.uniqueHistoryIndex { message ->
-                    (msgid == null || message.msgid == null) && message.sender == sender &&
+                    !message.pendingEcho && (msgid == null || message.msgid == null) && message.sender == sender &&
                         message.kind == kind && message.text == presentedText && message.timestampMs == timestampMs
                 }
             }
@@ -2859,17 +3065,18 @@ public class LiveCoordinator(
         quoteParentLocalId: Long?,
         freshLocal: Boolean,
     ) {
-        val interactionRevision = message.msgid?.let { reactionRevisions["${ref.storageKey}|$it"] }
+        val target = ref
         enqueuePersistence {
             if (networkStore.byId(ref.networkId) == null) return@enqueuePersistence
             val active = _buffers.value.values.firstOrNull { current ->
                 current.ref.networkId == ref.networkId && current.messages.any { it.localId == message.localId }
             }
             if (sessions[ref.networkId] !== session && active == null) return@enqueuePersistence
-            val target = active?.ref ?: currentRef(ref)
-            val quoteRowId = message.localReplyParentRowId ?: quoteParentLocalId?.let { parentId ->
+            val visibleMessage = active?.messages?.firstOrNull { it.localId == message.localId }
+            val quoteRowId = quoteParentLocalId?.let { parentId ->
                 active?.messages?.firstOrNull { it.localId == parentId }?.storedRowId
-            }
+                    ?: persistedRowsByLocalId["${ref.networkId}|$parentId"]
+            } ?: visibleMessage?.localReplyParentRowId ?: message.localReplyParentRowId
             val stored = StoredMessage(
                 networkId = target.networkId,
                 conversation = target,
@@ -2886,6 +3093,7 @@ public class LiveCoordinator(
                 highlightsMe = message.highlightsMe,
                 highlightsKnown = message.highlightsKnown,
                 playback = message.playback,
+                pendingEcho = message.pendingEcho,
                 replyToMsgid = message.replyToMsgid,
                 replyParentRowId = quoteRowId,
                 attachmentUrl = message.attachmentUrl,
@@ -2905,9 +3113,9 @@ public class LiveCoordinator(
                 freshLocal -> messageStore.recordLocalEcho(stored)
                 else -> messageStore.recordWithRowId(stored)
             }
-            val persisted = if (recordedRowId != null) messageStore.byRowId(target, recordedRowId)
-                else if (freshLocal) null else messageStore.findStoredMessage(stored)
-            if (persisted == null) {
+            val persisted = if (recordedRowId == null && !freshLocal) messageStore.findStoredMessage(stored) else null
+            val rowId = recordedRowId ?: persisted?.rowId
+            if (rowId == null) {
                 if ((stored.historyContext || stored.playback) && sessions[ref.networkId] === session &&
                     networkStore.byId(ref.networkId) != null) {
                     updateBufferKey(target.storageKey) { current ->
@@ -2919,11 +3127,8 @@ public class LiveCoordinator(
                 }
                 return@enqueuePersistence
             }
-            if (message.pendingEcho) persistedRowsByLocalId["${ref.networkId}|${message.localId}"] = persisted.rowId
+            if (message.pendingEcho) persistedRowsByLocalId["${ref.networkId}|${message.localId}"] = rowId
             else persistedRowsByLocalId.remove("${ref.networkId}|${message.localId}")
-            val parents = messageStore.replyParents(target, listOf(persisted))
-            val persistedMsgid = persisted.msgid
-            val restoredReactions = persistedMsgid?.let { messageStore.reactions(target, it) }
             if (networkStore.byId(ref.networkId) == null) return@enqueuePersistence
             val visible = _buffers.value.values.firstOrNull { current ->
                 current.ref.networkId == ref.networkId && current.messages.any { it.localId == message.localId }
@@ -2932,30 +3137,23 @@ public class LiveCoordinator(
                 val index = current.messages.indexOfFirst { it.localId == message.localId }
                 if (index < 0) current else {
                     val updated = current.messages.toMutableList()
-                    updated[index] = mergeChatMessageMetadata(updated[index], persisted.toChatMessage(message.localId))
-                        .copy(storedRowId = persisted.rowId)
-                    val hydrated = hydrateReplyPreviews(updated, parents)
-                    val redacted = hydrated.asSequence().filter { it.redacted }.mapNotNull { it.msgid }.toSet()
-                    val reactions = if (persistedMsgid != null && restoredReactions != null &&
-                        reactionRevisions["${current.key}|$persistedMsgid"] == interactionRevision
-                    ) {
-                        if (restoredReactions.isEmpty()) current.reactions - persistedMsgid
-                        else current.reactions + (persistedMsgid to restoredReactions)
-                    } else current.reactions
-                    current.copy(messages = hydrated, reactions = reactions - redacted)
+                    val previous = updated[index]
+                    updated[index] = (persisted?.let { mergeChatMessageMetadata(previous, it.toChatMessage(message.localId)) } ?: previous)
+                        .copy(storedRowId = rowId, pendingEcho = previous.pendingEcho, echoLabel = previous.echoLabel)
+                    val redacted = updated.asSequence().filter { it.redacted }.mapNotNull { it.msgid }.toSet()
+                    val messages = if (persisted != null && updated.any { it.localId != message.localId && it.storedRowId == rowId }) {
+                        mergeConversationMessages(emptyList(), updated, incomingCanonical = true)
+                    } else updated
+                    current.copy(messages = messages, reactions = current.reactions - redacted)
                 }
             }
-            refreshUnread(target)
-            if (target.storageKey in _buffers.value && !channelOrder.isParted(target.storageKey)) {
-                offlineStore?.saveConversation(OfflineConversationShell(target,
-                    _buffers.value[target.storageKey]?.displayName ?: ConversationNames.forRef(target), clock(),
-                    sessions[target.networkId]?.state?.casemapping ?: restoredCasemapping[target.networkId] ?: CaseMapping.RFC1459))
+            enqueueCoalescedPersistence("message-state:${target.storageKey}") {
+                refreshAfterWrite(target)
             }
             val writes = (writesSinceTrim[target.storageKey] ?: 0) + 1
             if (writes >= 100) {
                 messageStore.trimTo(target, MESSAGE_PER_CONVERSATION_LIMIT, clock())
                 writesSinceTrim[target.storageKey] = 0
-                refreshUnread(target)
             } else writesSinceTrim[target.storageKey] = writes
             scheduleMaintenance()
         }
@@ -2987,7 +3185,7 @@ public class LiveCoordinator(
         val created = ConversationBuffer(
             ref = ref,
             displayName = ConversationNames.forRef(ref),
-            joinState = if (channelOrder.isParted(ref.storageKey)) JoinState.IDLE else JoinState.JOINED,
+            joinState = if (ref.kind == ConversationKind.CHANNEL || channelOrder.isParted(ref.storageKey)) JoinState.IDLE else JoinState.JOINED,
             history = ConversationHistory(gaps = restoredGaps(ref)),
         )
         _buffers.update { it + (ref.storageKey to created) }
@@ -3095,17 +3293,19 @@ public class LiveCoordinator(
         this is SlashCommand.Query || this is SlashCommand.IgnoreAdd || this is SlashCommand.Whois ||
             this is SlashCommand.IgnoreRemove || this is SlashCommand.Help
 
-    public fun sendText(networkId: String, storageKey: String, input: String): Boolean {
-        val session = sessions[networkId] ?: return false
-        val activeBuffer = _buffers.value[storageKey] ?: return false
-        val command = SlashCommandParser.parse(input, activeBuffer.ref.rawTarget) ?: return false
-        if (session.statusFlow.value != ConnectionStatus.REGISTERED && !command.isLocal()) return false
-        val replyTo = activeBuffer.replyDraft?.takeIf { command is SlashCommand.PlainMessage }
-        if (replyTo != null) {
-            updateBufferKey(storageKey) { it.copy(replyDraft = null) }
+    public fun sendText(networkId: String, storageKey: String, input: String): Boolean = synchronized(sessionLifecycleLock) send@{
+        val session = sessions[networkId] ?: return@send false
+        synchronized(session.state) compose@{
+            val activeBuffer = _buffers.value[storageKey]?.takeIf { it.ref.networkId == networkId } ?: return@compose false
+            val command = SlashCommandParser.parse(input, activeBuffer.ref.rawTarget) ?: return@compose false
+            if ((!session.state.registered || session.statusFlow.value != ConnectionStatus.REGISTERED) && !command.isLocal()) return@compose false
+            val replyTo = activeBuffer.replyDraft?.takeIf { command is SlashCommand.PlainMessage }
+            if (replyTo != null) {
+                updateBufferKey(storageKey) { it.copy(replyDraft = null) }
+            }
+            dispatchCommand(session, activeBuffer.ref, command, replyToMsgid = replyTo?.msgid, quoteParent = replyTo)
+            true
         }
-        dispatchCommand(session, activeBuffer.ref, command, replyToMsgid = replyTo?.msgid, quoteParent = replyTo)
-        return true
     }
 
     public fun canSendOffline(networkId: String, storageKey: String, input: String): Boolean {
@@ -3139,6 +3339,10 @@ public class LiveCoordinator(
             )
             is SlashCommand.Query -> {
                 val ref = resolveTargetRef(session, command.nick)
+                if (ref.kind == ConversationKind.DIRECT_MESSAGE) {
+                    channelOrder.clearParted(ref.storageKey)
+                    _orderState.value = channelOrder.snapshot()
+                }
                 buffer(ref)
                 persistOpenedShell(ref)
             }

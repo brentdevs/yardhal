@@ -189,6 +189,54 @@ class OfflineStoreTests {
     }
 
     @Test
+    fun nickRenameUpdatesOnlyMatchingRosterAndPreservesIndependentObservations() = runBlocking {
+        val db = YardhalDatabase.inMemory(context)
+        try {
+            val store = OfflineStore(db.offlineDao())
+            val affected = ConversationRef.channel("nick-write", "#affected")
+            val unrelated = ConversationRef.channel("nick-write", "#unrelated")
+            store.saveConversation(shell(affected, 30, "topic", 10).copy(
+                modes = mapOf("n" to emptyList()), modesObservedAtMs = 20),
+                OfflineRoster(listOf(ChannelMember("Old", '@')), mapOf("Old" to CachedPresence(account = "account")),
+                    15, completeAtObservation = true))
+            store.saveConversation(shell(unrelated, 30), OfflineRoster(listOf(ChannelMember("bob")), observedAtMs = 25))
+            store.saveWhois(affected.networkId, WhoisInfo("Old", account = "account"), 11)
+            store.saveUser(affected.networkId, CachedUser("Old", observedAtMs = 12))
+            val original = assertNotNull(db.offlineDao().conversation(unrelated.networkId, unrelated.normalizedTarget))
+            val untouched = original.copy(modesJson = "{opaque unread modes",
+                rosterJson = assertNotNull(original.rosterJson).dropLast(1) + ",\"futureRosterField\":\"retained\"}")
+            db.offlineDao().putConversation(untouched)
+            db.openHelper.writableDatabase.execSQL(
+                "CREATE TRIGGER deny_unrelated_roster_insert BEFORE INSERT ON offline_conversations " +
+                    "WHEN NEW.conversation = '#unrelated' BEGIN SELECT RAISE(ABORT, 'unrelated cache rewritten'); END",
+            )
+            db.openHelper.writableDatabase.execSQL(
+                "CREATE TRIGGER deny_unrelated_roster_update BEFORE UPDATE ON offline_conversations " +
+                    "WHEN NEW.conversation = '#unrelated' BEGIN SELECT RAISE(ABORT, 'unrelated cache rewritten'); END",
+            )
+            store.renameUser(affected.networkId, "old", "New")
+            val roster = assertNotNull(store.roster(affected))
+            assertEquals(listOf(ChannelMember("New", '@')), roster.members)
+            assertEquals(mapOf("New" to CachedPresence(account = "account")), roster.presence)
+            assertEquals(mapOf("New" to 15L), roster.memberObservedAtMs)
+            assertEquals(mapOf("New" to 15L), roster.presenceObservedAtMs)
+            assertEquals(15L, roster.observedAtMs)
+            assertTrue(roster.completeAtObservation)
+            assertEquals(10L, store.shell(affected)?.topicObservedAtMs)
+            assertEquals(20L, store.shell(affected)?.modesObservedAtMs)
+            assertEquals(11L, store.whois(affected.networkId, "new")?.observedAtMs)
+            assertEquals(12L, store.user(affected.networkId, "new")?.observedAtMs)
+            assertEquals(untouched, db.offlineDao().conversation(unrelated.networkId, unrelated.normalizedTarget))
+            assertTrue(db.offlineDao().evidence().isEmpty())
+            store.renameUser(affected.networkId, "absent", "still-absent")
+            assertEquals(untouched, db.offlineDao().conversation(unrelated.networkId, unrelated.normalizedTarget))
+            assertEquals(roster, store.roster(affected))
+        } finally {
+            db.close()
+        }
+    }
+
+    @Test
     fun caseMappingRekeysCollisionsAndSelectionWithoutLosingNewestUserFields() = runBlocking {
         withStore { store, _ ->
             val left = ConversationRef.channel("n", "#[room]", CaseMapping.ASCII)
@@ -209,6 +257,96 @@ class OfflineStoreTests {
             assertEquals(listOf(ChannelMember("bob"), ChannelMember("[alice]", '@')).sortedBy { CaseMapping.RFC1459.fold(it.nick) }, store.roster(restored.ref)?.members)
             assertEquals("new", store.whois("n", "{alice}")?.info?.realName)
             assertEquals(mapOf("status" to "here"), store.user("n", "[alice]")?.metadata)
+        }
+    }
+
+    @Test
+    fun repeatedCaseMappingFollowsSurvivingSelectionAliasAndKeepsItsPriority() = runBlocking {
+        withStore { store, _ ->
+            val selected = ConversationRef.channel("alias", "#[room]", CaseMapping.ASCII)
+            val surviving = ConversationRef.channel("alias", "#{room}", CaseMapping.ASCII)
+            val other = ConversationRef.channel("alias", "#other", CaseMapping.ASCII)
+            store.saveConversation(shell(selected, 20, "newest topic", 20).copy(caseMapping = CaseMapping.ASCII))
+            store.saveConversation(shell(surviving, 30, "older topic", 10).copy(caseMapping = CaseMapping.ASCII,
+                modes = mapOf("n" to emptyList()), modesObservedAtMs = 30))
+            store.saveConversation(shell(other, 100).copy(caseMapping = CaseMapping.ASCII))
+            store.select(selected, 101)
+
+            repeat(2) {
+                store.rekeyNetwork("alias", CaseMapping.RFC1459)
+                val merged = assertNotNull(store.selection())
+                assertEquals(surviving, merged)
+                assertEquals(merged, store.shells("alias", 1).single().ref)
+                assertEquals("newest topic", store.shell(merged)?.topic)
+                assertEquals(20L, store.shell(merged)?.topicObservedAtMs)
+                assertEquals(mapOf("n" to emptyList()), store.shell(merged)?.modes)
+                assertEquals(30L, store.shell(merged)?.modesObservedAtMs)
+
+                store.rekeyNetwork("alias", CaseMapping.ASCII)
+                store.maintain(101)
+                assertEquals(surviving, store.selection())
+                assertEquals(surviving, store.shells("alias", 1).single().ref)
+                assertNull(store.shell(selected))
+                assertEquals(setOf(surviving, other), store.shells("alias").map { it.ref }.toSet())
+            }
+        }
+    }
+
+    @Test
+    fun historyOnlyLaunchSelectionSurvivesCacheMaintenanceAndDurableReload() = runBlocking {
+        val name = "history-only-selection.db"
+        val ref = ConversationRef.channel("history-selection", "#[history]", CaseMapping.ASCII)
+        context.deleteDatabase(name)
+        try {
+            val db = YardhalDatabase.build(context, name)
+            try {
+                val store = OfflineStore(db.offlineDao())
+                val messages = MessageStore(db.messageDao())
+                messages.record(StoredMessage(networkId = ref.networkId, conversation = ref, msgid = "history",
+                    senderNick = "alice", senderUser = null, senderHost = null, kind = MessageKind.PRIVMSG,
+                    text = "durable history without cached metadata", sentByUs = false, timestampMs = 100))
+                store.select(ref, 101)
+                assertNull(store.shell(ref))
+                val unrelated = ConversationRef.channel(ref.networkId, "#unrelated", CaseMapping.ASCII)
+                val renamed = ConversationRef.channel(ref.networkId, "#renamed", CaseMapping.ASCII)
+                store.saveConversation(shell(unrelated, 100).copy(caseMapping = CaseMapping.ASCII))
+                assertEquals(ref, store.selection())
+                store.renameConversation(unrelated, renamed, CaseMapping.ASCII)
+                assertEquals(ref, store.selection())
+                store.deleteConversation(renamed)
+                assertEquals(ref, store.selection())
+                store.maintain(OfflineCachePolicy.RETENTION_MS + 101)
+                assertEquals(ref, store.selection())
+                assertTrue(store.shells().isEmpty())
+            } finally {
+                db.close()
+            }
+            val reopened = YardhalDatabase.build(context, name)
+            try {
+                val store = OfflineStore(reopened.offlineDao())
+                val messages = MessageStore(reopened.messageDao())
+                assertEquals(ref, store.selection())
+                assertEquals("durable history without cached metadata", messages.recent(ref, 1).single().text)
+                val folded = ConversationRef.channel(ref.networkId, ref.rawTarget, CaseMapping.RFC1459)
+                messages.renameConversation(ref, folded)
+                store.rekeyNetwork(ref.networkId, CaseMapping.RFC1459)
+                assertEquals(folded, store.selection())
+                messages.renameConversation(folded, ref)
+                store.rekeyNetwork(ref.networkId, CaseMapping.ASCII)
+                assertEquals(ref, store.selection())
+                assertNull(store.shell(ref))
+                store.deleteConversation(ref)
+                assertNull(store.selection())
+                assertEquals(1, messages.recent(ref, 1).size)
+                store.select(ref, 102)
+                messages.deleteNetwork(ref.networkId)
+                store.maintain(102)
+                assertNull(store.selection())
+            } finally {
+                reopened.close()
+            }
+        } finally {
+            context.deleteDatabase(name)
         }
     }
 
@@ -332,6 +470,97 @@ class OfflineStoreTests {
     }
 
     @Test
+    fun networkDeletionRemovesQuarantinedPrivatePayloadsAndOnlyItsNoticesAcrossReload() = runBlocking {
+        val name = "offline-network-private-evidence.db"
+        val removed = ConversationRef.channel("removed-network", "#private")
+        val retained = ConversationRef.channel("retained-network", "#private")
+        val temporary = StorageRecoveryNotice("Active temporary database", null, true)
+        val otherNotice = StorageRecoveryNotice("Other retained storage evidence", "/retained/evidence", false)
+        StorageRecovery.clearSessionNotices()
+        context.deleteDatabase(name)
+        try {
+            val db = YardhalDatabase.build(context, name)
+            try {
+                val store = OfflineStore(db.offlineDao())
+                for (ref in listOf(removed, retained)) {
+                    db.offlineDao().putConversation(OfflineConversationRow(ref.networkId, ref.normalizedTarget, ref.rawTarget,
+                        ConversationKind.CHANNEL.name, ref.rawTarget, CaseMapping.RFC1459.wireName,
+                        100, "private cached topic", 100, "{private unread modes", 100, null, null))
+                    db.offlineDao().putUser(WhoisCacheRow(ref.networkId, "private", "Private", CaseMapping.RFC1459.wireName,
+                        100, "{private unread whois", 100, null, null))
+                    assertNotNull(store.shell(ref))
+                    assertNull(store.whois(ref.networkId, "Private"))
+                }
+                StorageRecovery.report(temporary)
+                StorageRecovery.report(otherNotice)
+                store.select(retained, 101)
+                assertEquals(4, db.offlineDao().evidence().size)
+                store.deleteNetwork(removed.networkId)
+                assertEquals(retained, store.selection())
+                assertNull(store.shell(removed))
+                assertNull(store.whois(removed.networkId, "Private"))
+                assertEquals(2, db.offlineDao().evidence().size)
+                assertTrue(db.offlineDao().evidence().all { it.networkId == retained.networkId })
+                assertFalse(StorageRecovery.notices.value.any { it.scopeKey == "offline:${removed.networkId}" })
+                assertEquals(2, StorageRecovery.notices.value.count { it.scopeKey == "offline:${retained.networkId}" })
+                assertTrue(temporary in StorageRecovery.notices.value)
+                assertTrue(otherNotice in StorageRecovery.notices.value)
+            } finally {
+                db.close()
+            }
+            StorageRecovery.clearSessionNotices()
+            val reopened = YardhalDatabase.build(context, name)
+            try {
+                val store = OfflineStore(reopened.offlineDao())
+                assertEquals(listOf(retained), store.shells().map { it.ref })
+                assertEquals(2, reopened.offlineDao().evidence().size)
+                assertFalse(StorageRecovery.notices.value.any { it.scopeKey == "offline:${removed.networkId}" })
+                assertEquals(2, StorageRecovery.notices.value.count { it.scopeKey == "offline:${retained.networkId}" })
+                store.deleteNetwork(retained.networkId)
+                assertTrue(reopened.offlineDao().evidence().isEmpty())
+                assertTrue(reopened.offlineDao().evidenceNotices().isEmpty())
+                assertTrue(StorageRecovery.notices.value.isEmpty())
+            } finally {
+                reopened.close()
+            }
+        } finally {
+            context.deleteDatabase(name)
+            StorageRecovery.clearSessionNotices()
+        }
+    }
+
+    @Test
+    fun failedNetworkEvidenceDeletionKeepsMetadataAndItsNotices() = runBlocking {
+        StorageRecovery.clearSessionNotices()
+        val db = YardhalDatabase.inMemory(context)
+        try {
+            val ref = ConversationRef.channel("failed-network-deletion", "#room")
+            val store = OfflineStore(db.offlineDao())
+            db.offlineDao().putConversation(OfflineConversationRow(ref.networkId, ref.normalizedTarget, ref.rawTarget,
+                ConversationKind.CHANNEL.name, ref.rawTarget, CaseMapping.RFC1459.wireName,
+                100, "private topic", 100, "{private unread modes", 100, null, null))
+            store.saveWhois(ref.networkId, WhoisInfo("alice", realName = "private profile"), 100)
+            store.select(ref, 101)
+            val restored = assertNotNull(store.shell(ref))
+            val evidence = db.offlineDao().evidence()
+            val notices = StorageRecovery.notices.value
+            db.openHelper.writableDatabase.execSQL(
+                "CREATE TRIGGER deny_offline_evidence_delete BEFORE DELETE ON offline_quarantine BEGIN " +
+                    "SELECT RAISE(ABORT, 'fixture evidence deletion failed'); END",
+            )
+            assertFailsWith<SQLiteException> { store.deleteNetwork(ref.networkId) }
+            assertEquals(restored, store.shell(ref))
+            assertEquals("private profile", store.whois(ref.networkId, "alice")?.info?.realName)
+            assertEquals(ref, store.selection())
+            assertEquals(evidence, db.offlineDao().evidence())
+            assertEquals(notices, StorageRecovery.notices.value)
+        } finally {
+            db.close()
+            StorageRecovery.clearSessionNotices()
+        }
+    }
+
+    @Test
     fun malformedMetadataQuarantinesExactOriginalsAndLiveWritesHealFields() = runBlocking {
         StorageRecovery.clearSessionNotices()
         withStore { store, dao ->
@@ -397,7 +626,7 @@ class OfflineStoreTests {
             store.maintain(OfflineCachePolicy.RETENTION_MS + 20)
             store.maintain(OfflineCachePolicy.RETENTION_MS + 20)
             assertEquals(originalEvidence, dao.evidence())
-            assertEquals(originalEvidence.map { OfflineEvidenceNoticeRow(it.networkId, it.kind, it.identity) }.toSet(),
+            assertEquals(originalEvidence.map { OfflineEvidenceNoticeRow(it.networkId, it.kind, it.identity, it.evidenceId) }.toSet(),
                 dao.evidenceNotices().toSet())
             assertEquals(4, StorageRecovery.notices.value.size)
             assertTrue(StorageRecovery.notices.value.all { it.quarantinePath == null && !it.temporary })
@@ -411,6 +640,38 @@ class OfflineStoreTests {
             store.maintain(OfflineCachePolicy.RETENTION_MS * 2)
             assertTrue(store.shells(network).isEmpty())
             assertEquals(5, dao.evidence().size)
+        }
+    }
+
+    @Test
+    fun differentMalformedSnapshotsAtSameIdentityProduceDistinctRecoverableNotices() = runBlocking {
+        StorageRecovery.clearSessionNotices()
+        try {
+            withStore { store, dao ->
+                val ref = ConversationRef.channel("distinct-offline-evidence", "#room")
+                val original = OfflineConversationRow(ref.networkId, ref.normalizedTarget, ref.rawTarget,
+                    ConversationKind.CHANNEL.name, ref.rawTarget, CaseMapping.RFC1459.wireName,
+                    100, "first cached topic", 100, "{invalid-first", 100, null, null)
+                dao.putConversation(original)
+                assertEquals("first cached topic", store.shell(ref)?.topic)
+                val firstNotice = StorageRecovery.notices.value.single()
+                val firstEvidence = dao.evidence().single()
+                assertEquals(firstEvidence.evidenceId, firstNotice.evidenceKey)
+
+                dao.putConversation(original.copy(topic = "later cached topic", modesJson = "{invalid-later"))
+                assertEquals("later cached topic", store.shell(ref)?.topic)
+                val notices = StorageRecovery.notices.value
+                assertEquals(2, notices.size)
+                assertEquals(1, notices.map { it.message }.distinct().size)
+                assertEquals(2, notices.map { it.evidenceKey }.distinct().size)
+                assertEquals(dao.evidence().map { it.evidenceId }.toSet(), notices.map { it.evidenceKey }.toSet())
+                StorageRecovery.clearSessionNotices()
+                assertEquals("later cached topic", store.shell(ref)?.topic)
+                assertEquals(notices.toSet(), StorageRecovery.notices.value.toSet())
+                assertEquals(2, dao.evidenceNotices().size)
+            }
+        } finally {
+            StorageRecovery.clearSessionNotices()
         }
     }
 
@@ -441,10 +702,11 @@ class OfflineStoreTests {
                 val store = OfflineStore(reopened.offlineDao())
                 assertEquals(evidence, reopened.offlineDao().evidence().single())
                 assertEquals(original, OfflineCodec.json.decodeFromString<OfflineConversationRow>(evidence.payloadJson))
-                assertEquals(listOf(OfflineEvidenceNoticeRow(ref.networkId, "conversation", ref.normalizedTarget)),
+                assertEquals(listOf(OfflineEvidenceNoticeRow(ref.networkId, "conversation", ref.normalizedTarget, evidence.evidenceId)),
                     reopened.offlineDao().evidenceNotices())
                 assertNull(store.shells().single().modesObservedAtMs)
                 assertEquals(1, StorageRecovery.notices.value.size)
+                assertEquals(evidence.evidenceId, StorageRecovery.notices.value.single().evidenceKey)
                 assertTrue(StorageRecovery.notices.value.all { it.quarantinePath == null && !it.temporary })
                 store.saveConversation(shell(ref, 200).copy(modes = mapOf("n" to emptyList()), modesObservedAtMs = 200))
                 assertEquals(mapOf("n" to emptyList()), store.shells().single().modes)

@@ -90,7 +90,7 @@ public class ChannelState(public val ref: ConversationRef) {
         for (member in other.members.values) members[casemapping.fold(member.nick)] = member
         membersComplete = membersComplete || other.membersComplete
         metadata.putAll(other.metadata)
-        if (other.modesComplete) modes.clear()
+        if (other.modesComplete) modes.keys.removeAll { it.single() !in listModes }
         for ((mode, parameters) in other.modes) {
             val prior = modes[mode]
             modes[mode] = if (prior != null && mode.single() in listModes) {

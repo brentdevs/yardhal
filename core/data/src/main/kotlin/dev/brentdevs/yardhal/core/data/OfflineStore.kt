@@ -125,6 +125,7 @@ public class OfflineStore(private val dao: OfflineDao) {
 
     public suspend fun deleteNetwork(networkId: String) {
         dao.deleteNetwork(networkId)
+        StorageRecovery.clearScope("offline:$networkId")
     }
 
     public suspend fun maintain(nowMs: Long) {
@@ -141,11 +142,13 @@ internal object OfflineCodec {
         null
     }
 
-    fun notice(identity: String) {
+    fun notice(networkId: String, identity: String, evidenceId: String) {
         StorageRecovery.report(StorageRecoveryNotice(
-            message = "Saved cached metadata for $identity could not be read. Original metadata is retained as database evidence; this information was not recovered.",
+            message = "Saved cached metadata for $networkId|$identity could not be read. Original metadata is retained as database evidence; this information was not recovered.",
             quarantinePath = null,
             temporary = false,
+            scopeKey = "offline:$networkId",
+            evidenceKey = evidenceId,
         ))
     }
 
@@ -262,9 +265,9 @@ internal object OfflineCodec {
 
     fun renameRoster(roster: OfflineRoster, oldNick: String, newNick: String, mapping: CaseMapping): OfflineRoster {
         val oldKey = mapping.fold(oldNick)
+        if (roster.members.none { mapping.fold(it.nick) == oldKey } && roster.presence.keys.none { mapping.fold(it) == oldKey }) return roster
         val sourceMembers = roster.members.filter { mapping.fold(it.nick) == oldKey }
         val sourcePresence = roster.presence.filterKeys { mapping.fold(it) == oldKey }
-        if (sourceMembers.isEmpty() && sourcePresence.isEmpty()) return roster
         val source = roster.copy(
             members = sourceMembers.map { it.copy(nick = newNick) },
             presence = sourcePresence.values.firstOrNull()?.let { mapOf(newNick to it) }.orEmpty(),

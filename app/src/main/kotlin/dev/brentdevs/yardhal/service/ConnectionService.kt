@@ -8,10 +8,15 @@ import android.os.IBinder
 import androidx.core.content.ContextCompat
 import dev.brentdevs.yardhal.YardhalApplication
 import dev.brentdevs.yardhal.coordinator.RecoveryPhase
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 
 public class ConnectionService : Service() {
     private var foregroundNetworkCount = 0
     private var foregroundNotification: Notification? = null
+    private var restartCheck: Job? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -22,9 +27,9 @@ public class ConnectionService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val stopping = intent?.action == ACTION_STOP ||
-            (intent == null && (application as? YardhalApplication)?.coordinator?.networks?.value
-                ?.any { it.connectionPhase.keepsRecoveryService() } != true)
+        restartCheck?.cancel()
+        val app = application as? YardhalApplication
+        val stopping = intent?.action == ACTION_STOP || intent == null && app == null
         val count = if (stopping) foregroundNetworkCount else intent?.getIntExtra(EXTRA_NETWORK_COUNT, 0) ?: 0
         val notification = if (count == foregroundNetworkCount) {
             requireNotNull(foregroundNotification)
@@ -39,10 +44,25 @@ public class ConnectionService : Service() {
             stopSelf(startId)
             return START_NOT_STICKY
         }
+        if (intent == null && app != null) {
+            restartCheck = app.appScope.launch(Dispatchers.Main.immediate) {
+                if (!app.awaitInitialization()) {
+                    stopSelf(startId)
+                    return@launch
+                }
+                app.coordinator.restorationReady.first { it }
+                if (app.coordinator.networks.value.none { it.connectionPhase.keepsRecoveryService() }) stopSelf(startId)
+            }
+        }
         return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onDestroy() {
+        restartCheck?.cancel()
+        super.onDestroy()
+    }
 
     public companion object {
         public const val EXTRA_NETWORK_COUNT: String = "network_count"

@@ -110,4 +110,86 @@ class DurableReadMarkerTests {
         assertEquals(ReadCursor(1000, 10), store.cursor("n1|old"))
         assertEquals(ReadCursor(1000, 10), store.pending("n1")["n1|old"])
     }
+
+    @Test
+    fun blockedRecoveryUsesExplicitVolatileCursorsWithoutReplacingOriginalBytes() {
+        StorageRecovery.clearSessionNotices()
+        val file = File(tmp.root, "read-markers.json")
+        val original = "malformed read marker original".toByteArray()
+        file.writeBytes(original)
+        File(tmp.root, "storage-quarantine").writeText("unrelated preservation blocker")
+        val store = ReadMarkerStore(tmp.root)
+        assertEquals(ReadMarkerPersistence.VOLATILE, store.persistence.value)
+        assertTrue(store.advance("n1|old", 1000, 10))
+        assertEquals(ReadCursor(1000, 10), store.cursor("n1|old"))
+        assertEquals(ReadCursor(1000, 10), store.pending("n1")["n1|old"])
+        assertTrue(store.rename("n1|old", "n1|new"))
+        assertTrue(store.acknowledge("n1|new", ReadCursor(1000, 10)))
+        assertTrue(store.reconcileRemote("n1|new", 2000))
+        assertEquals(ReadCursor(2000, Long.MAX_VALUE), store.cursor("n1|new"))
+        assertTrue(store.advance("n2|kept", 3000, 30))
+        assertTrue(store.retainNetwork("n1", emptySet()))
+        assertEquals(ReadCursor(3000, 30), store.cursor("n2|kept"))
+        store.deleteNetwork("n2")
+        assertTrue(store.all().isEmpty())
+        kotlin.test.assertContentEquals(original, file.readBytes())
+        assertTrue(StorageRecovery.notices.value.any { it.temporary })
+        assertTrue(StorageRecovery.notices.value.filter { it.temporary }.all { !StorageRecovery.acknowledge(it) })
+        assertTrue(ReadMarkerStore(tmp.root).all().isEmpty())
+        assertEquals(ReadMarkerPersistence.VOLATILE, store.persistence.value)
+    }
+
+    @Test
+    fun volatilePendingMarkersDisappearAcrossRestartInsteadOfClaimingDurability() {
+        val blocked = tmp.newFolder("read-markers.json")
+        File(blocked, "unrelated").writeText("keep")
+        val store = ReadMarkerStore(tmp.root)
+        assertTrue(store.advance("n1|#room", 1000, 10))
+        assertEquals(mapOf("n1|#room" to ReadCursor(1000, 10)), store.pending("n1"))
+        assertEquals(ReadMarkerPersistence.VOLATILE, store.persistence.value)
+        val restarted = ReadMarkerStore(tmp.root)
+        assertEquals(ReadCursor(), restarted.cursor("n1|#room"))
+        assertTrue(restarted.pending("n1").isEmpty())
+        assertEquals("keep", File(blocked, "unrelated").readText())
+    }
+
+    @Test
+    fun blockedReadMarkersBecomeDurableOnNextLaunchAfterRecoveryCanFinish() {
+        val file = File(tmp.root, "read-markers.json")
+        val original = "failed original".toByteArray()
+        file.writeBytes(original)
+        val fileStore = JsonFileStore(file, ReadMarkerSerializer, Json) { directory ->
+            if (File(directory, ".planned").isFile) throw IOException("fixture preservation interrupted")
+            syncStoreDirectory(directory)
+        }
+        val store = ReadMarkerStore(fileStore)
+        assertTrue(store.advance("n1|#room", 1000, 10))
+        assertEquals(ReadMarkerPersistence.VOLATILE, store.persistence.value)
+        val restarted = ReadMarkerStore(tmp.root)
+        assertEquals(ReadMarkerPersistence.DURABLE, restarted.persistence.value)
+        assertEquals(ReadCursor(), restarted.cursor("n1|#room"))
+        assertTrue(restarted.advance("n1|#room", 2000, 20))
+        assertEquals(ReadCursor(2000, 20), ReadMarkerStore(tmp.root).cursor("n1|#room"))
+        val evidence = StorageRecovery.retainedEvidence(file).single()
+        kotlin.test.assertContentEquals(original, File(evidence, file.name).readBytes())
+    }
+
+    @Test
+    fun readMarkerProgrammerAndCancellationFailuresNeverPublishVolatileSuccess() {
+        val file = File(tmp.root, "read-markers.json")
+        var failure: RuntimeException? = null
+        val fileStore = JsonFileStore(file, ReadMarkerSerializer, Json) { directory ->
+            failure?.let { throw it }
+            syncStoreDirectory(directory)
+        }
+        val store = ReadMarkerStore(fileStore)
+        assertTrue(store.advance("n1|#room", 1000, 10))
+        failure = IllegalArgumentException("fixture programmer error")
+        assertFailsWith<IllegalArgumentException> { store.advance("n1|#room", 2000, 20) }
+        failure = java.util.concurrent.CancellationException("fixture cancellation")
+        assertFailsWith<java.util.concurrent.CancellationException> { store.advance("n1|#room", 3000, 30) }
+        assertEquals(ReadCursor(1000, 10), store.cursor("n1|#room"))
+        assertEquals(ReadCursor(1000, 10), store.pending("n1")["n1|#room"])
+        assertEquals(ReadMarkerPersistence.DURABLE, store.persistence.value)
+    }
 }

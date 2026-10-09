@@ -12,6 +12,9 @@ import kotlinx.serialization.SerializationException
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
+public class StorageWriteBlockedException internal constructor() :
+    IOException("Storage evidence must be preserved before persisted data can be replaced")
+
 public open class JsonFileStore<T> internal constructor(
     private val file: File,
     private val serializer: kotlinx.serialization.KSerializer<T>,
@@ -30,6 +33,9 @@ public open class JsonFileStore<T> internal constructor(
     private var writesBlocked = false
     private var evidenceChecked = false
 
+    internal val persistenceBlocked: Boolean
+        @Synchronized get() = writesBlocked
+
     @Synchronized
     public fun loadOrDefault(defaultValue: T): T {
         cachedValue?.let { return it }
@@ -45,7 +51,7 @@ public open class JsonFileStore<T> internal constructor(
     @Synchronized
     public fun save(value: T) {
         if (cachedValue == null && !uncommittedReplacement) cachedValue = readStoredValue()
-        if (writesBlocked) throw IOException("Storage evidence must be preserved before persisted data can be replaced")
+        if (writesBlocked) throw StorageWriteBlockedException()
         val encoded = json.encodeToString(serializer, value).toByteArray(Charsets.UTF_8)
         val target = file.absoluteFile
         val parent = target.parentFile ?: throw IOException("Persisted data has no parent directory")
@@ -78,10 +84,11 @@ public open class JsonFileStore<T> internal constructor(
     }
 
     private fun readStoredValue(): T? {
+        StorageRecovery.configure(file)
         try {
             if (!evidenceChecked) {
                 evidenceChecked = true
-                if (StorageRecovery.announceRetained(file)) {
+                if (StorageRecovery.announceRetained(file, syncDirectory = syncDirectory)) {
                     writesBlocked = true
                     StorageRecovery.report(
                         StorageRecoveryNotice(

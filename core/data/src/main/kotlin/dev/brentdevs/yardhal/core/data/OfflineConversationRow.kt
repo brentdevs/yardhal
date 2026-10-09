@@ -39,3 +39,8 @@ public data class OfflineShellRow(
     public val modesJson: String,
     public val modesObservedAtMs: Long?,
 )
+
+public data class OfflineRosterRow(
+    public val conversation: String,
+    public val rosterJson: String,
+)

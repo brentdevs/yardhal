@@ -52,6 +52,11 @@ import java.time.format.DateTimeFormatter
 
 private val TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
 
+internal enum class MessageDeliveryStatus { UNCONFIRMED }
+
+internal fun messageDeliveryStatus(message: ChatMessage): MessageDeliveryStatus? =
+    if (message.pendingEcho) MessageDeliveryStatus.UNCONFIRMED else null
+
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 public fun MessageRow(
@@ -275,6 +280,15 @@ private fun ChatLine(
                             fontFamily = chatFontFamily,
                         ),
                     )
+                }
+                when (messageDeliveryStatus(message)) {
+                    MessageDeliveryStatus.UNCONFIRMED -> Text(
+                        text = "Delivery unconfirmed",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 3.dp),
+                    )
+                    null -> Unit
                 }
                 if (message.reactionsTruncated) {
                     Text(

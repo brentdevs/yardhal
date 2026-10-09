@@ -21,9 +21,7 @@ internal fun Reduction.handleJoin(message: IrcMessage) {
     if (fromUs) {
         channelOrCreate(ref)
         emit(InboundEffect.EnsureBuffer(ref))
-        if ("no-implicit-names" in state.supportedCaps) {
-            emit(InboundEffect.SetJoinState(ref, JoinState.JOINED))
-        }
+        if (!isPlayback(message)) emit(InboundEffect.SetJoinState(ref, JoinState.JOINED))
         emit(InboundEffect.SendRaw("TOPIC $channelName"))
         emit(InboundEffect.SendRaw("MODE $channelName"))
         requestHistory(ref)
@@ -58,7 +56,10 @@ internal fun Reduction.handleKick(message: IrcMessage) {
         state.pendingNames.remove(ref.storageKey)
         val channel = channelOrCreate(ref)
         channel.members.clear()
+        channel.membersComplete = false
+        channel.modesComplete = false
         publishMembers(channel)
+        publishModes(channel)
         emit(InboundEffect.ClearTyping(ref))
         emit(InboundEffect.SetJoinState(ref, JoinState.FAILED))
     } else {
@@ -141,16 +142,25 @@ internal fun Reduction.handleMode(message: IrcMessage) {
 }
 
 internal fun Reduction.handleModeNumeric(message: IrcMessage) {
-    if (isPlayback(message)) return
-    val channelName = message.parameters.getOrNull(1) ?: return
-    if (!state.isChannelName(channelName)) return
-    val encoded = message.parameters.getOrNull(2) ?: return
+    val channelName = message.parameters.getOrNull(1)
+    val encoded = message.parameters.getOrNull(2)
+    if (isPlayback(message) || channelName == null || !state.isChannelName(channelName) || encoded.isNullOrEmpty()) {
+        serverLine(message)
+        return
+    }
     val ref = state.channelRef(channelName)
-    if (!context.hasBuffer(ref.storageKey)) return
+    if (!context.hasBuffer(ref.storageKey)) {
+        serverLine(message)
+        return
+    }
     val modes = LinkedHashMap<String, List<String>>()
-    if (!applyChannelModes(modes, encoded, message.parameters, 3)) return
+    if (!applyChannelModes(modes, encoded, message.parameters, 3)) {
+        serverLine(message)
+        return
+    }
     val channel = channelOrCreate(ref)
-    channel.modes.clear()
+    val listModes = state.isupport.chanmodes.listA
+    channel.modes.keys.removeAll { it.single() !in listModes }
     channel.modes.putAll(modes)
     channel.modesComplete = true
     publishModes(channel)
@@ -169,7 +179,13 @@ private fun Reduction.applyChannelModes(
         when (mode) {
             '+' -> adding = true
             '-' -> adding = false
-            else -> if (mode in state.prefixModes.modes || requiresModeParameter(mode, adding, classes)) requiredParameters += 1
+            else -> {
+                val prefix = mode in state.prefixModes.modes
+                if (!prefix && mode !in classes.listA && mode !in classes.listB &&
+                    mode !in classes.alwaysWithParamC && mode !in classes.neverWithParamD
+                ) return false
+                if (prefix || requiresModeParameter(mode, adding, classes)) requiredParameters += 1
+            }
         }
     }
     if (requiredParameters > parameters.size - parameterStart) return false
@@ -262,7 +278,6 @@ internal fun Reduction.finalizeNames(message: IrcMessage) {
     channel.membersComplete = true
     for ((folded, member) in pending) state.users.getOrPut(folded) { UserState(member.nick) }
     publishMembers(channel)
-    emit(InboundEffect.SetJoinState(ref, JoinState.JOINED))
 }
 
 internal fun Reduction.handleWhoXLine(message: IrcMessage) {

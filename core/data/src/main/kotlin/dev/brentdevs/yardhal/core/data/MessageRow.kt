@@ -11,6 +11,9 @@ import androidx.room.PrimaryKey
         Index(value = ["networkId", "conversation", "msgid"], unique = true),
         Index(value = ["networkId", "conversation", "timestampMs"]),
         Index(value = ["contentHash"]),
+        Index(value = ["replyParentRowId"]),
+        Index(value = ["networkId", "conversation", "replyToMsgid"]),
+        Index(value = ["networkId", "conversation", "pendingEcho", "timestampMs"]),
     ],
 )
 public data class MessageRow(
@@ -43,4 +46,5 @@ public data class MessageRow(
     @ColumnInfo(defaultValue = "1") public val highlightsKnown: Boolean = true,
     public val originalIdentityHash: String? = null,
     @ColumnInfo(defaultValue = "0") public val reactionsTruncated: Boolean = false,
+    @ColumnInfo(defaultValue = "0") public val pendingEcho: Boolean = false,
 )

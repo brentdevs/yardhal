@@ -161,7 +161,7 @@ internal fun mergeConversationMessages(
             ?: message.storedRowId?.let(byStoredRowId::get)
             ?: -1
         val anonymous = if (identified >= 0) -1 else merged.uniqueHistoryIndex {
-            (it.storedRowId == null || message.storedRowId == null) &&
+            !it.pendingEcho && !message.pendingEcho && (it.storedRowId == null || message.storedRowId == null) &&
                 (it.msgid == null || message.msgid == null) && it.sender == message.sender &&
                 it.kind == message.kind && it.text == message.text && it.timestampMs == message.timestampMs
         }
@@ -192,7 +192,7 @@ internal fun mergeChatMessageMetadata(
         other.replyPreview?.redacted == true -> other.replyPreview
         else -> base.replyPreview ?: other.replyPreview
     }
-    val pendingEcho = (preferred.pendingEcho || incoming.pendingEcho) && preferred.msgid == null && incoming.msgid == null
+    val pendingEcho = preferred.pendingEcho && incoming.pendingEcho && preferred.msgid == null && incoming.msgid == null
     val merged = base.copy(
         localId = preferred.localId,
         msgid = base.msgid ?: other.msgid,

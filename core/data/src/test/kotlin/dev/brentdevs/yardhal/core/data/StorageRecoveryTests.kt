@@ -121,22 +121,157 @@ class StorageRecoveryTests {
     }
 
     @Test
-    fun interruptedJsonEvidenceSyncKeepsOriginalAndLaterInstancesDoNotDecodeOrOverwriteIt() {
+    fun interruptedJsonEvidenceSyncRetainsBothCopiedAndSubsequentlyChangedSourceBytes() {
         val file = File(tmp.root, "fixture.json")
         val original = "corrupt original".toByteArray()
         file.writeBytes(original)
         val store = JsonFileStore(file, String.serializer(), Json) { directory ->
-            if (File(directory, ".complete").exists()) throw IOException("fixture evidence sync failure")
+            if (directory.parentFile?.name == "storage-quarantine" && File(directory, file.name).isFile && !File(directory, ".complete").exists()) {
+                throw IOException("fixture evidence sync failure")
+            }
             syncStoreDirectory(directory)
         }
         assertEquals("empty", store.loadOrDefault("empty"))
-        assertContentEquals(original, file.readBytes())
-        assertFailsWith<IOException> { store.save("must not overwrite") }
+        val evidence = StorageRecovery.retainedEvidence(file).single()
+        assertFalse(File(evidence, ".complete").exists())
+        assertContentEquals(original, File(evidence, file.name).readBytes())
+        assertFailsWith<StorageWriteBlockedException> { store.save("must not overwrite") }
+        val changedOriginal = "different failed original must also be preserved".toByteArray()
+        file.writeBytes(changedOriginal)
         val later = JsonFileStore(file, String.serializer())
         assertEquals("empty", later.loadOrDefault("empty"))
-        assertFailsWith<IOException> { later.save("must not overwrite") }
+        assertFalse(file.exists())
+        assertTrue(File(evidence, ".retired").isFile)
+        later.save("new persistent state")
+        assertEquals("new persistent state", JsonFileStore(file, String.serializer()).loadOrDefault("empty"))
+        assertContentEquals(original, File(evidence, file.name).readBytes())
+        assertTrue(evidence.walkTopDown().filter { it.isFile }.any { it.readBytes().contentEquals(changedOriginal) })
+        assertEquals(listOf(evidence), StorageRecovery.retainedEvidence(file))
+    }
+
+    @Test
+    fun interruptedJsonCopyPlanningResumesCopyingBeforeRetiringTheOriginal() {
+        val file = File(tmp.root, "fixture.json")
+        val original = "corrupt original awaiting preservation".toByteArray()
+        file.writeBytes(original)
+        val store = JsonFileStore(file, String.serializer(), Json) { directory ->
+            if (File(directory, ".planned").isFile) throw IOException("fixture before evidence copy")
+            syncStoreDirectory(directory)
+        }
+        assertEquals("empty", store.loadOrDefault("empty"))
+        val evidence = StorageRecovery.retainedEvidence(file).single()
+        assertFalse(File(evidence, file.name).exists())
         assertContentEquals(original, file.readBytes())
-        assertEquals(1, StorageRecovery.retainedEvidence(file).size)
+        val reopened = JsonFileStore(file, String.serializer())
+        assertEquals("empty", reopened.loadOrDefault("empty"))
+        assertTrue(File(evidence, ".retired").isFile)
+        assertContentEquals(original, File(evidence, file.name).readBytes())
+        reopened.save("durable after resumed copying")
+        assertEquals("durable after resumed copying", JsonFileStore(file, String.serializer()).loadOrDefault("empty"))
+    }
+
+    @Test
+    fun acknowledgementSurvivesRestartWithoutDeletingEvidenceAndCannotHideTemporaryFailures() {
+        val file = File(tmp.root, "fixture.json")
+        val original = "corrupt original".toByteArray()
+        file.writeBytes(original)
+        val store = JsonFileStore(file, String.serializer())
+        assertEquals("empty", store.loadOrDefault("empty"))
+        val evidence = StorageRecovery.retainedEvidence(file).single()
+        val completed = StorageRecovery.notices.value.single()
+        val active = StorageRecoveryNotice("active unavailable store", null, temporary = true)
+        StorageRecovery.report(active)
+        assertTrue(StorageRecovery.canAcknowledge(completed))
+        assertFalse(StorageRecovery.canAcknowledge(active))
+        assertFalse(StorageRecovery.acknowledge(active))
+        assertTrue(StorageRecovery.acknowledge(completed))
+        assertEquals(listOf(active), StorageRecovery.notices.value)
+        assertContentEquals(original, File(evidence, file.name).readBytes())
+        store.save("durable replacement")
+        StorageRecovery.clearSessionNotices()
+        assertEquals("durable replacement", JsonFileStore(file, String.serializer()).loadOrDefault("empty"))
+        assertTrue(StorageRecovery.notices.value.isEmpty())
+        assertContentEquals(original, File(evidence, file.name).readBytes())
+    }
+
+    @Test
+    fun failedAcknowledgementLeavesCompletedNotificationAndEvidenceVisible() {
+        val file = File(tmp.root, "fixture.json")
+        file.writeText("corrupt original")
+        JsonFileStore(file, String.serializer()).loadOrDefault("empty")
+        val evidence = StorageRecovery.retainedEvidence(file).single()
+        val notice = StorageRecovery.notices.value.single()
+        assertTrue(File(evidence, ".acknowledged").mkdir())
+        assertFalse(StorageRecovery.acknowledge(notice))
+        assertEquals(listOf(notice), StorageRecovery.notices.value)
+        StorageRecovery.clearSessionNotices()
+        JsonFileStore(file, String.serializer()).loadOrDefault("empty")
+        assertEquals(evidence.path, StorageRecovery.notices.value.single().quarantinePath)
+        assertEquals("corrupt original", File(evidence, file.name).readText())
+    }
+
+    @Test
+    fun completedMetadataAcknowledgementIsScopedAndSurvivesRestart() {
+        StorageRecovery.configure(File(tmp.root, "fixture.db"))
+        val first = StorageRecoveryNotice("retained metadata", null, temporary = false, scopeKey = "offline:first")
+        val second = first.copy(scopeKey = "offline:second")
+        StorageRecovery.report(first)
+        StorageRecovery.report(second)
+        assertTrue(StorageRecovery.acknowledge(first))
+        StorageRecovery.clearSessionNotices()
+        StorageRecovery.report(first)
+        StorageRecovery.report(second)
+        assertEquals(listOf(second), StorageRecovery.notices.value)
+    }
+
+    @Test
+    fun legacyIncompleteCopiesRemainUntouchedWhileAdditionalCompleteEvidenceIsPreserved() {
+        val file = File(tmp.root, "fixture.json")
+        val original = "corrupt original with complete byte evidence".toByteArray()
+        file.writeBytes(original)
+        val root = tmp.newFolder("storage-quarantine")
+        val legacy = File(root, "legacy-interrupted")
+        assertTrue(legacy.mkdir())
+        File(legacy, ".source").writeText(file.name)
+        val partial = original.copyOf(7)
+        File(legacy, file.name).writeBytes(partial)
+        val store = JsonFileStore(file, String.serializer())
+        assertEquals("empty", store.loadOrDefault("empty"))
+        val replacement = StorageRecovery.retainedEvidence(file).single { it != legacy }
+        assertContentEquals(partial, File(legacy, file.name).readBytes())
+        assertContentEquals(original, File(replacement, file.name).readBytes())
+        assertTrue(File(legacy, ".retired").isFile)
+        assertTrue(File(replacement, ".retired").isFile)
+        assertFalse(file.exists())
+        store.save("new durable value")
+        assertEquals("new durable value", JsonFileStore(file, String.serializer()).loadOrDefault("empty"))
+        assertContentEquals(partial, File(legacy, file.name).readBytes())
+    }
+
+    @Test
+    fun acknowledgingOneAnnouncementSuppressesOtherCompletedAnnouncementsOfTheSameEvidence() {
+        val file = File(tmp.root, "fixture.json")
+        file.writeText("corrupt original")
+        JsonFileStore(file, String.serializer()).loadOrDefault("empty")
+        JsonFileStore(file, String.serializer()).loadOrDefault("empty")
+        assertEquals(2, StorageRecovery.notices.value.size)
+        assertTrue(StorageRecovery.acknowledge(StorageRecovery.notices.value.first()))
+        assertTrue(StorageRecovery.notices.value.isEmpty())
+    }
+
+    @Test
+    fun acknowledgementOfEarlierMetadataDoesNotHideNewEvidenceForTheSameIdentity() {
+        StorageRecovery.configure(File(tmp.root, "fixture.db"))
+        val earlier = StorageRecoveryNotice(
+            "retained metadata", null, temporary = false, scopeKey = "offline:network", evidenceKey = "earlier-bytes",
+        )
+        StorageRecovery.report(earlier)
+        assertTrue(StorageRecovery.acknowledge(earlier))
+        StorageRecovery.clearSessionNotices()
+        StorageRecovery.report(earlier)
+        val later = earlier.copy(evidenceKey = "different-bytes")
+        StorageRecovery.report(later)
+        assertEquals(listOf(later), StorageRecovery.notices.value)
     }
 
     @Test

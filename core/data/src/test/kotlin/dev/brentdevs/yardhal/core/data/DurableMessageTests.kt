@@ -62,17 +62,210 @@ class DurableMessageTests {
         YardhalDatabase.inMemory(context).use { db ->
             val store = MessageStore(db.messageDao())
             val parent = assertNotNull(store.recordWithRowId(message("parent")))
-            val outgoing = message(null, 1000, "same body").copy(sentByUs = true, replyParentRowId = parent)
+            val outgoing = message(null, 1000, "same body").copy(sentByUs = true, replyParentRowId = parent, pendingEcho = true)
             val first = assertNotNull(store.recordLocalEcho(outgoing))
             val second = assertNotNull(store.recordLocalEcho(outgoing))
             assertTrue(first != second)
             assertEquals(second, store.healEcho(ref, second, outgoing))
             assertEquals(first, store.healEcho(ref, first, outgoing))
-            assertEquals(first, store.healEcho(ref, first, outgoing.copy(msgid = "first")))
-            assertEquals(second, store.healEcho(ref, second, outgoing.copy(msgid = "second")))
+            assertEquals(first, store.healEcho(ref, first, outgoing.copy(msgid = "first", pendingEcho = false)))
+            assertEquals(second, store.healEcho(ref, second, outgoing.copy(msgid = "second", pendingEcho = false)))
             assertEquals(listOf(first, second), store.recent(ref, 10).filter { it.sentByUs }.map { it.rowId })
             assertEquals(listOf(parent, parent), store.recent(ref, 10).filter { it.sentByUs }.map { it.replyParentRowId })
             assertEquals(setOf(first, second), store.search("same body").map { it.rowId }.toSet())
+            assertTrue(store.recent(ref, 10).filter { it.sentByUs }.none { it.pendingEcho })
+        }
+    }
+
+    @Test
+    fun renameKeepsRepeatedAnonymousSendsAndEachLocalQuoteDistinct() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        for (pending in listOf(false, true)) {
+            YardhalDatabase.inMemory(context).use { db ->
+                val store = MessageStore(db.messageDao())
+                val outgoing = message(null, 1000, "repeated").copy(sentByUs = true, pendingEcho = pending)
+                val first = assertNotNull(store.recordLocalEcho(outgoing))
+                val second = assertNotNull(store.recordLocalEcho(outgoing))
+                val firstQuote = assertNotNull(store.recordWithRowId(message("quote-first", 2000).copy(replyParentRowId = first)))
+                val secondQuote = assertNotNull(store.recordWithRowId(message("quote-second", 2000).copy(replyParentRowId = second)))
+                val target = ConversationRef.channel("n1", "#renamed")
+                val merges = mutableListOf<Pair<Long, Long>>()
+                store.renameConversation(ref, target) { removed, retained -> merges.add(removed to retained) }
+                assertTrue(merges.isEmpty())
+                assertEquals(listOf(first, second), store.recent(target, 10).filter { it.sentByUs }.map { it.rowId })
+                assertEquals(first, store.byRowId(target, firstQuote)?.replyParentRowId)
+                assertEquals(second, store.byRowId(target, secondQuote)?.replyParentRowId)
+                assertEquals(listOf(pending, pending), store.recent(target, 10).filter { it.sentByUs }.map { it.pendingEcho })
+                assertEquals(setOf(first, second), store.search("repeated").map { it.rowId }.toSet())
+            }
+        }
+    }
+
+    @Test
+    fun renameUsesEachAnonymousDestinationOverlapOnlyOnce() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        YardhalDatabase.inMemory(context).use { db ->
+            val store = MessageStore(db.messageDao())
+            val target = ConversationRef.channel("n1", "#renamed")
+            val outgoing = message(null, 1000, "repeated").copy(sentByUs = true)
+            val retained = assertNotNull(store.recordWithRowId(outgoing.copy(conversation = target)))
+            val first = assertNotNull(store.recordLocalEcho(outgoing))
+            val second = assertNotNull(store.recordLocalEcho(outgoing))
+            val quote = assertNotNull(store.recordWithRowId(message("quote", 2000).copy(replyParentRowId = second)))
+            val merges = mutableListOf<Pair<Long, Long>>()
+            store.renameConversation(ref, target) { removed, survivor -> merges.add(removed to survivor) }
+            assertEquals(listOf(first to retained), merges)
+            assertEquals(setOf(retained, second), store.recent(target, 10).filter { it.sentByUs }.map { it.rowId }.toSet())
+            assertEquals(second, store.byRowId(target, quote)?.replyParentRowId)
+        }
+    }
+
+    @Test
+    fun reopenedUnconfirmedRepeatedSendsHealOneToOneFromIdentifiedHistory() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val name = "pending-echo-history-test.db"
+        context.deleteDatabase(name)
+        try {
+            val ids = YardhalDatabase.build(context, name).use { db ->
+                val store = MessageStore(db.messageDao())
+                val firstParent = assertNotNull(store.recordWithRowId(message("parent-first", 500)))
+                val secondParent = assertNotNull(store.recordWithRowId(message("parent-second", 500)))
+                val outgoing = message(null, 1000, "repeat").copy(sentByUs = true, pendingEcho = true)
+                val first = assertNotNull(store.recordLocalEcho(outgoing.copy(replyParentRowId = firstParent)))
+                val second = assertNotNull(store.recordLocalEcho(outgoing.copy(replyParentRowId = secondParent)))
+                listOf(first, second, firstParent, secondParent)
+            }
+            YardhalDatabase.build(context, name).use { db ->
+                val store = MessageStore(db.messageDao())
+                assertTrue(assertNotNull(store.byRowId(ref, ids[0])).pendingEcho)
+                assertTrue(assertNotNull(store.byRowId(ref, ids[1])).pendingEcho)
+                val firstHistory = message("wire-first", 1200, "repeat").copy(sentByUs = true, historyContext = true, playback = true)
+                assertFalse(store.record(firstHistory))
+                assertEquals(ids[0], store.findStoredMessage(firstHistory)?.rowId)
+                assertFalse(assertNotNull(store.byRowId(ref, ids[0])).pendingEcho)
+                assertTrue(assertNotNull(store.byRowId(ref, ids[1])).pendingEcho)
+                assertFalse(store.record(firstHistory))
+                assertTrue(assertNotNull(store.byRowId(ref, ids[1])).pendingEcho)
+                val secondHistory = firstHistory.copy(msgid = "wire-second", timestampMs = 1300)
+                assertFalse(store.record(secondHistory))
+                assertEquals(ids[1], store.findStoredMessage(secondHistory)?.rowId)
+                assertEquals(ids[2], store.byRowId(ref, ids[0])?.replyParentRowId)
+                assertEquals(ids[3], store.byRowId(ref, ids[1])?.replyParentRowId)
+                assertEquals(1200L, store.byRowId(ref, ids[0])?.timestampMs)
+                assertEquals(1300L, store.byRowId(ref, ids[1])?.timestampMs)
+                assertEquals(setOf(ids[0], ids[1]), store.search("repeat").map { it.rowId }.toSet())
+            }
+            YardhalDatabase.build(context, name).use { db ->
+                val store = MessageStore(db.messageDao())
+                assertEquals(listOf(false, false), store.recent(ref, 10).filter { it.sentByUs }.map { it.pendingEcho })
+                assertEquals(listOf("wire-first", "wire-second"), store.recent(ref, 10).filter { it.sentByUs }.map { it.msgid })
+            }
+        } finally {
+            context.deleteDatabase(name)
+        }
+    }
+
+    @Test
+    fun historyHealingRejectsOldMessagesDifferentWireQuotesAndAnonymousAmbiguity() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        YardhalDatabase.inMemory(context).use { db ->
+            val store = MessageStore(db.messageDao())
+            val local = message(null, 200_000, "same").copy(sentByUs = true, pendingEcho = true, replyToMsgid = "parent")
+            val rowId = assertNotNull(store.recordLocalEcho(local))
+            val history = local.copy(pendingEcho = false, historyContext = true, playback = true)
+            assertTrue(store.record(history.copy(msgid = "old", timestampMs = 1000)))
+            assertTrue(store.record(history.copy(msgid = "different-quote", replyToMsgid = "other")))
+            assertTrue(store.record(history.copy(msgid = "other-sender", senderNick = "bob")))
+            store.record(history.copy(msgid = null))
+            val unconfirmed = assertNotNull(store.byRowId(ref, rowId))
+            assertTrue(unconfirmed.pendingEcho)
+            assertEquals("parent", unconfirmed.replyToMsgid)
+            assertEquals(200_000L, unconfirmed.timestampMs)
+        }
+    }
+
+    @Test
+    fun identifiedHistoryHealingIncludesItsClockWindowBoundaryAndRejectsOutsideIt() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        YardhalDatabase.inMemory(context).use { db ->
+            val store = MessageStore(db.messageDao())
+            val local = message(null, 200_000, "boundary").copy(sentByUs = true, pendingEcho = true)
+            val first = assertNotNull(store.recordLocalEcho(local))
+            val atBoundary = local.copy(
+                msgid = "confirmed", timestampMs = 320_000, pendingEcho = false, historyContext = true,
+            )
+            assertFalse(store.record(atBoundary))
+            assertEquals(first, store.findStoredMessage(atBoundary)?.rowId)
+            assertFalse(assertNotNull(store.byRowId(ref, first)).pendingEcho)
+            val second = assertNotNull(store.recordLocalEcho(local.copy(timestampMs = 400_000)))
+            assertTrue(store.record(atBoundary.copy(msgid = "too-late", timestampMs = 520_001)))
+            assertTrue(store.record(atBoundary.copy(msgid = "not-ours", timestampMs = 400_000, sentByUs = false)))
+            assertTrue(assertNotNull(store.byRowId(ref, second)).pendingEcho)
+            assertEquals(4, store.recent(ref, 10).size)
+        }
+    }
+
+    @Test
+    fun retentionCollisionPreservesSurvivingBodyWhilePrivacyCollisionRedactsIt() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        for (privacy in listOf(false, true)) {
+            YardhalDatabase.inMemory(context).use { db ->
+                val store = MessageStore(db.messageDao())
+                val target = ConversationRef.channel("n1", "#renamed")
+                val original = message("shared", 1000, "retained body")
+                store.record(original)
+                val surviving = assertNotNull(store.recordWithRowId(original.copy(conversation = target)))
+                val quote = assertNotNull(store.recordWithRowId(message("quote", 2000).copy(conversation = target, replyParentRowId = surviving)))
+                if (privacy) store.redact(ref, "shared", 1000)
+                store.trimTo(ref, 0, 2000)
+                store.renameConversation(ref, target)
+                val parent = assertNotNull(store.byRowId(target, surviving))
+                assertEquals(privacy, parent.redacted)
+                assertEquals(if (privacy) "" else "retained body", parent.text)
+                assertEquals(surviving, store.byRowId(target, quote)?.replyParentRowId)
+                assertFalse(store.record(original.copy(conversation = target, historyContext = true)))
+                assertEquals(privacy, assertNotNull(store.byRowId(target, surviving)).redacted)
+                store.applyReaction(target, "shared", "bob", "heart", true, 3000)
+                assertEquals(if (privacy) emptyMap() else mapOf("heart" to setOf("bob")), store.reactions(target, "shared"))
+                assertEquals(if (privacy) emptyList() else listOf(surviving), store.search("retained body").map { it.rowId })
+            }
+        }
+    }
+
+    @Test
+    fun retentionOfOneAnonymousRepeatDoesNotRedactItsSurvivingSibling() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        YardhalDatabase.inMemory(context).use { db ->
+            val store = MessageStore(db.messageDao())
+            val outgoing = message(null, 1000, "same").copy(sentByUs = true)
+            store.recordLocalEcho(outgoing)
+            val survivor = assertNotNull(store.recordLocalEcho(outgoing))
+            store.trimTo(ref, 1, 2000)
+            val target = ConversationRef.channel("n1", "#renamed")
+            store.renameConversation(ref, target)
+            assertEquals("same", store.byRowId(target, survivor)?.text)
+            assertFalse(assertNotNull(store.byRowId(target, survivor)).redacted)
+            assertEquals(listOf(survivor), store.search("same").map { it.rowId })
+        }
+    }
+
+    @Test
+    fun retentionClearsAllPrunedParentsAcrossBatchBoundariesWithoutTouchingRetainedQuotes() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        YardhalDatabase.inMemory(context).use { db ->
+            val store = MessageStore(db.messageDao())
+            val parents = (0..500).map { assertNotNull(store.recordWithRowId(message("parent-$it", it.toLong()))) }
+            val keptParent = assertNotNull(store.recordWithRowId(message("kept-parent", 5000)))
+            val children = parents.mapIndexed { index, parent ->
+                assertNotNull(store.recordWithRowId(message("child-$index", 10_000 + index.toLong()).copy(replyParentRowId = parent)))
+            }
+            val keptChild = assertNotNull(store.recordWithRowId(message("kept-child", 20_000).copy(replyParentRowId = keptParent)))
+            store.trimTo(ref, children.size + 2, 30_000)
+            assertTrue(store.byRowIds(ref, children).all { it.replyParentRowId == null })
+            assertEquals(keptParent, store.byRowId(ref, keptChild)?.replyParentRowId)
+            assertTrue(store.byRowIds(ref, parents).isEmpty())
+            assertEquals(children.size + 2, store.recent(ref, 1000).size)
+            assertTrue(store.search("parent", limit = 1000).none { it.rowId in parents })
         }
     }
 
@@ -354,16 +547,25 @@ class DurableMessageTests {
         val context = ApplicationProvider.getApplicationContext<Context>()
         YardhalDatabase.inMemory(context).use { db ->
             val store = MessageStore(db.messageDao())
-            for (i in 0..1000) store.applyReaction(ref, "orphan-$i", "bob", "heart", true, i.toLong())
+            for (i in 0..1000) {
+                store.applyReaction(ref, "orphan-$i", "bob", "heart", true, i.toLong())
+                assertTrue(db.messageDao().orphanReactionCount() <= 1000)
+            }
             assertEquals(1000, db.messageDao().reactions("n1", "#room").size)
+            assertEquals(1000L, db.messageDao().reactionMembershipCount("n1"))
+            assertEquals(1000L, db.messageDao().orphanReactionCount())
             assertFalse(db.messageDao().reactions("n1", "#room").any { it.msgid == "orphan-0" })
             store.maintain(30L * 24 * 60 * 60 * 1000 + 1001)
             assertTrue(store.reactions(ref).isEmpty())
+            assertNull(db.messageDao().reactionMembershipCount("n1"))
+            assertEquals(0L, db.messageDao().orphanReactionCount())
             store.applyReaction(ref, "future", "bob", "heart", true, 1000)
             store.redact(ref, "gone", 1000)
             store.record(message("present"))
             store.deleteNetwork("n1")
             assertTrue(db.messageDao().reactions("n1", "#room").isEmpty())
+            assertNull(db.messageDao().reactionMembershipCount("n1"))
+            assertEquals(0L, db.messageDao().orphanReactionCount())
             assertTrue(db.messageDao().tombstones("n1", "#room").isEmpty())
             assertTrue(store.search("present").isEmpty())
             assertTrue(store.record(message("gone")))

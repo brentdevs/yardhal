@@ -21,15 +21,32 @@ public interface MessageDao {
 
     @Query(
         "SELECT * FROM messages WHERE networkId = :networkId AND conversation = :conversation AND contentHash = :hash " +
-            "ORDER BY rowId LIMIT 1",
+            "AND pendingEcho = 0 ORDER BY rowId LIMIT 1",
     )
     public suspend fun byHash(networkId: String, conversation: String, hash: String): MessageRow?
 
     @Query(
         "SELECT rowId FROM messages WHERE contentHash = :hash AND conversation = :conversation AND networkId = :networkId " +
-            "AND msgid IS NULL ORDER BY rowId LIMIT 1",
+            "AND msgid IS NULL AND pendingEcho = 0 ORDER BY rowId LIMIT 1",
     )
     public suspend fun rowIdWithoutMsgidByHash(networkId: String, conversation: String, hash: String): Long?
+
+    @Query(
+        "SELECT * FROM messages WHERE networkId = :networkId AND conversation = :conversation AND pendingEcho = 1 " +
+            "AND sentByUs = 1 AND msgid IS NULL AND redacted = 0 AND senderNick = :senderNick AND kind = :kind " +
+            "AND text = :text AND replyToMsgid IS :replyToMsgid AND timestampMs BETWEEN :fromMs AND :throughMs " +
+            "ORDER BY timestampMs ASC, rowId ASC LIMIT 1",
+    )
+    public suspend fun pendingHistoryEcho(
+        networkId: String,
+        conversation: String,
+        senderNick: String,
+        kind: String,
+        text: String,
+        replyToMsgid: String?,
+        fromMs: Long,
+        throughMs: Long,
+    ): MessageRow?
 
     @Query(
         "SELECT * FROM messages WHERE networkId = :networkId AND conversation = :conversation " +
@@ -186,23 +203,24 @@ public interface MessageDao {
     public suspend fun insertTombstone(row: MessageTombstoneRow): Long
 
     @Query(
-        "UPDATE message_tombstones SET observedAtMs = MAX(observedAtMs, :observedAtMs) " +
+        "UPDATE message_tombstones SET observedAtMs = MAX(observedAtMs, :observedAtMs), " +
+            "privacyDeletion = MAX(privacyDeletion, :privacyDeletion) " +
             "WHERE networkId = :networkId AND conversation = :conversation AND identity = :identity",
     )
-    public suspend fun refreshTombstone(networkId: String, conversation: String, identity: String, observedAtMs: Long)
+    public suspend fun refreshTombstone(networkId: String, conversation: String, identity: String, observedAtMs: Long, privacyDeletion: Boolean)
 
     @Transaction
     public suspend fun putTombstone(row: MessageTombstoneRow) {
         if (insertTombstone(row) == -1L) {
-            refreshTombstone(row.networkId, row.conversation, row.identity, row.observedAtMs)
+            refreshTombstone(row.networkId, row.conversation, row.identity, row.observedAtMs, row.privacyDeletion)
         }
     }
 
     @Query(
         "SELECT EXISTS(SELECT 1 FROM message_tombstones WHERE networkId = :networkId AND conversation = :conversation " +
-            "AND identity = :identity)",
+            "AND identity = :identity AND (:privacyOnly = 0 OR privacyDeletion = 1))",
     )
-    public suspend fun tombstoned(networkId: String, conversation: String, identity: String): Boolean
+    public suspend fun tombstoned(networkId: String, conversation: String, identity: String, privacyOnly: Boolean = false): Boolean
 
     @Query("SELECT * FROM message_tombstones WHERE networkId = :networkId AND conversation = :conversation")
     public suspend fun tombstones(networkId: String, conversation: String): List<MessageTombstoneRow>
@@ -214,7 +232,10 @@ public interface MessageDao {
     public suspend fun retentionFloor(networkId: String, conversation: String): Long?
 
     @Query("UPDATE messages SET replyParentRowId = :toRowId WHERE replyParentRowId = :fromRowId")
-    public suspend fun moveReplyParents(fromRowId: Long, toRowId: Long?)
+    public suspend fun moveReplyParents(fromRowId: Long, toRowId: Long)
+
+    @Query("UPDATE messages SET replyParentRowId = NULL WHERE replyParentRowId IN (:rowIds)")
+    public suspend fun clearReplyParents(rowIds: List<Long>)
 
     @Query(
         "UPDATE messages SET replyParentRowId = :rowId WHERE networkId = :networkId AND conversation = :conversation " +
@@ -232,28 +253,40 @@ public interface MessageDao {
         val echo = echoRowId?.let { byRowId(it) }?.takeIf {
             it.networkId == incoming.networkId && it.conversation == incoming.conversation
         }
-        val overlap = identified ?: echo ?: if (freshLocal) null else if (incoming.msgid == null) {
+        val historyEcho = if (identified == null && echo == null && incoming.sentByUs &&
+            incoming.msgid != null && (incoming.historyContext || incoming.playback)
+        ) {
+            pendingHistoryEcho(
+                incoming.networkId, incoming.conversation, incoming.senderNick, incoming.kind, incoming.text,
+                incoming.replyToMsgid, incoming.timestampMs - PENDING_ECHO_HISTORY_WINDOW_MS,
+                incoming.timestampMs + PENDING_ECHO_HISTORY_WINDOW_MS,
+            )
+        } else null
+        val overlap = identified ?: echo ?: historyEcho ?: if (freshLocal) null else if (incoming.msgid == null) {
             byHash(incoming.networkId, incoming.conversation, incoming.contentHash)
         } else {
             rowIdWithoutMsgidByHash(incoming.networkId, incoming.conversation, incoming.contentHash)?.let { byRowId(it) }
         }
         if (overlap != null) {
-            val erased = incoming.msgid?.let { tombstoned(incoming.networkId, incoming.conversation, "msgid:$it") } == true
+            val erased = incoming.msgid?.let {
+                tombstoned(incoming.networkId, incoming.conversation, "msgid:$it", privacyOnly = true)
+            } == true
             val base = if (echo != null && echo.rowId != overlap.rowId) mergeMetadata(overlap, echo) else overlap
-            val merged = mergeMetadata(base, incoming.copy(redacted = incoming.redacted || erased), replaceEcho = echo?.rowId == overlap.rowId)
+            val replacingEcho = echo?.rowId == overlap.rowId || historyEcho?.rowId == overlap.rowId
+            val merged = mergeMetadata(base, incoming.copy(redacted = incoming.redacted || erased), replaceEcho = replacingEcho)
             update(merged)
             if (echo != null && echo.rowId != overlap.rowId) {
                 moveReplyParents(echo.rowId, overlap.rowId)
                 deleteIndexedRow(echo.rowId)
             }
-            bindAndIndex(merged, replaceIndex = echo?.rowId == overlap.rowId)
+            bindAndIndex(merged, replaceIndex = replacingEcho)
             return null
         }
         if (!freshLocal && blocked(incoming)) return null
         val parent = incoming.replyParentRowId?.let { byRowId(it) }?.takeIf {
             it.networkId == incoming.networkId && it.conversation == incoming.conversation
         } ?: incoming.replyToMsgid?.let { byMsgid(incoming.networkId, incoming.conversation, it) }
-        val candidate = incoming.copy(replyParentRowId = parent?.rowId)
+        val candidate = incoming.copy(replyParentRowId = parent?.rowId, pendingEcho = incoming.pendingEcho && incoming.msgid == null)
         val row = if (candidate.redacted) mergeMetadata(candidate, candidate) else candidate
         val inserted = insert(row)
         if (inserted == -1L) return null
@@ -261,12 +294,12 @@ public interface MessageDao {
         return inserted
     }
 
-    public suspend fun identityTombstoned(row: MessageRow): Boolean =
+    public suspend fun identityTombstoned(row: MessageRow, privacyOnly: Boolean = false): Boolean =
         if (row.msgid != null) {
-            tombstoned(row.networkId, row.conversation, "msgid:${row.msgid}")
+            tombstoned(row.networkId, row.conversation, "msgid:${row.msgid}", privacyOnly)
         } else {
-            tombstoned(row.networkId, row.conversation, "hash:${row.contentHash}") ||
-                tombstoned(row.networkId, row.conversation, "content:${MessageStore.identityHash(row)}")
+            tombstoned(row.networkId, row.conversation, "hash:${row.contentHash}", privacyOnly) ||
+                tombstoned(row.networkId, row.conversation, "content:${MessageStore.identityHash(row)}", privacyOnly)
         }
 
     public suspend fun blocked(row: MessageRow): Boolean {
@@ -332,6 +365,7 @@ public interface MessageDao {
             attachmentHeight = if (redacted) null else existing.attachmentHeight ?: incoming.attachmentHeight,
             redacted = redacted,
             reactionsTruncated = !redacted && (existing.reactionsTruncated || incoming.reactionsTruncated),
+            pendingEcho = !redacted && existing.pendingEcho && incoming.pendingEcho && existing.msgid == null && incoming.msgid == null,
         )
     }
 
@@ -371,63 +405,77 @@ public interface MessageDao {
         networkLimit: Int = MESSAGE_REACTIONS_PER_NETWORK_LIMIT,
     ): Set<Long> {
         require(perParentLimit >= 0 && networkLimit >= 0)
-        if (tombstoned(row.networkId, row.conversation, "msgid:${row.msgid}")) return emptySet()
         val parent = byMsgid(row.networkId, row.conversation, row.msgid)
-        if (parent?.redacted == true) return emptySet()
+        if (parent?.redacted == true || tombstoned(
+                row.networkId, row.conversation, "msgid:${row.msgid}", privacyOnly = parent != null,
+            )
+        ) return emptySet()
         if (added) putReaction(row) else removeReaction(row.networkId, row.conversation, row.msgid, row.sender, row.emoji)
-        pruneOrphanReactions(row.observedAtMs)
-        if (parent != null) capParentReactions(row.networkId, row.conversation, row.msgid, perParentLimit)
         val changed = linkedSetOf<Long>()
         if (parent != null) changed.add(parent.rowId)
-        changed.addAll(networkReactionVictimRows(row.networkId, networkLimit))
-        capNetworkReactions(row.networkId, networkLimit)
+        if (added) {
+            capOrphans(MESSAGE_ORPHAN_REACTION_LIMIT)
+            if (parent != null) capParentReactions(row.networkId, row.conversation, row.msgid, perParentLimit)
+            changed.addAll(capNetworkReactions(row.networkId, networkLimit))
+        }
         return changed
     }
 
     @Query(
-        "UPDATE messages SET reactionsTruncated = 1 WHERE networkId = :networkId AND conversation = :conversation " +
-            "AND msgid = :msgid AND redacted = 0 AND EXISTS (SELECT 1 FROM message_reactions WHERE networkId = :networkId " +
-            "AND conversation = :conversation AND msgid = :msgid LIMIT 1 OFFSET :keep)",
+        "SELECT rowid FROM message_reactions WHERE networkId = :networkId AND conversation = :conversation " +
+            "AND msgid = :msgid ORDER BY observedAtMs DESC, emoji ASC, sender ASC LIMIT :limit OFFSET :keep",
     )
-    public suspend fun markParentReactionsTruncated(networkId: String, conversation: String, msgid: String, keep: Int)
+    public suspend fun parentReactionVictims(networkId: String, conversation: String, msgid: String, keep: Int, limit: Int): List<Long>
 
-    @Query(
-        "DELETE FROM message_reactions WHERE rowid IN (SELECT rowid FROM message_reactions WHERE networkId = :networkId " +
-            "AND conversation = :conversation AND msgid = :msgid ORDER BY observedAtMs DESC, emoji ASC, sender ASC LIMIT -1 OFFSET :keep)",
-    )
-    public suspend fun trimParentReactions(networkId: String, conversation: String, msgid: String, keep: Int)
+    @Query("UPDATE messages SET reactionsTruncated = 1 WHERE rowId IN (:rowIds) AND redacted = 0")
+    public suspend fun markReactionsTruncated(rowIds: List<Long>)
+
+    @Query("DELETE FROM message_reactions WHERE rowid IN (:rowIds)")
+    public suspend fun deleteReactionRows(rowIds: List<Long>)
 
     @Transaction
     public suspend fun capParentReactions(networkId: String, conversation: String, msgid: String, keep: Int) {
-        markParentReactionsTruncated(networkId, conversation, msgid, keep)
-        trimParentReactions(networkId, conversation, msgid, keep)
+        var marked = false
+        while (true) {
+            val victims = parentReactionVictims(networkId, conversation, msgid, keep, 500)
+            if (victims.isEmpty()) return
+            if (!marked) {
+                byMsgid(networkId, conversation, msgid)?.let { markReactionsTruncated(listOf(it.rowId)) }
+                marked = true
+            }
+            deleteReactionRows(victims)
+        }
     }
 
     @Query(
-        "UPDATE messages SET reactionsTruncated = 1 WHERE networkId = :networkId AND redacted = 0 AND rowId IN " +
-            "(SELECT m.rowId FROM messages m JOIN (SELECT conversation, msgid FROM message_reactions WHERE networkId = :networkId " +
-            "ORDER BY observedAtMs DESC, conversation ASC, msgid ASC, emoji ASC, sender ASC LIMIT -1 OFFSET :keep) overflow " +
-            "ON m.networkId = :networkId AND m.conversation = overflow.conversation AND m.msgid = overflow.msgid)",
+        "SELECT overflow.rowid AS reactionRowId, m.rowId AS parentRowId FROM " +
+            "(SELECT rowid, networkId, conversation, msgid FROM message_reactions WHERE networkId = :networkId " +
+            "ORDER BY observedAtMs ASC, conversation DESC, msgid DESC, emoji DESC, sender DESC LIMIT :limit) overflow " +
+            "LEFT JOIN messages m ON m.networkId = overflow.networkId AND m.conversation = overflow.conversation " +
+            "AND m.msgid = overflow.msgid AND m.redacted = 0",
     )
-    public suspend fun markNetworkReactionsTruncated(networkId: String, keep: Int)
+    public suspend fun networkReactionVictims(networkId: String, limit: Int): List<MessageReactionVictim>
 
-    @Query(
-        "SELECT DISTINCT m.rowId FROM messages m JOIN (SELECT conversation, msgid FROM message_reactions WHERE networkId = :networkId " +
-            "ORDER BY observedAtMs DESC, conversation ASC, msgid ASC, emoji ASC, sender ASC LIMIT -1 OFFSET :keep) overflow " +
-            "ON m.networkId = :networkId AND m.conversation = overflow.conversation AND m.msgid = overflow.msgid WHERE m.redacted = 0",
-    )
-    public suspend fun networkReactionVictimRows(networkId: String, keep: Int): List<Long>
-
-    @Query(
-        "DELETE FROM message_reactions WHERE rowid IN (SELECT rowid FROM message_reactions WHERE networkId = :networkId " +
-            "ORDER BY observedAtMs DESC, conversation ASC, msgid ASC, emoji ASC, sender ASC LIMIT -1 OFFSET :keep)",
-    )
-    public suspend fun trimNetworkReactions(networkId: String, keep: Int)
+    @Query("SELECT membershipCount FROM message_reaction_counts WHERE networkId = :networkId")
+    public suspend fun reactionMembershipCount(networkId: String): Long?
 
     @Transaction
-    public suspend fun capNetworkReactions(networkId: String, keep: Int) {
-        markNetworkReactionsTruncated(networkId, keep)
-        trimNetworkReactions(networkId, keep)
+    public suspend fun capNetworkReactions(networkId: String, keep: Int): Set<Long> {
+        var overflow = (reactionMembershipCount(networkId) ?: 0) - keep.toLong()
+        if (overflow <= 0) return emptySet()
+        val changed = linkedSetOf<Long>()
+        while (overflow > 0) {
+            val victims = networkReactionVictims(networkId, minOf(overflow, 500).toInt())
+            if (victims.isEmpty()) return changed
+            val parents = victims.mapNotNull { it.parentRowId }.distinct()
+            if (parents.isNotEmpty()) {
+                markReactionsTruncated(parents)
+                changed.addAll(parents)
+            }
+            deleteReactionRows(victims.map { it.reactionRowId })
+            overflow -= victims.size
+        }
+        return changed
     }
 
     @Query(
@@ -437,7 +485,7 @@ public interface MessageDao {
     )
     public suspend fun overflowReactionParents(networkId: String, keep: Int): List<MessageReactionParent>
 
-    @Query("SELECT DISTINCT networkId FROM message_reactions ORDER BY networkId")
+    @Query("SELECT networkId FROM message_reaction_counts ORDER BY networkId")
     public suspend fun reactionNetworks(): List<String>
 
     @Transaction
@@ -450,18 +498,29 @@ public interface MessageDao {
     }
 
     @Query(
-        "DELETE FROM message_reactions WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.networkId = message_reactions.networkId " +
-            "AND m.conversation = message_reactions.conversation AND m.msgid = message_reactions.msgid) " +
-            "AND observedAtMs < :beforeMs",
+        "DELETE FROM message_reactions WHERE orphan = 1 AND observedAtMs < :beforeMs",
     )
     public suspend fun deleteOldOrphans(beforeMs: Long)
 
+    @Query("SELECT membershipCount FROM message_orphan_reaction_count WHERE singletonId = 0")
+    public suspend fun orphanReactionCount(): Long
+
     @Query(
-        "DELETE FROM message_reactions WHERE rowid IN (SELECT r.rowid FROM message_reactions r WHERE NOT EXISTS " +
-            "(SELECT 1 FROM messages m WHERE m.networkId = r.networkId AND m.conversation = r.conversation AND m.msgid = r.msgid) " +
-            "ORDER BY r.observedAtMs DESC, r.rowid DESC LIMIT -1 OFFSET :keep)",
+        "SELECT rowid FROM message_reactions WHERE orphan = 1 " +
+            "ORDER BY observedAtMs ASC, rowid ASC LIMIT :limit",
     )
-    public suspend fun capOrphans(keep: Int)
+    public suspend fun orphanReactionVictims(limit: Int): List<Long>
+
+    @Transaction
+    public suspend fun capOrphans(keep: Int) {
+        var overflow = orphanReactionCount() - keep.toLong()
+        while (overflow > 0) {
+            val victims = orphanReactionVictims(minOf(overflow, 500).toInt())
+            if (victims.isEmpty()) return
+            deleteReactionRows(victims)
+            overflow -= victims.size
+        }
+    }
 
     @Transaction
     public suspend fun pruneOrphanReactions(nowMs: Long) {
@@ -529,14 +588,19 @@ public interface MessageDao {
     public suspend fun deleteRetainedRows(networkId: String, conversation: String, deleting: List<MessageRow>, nowMs: Long) {
         val floor = deleting.maxOfOrNull { it.timestampMs }
         if (floor != null) putRetention(MessageRetentionRow(networkId, conversation, maxOf(floor, retentionFloor(networkId, conversation) ?: Long.MIN_VALUE)))
+        var offset = 0
+        while (offset < deleting.size) {
+            val batch = deleting.subList(offset, minOf(offset + 500, deleting.size))
+            clearReplyParents(batch.map { it.rowId })
+            offset += batch.size
+        }
         for (row in deleting) {
-            putTombstone(MessageTombstoneRow(networkId, conversation, "hash:${row.contentHash}", row.timestampMs, nowMs))
-            putTombstone(MessageTombstoneRow(networkId, conversation, "content:${MessageStore.identityHash(row)}", row.timestampMs, nowMs))
+            putTombstone(MessageTombstoneRow(networkId, conversation, "hash:${row.contentHash}", row.timestampMs, nowMs, row.redacted))
+            putTombstone(MessageTombstoneRow(networkId, conversation, "content:${MessageStore.identityHash(row)}", row.timestampMs, nowMs, row.redacted))
             row.msgid?.let {
-                putTombstone(MessageTombstoneRow(networkId, conversation, "msgid:$it", row.timestampMs, nowMs))
+                putTombstone(MessageTombstoneRow(networkId, conversation, "msgid:$it", row.timestampMs, nowMs, row.redacted))
                 removeReactions(networkId, conversation, it)
             }
-            moveReplyParents(row.rowId, null)
             deleteIndexedRow(row.rowId)
         }
         capTombstones(networkId, conversation, MESSAGE_TOMBSTONE_LIMIT)
@@ -685,6 +749,10 @@ public interface MessageDao {
     @Transaction
     public suspend fun renameAtomic(networkId: String, from: String, to: String): ConversationMerge {
         val moving = allIn(networkId, from)
+        val destination = allIn(networkId, to)
+        val byDestinationMsgid = destination.mapNotNull { row -> row.msgid?.let { it to row } }.toMap()
+        val byDestinationHash = destination.groupBy { it.contentHash }
+        val consumedHashOverlaps = hashSetOf<Long>()
         val merged = mutableListOf<RowMerge>()
         for (original in moving) {
             val current = byRowId(original.rowId) ?: continue
@@ -692,11 +760,14 @@ public interface MessageDao {
                 conversation = to,
                 contentHash = if (current.redacted) current.contentHash else MessageStore.renamedHash(current, to),
             )
-            val duplicate = row.msgid?.let { byMsgid(networkId, to, it) }
-                ?: if (row.msgid == null) byHash(networkId, to, row.contentHash)
-                else rowIdWithoutMsgidByHash(networkId, to, row.contentHash)?.let { byRowId(it) }
+            val identified = row.msgid?.let { byDestinationMsgid[it] }
+            val duplicate = identified ?: byDestinationHash[row.contentHash]?.firstOrNull { candidate ->
+                candidate.rowId !in consumedHashOverlaps && !row.pendingEcho && !candidate.pendingEcho &&
+                    (row.msgid == null || candidate.msgid == null)
+            }
             if (duplicate != null) {
-                val survivor = mergeMetadata(duplicate, row)
+                consumedHashOverlaps.add(duplicate.rowId)
+                val survivor = mergeMetadata(byRowId(duplicate.rowId) ?: duplicate, row)
                 update(survivor)
                 moveReplyParents(row.rowId, duplicate.rowId)
                 deleteIndexedRow(row.rowId)
@@ -713,7 +784,7 @@ public interface MessageDao {
             mutateRaw(SimpleSQLiteQuery("DELETE FROM $table WHERE networkId = ? AND conversation = ?", arrayOf<Any>(networkId, from)))
         }
         for (row in allIn(networkId, to)) {
-            if (identityTombstoned(row)) {
+            if (identityTombstoned(row, privacyOnly = true)) {
                 row.msgid?.let { redactAtomic(networkId, to, it, System.currentTimeMillis()) }
                     ?: run {
                         val redacted = mergeMetadata(row, row.copy(redacted = true))

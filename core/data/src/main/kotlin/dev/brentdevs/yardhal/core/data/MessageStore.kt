@@ -50,6 +50,7 @@ public class MessageStore(private val dao: MessageDao) {
         senderAccount = senderAccount,
         redacted = redacted,
         reactionsTruncated = reactionsTruncated,
+        pendingEcho = pendingEcho,
     )
 
     public suspend fun findStoredMessage(message: StoredMessage): StoredMessage? {
@@ -342,6 +343,7 @@ public class MessageStore(private val dao: MessageDao) {
             senderAccount = senderAccount,
             redacted = redacted,
             reactionsTruncated = reactionsTruncated,
+            pendingEcho = pendingEcho,
         )
     }
 }

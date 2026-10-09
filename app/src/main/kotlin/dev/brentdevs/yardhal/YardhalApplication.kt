@@ -1,6 +1,7 @@
 package dev.brentdevs.yardhal
 
 import android.app.Application
+import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -27,15 +28,31 @@ import dev.brentdevs.yardhal.service.ConnectionService
 import dev.brentdevs.yardhal.service.Notifications
 import dev.brentdevs.yardhal.service.keepsRecoveryService
 import dev.brentdevs.yardhal.ui.image.RemoteImageLoader
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.SupervisorJob
+
+enum class ApplicationStartup {
+    LOADING,
+    READY,
+    FAILED,
+}
 
 class YardhalApplication : Application() {
 
     val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val mutableStartup = MutableStateFlow(ApplicationStartup.LOADING)
+    val startup: StateFlow<ApplicationStartup> = mutableStartup.asStateFlow()
+
+    suspend fun awaitInitialization(): Boolean = startup.first { it != ApplicationStartup.LOADING } == ApplicationStartup.READY
 
     var sharedText: String? by mutableStateOf(null)
 
@@ -60,6 +77,20 @@ class YardhalApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        appScope.launch(Dispatchers.IO) {
+            try {
+                initializeStoresAndCoordinator()
+                mutableStartup.value = ApplicationStartup.READY
+            } catch (failure: CancellationException) {
+                throw failure
+            } catch (failure: Exception) {
+                Log.e("Yardhal", "Local initialization failed", failure)
+                mutableStartup.value = ApplicationStartup.FAILED
+            }
+        }
+    }
+
+    private fun initializeStoresAndCoordinator() {
         val dir = filesDir
         networkStore = NetworkStore(dir)
         val db = DatabaseRecovery.open(this)
@@ -152,7 +183,8 @@ class YardhalApplication : Application() {
     }
 
     override fun onTerminate() {
-        connectivityObserver.close()
+        if (::connectivityObserver.isInitialized) connectivityObserver.close()
+        appScope.cancel()
         super.onTerminate()
     }
 

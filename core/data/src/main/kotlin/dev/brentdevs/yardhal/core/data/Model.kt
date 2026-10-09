@@ -73,4 +73,5 @@ public data class StoredMessage(
     public val redacted: Boolean = false,
     public val highlightsKnown: Boolean = true,
     public val reactionsTruncated: Boolean = false,
+    public val pendingEcho: Boolean = false,
 )

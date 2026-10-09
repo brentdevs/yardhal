@@ -25,6 +25,7 @@ import java.util.concurrent.Executors
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -214,46 +215,62 @@ class MetadataCoordinatorLoopbackTests {
     }
 
     @Test
-    fun disconnectClearsProfilesUntilReplacementSessionPublishesFreshMetadata() = withHarness { _, harness ->
+    fun disconnectRetainsCachedProfilesUntilReplacementPublishesFreshMetadata() = withHarness { _, harness ->
         val coordinator = harness.coordinator
         val networkId = harness.config.id
+        val observed = assertNotNull(coordinator.profiles.value[networkId]?.forNick("alice"))
         coordinator.disconnect(networkId)
-        assertFalse(coordinator.profiles.value.containsKey(networkId))
+        val retained = assertNotNull(coordinator.profiles.value[networkId]?.forNick("alice"))
+        assertEquals(observed.displayName, retained.displayName)
+        assertEquals(observed.avatarUrl, retained.avatarUrl)
+        assertTrue(retained.cached)
 
         Server(publishProfiles = false).use { replacement ->
             replacement.start()
             assertTrue(coordinator.updateNetwork(harness.config.copy(port = replacement.port)))
             coordinator.connectNetwork(networkId)
-            assertFalse(coordinator.profiles.value.containsKey(networkId))
             await { replacement.received.contains("JOIN #room") }
             await { coordinator.networks.value.singleOrNull()?.status == ConnectionStatus.REGISTERED }
-            assertFalse(coordinator.profiles.value.containsKey(networkId))
+            assertEquals(retained, coordinator.profiles.value[networkId]?.forNick("alice"))
 
             replacement.send(":srv METADATA alice display-name * :Alice Fresh")
             await { coordinator.profiles.value[networkId]?.forNick("alice")?.displayName == "Alice Fresh" }
-            assertEquals(null, coordinator.profiles.value[networkId]?.forNick("alice")?.avatarUrl)
+            val partial = assertNotNull(coordinator.profiles.value[networkId]?.forNick("alice"))
+            assertEquals(retained.avatarUrl, partial.avatarUrl)
+            assertTrue(partial.cached)
+            replacement.send(":srv METADATA alice avatar * :https://example.org/fresh.png")
+            await {
+                coordinator.profiles.value[networkId]?.forNick("alice")?.let {
+                    it.avatarUrl == "https://example.org/fresh.png" && !it.cached
+                } == true
+            }
             coordinator.disconnect(networkId)
-            assertFalse(coordinator.profiles.value.containsKey(networkId))
+            val refreshed = assertNotNull(coordinator.profiles.value[networkId]?.forNick("alice"))
+            assertEquals("Alice Fresh", refreshed.displayName)
+            assertTrue(refreshed.cached)
         }
     }
 
     @Test
-    fun reconnectWithoutMetadataDoesNotRestoreDiscardedProfiles() = withHarness { _, harness ->
+    fun reconnectWithoutMetadataRetainsHistoricalProfilesWithoutAdvertisingFreshness() = withHarness { _, harness ->
         val coordinator = harness.coordinator
         val networkId = harness.config.id
+        val observed = assertNotNull(coordinator.profiles.value[networkId]?.forNick("alice"))
         coordinator.disconnect(networkId)
-        assertFalse(coordinator.profiles.value.containsKey(networkId))
 
         Server(metadataEnabled = false).use { replacement ->
             replacement.start()
             assertTrue(coordinator.updateNetwork(harness.config.copy(port = replacement.port)))
             coordinator.connectNetwork(networkId)
-            assertFalse(coordinator.profiles.value.containsKey(networkId))
             await { replacement.received.contains("JOIN #room") }
             await { coordinator.networks.value.singleOrNull()?.status == ConnectionStatus.REGISTERED }
-            assertFalse(coordinator.profiles.value.containsKey(networkId))
+            val retained = assertNotNull(coordinator.profiles.value[networkId]?.forNick("alice"))
+            assertEquals(observed.displayName, retained.displayName)
+            assertEquals(observed.avatarUrl, retained.avatarUrl)
+            assertTrue(retained.cached)
             assertTrue(replacement.received.none { it.startsWith("METADATA ") })
             coordinator.disconnect(networkId)
+            assertEquals(retained, coordinator.profiles.value[networkId]?.forNick("alice"))
         }
     }
 

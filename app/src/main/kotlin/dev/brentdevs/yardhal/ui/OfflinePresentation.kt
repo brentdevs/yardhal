@@ -26,6 +26,14 @@ internal fun metadataFreshnessLabel(cached: Boolean, connected: Boolean, observe
     return if (observed == null) status else "$status · observed $observed"
 }
 
+internal enum class StorageRecoveryBanner { WARNING, TEMPORARY_SESSION }
+
+internal fun storageRecoveryBanner(notices: List<StorageRecoveryNotice>): StorageRecoveryBanner? = when {
+    notices.isEmpty() -> null
+    notices.any { it.temporary } -> StorageRecoveryBanner.TEMPORARY_SESSION
+    else -> StorageRecoveryBanner.WARNING
+}
+
 internal fun storageRecoveryExplanation(notice: StorageRecoveryNotice): String = buildString {
     append(notice.message)
     if (notice.quarantinePath != null) {

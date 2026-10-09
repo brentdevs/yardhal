@@ -1411,7 +1411,7 @@ private fun CollapsedEventsRow(
     }
 }
 
-private sealed interface OverviewEntry {
+internal sealed interface OverviewEntry {
     public data class NetworkHeader(
         public val network: dev.brentdevs.yardhal.coordinator.UiNetwork,
         public val isCollapsed: Boolean,
@@ -1437,7 +1437,7 @@ private sealed interface OverviewEntry {
 }
 
 
-private fun buildOverviewEntries(
+internal fun buildOverviewEntries(
     networks: List<dev.brentdevs.yardhal.coordinator.UiNetwork>,
     buffers: List<ConversationBuffer>,
     mutedKeys: Set<String>,
@@ -1453,13 +1453,22 @@ private fun buildOverviewEntries(
             it.ref.networkId == network.id && it.ref.kind != dev.brentdevs.yardhal.core.data.ConversationKind.SERVER
         }
         val isCollapsed = network.id in collapsedNetworkIds
-        val netHasUnread = own.any { it.hasUnread }
-        val netUnreadCount = own.sumOf { conversationUnreadCount(it) }
+        var netHasUnread = false
+        var netUnreadCount = 0
+        var netMentionCount = 0
+        var netMentionCountKnown = true
+        for (buffer in own) {
+            if (buffer.key in mutedKeys) continue
+            netHasUnread = netHasUnread || buffer.hasUnread
+            netUnreadCount += conversationUnreadCount(buffer)
+            netMentionCount += conversationMentionCount(buffer)
+            netMentionCountKnown = netMentionCountKnown && buffer.mentionCountKnown
+        }
         entries.add(
             OverviewEntry.NetworkHeader(
                 network, isCollapsed, netHasUnread, netUnreadCount,
-                own.sumOf { conversationMentionCount(it) },
-                own.all { it.mentionCountKnown },
+                netMentionCount,
+                netMentionCountKnown,
             ),
         )
 

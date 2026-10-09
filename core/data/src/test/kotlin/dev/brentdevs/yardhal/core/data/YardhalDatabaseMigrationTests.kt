@@ -192,12 +192,29 @@ class YardhalDatabaseMigrationTests {
                 assertEquals(enriched, store.byRowId(ref, 41))
                 assertEquals(UnreadCounts(1, 1, true), store.unreadCounts(ref, ReadCursor()))
                 assertEquals(201L, assertNotNull(store.recordWithRowId(message(ref, 0, "new", "new body", 3000))))
+                val pending = message(ref, 0, null, "pending body", 4000).copy(
+                    sentByUs = true, pendingEcho = true, replyParentRowId = 41,
+                )
+                assertEquals(202L, store.recordLocalEcho(pending))
             }
             YardhalDatabase.build(context, name).use { db ->
                 val restored = MessageStore(db.messageDao()).recent(ref, 10).first()
                 assertEquals("account", restored.senderAccount)
                 assertEquals(10, restored.attachmentWidth)
                 assertTrue(restored.highlightsMe)
+                val store = MessageStore(db.messageDao())
+                assertTrue(assertNotNull(store.byRowId(ref, 202)).pendingEcho)
+                val confirmed = message(ref, 0, "confirmed", "pending body", 4500).copy(sentByUs = true, historyContext = true)
+                assertFalse(store.record(confirmed))
+                val healed = assertNotNull(store.byRowId(ref, 202))
+                assertFalse(healed.pendingEcho)
+                assertEquals("confirmed", healed.msgid)
+                assertEquals(41L, healed.replyParentRowId)
+                store.applyReaction(ref, "confirmed", "bob", "heart", true, 5000)
+                assertEquals(1L, db.messageDao().reactionMembershipCount(ref.networkId))
+                assertEquals(mapOf("heart" to setOf("bob")), store.reactions(ref, "confirmed"))
+                store.applyReaction(ref, "confirmed", "bob", "heart", false, 5001)
+                assertEquals(null, db.messageDao().reactionMembershipCount(ref.networkId))
             }
         } finally {
             context.deleteDatabase(name)

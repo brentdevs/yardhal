@@ -290,7 +290,7 @@ class DatabaseRecoveryTests {
     }
 
     @Test
-    fun completedEvidenceWithInterruptedRetirementIsNeverOpenedOrMigratedAgain() {
+    fun completedEvidenceWithInterruptedRetirementResumesBeforeOpeningOnlyTheFreshReplacement() {
         val context = context()
         val source = context.getDatabasePath("interrupted-fixture.db")
         val original = "known failed original".toByteArray()
@@ -314,11 +314,154 @@ class DatabaseRecoveryTests {
         assertFalse(File(evidence, ".retired").exists())
         DatabaseRecovery.open(
             source,
-            persistent = { attempts++; YardhalDatabase.build(context, source.name, PreservingOpenHelperFactory) },
+            persistent = {
+                attempts++
+                assertFalse(source.exists())
+                YardhalDatabase.build(context, source.name, PreservingOpenHelperFactory)
+            },
             temporary = { YardhalDatabase.inMemory(context) },
         ).use { assertTrue(it.isOpen) }
+        assertEquals(2, attempts)
+        assertFalse(StorageRecovery.databaseTemporary.value)
+        assertTrue(File(evidence, ".retired").isFile)
+        assertContentEquals(original, File(evidence, source.name).readBytes())
+    }
+
+    @Test
+    fun interruptedOriginalCopyResumesFromTheGuardWithoutRetryingKnownFailedMigration() {
+        val context = context()
+        val source = context.getDatabasePath("interrupted-copy-fixture.db")
+        val originals = databaseFiles(source)
+        val bytes = originals.mapIndexed { index, _ -> ByteArray(1025) { (it * 19 + index).toByte() } }
+        originals.zip(bytes).forEach { (file, original) -> file.writeBytes(original) }
+        var attempts = 0
+        DatabaseRecovery.open(
+            source,
+            persistent = {
+                attempts++
+                source.writeText("simulated modified failed opening")
+                File(source.path + "-wal").delete()
+                throw IllegalStateException("Migration didn't properly handle: fixture")
+            },
+            temporary = { YardhalDatabase.inMemory(context) },
+            preserve = { file, files, retire ->
+                preserveStorageEvidence(file, files, retire) { directory ->
+                    if (File(directory, ".planned").isFile) throw IOException("fixture before copy")
+                    syncStoreDirectory(directory)
+                }
+            },
+        ).close()
         assertEquals(1, attempts)
         assertTrue(StorageRecovery.databaseTemporary.value)
+        val evidence = StorageRecovery.retainedEvidence(source).single()
+        assertFalse(File(evidence, ".complete").exists())
+        DatabaseRecovery.open(
+            source,
+            persistent = {
+                attempts++
+                assertTrue(originals.none { it.exists() })
+                YardhalDatabase.build(context, source.name, PreservingOpenHelperFactory)
+            },
+            temporary = { YardhalDatabase.inMemory(context) },
+        ).use { assertTrue(it.isOpen) }
+        assertEquals(2, attempts)
+        assertFalse(StorageRecovery.databaseTemporary.value)
+        assertTrue(File(evidence, ".retired").isFile)
+        for ((file, original) in originals.zip(bytes)) {
+            assertContentEquals(original, File(evidence, file.name).readBytes())
+        }
+        assertEquals(listOf(evidence), StorageRecovery.retainedEvidence(source))
+    }
+
+    @Test
+    fun failedPostOpenCorruptionGuardTransitionsToFreshPersistentStorageOnNextLaunch() {
+        val context = context()
+        val source = context.getDatabasePath("post-open-fixture.db")
+        DatabaseRecovery.open(context, source.name).use { database ->
+            database.openHelper.writableDatabase.execSQL("CREATE TABLE original_payload(value TEXT)")
+            database.openHelper.writableDatabase.execSQL("INSERT INTO original_payload VALUES('retained evidence')")
+        }
+        val original = source.readBytes()
+        val guard = requireNotNull(DatabaseOpeningGuard.prepare(source, protectOriginal = true))
+        guard.markFailed()
+        var attempts = 0
+        DatabaseRecovery.open(
+            source,
+            persistent = {
+                attempts++
+                assertFalse(source.exists())
+                YardhalDatabase.build(context, source.name, PreservingOpenHelperFactory)
+            },
+            temporary = { YardhalDatabase.inMemory(context) },
+        ).use { database ->
+            database.openHelper.writableDatabase.query(
+                "SELECT name FROM sqlite_master WHERE name='original_payload'",
+            ).use { assertFalse(it.moveToFirst()) }
+        }
+        assertEquals(1, attempts)
+        assertFalse(StorageRecovery.databaseTemporary.value)
+        val evidence = StorageRecovery.retainedEvidence(source).single()
+        assertContentEquals(original, File(evidence, source.name).readBytes())
+        assertTrue(File(evidence, ".retired").isFile)
+        DatabaseRecovery.open(context, source.name).use { assertTrue(it.isOpen) }
+        assertEquals(listOf(evidence), StorageRecovery.retainedEvidence(source))
+    }
+
+    @Test
+    fun olderSQLitePreflightChecksWholeDatabaseOnceAndPreservesWorkingFtsSearch() {
+        val context = context()
+        val source = context.getDatabasePath("old-sqlite-fixture.db")
+        DatabaseRecovery.open(context, source.name).use { database ->
+            val sqlite = database.openHelper.writableDatabase
+            sqlite.execSQL(
+                "INSERT INTO messages(rowId,networkId,conversation,contentHash,senderNick,kind,text,sentByUs,timestampMs) " +
+                    "VALUES(41,'network','#room','fixture-hash','alice','PRIVMSG','searchable needle',0,1000)",
+            )
+            sqlite.execSQL("INSERT INTO message_fts(rowid,sender,body) VALUES(41,'alice','searchable needle')")
+        }
+        var checks = 0
+        SQLiteDatabase.openDatabase(source.path, null, SQLiteDatabase.OPEN_READONLY).use { sqlite ->
+            DatabaseRecovery.validateReadOnly(sqlite, version = "3.32.3", checked = { checks++ })
+        }
+        assertEquals(1, checks)
+        DatabaseRecovery.open(context, source.name).use { database ->
+            database.openHelper.writableDatabase.query(
+                "SELECT rowid FROM message_fts WHERE message_fts MATCH 'needle'",
+            ).use { rows ->
+                assertTrue(rows.moveToFirst())
+                assertEquals(41L, rows.getLong(0))
+            }
+        }
+        assertFalse(StorageRecovery.databaseTemporary.value)
+        assertTrue(StorageRecovery.retainedEvidence(source).isEmpty())
+    }
+
+    @Test
+    fun healthyBtreesDoNotHideBrokenFtsIndexDuringWritableValidation() {
+        val context = context()
+        val source = context.getDatabasePath("fts-corrupt-fixture.db")
+        DatabaseRecovery.open(context, source.name).use { database ->
+            val sqlite = database.openHelper.writableDatabase
+            sqlite.execSQL(
+                "INSERT INTO messages(rowId,networkId,conversation,contentHash,senderNick,kind,text,sentByUs,timestampMs) " +
+                    "VALUES(41,'network','#room','fixture-hash','alice','PRIVMSG','searchable needle',0,1000)",
+            )
+            sqlite.execSQL("INSERT INTO message_fts(rowid,sender,body) VALUES(41,'alice','searchable needle')")
+            sqlite.execSQL("DELETE FROM message_fts_segdir")
+        }
+        val original = source.readBytes()
+        SQLiteDatabase.openDatabase(source.path, null, SQLiteDatabase.OPEN_READONLY).use { sqlite ->
+            DatabaseRecovery.validateReadOnly(sqlite, version = "3.32.3")
+        }
+        DatabaseRecovery.open(context, source.name).use { database ->
+            database.openHelper.writableDatabase.query("SELECT COUNT(*) FROM messages").use { rows ->
+                assertTrue(rows.moveToFirst())
+                assertEquals(0L, rows.getLong(0))
+            }
+        }
+        val evidence = StorageRecovery.retainedEvidence(source).single()
+        assertContentEquals(original, File(evidence, source.name).readBytes())
+        assertFalse(StorageRecovery.databaseTemporary.value)
     }
 
     @Test
