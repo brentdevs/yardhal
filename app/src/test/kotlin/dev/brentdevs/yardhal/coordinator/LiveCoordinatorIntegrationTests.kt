@@ -146,7 +146,7 @@ class LiveCoordinatorIntegrationTests {
 
                 coordinator.sendText(config.id, ref.storageKey, "hello")
                 await { coordinator.buffers.value[ref.storageKey]?.messages?.singleOrNull()?.msgid == "echo-1" }
-                await { messages.recent(ref, 10).size == 1 }
+                await { messages.recent(ref, 10).singleOrNull()?.msgid == "echo-1" }
                 assertEquals("echo-1", messages.recent(ref, 10).single().msgid)
 
                 server.send(":alice!u@h PRIVMSG #room :local quote parent")
