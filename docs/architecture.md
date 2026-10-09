@@ -408,6 +408,8 @@ Application initialization opens/validates Room and constructs stores on
 a sticky service promotes to foreground immediately, then awaits initialization
 and coordinator restoration. Session startup is state-locked and rejects retired
 or no-longer-wanted sessions.
+Startup results are consumed asynchronously; publishing ready/failure does not
+mean a waiting activity/service continuation has already run.
 
 Healthy current-schema files receive read-only physical-table checks plus writable
 FTS logical validation, without whole-database backup copies. SQLite before 3.33

@@ -17,6 +17,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -57,10 +58,15 @@ class ApplicationStartupTests {
             assertFalse(shadowOf(service).isStoppedBySelf)
             release.countDown()
             runBlocking {
-                withTimeout(5_000) { app.startup.first { it == ApplicationStartup.FAILED } }
-                assertFalse(app.awaitInitialization())
+                withTimeout(5_000) {
+                    app.startup.first { it == ApplicationStartup.FAILED }
+                    assertFalse(app.awaitInitialization())
+                    while (!shadowOf(service).isStoppedBySelf) {
+                        shadowOf(Looper.getMainLooper()).idle()
+                        delay(10)
+                    }
+                }
             }
-            shadowOf(Looper.getMainLooper()).idle()
             assertTrue(shadowOf(service).isStoppedBySelf)
         } finally {
             release.countDown()
