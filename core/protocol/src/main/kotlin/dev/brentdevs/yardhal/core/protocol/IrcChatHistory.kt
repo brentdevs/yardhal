@@ -17,8 +17,8 @@ public object IrcChatHistory {
     private val timestampFormat = DateTimeFormatterBuilder().appendInstant(3).toFormatter()
     private val defaultReferenceTypes = listOf("timestamp", "msgid")
 
-    public fun support(isupport: ISupport, capabilities: Set<String>): ChatHistorySupport {
-        val enabled = isupport.supports("CHATHISTORY") ||
+    public fun support(isupport: ISupport, capabilities: Set<String>, allowIsupportDiscovery: Boolean = true): ChatHistorySupport {
+        val enabled = (allowIsupportDiscovery && isupport.supports("CHATHISTORY")) ||
             "draft/chathistory" in capabilities || "chathistory" in capabilities
         val maximum = isupport["CHATHISTORY"]?.toLongOrNull()?.takeIf { it > 0 }
         val limit = maximum?.coerceAtMost(CLIENT_LIMIT.toLong())?.toInt() ?: CLIENT_LIMIT

@@ -1,6 +1,8 @@
 package dev.brentdevs.yardhal.core.client
 
 import dev.brentdevs.yardhal.core.protocol.IrcMessage
+import dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks
+import dev.brentdevs.yardhal.core.protocol.IrcTags
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -108,6 +110,116 @@ class ManualAuthenticationRedactionTests {
                 assertTrue(tapped.any { "REGISTER <redacted>" in it })
                 assertTrue(tapped.any { "SET PASSWORD <redacted>" in it })
                 assertEquals("account nickname operator me@example.org", connection.redactPresentation("account nickname operator me@example.org"))
+            } finally {
+                connection.disconnect()
+                scope.cancel()
+            }
+        }
+    }
+
+    @Test
+    fun bouncerManagementRawTapMasksUnknownPasswordsAndRetainsWildcardDiagnostics() = runBlocking {
+        val draftPassword = "draft;secret\\ value"
+        val changedPassword = "changed-secret"
+        val cases = listOf(
+            IrcBouncerNetworks.addNetworkCommand(IrcBouncerNetworks.Attributes(name = "new", pass = draftPassword)) to
+                ":srv NOTICE * :Rejected $draftPassword and ${IrcTags.escape(draftPassword)} done-0",
+            IrcBouncerNetworks.changeNetworkCommand("42", IrcBouncerNetworks.Attributes(pass = changedPassword)) to
+                ":srv NOTICE * :Rejected $changedPassword done-1",
+            "PRIVMSG BouncerServ :network update new -pass service-secret" to
+                ":BouncerServ!service@bouncer NOTICE tester :Rejected service-secret done-2",
+            "PRIVMSG *controlpanel :AddServer account new irc.example +6697 module-secret" to
+                ":*controlpanel!service@znc PRIVMSG tester :Rejected module-secret done-3",
+        )
+        val passwords = listOf(draftPassword, IrcTags.escape(draftPassword), "draft;secret\\", "value", changedPassword, "service-secret", "module-secret")
+        val diagnostic = ":srv NOTICE * :Upstream connection refused"
+        LoopbackIrcServer().use { server ->
+            server.start()
+            server.lineListener = { line ->
+                if (line.startsWith("USER ")) {
+                    server.sendLine(":srv 001 tester :Welcome")
+                } else {
+                    val index = cases.indexOfFirst { it.first == line }
+                    if (index >= 0) {
+                        server.sendLine(":tester!u@h $line")
+                        server.sendLine(cases[index].second)
+                    }
+                }
+            }
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            val tapped = CopyOnWriteArrayList<Pair<Boolean, String>>()
+            val connection = IrcConnection(
+                IrcConnectionConfig(host = "127.0.0.1", port = server.port, tls = false, nick = "tester", capabilities = emptySet()),
+                rawTap = { outbound, line -> tapped += outbound to line },
+            )
+            try {
+                val collector = EventCollector(scope, connection.events)
+                connection.start()
+                collector.awaitRegistered()
+                for ((index, case) in cases.withIndex()) {
+                    connection.sendLine(case.first)
+                    while (true) {
+                        val event = collector.awaitInstance<IrcEvent.MessageReceived>()
+                        if (event.message.parameters.lastOrNull()?.endsWith("done-$index") == true) break
+                    }
+                    assertTrue(server.receivedLines.contains(case.first))
+                }
+                server.sendLine(diagnostic)
+                while (true) {
+                    val event = collector.awaitInstance<IrcEvent.MessageReceived>()
+                    if (event.message.parameters.lastOrNull() == "Upstream connection refused") break
+                }
+                assertTrue(tapped.any { !it.first && it.second == diagnostic })
+                assertTrue(tapped.any { !it.first && it.second == ":srv NOTICE * :Rejected <redacted> and <redacted> done-0" })
+                assertTrue(tapped.any { !it.first && it.second == ":srv NOTICE * :Rejected <redacted> done-1" })
+                assertTrue(tapped.any { it.first && it.second == "BOUNCER ADDNETWORK <redacted>" })
+                assertTrue(tapped.any { it.first && it.second == "BOUNCER CHANGENETWORK <redacted>" })
+                assertFalse(tapped.any { (_, line) -> passwords.any { it in line } })
+            } finally {
+                connection.disconnect()
+                scope.cancel()
+            }
+        }
+    }
+
+    @Test
+    fun zncComposedPassAndRawVaultPasswordAreMaskedAcrossSocketTraffic() = runBlocking {
+        val password = "vault:password\\suffix"
+        val composedPass = "account/network:$password"
+        val diagnostic = ":srv NOTICE * :Rejected $password and $composedPass"
+        LoopbackIrcServer().use { server ->
+            server.start()
+            server.lineListener = { line ->
+                when {
+                    line.startsWith("PASS ") -> server.sendLine(":srv $line")
+                    line.startsWith("USER ") -> {
+                        server.sendLine(":srv 001 tester :Welcome")
+                        server.sendLine(diagnostic)
+                    }
+                }
+            }
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            val tapped = CopyOnWriteArrayList<Pair<Boolean, String>>()
+            val connection = IrcConnection(
+                IrcConnectionConfig(
+                    host = "127.0.0.1", port = server.port, tls = false, nick = "tester", capabilities = emptySet(),
+                    serverPassword = composedPass, knownSecrets = setOf(password),
+                ),
+                rawTap = { outbound, line -> tapped += outbound to line },
+            )
+            try {
+                val collector = EventCollector(scope, connection.events)
+                connection.start()
+                collector.awaitRegistered()
+                while (true) {
+                    val event = collector.awaitInstance<IrcEvent.MessageReceived>()
+                    if (event.message.parameters.lastOrNull() == diagnostic.substringAfter(" :")) break
+                }
+                assertTrue(server.receivedLines.contains("PASS :$composedPass"))
+                assertTrue(tapped.any { it.first && it.second == "PASS <redacted>" })
+                assertTrue(tapped.any { !it.first && it.second == ":srv PASS <redacted>" })
+                assertTrue(tapped.any { !it.first && it.second == ":srv NOTICE * :Rejected <redacted> and <redacted>" })
+                assertFalse(tapped.any { (_, line) -> password in line || composedPass in line })
             } finally {
                 connection.disconnect()
                 scope.cancel()

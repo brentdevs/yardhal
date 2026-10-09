@@ -50,7 +50,7 @@ public object IrcTags {
         return body.isNotEmpty() && body.all { it.isLetterOrDigit() || it in "-./_" }
     }
 
-    internal fun parseSection(section: String): LinkedHashMap<String, String?> {
+    public fun parseSection(section: String): LinkedHashMap<String, String?> {
         val tags = LinkedHashMap<String, String?>()
         if (section.isEmpty()) return tags
         for (entry in section.split(';')) {

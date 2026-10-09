@@ -5,14 +5,15 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 class BouncerServCommandTests {
 
     @Test
     fun networkUpdateToggle() {
-        assertEquals("network update libera -enabled", BouncerServCommand.networkUpdate("libera", true))
-        assertEquals("network update libera -disabled", BouncerServCommand.networkUpdate("libera", false))
+        assertEquals("network update libera -enabled true", BouncerServCommand.networkUpdate("libera", true))
+        assertEquals("network update libera -enabled false", BouncerServCommand.networkUpdate("libera", false))
     }
 
     @Test
@@ -25,17 +26,17 @@ class BouncerServCommandTests {
 
     @Test
     fun durationFormattingPicksLargestUnit() {
-        assertEquals("1d", BouncerServCommand.formatDuration(86400))
+        assertEquals("24h", BouncerServCommand.formatDuration(86400))
         assertEquals("90m", BouncerServCommand.formatDuration(5400))
         assertEquals("59s", BouncerServCommand.formatDuration(59))
         assertEquals("0", BouncerServCommand.formatDuration(0))
-        assertEquals("-1h", BouncerServCommand.formatDuration(-3600))
+        assertFailsWith<IllegalArgumentException> { BouncerServCommand.formatDuration(-3600) }
     }
 
     @Test
     fun channelUpdateAssemblesFlagsInOrder() {
         assertEquals(
-            "channel update '#room' -detach-after 1d -relay-detached highlight -reattach-on message",
+            "channel update '#room' -detach-after 24h -relay-detached highlight -reattach-on message",
             BouncerServCommand.channelUpdate(
                 "#room",
                 detachAfterSeconds = 86400,
@@ -48,7 +49,7 @@ class BouncerServCommandTests {
     @Test
     fun channelStatusVariants() {
         assertEquals("channel status", BouncerServCommand.channelStatus())
-        assertEquals("channel status '#a'", BouncerServCommand.channelStatus("#a"))
+        assertEquals("channel status -network '#a'", BouncerServCommand.channelStatus("#a"))
     }
 }
 
@@ -79,6 +80,9 @@ class BouncerNetworkDraftTests {
         )
         assertNull(BouncerNetworkDraft(addr = "ircs://host:6697").addrValidationError())
         assertTrue(BouncerNetworkDraft(addr = "ircs://host").isValid())
+        assertFalse(BouncerNetworkDraft(addr = "ircs://host:abc").isValid())
+        assertFalse(BouncerNetworkDraft(addr = "ircs://host:999999").isValid())
+        assertFalse(BouncerNetworkDraft(addr = "ircs://[2001:db8::1").isValid())
     }
 
     @Test
@@ -93,6 +97,19 @@ class BouncerNetworkDraftTests {
     }
 
     @Test
+    fun unixAddressesRetainTheirSchemeAndClearTcpAddressFields() {
+        val draft = BouncerNetworkDraft(addr = "irc+unix:///run/irc.sock")
+        val attributes = draft.toAttributes()
+        assertEquals("irc+unix:///run/irc.sock", attributes.host)
+        assertEquals(mapOf("port" to "", "tls" to ""), attributes.unknown)
+        val baseline = IrcBouncerNetworks.Attributes(host = "h", port = 6697, tls = true)
+        val diff = draft.attributesChangedAgainst(baseline)
+        assertEquals("irc+unix:///run/irc.sock", diff.host)
+        assertEquals(mapOf("port" to "", "tls" to ""), diff.unknown)
+        assertEquals(draft.addr, BouncerNetworkDraft.fromAttributes(attributes).addr)
+    }
+
+    @Test
     fun diffContainsOnlyChangedKeys() {
         val baseline = IrcBouncerNetworks.Attributes(name = "n", host = "old", port = 6697, tls = true)
         val diff = BouncerNetworkDraft(addr = "ircs://new", name = "n")
@@ -101,6 +118,76 @@ class BouncerNetworkDraftTests {
         assertNull(diff.name)
         assertNull(diff.port)
         assertNull(diff.pass)
+    }
+
+    @Test
+    fun clearingFieldsAndPasswordIsAnExplicitChange() {
+        val baseline = IrcBouncerNetworks.Attributes(name = "n", host = "h", nickname = "nick", realname = "Old Name")
+        val draft = BouncerNetworkDraft.fromAttributes(baseline).copy(nick = "", realname = "", passwordChanged = true)
+        val diff = draft.attributesChangedAgainst(baseline)
+        assertEquals("", diff.nickname)
+        assertEquals("", diff.realname)
+        assertEquals("", diff.pass)
+        assertNull(diff.host)
+        assertNull(diff.name)
+    }
+
+    @Test
+    fun passwordAndExistingIpv6AreNotLost() {
+        val baseline = IrcBouncerNetworks.Attributes(host = "2001:db8::1", port = 6697, tls = true)
+        val draft = BouncerNetworkDraft.fromAttributes(baseline)
+        assertEquals("ircs://[2001:db8::1]:6697", draft.addr)
+        assertEquals("", draft.attributesChangedAgainst(baseline).attributeString())
+        assertFalse(draft.copy(password = "hidden-password").toString().contains("hidden-password"))
+    }
+
+    @Test
+    fun acceptedAddressUserinfoIsIgnoredAndNeverForwardedOrPrinted() {
+        val draft = BouncerNetworkDraft(addr = "ircs://user:address-secret@[2001:db8::1]:7000")
+        assertTrue(draft.isValid())
+        assertEquals(
+            BouncerNetworkDraft.ParsedAddr(BouncerNetworkDraft.Scheme.TLS, "2001:db8::1", 7000),
+            draft.parseAddr(),
+        )
+        val attributes = draft.toAttributes()
+        assertEquals("2001:db8::1", attributes.host)
+        assertNull(attributes.pass)
+        assertFalse(IrcBouncerNetworks.addNetworkCommand(attributes).contains("address-secret"))
+        assertFalse(draft.toString().contains("address-secret"))
+        assertFalse(BouncerNetworkDraft(addr = "ircs://user:secret@").isValid())
+    }
+
+    @Test
+    fun omittedNativeUnixEndpointRemainsOmittedWhenEditingOtherAttributes() {
+        val native = IrcBouncerNetworks.parseAttributes("name=unix;nickname=old;state=disconnected")
+        val draft = BouncerNetworkDraft.fromAttributes(native)
+        assertEquals("", draft.addr)
+        val diff = draft.copy(nick = "new").attributesChangedAgainst(native)
+        assertEquals("nickname=new", diff.attributeString())
+        assertNull(draft.toAttributes().host)
+        assertNull(draft.toAttributes().port)
+        assertNull(draft.toAttributes().tls)
+    }
+
+    @Test
+    fun nativeUnixHostTakesPrecedenceOverStaleStatusAddress() {
+        val native = IrcBouncerNetworks.Attributes(
+            host = "irc+unix:///run/new.sock", unknown = mapOf("addr" to "irc+unix:///run/old.sock"),
+        )
+        val draft = BouncerNetworkDraft.fromAttributes(native)
+        assertEquals("irc+unix:///run/new.sock", draft.addr)
+        assertEquals("", draft.attributesChangedAgainst(native).attributeString())
+    }
+
+    @Test
+    fun maskedPasswordIsKeptUnlessClearWasExplicitlySelected() {
+        val baseline = IrcBouncerNetworks.Attributes(host = "h", name = "n", pass = "saved-secret")
+        val unchanged = BouncerNetworkDraft.fromAttributes(baseline)
+        assertEquals("", unchanged.password)
+        assertNull(unchanged.copy(name = "renamed").attributesChangedAgainst(baseline).pass)
+        assertEquals("", unchanged.copy(passwordChanged = true).attributesChangedAgainst(baseline).pass)
+        assertEquals("replacement", unchanged.copy(passwordChanged = true, password = "replacement").attributesChangedAgainst(baseline).pass)
+        assertFalse(unchanged.toString().contains("saved-secret"))
     }
 
     @Test

@@ -1,6 +1,7 @@
 package dev.brentdevs.yardhal.coordinator
 
 import dev.brentdevs.yardhal.core.client.AuthenticationRejectedException
+import dev.brentdevs.yardhal.core.client.BouncerBindRejectedException
 import dev.brentdevs.yardhal.core.client.CertificateInspection
 import dev.brentdevs.yardhal.core.client.CertificateRejectedException
 import dev.brentdevs.yardhal.core.client.ReconnectState
@@ -28,6 +29,8 @@ import dev.brentdevs.yardhal.core.data.MuteStore
 import dev.brentdevs.yardhal.core.data.MentionMatcher
 import dev.brentdevs.yardhal.core.data.NetworkConfig
 import dev.brentdevs.yardhal.core.data.NetworkStore
+import dev.brentdevs.yardhal.core.data.NetworkMode
+import dev.brentdevs.yardhal.core.data.SojuUpstreamConfig
 import dev.brentdevs.yardhal.core.data.ReadMarkerStore
 import dev.brentdevs.yardhal.core.data.SaslMode
 import dev.brentdevs.yardhal.core.data.SlashCommand
@@ -156,6 +159,17 @@ public class LiveCoordinator(
     }
 
     private val sessions = ConcurrentHashMap<String, Session>()
+    public val bouncerManagement: BouncerManagement = BouncerManagement(scope, send = { networkId, generation, line ->
+        val session = sessions[networkId] ?: throw java.io.IOException("The bouncer connection is no longer available")
+        synchronized(session.state) {
+            if (sessions[networkId] !== session || session.managementGeneration != generation ||
+                !session.state.registered || session.acceptedEpoch != session.attemptToken ||
+                session.statusFlow.value != ConnectionStatus.REGISTERED
+            ) throw java.io.IOException("The bouncer connection changed before the command could be sent")
+            val connection = session.connection ?: throw java.io.IOException("The bouncer is disconnected")
+            connection.sendLine(line)
+        }
+    })
     private val pendingStorageMigrations = ConcurrentHashMap<String, Int>()
     private val deferredStorageReads = mutableMapOf<String, MutableList<suspend () -> Unit>>()
     private val renamedConversations = ConcurrentHashMap<String, ConversationRef>()
@@ -167,6 +181,29 @@ public class LiveCoordinator(
     private var persistenceTail: Job? = null
     private val coalescedPersistence = mutableMapOf<String, suspend () -> Unit>()
     private var persistenceBatch = 0L
+
+    init {
+        scope.launch {
+            bouncerManagement.accounts.collect { accounts ->
+                synchronized(sessionLifecycleLock) {
+                    for ((parentId, account) in accounts) {
+                        val session = sessions[parentId] ?: continue
+                        if (!account.connected || account.generation != session.managementGeneration ||
+                            managementMode(session) != NetworkMode.SOJU || session.config.bouncerBinding != null
+                        ) continue
+                        for ((netId, attributes) in account.sojuNetworks) {
+                            val enabled = when (attributes.unknown["enabled"]) {
+                                "0" -> false
+                                "1" -> true
+                                else -> continue
+                            }
+                            setDiscoveredUpstreamEnabled(parentId, netId, enabled)
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     private fun enqueueCoalescedPersistence(key: String, operation: suspend () -> Unit) {
         synchronized(persistenceLock) {
@@ -201,7 +238,12 @@ public class LiveCoordinator(
         manuallyWanted: Boolean = false,
         allowStartup: Boolean = true,
     ) {
-        val state = PerNetworkState(config.id, config.nick, config.autojoin).also { it.casemapping = casemapping }
+        val state = PerNetworkState(config.id, config.nick,
+            if (config.mode == NetworkMode.SOJU && config.bouncerBinding == null) emptyList() else config.autojoin,
+            config.bouncerBinding?.netId,
+        ).also {
+            it.casemapping = casemapping
+        }
         val historyGeneration = idGenerator.getAndIncrement()
         var storedMappingKnown = _buffers.value.values.any { it.ref.networkId == config.id }
         val lifecycleJob = SupervisorJob(scope.coroutineContext[Job])
@@ -233,6 +275,8 @@ public class LiveCoordinator(
         var whoisRefreshToken: Long? = null
         var publishedProfileKeys: Set<String> = emptySet()
         var whoisRefreshEpoch: Int? = null
+        var managementGeneration = idGenerator.getAndIncrement()
+        val sojuDiscovery = SojuDiscoveryTracker()
 
         init {
             lifecycleJob.invokeOnCompletion {
@@ -281,6 +325,7 @@ public class LiveCoordinator(
                 val opened = mutableSetOf<String>()
                 try {
                     for (frame in result.frames) {
+                        if (isManagementChat(session, frame)) continue
                         val supported = when (frame.command) {
                             "PRIVMSG", "NOTICE", "TAGMSG", "REDACT" -> true
                             "BATCH" -> !frame.parameters.firstOrNull().orEmpty().startsWith("+") ||
@@ -410,7 +455,7 @@ public class LiveCoordinator(
                 _operationError.value = "Saved conversation state could not be loaded: ${error.message ?: "storage unavailable"}"
             }
             enqueuePersistence {
-                for (config in networkStore.all()) connect(config)
+                for (config in networkStore.all().sortedBy { it.bouncerBinding != null }) connect(config)
                 for (config in networkStore.all()) {
                     val retained = startupShellKeys[config.id].orEmpty().mapNotNull { _buffers.value[it]?.ref }
                     retainConversationShells(config.id, retained, emptyList(), startupSelection)
@@ -1027,22 +1072,173 @@ public class LiveCoordinator(
 
     public fun connectNetwork(networkId: String) {
         synchronized(sessionLifecycleLock) {
-            if (!saveDisconnectIntent(networkId, false)) {
+            val saved = networkStore.byId(networkId) ?: return
+            val binding = saved.bouncerBinding
+            if (binding != null) {
+                if (!binding.enabled) {
+                    showConnectionError(networkId, "This upstream is disabled on the bouncer. Enable it in bouncer management before connecting.")
+                    return
+                }
+                val parent = networkStore.byId(binding.parentId) ?: return
+                if (sessions[parent.id]?.recovery?.desiredConnection != true || parent.userDisconnected) connectNetwork(parent.id)
+                if (sessions[parent.id]?.recovery?.desiredConnection != true) return
+            }
+            val config = saved.copy(userDisconnected = false, bouncerBinding = binding?.copy(rejectionReason = null))
+            if (config != saved && !networkStore.update(config)) {
                 showConnectionError(networkId, "Could not save Connect intent. Check device storage and retry; the saved disconnect preference is unchanged.")
                 return
             }
-            val config = networkStore.byId(networkId) ?: return
-            val previous = sessions[networkId]
-            if (previous == null) {
-                startSession(config, manuallyWanted = true)
-            } else {
-                synchronized(previous.state) {
-                    val mapping = previous.state.casemapping
-                    stopSession(previous, "Connecting with current network settings")
-                    startSession(config, mapping, manuallyWanted = true)
+            restartSession(config, manuallyWanted = true)
+            if (binding == null) resumeDependents(networkId)
+        }
+    }
+
+    public fun dependentNetworks(parentId: String): List<NetworkConfig> = networkStore.dependents(parentId)
+
+    private fun restartSession(config: NetworkConfig, manuallyWanted: Boolean, allowStartup: Boolean = false) {
+        val previous = sessions[config.id]
+        val mapping = previous?.state?.casemapping ?: restoredCasemapping[config.id] ?: CaseMapping.RFC1459
+        if (previous != null) synchronized(previous.state) { stopSession(previous, "Connecting with current network settings") }
+        startSession(config, mapping, manuallyWanted, allowStartup)
+    }
+
+    private fun upstreamEligible(config: NetworkConfig): Boolean {
+        val binding = config.bouncerBinding ?: return true
+        if (!binding.enabled || binding.rejectionReason != null) return false
+        val parent = networkStore.byId(binding.parentId) ?: return false
+        return !parent.userDisconnected && sessions[parent.id]?.recovery?.desiredConnection == true
+    }
+
+    private fun resumeDependents(parentId: String) {
+        for (config in networkStore.dependents(parentId)) {
+            val current = sessions[config.id]
+            if (current == null) startSession(config)
+            else if (upstreamEligible(current.config) && current.recovery.desiredConnection) launchSession(current)
+        }
+    }
+
+    private fun managementMode(session: Session): NetworkMode =
+        if (session.config.mode == NetworkMode.DIRECT &&
+            dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.CAPABILITY in session.state.supportedCaps
+        ) NetworkMode.SOJU else session.config.mode
+
+    private fun isBouncerOwnedSession(session: Session): Boolean =
+        session.config.bouncerBinding != null || session.config.mode == NetworkMode.ZNC ||
+            dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.CAPABILITY in session.state.supportedCaps ||
+            session.state.supportedCaps.any { it.startsWith("znc.in/") }
+
+    private fun isManagementChat(session: Session, message: IrcMessage): Boolean {
+        if (managementMode(session) == NetworkMode.DIRECT ||
+            (message.command != "PRIVMSG" && message.command != "NOTICE" && message.command != "TAGMSG")
+        ) return false
+        val sender = message.prefix?.nick.orEmpty()
+        val target = message.parameters.firstOrNull().orEmpty()
+        return sender.equals("BouncerServ", true) || target.equals("BouncerServ", true) ||
+            sender.equals("*status", true) || target.equals("*status", true) ||
+            sender.equals("*controlpanel", true) || target.equals("*controlpanel", true)
+    }
+
+    private fun restoredSojuAttributes(parentId: String): Map<String, dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.Attributes> =
+        networkStore.dependents(parentId).mapNotNull { config ->
+            config.bouncerBinding?.let { binding ->
+                binding.netId to dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.Attributes(
+                    name = config.name, nickname = binding.nickname, realname = binding.realName,
+                )
+            }
+        }.toMap()
+
+    private fun reconcileSojuDiscovery(session: Session, message: IrcMessage) {
+        for (change in session.sojuDiscovery.receive(session.managementGeneration, message)) {
+            when (change) {
+                is SojuDiscoveryChange.Upsert -> reconcileSojuUpstream(session.config, change.netId, change.attributes)
+                is SojuDiscoveryChange.Delete -> networkStore.dependents(session.config.id)
+                    .firstOrNull { it.bouncerBinding?.netId == change.netId }?.let { config ->
+                        if (!removeNetwork(config.id)) stopDeletedUpstream(config)
+                    }
+                is SojuDiscoveryChange.Snapshot -> {
+                    val absent = networkStore.dependents(session.config.id).filter { it.bouncerBinding?.netId !in change.netIds }
+                    if (absent.isNotEmpty()) {
+                        if (networkStore.removeAll(absent.map { it.id }.toSet())) {
+                            for (config in absent) removePersistedNetwork(config)
+                            refreshNetworkStates()
+                        } else {
+                            for (config in absent) stopDeletedUpstream(config)
+                            _operationError.value = "The bouncer's removed upstreams are stopped, but their saved rows could not be deleted. Existing conversations were retained."
+                        }
+                    }
                 }
             }
         }
+    }
+
+    private fun reconcileSojuUpstream(
+        parent: NetworkConfig,
+        netId: String,
+        attributes: dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.Attributes,
+    ) {
+        val saved = networkStore.dependents(parent.id).firstOrNull { it.bouncerBinding?.netId == netId }
+        val previous = saved?.let { sessions[it.id]?.config ?: it }
+        val updated = SojuUpstreamConfig.reconcile(parent, netId, attributes, previous)
+        if (previous == null && networkStore.byId(updated.id) != null) {
+            _operationError.value = "A saved network conflicts with this upstream's stable identity. Existing conversations were retained."
+            return
+        }
+        if (!networkStore.upsertAll(listOf(updated))) {
+            _operationError.value = "The discovered upstream could not be saved. Check device storage and refresh bouncer management."
+            return
+        }
+        if (previous == null || sessions[updated.id] == null) {
+            startSession(
+                updated,
+                manuallyWanted = previous == null && sessions[parent.id]?.recovery?.desiredConnection == true && !updated.userDisconnected,
+            )
+        } else applyUpdatedConfig(previous, updated, credentialsChanged = false)
+        val child = sessions[updated.id]
+        if (child != null && attributes.error != null && child.config.bouncerBinding?.rejectionReason == null) {
+            child.connectionError = attributes.error?.takeIf(String::isNotEmpty)?.let {
+                "Upstream reported: ${redactPresentation(child, it)}"
+            }
+        }
+        refreshNetworkStates()
+    }
+
+    public fun setDiscoveredUpstreamEnabled(parentId: String, netId: String, enabled: Boolean): Boolean =
+        synchronized(sessionLifecycleLock) {
+            val previous = networkStore.dependents(parentId).firstOrNull { it.bouncerBinding?.netId == netId }
+                ?: return@synchronized false
+            val binding = previous.bouncerBinding ?: return@synchronized false
+            val runtimeBinding = sessions[previous.id]?.config?.bouncerBinding
+            if (binding.enabled == enabled && (runtimeBinding == null || runtimeBinding.enabled == enabled)) return@synchronized true
+            val updated = previous.copy(bouncerBinding = binding.copy(enabled = enabled, rejectionReason = binding.rejectionReason.takeUnless { enabled }))
+            val persisted = updated == previous || networkStore.update(updated)
+            if (!persisted) {
+                _operationError.value = "The upstream's enabled state was applied for this session, but could not be saved. Check device storage and refresh bouncer management."
+            }
+            applyUpdatedConfig(previous, updated, credentialsChanged = false)
+            if (sessions[updated.id] == null) startSession(updated)
+            refreshNetworkStates()
+            persisted
+        }
+
+    private fun persistUpstreamRejection(session: Session, reason: String) {
+        val saved = networkStore.byId(session.config.id) ?: return
+        val binding = saved.bouncerBinding ?: return
+        val updated = saved.copy(bouncerBinding = binding.copy(rejectionReason = redactPresentation(session, reason)))
+        session.config = updated
+        if (!networkStore.update(updated)) {
+            _operationError.value = "The rejected upstream is stopped for this session, but its restart state could not be saved."
+        }
+    }
+
+    private fun stopDeletedUpstream(config: NetworkConfig) {
+        val previous = sessions[config.id]?.config ?: config
+        val binding = previous.bouncerBinding ?: return
+        val updated = previous.copy(bouncerBinding = binding.copy(
+            rejectionReason = "The bouncer removed this upstream, but its saved row could not be deleted.",
+        ))
+        if (sessions[config.id] == null) startSession(updated, allowStartup = false)
+        else applyUpdatedConfig(previous, updated, credentialsChanged = false)
+        refreshNetworkStates()
     }
 
     public fun updateConnectivity(available: Boolean, networkHandle: Long? = null) {
@@ -1093,9 +1289,10 @@ public class LiveCoordinator(
                     effective.port != inspection.port
                 ) return@trust false
                 val config = networkStore.byId(networkId) ?: return@trust false
-                val updated = config.copy(certificatePin = CertificatePin(inspection.host, inspection.port, leaf.sha256))
+                val account = config.bouncerBinding?.parentId?.let(networkStore::byId) ?: config
+                val updated = account.copy(certificatePin = CertificatePin(inspection.host, inspection.port, leaf.sha256))
                 val persisted = try {
-                    networkStore.update(updated)
+                    updateNetwork(updated)
                 } catch (_: java.io.IOException) {
                     false
                 }
@@ -1103,10 +1300,6 @@ public class LiveCoordinator(
                     showConnectionError(networkId, "Certificate trust was not saved. Check device storage and retry.")
                     return@trust false
                 }
-                val wanted = session.recovery.desiredConnection
-                val mapping = session.state.casemapping
-                stopSession(session, "Certificate trust changed")
-                startSession(updated, mapping, manuallyWanted = wanted)
                 true
             }
         }
@@ -1114,9 +1307,10 @@ public class LiveCoordinator(
     public fun removeCertificateTrust(networkId: String): Boolean =
         synchronized(sessionLifecycleLock) remove@{
             val saved = networkStore.byId(networkId) ?: return@remove false
-            if (saved.certificatePin == null) return@remove false
+            val account = saved.bouncerBinding?.parentId?.let(networkStore::byId) ?: saved
+            if (account.certificatePin == null) return@remove false
             val removed = try {
-                updateNetwork(saved.copy(certificatePin = null))
+                updateNetwork(account.copy(certificatePin = null))
             } catch (_: java.io.IOException) {
                 false
             }
@@ -1128,28 +1322,43 @@ public class LiveCoordinator(
         synchronized(sessionLifecycleLock) update@{
             val saved = networkStore.byId(config.id) ?: return@update false
             val updated = config.copy(userDisconnected = saved.userDisconnected)
-            val session = sessions[config.id]
-            if (session == null) {
-                if (!networkStore.update(updated)) return@update false
-                clearNewAutojoins(saved, updated, CaseMapping.RFC1459)
-                refreshNetworkStates()
-            } else {
-                synchronized(session.state) {
-                    if (!networkStore.update(updated)) return@update false
-                    clearNewAutojoins(saved, updated, session.state.casemapping)
-                    if (!credentialsChanged && session.config.connectionSettingsMatch(updated)) {
-                        session.config = updated
-                        refreshNetworkStates()
-                    } else {
-                        val wanted = session.recovery.desiredConnection && !updated.userDisconnected
-                        val mapping = session.state.casemapping
-                        stopSession(session, "Network settings changed")
-                        startSession(updated, mapping, manuallyWanted = wanted, allowStartup = false)
-                    }
-                }
+            if (saved.bouncerBinding == null && networkStore.dependents(saved.id).isNotEmpty() && updated.mode != NetworkMode.SOJU) {
+                _operationError.value = "Remove the discovered upstreams before changing this bouncer account to another connection mode."
+                return@update false
             }
+            val resetRejectedUpstreams = credentialsChanged || !saved.connectionSettingsMatch(updated)
+            val children = networkStore.dependents(config.id).map { savedChild ->
+                val child = sessions[savedChild.id]?.config ?: savedChild
+                val binding = child.bouncerBinding
+                SojuUpstreamConfig.inherit(updated, if (resetRejectedUpstreams) child.copy(
+                    bouncerBinding = binding?.copy(rejectionReason = null),
+                ) else child)
+            }
+            if (!networkStore.upsertAll(listOf(updated) + children)) return@update false
+            applyUpdatedConfig(saved, updated, credentialsChanged)
+            for (child in children) {
+                val previous = sessions[child.id]?.config ?: continue
+                applyUpdatedConfig(previous, child, credentialsChanged)
+            }
+            refreshNetworkStates()
             true
         }
+
+    private fun applyUpdatedConfig(previous: NetworkConfig, updated: NetworkConfig, credentialsChanged: Boolean) {
+        val session = sessions[updated.id]
+        clearNewAutojoins(previous, updated, session?.state?.casemapping ?: CaseMapping.RFC1459)
+        if (session == null) return
+        synchronized(session.state) {
+            if (!credentialsChanged && session.config.connectionSettingsMatch(updated)) {
+                session.config = updated
+            } else {
+                val wanted = session.recovery.desiredConnection && !updated.userDisconnected
+                val mapping = session.state.casemapping
+                stopSession(session, "Network settings changed")
+                startSession(updated, mapping, manuallyWanted = wanted, allowStartup = false)
+            }
+        }
+    }
 
     private fun NetworkConfig.connectionSettingsMatch(other: NetworkConfig): Boolean =
         id == other.id &&
@@ -1172,6 +1381,9 @@ public class LiveCoordinator(
             proxy == other.proxy &&
             tlsClientAlias == other.tlsClientAlias &&
             certificatePin == other.certificatePin &&
+            mode == other.mode &&
+            bouncerBinding == other.bouncerBinding &&
+            zncNetwork == other.zncNetwork &&
             saslPassword == other.saslPassword &&
             serverPassword == other.serverPassword &&
             nickServPassword == other.nickServPassword &&
@@ -1198,6 +1410,8 @@ public class LiveCoordinator(
         val session = Session(config, casemapping, manuallyWanted, allowStartup)
         session.recovery.handle(RecoverySignal.START)
         sessions[config.id] = session
+        bouncerManagement.start(config.id, session.managementGeneration, managementMode(session),
+            config.saslAuthcid.orEmpty(), config.bouncerBinding?.netId ?: config.zncNetwork)
         _profiles.update { profiles ->
             val retained = profiles[config.id] ?: return@update profiles
             profiles + (config.id to retained.copy(byFoldedNick = retained.byFoldedNick.mapValues { (_, profile) ->
@@ -1213,12 +1427,15 @@ public class LiveCoordinator(
                 joinState = if (buffer.ref.kind == ConversationKind.CHANNEL &&
                     !channelOrder.isParted(buffer.ref.storageKey)
                 ) {
-                    if (session.recovery.desiredConnection) JoinState.JOINING else JoinState.IDLE
+                    if (session.recovery.desiredConnection && upstreamEligible(config)) JoinState.JOINING else JoinState.IDLE
                 } else buffer.joinState,
             )
         }
         ensureBaseBuffers(session)
         restoreKnownConversations(session)
+        session.connectionError = config.bouncerBinding?.let { binding ->
+            binding.rejectionReason ?: if (!binding.enabled) "This upstream is disabled on the bouncer." else null
+        }
         refreshNetworkStates()
         if (session.recovery.desiredConnection) launchSession(session)
     }
@@ -1287,6 +1504,13 @@ public class LiveCoordinator(
                 session.connectionError?.let { ingestRaw(networkId, false, it) }
                 refreshNetworkStates()
             }
+            if (saved.bouncerBinding == null) {
+                for (child in networkStore.dependents(networkId)) {
+                    val dependent = sessions[child.id] ?: continue
+                    val wanted = dependent.recovery.desiredConnection
+                    restartSession(dependent.config, manuallyWanted = wanted)
+                }
+            }
         }
     }
 
@@ -1316,6 +1540,7 @@ public class LiveCoordinator(
     private fun retireTransport(session: Session, quitReason: String) {
         session.quitRequested = true
         sendRaw(session, "QUIT :$quitReason")
+        bouncerManagement.disconnected(session.config.id, session.managementGeneration)
         session.acceptedEpoch = null
         session.state.registered = false
         session.statusFlow.value = ConnectionStatus.DISCONNECTED
@@ -1329,11 +1554,21 @@ public class LiveCoordinator(
         session.lifecycleJob.cancel()
     }
 
-    public fun removeNetwork(networkId: String) {
-        synchronized(sessionLifecycleLock) {
-            val saved = networkStore.byId(networkId) ?: return
-            if (!networkStore.remove(networkId)) return
-            synchronized(persistenceLock) { persistenceBatch += 1 }
+    public fun removeNetwork(networkId: String): Boolean = synchronized(sessionLifecycleLock) {
+        val saved = networkStore.byId(networkId) ?: return@synchronized false
+        val removed = listOf(saved) + networkStore.dependents(networkId)
+        if (!networkStore.removeAll(removed.map { it.id }.toSet())) {
+            _operationError.value = "The network and its upstreams were not removed because the configuration could not be saved."
+            return@synchronized false
+        }
+        synchronized(persistenceLock) { persistenceBatch += 1 }
+        for (config in removed) removePersistedNetwork(config)
+        refreshNetworkStates()
+        true
+    }
+
+    private fun removePersistedNetwork(saved: NetworkConfig) {
+            val networkId = saved.id
             sessions[networkId]?.let { session ->
                 synchronized(session.state) { stopSession(session, "Network removed") }
             }
@@ -1341,6 +1576,10 @@ public class LiveCoordinator(
                 messageStore.deleteNetwork(networkId)
                 offlineStore?.deleteNetwork(networkId)
                 readMarkers.deleteNetwork(networkId)
+                channelOrder.forgetNetwork(networkId)
+                mutes.deleteNetwork(networkId)
+                _orderState.value = channelOrder.snapshot()
+                _mutedState.value = mutes.all()
                 try {
                     networkStore.deleteUnreferencedPasswords(
                         listOfNotNull(saved.saslPasswordRef, saved.serverPasswordRef, saved.nickServPasswordRef, saved.proxy?.passwordRef),
@@ -1351,6 +1590,7 @@ public class LiveCoordinator(
                 }
             }
             history.removeNetwork(networkId)
+            bouncerManagement.remove(networkId)
             synchronized(selectionLock) {
                 if (selectedStorageKey?.substringBefore("|") == networkId) {
                     selectedStorageKey = null
@@ -1377,8 +1617,6 @@ public class LiveCoordinator(
             if (_whoisPresentation.value?.networkId == networkId) dismissWhois()
             rawLogs.remove(networkId)
             _rawLogVersion.update { it + 1 }
-            refreshNetworkStates()
-        }
     }
 
     private fun redactPresentation(session: Session, rawText: String): String {
@@ -1413,7 +1651,7 @@ public class LiveCoordinator(
 
     private fun launchSession(session: Session) = synchronized(session.state) {
         if (sessions[session.config.id] !== session || session.quitRequested || !session.lifecycleJob.isActive ||
-            !session.recovery.desiredConnection || session.reconnector != null
+            !session.recovery.desiredConnection || session.reconnector != null || !upstreamEligible(session.config)
         ) return@synchronized
         if (startupRequested && !_restorationReady.value) return@synchronized
         val reconnector = IrcReconnector(
@@ -1429,6 +1667,7 @@ public class LiveCoordinator(
                     session.redactionConnection = null
                     token = session.reconnector?.currentEpoch ?: throw kotlinx.coroutines.CancellationException()
                     session.attemptToken = token
+                    session.managementGeneration = idGenerator.getAndIncrement()
                     session.recovery.handle(RecoverySignal.CONNECTING, token)
                     session.acceptedEpoch = token.takeIf { networkAvailable && session.recovery.phase == RecoveryPhase.CONNECTING }
                     session.statusFlow.value = ConnectionStatus.CONNECTING
@@ -1443,12 +1682,7 @@ public class LiveCoordinator(
                         throw kotlinx.coroutines.CancellationException()
                     }
                     session.effective = effective
-                    session.presentationSecrets = buildSet {
-                        effective.saslPassword?.takeIf(String::isNotEmpty)?.let { add(it) }
-                        effective.serverPassword?.takeIf(String::isNotEmpty)?.let { add(it) }
-                        effective.nickServPassword?.takeIf(String::isNotEmpty)?.let { add(it) }
-                        effective.proxyPassword?.takeIf(String::isNotEmpty)?.let { add(it) }
-                    }
+                    session.presentationSecrets = effective.knownSecrets
                 }
                 connectionFactory.create(effective) { port ->
                     synchronized(session.state) {
@@ -1487,14 +1721,41 @@ public class LiveCoordinator(
         reconnector.start()
     }
 
-    private fun effectiveConfig(config: NetworkConfig, stsUpgradePort: Int? = null): NetworkConfig {
-        val saslPassword = resolvePassword(config.saslPasswordRef, config.saslPassword, "SASL")
-        if ((config.saslMode == SaslMode.PLAIN || config.saslMode == SaslMode.SCRAM_SHA_256) &&
+    private fun effectiveConfig(savedConfig: NetworkConfig, stsUpgradePort: Int? = null): NetworkConfig {
+        val config = savedConfig.bouncerBinding?.let { binding ->
+            val parent = networkStore.byId(binding.parentId)
+                ?: throw BouncerBindRejectedException("The parent bouncer account no longer exists.")
+            SojuUpstreamConfig.inherit(parent, savedConfig)
+        } ?: savedConfig
+        val znc = config.mode == NetworkMode.ZNC
+        val saslPassword = if (znc) null else resolvePassword(config.saslPasswordRef, config.saslPassword, "SASL")
+        if (!znc && (config.saslMode == SaslMode.PLAIN || config.saslMode == SaslMode.SCRAM_SHA_256) &&
             saslPassword.isNullOrEmpty()
         ) throw AuthenticationRejectedException("The selected SASL mechanism requires a saved password. Replace it in network settings.")
-        val serverPassword = resolvePassword(config.serverPasswordRef, config.serverPassword, "server")
+        if (config.mode == NetworkMode.SOJU &&
+            (config.saslAuthcid?.any { it.isWhitespace() || it == '\u0000' } == true ||
+                saslPassword?.contains('\u0000') == true)
+        ) throw AuthenticationRejectedException("The soju account or password contains an invalid authentication value. Correct account settings.")
+        val savedServerPassword = resolvePassword(config.serverPasswordRef, config.serverPassword, if (znc) "ZNC account" else "server")
         val nickServPassword = resolvePassword(config.nickServPasswordRef, config.nickServPassword, "NickServ")
         val proxyPassword = resolvePassword(config.proxy?.passwordRef, config.proxyPassword, "proxy")
+        val knownSecrets = buildSet {
+            addAll(config.knownSecrets)
+            saslPassword?.takeIf(String::isNotEmpty)?.let { add(it) }
+            savedServerPassword?.takeIf(String::isNotEmpty)?.let { add(it) }
+            nickServPassword?.takeIf(String::isNotEmpty)?.let { add(it) }
+            proxyPassword?.takeIf(String::isNotEmpty)?.let { add(it) }
+        }
+        val serverPassword = if (znc) {
+            val account = config.saslAuthcid?.takeIf { it.isNotBlank() && it.none { character -> character.isWhitespace() || character in "\u0000\r\n:/@" } }
+                ?: throw AuthenticationRejectedException("The ZNC account username is missing or invalid. Correct account settings.")
+            val network = config.zncNetwork?.takeIf { it.isNotBlank() }
+            if (network?.any { it.isWhitespace() || it in "\u0000\r\n:/@" } == true) {
+                throw AuthenticationRejectedException("The ZNC network name is invalid. Correct account settings.")
+            }
+            val password = savedServerPassword ?: throw AuthenticationRejectedException("The ZNC account password is missing. Replace it in account settings.")
+            if (network == null) "$account:$password" else "$account/$network:$password"
+        } else savedServerPassword
         if (nickServPassword != null && (config.nickServService.isBlank() ||
                 config.nickServService.any { it.isWhitespace() || it in "\u0000\r\n:,#&*" || it == '$' } ||
                 config.nickServAccount?.let { it.isBlank() || it.any { character -> character.isWhitespace() || character in "\u0000\r\n" } } == true ||
@@ -1516,11 +1777,11 @@ public class LiveCoordinator(
         val securePort = (decision as? StsUpgradeDecision.UpgradeRequired)?.port ?: stsUpgradePort
         val effectiveTls = config.tls || securePort != null
         val effectivePort = securePort ?: config.port
-        if (config.saslMode == SaslMode.EXTERNAL && !effectiveTls) {
+        if (!znc && config.saslMode == SaslMode.EXTERNAL && !effectiveTls) {
             throw TlsIdentityUnavailableException("SASL EXTERNAL requires TLS. Enable TLS in network security settings.")
         }
         val identity = config.tlsClientAlias?.let(clientIdentityProvider) ?: config.tlsClientIdentity
-        if (config.saslMode == SaslMode.EXTERNAL && identity == null) {
+        if (!znc && config.saslMode == SaslMode.EXTERNAL && identity == null) {
             throw TlsIdentityUnavailableException("SASL EXTERNAL requires TLS and a selected client certificate. Correct the network security settings.")
         }
         val pin = config.certificatePin?.takeIf {
@@ -1529,13 +1790,15 @@ public class LiveCoordinator(
         return config.copy(
             port = effectivePort,
             tls = effectiveTls,
-            saslAuthcid = config.saslAuthcid.takeIf { saslPassword != null || config.saslMode == SaslMode.EXTERNAL },
+            saslAuthcid = config.saslAuthcid.takeIf { !znc && (saslPassword != null || config.saslMode == SaslMode.EXTERNAL) },
             saslPassword = saslPassword,
+            saslMode = if (znc) SaslMode.AUTO else config.saslMode,
             serverPassword = serverPassword,
             nickServPassword = nickServPassword,
             proxyPassword = proxyPassword,
             tlsClientIdentity = identity,
             certificatePin = pin,
+            knownSecrets = knownSecrets,
         )
     }
 
@@ -1552,6 +1815,7 @@ public class LiveCoordinator(
     }
 
     private fun recover(session: Session, signal: RecoverySignal) {
+        if (!upstreamEligible(session.config)) return
         when (session.recovery.handle(signal)) {
             RecoveryAction.NONE -> Unit
             RecoveryAction.START -> launchSession(session)
@@ -1612,6 +1876,7 @@ public class LiveCoordinator(
 
     private fun routeEvent(session: Session, envelope: ReconnectionEvent) {
         val event = envelope.event
+        synchronized(sessionLifecycleLock) {
         synchronized(session.state) {
             if (session.reconnector?.currentEpoch != envelope.epoch || session.attemptToken != envelope.epoch ||
                 envelope.connection != null && session.connection !== envelope.connection
@@ -1622,6 +1887,21 @@ public class LiveCoordinator(
             if (session.recovery.phase == RecoveryPhase.AUTHENTICATION_REJECTED ||
                 session.recovery.phase == RecoveryPhase.CERTIFICATE_REJECTED
             ) return
+            if (event is IrcEvent.ConnectionOpened) {
+                session.sojuDiscovery.begin(session.managementGeneration, restoredSojuAttributes(session.config.id))
+                bouncerManagement.start(session.config.id, session.managementGeneration, managementMode(session),
+                    session.config.saslAuthcid.orEmpty(), session.config.bouncerBinding?.netId ?: session.config.zncNetwork)
+            }
+            if (event is IrcEvent.CapabilitiesNegotiated &&
+                session.config.mode == NetworkMode.DIRECT &&
+                dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.CAPABILITY in event.capabilities
+            ) {
+                val updated = session.config.copy(mode = NetworkMode.SOJU)
+                if (networkStore.update(updated)) session.config = updated
+                else _operationError.value = "The discovered soju account mode could not be saved. Check device storage."
+                bouncerManagement.start(session.config.id, session.managementGeneration, NetworkMode.SOJU,
+                    session.config.saslAuthcid.orEmpty())
+            }
             if (event is IrcEvent.Registered) {
                 if (session.state.registered || session.pendingRegistration != null) return
                 if (session.authenticatedNick == "*") {
@@ -1636,6 +1916,10 @@ public class LiveCoordinator(
                 return
             }
             if (event is IrcEvent.MessageReceived) {
+                if (managementMode(session) == NetworkMode.SOJU && session.config.bouncerBinding == null) {
+                    reconcileSojuDiscovery(session, event.message)
+                }
+                if (bouncerManagement.receive(session.config.id, session.managementGeneration, event.message)) return
                 updateAuthenticatedIdentity(session, event.message)
                 val gate = session.identificationGate
                 if (gate != null && event.message.tags["batch"] == null) {
@@ -1707,7 +1991,12 @@ public class LiveCoordinator(
                 )
             }
             for (effect in effects) processEffect(session, effect)
-            if (event is IrcEvent.CapabilitiesNegotiated) replayPendingReadMarkers(session)
+            if (event is IrcEvent.CapabilitiesNegotiated) {
+                if (session.state.registered) bouncerManagement.capabilitiesChanged(
+                    session.config.id, session.managementGeneration, session.state.supportedCaps,
+                )
+                replayPendingReadMarkers(session)
+            }
             when (event) {
                 is IrcEvent.ConnectionOpened -> {
                     session.replayedReadCursors.clear()
@@ -1717,6 +2006,7 @@ public class LiveCoordinator(
                     session.statusFlow.value = ConnectionStatus.CONNECTING
                 }
                 is IrcEvent.Disconnected -> {
+                    bouncerManagement.disconnected(session.config.id, session.managementGeneration)
                     markNetworkCached(session.config.id)
                     session.connection = null
                     session.acceptedEpoch = null
@@ -1725,6 +2015,7 @@ public class LiveCoordinator(
                 else -> Unit
             }
             refreshNetworkStates()
+        }
         }
     }
 
@@ -1781,7 +2072,11 @@ public class LiveCoordinator(
         history.registered(
             session.config.id, session.historyGeneration, session.state.connectionEpoch.toLong(),
             session.state.casemapping, session.state.ownNick, session.state.isupport, session.state.supportedCaps,
+            allowIsupportDiscovery = session.config.mode != NetworkMode.ZNC,
         )
+        bouncerManagement.connected(session.config.id, session.managementGeneration, managementMode(session),
+            session.state.supportedCaps, session.config.saslAuthcid.orEmpty(),
+            session.config.bouncerBinding?.netId ?: session.config.zncNetwork)
         replayPendingReadMarkers(session)
         refreshRequestedWhois(session)
         refreshNetworkStates()
@@ -1880,6 +2175,11 @@ public class LiveCoordinator(
         var certificateFailure: CertificateException? = null
         while (error != null && depth < 32) {
             when (error) {
+                is BouncerBindRejectedException -> {
+                    persistUpstreamRejection(session, error.message ?: "The bouncer rejected this upstream.")
+                    authenticationFailed(session, error.message ?: "The bouncer rejected this upstream.")
+                    return
+                }
                 is CertificateRejectedException -> {
                     session.rejectedCertificate = error.inspection
                     session.connectionError = "The server certificate was rejected. Inspect its details before deciding whether to trust it."
@@ -1944,7 +2244,7 @@ public class LiveCoordinator(
             isIgnored = { nick -> ignoreStore?.isIgnored(nick) == true },
             hasBuffer = { key -> key in _buffers.value },
             openChannels = {
-                _buffers.value.values
+                if (managementMode(session) == NetworkMode.SOJU && session.config.bouncerBinding == null) emptyList() else _buffers.value.values
                     .filter {
                         it.ref.networkId == networkId && it.ref.kind == ConversationKind.CHANNEL &&
                             !channelOrder.isParted(it.ref.storageKey)
@@ -2014,9 +2314,26 @@ public class LiveCoordinator(
                 persistOpenedShell(effect.ref)
             }
             is InboundEffect.RemoveBuffer -> {
-                removeBuffer(effect.ref.storageKey)
-                channelOrder.markParted(effect.ref.storageKey)
-                _orderState.value = channelOrder.snapshot()
+                if (isBouncerOwnedSession(session) && !channelOrder.isParted(effect.ref.storageKey)) {
+                    loadedRosters.remove(effect.ref.storageKey)
+                    rosterObservedAt.remove(effect.ref.storageKey)
+                    updateBufferKey(effect.ref.storageKey) { current ->
+                        current.copy(
+                            joinState = JoinState.IDLE,
+                            members = emptyList(),
+                            memberPresence = emptyMap(),
+                            typingUsers = emptyMap(),
+                            cachedRoster = false,
+                            rosterTruncated = false,
+                            cachedTopic = current.cachedTopic || topicObservedAt.containsKey(current.key),
+                            cachedModes = current.cachedModes || modesObservedAt.containsKey(current.key),
+                        )
+                    }
+                } else {
+                    removeBuffer(effect.ref.storageKey)
+                    channelOrder.markParted(effect.ref.storageKey)
+                    _orderState.value = channelOrder.snapshot()
+                }
             }
             is InboundEffect.RenameBuffer -> renameConversation(session, effect.from, effect.to)
             is InboundEffect.AppendMessage -> appendChat(
@@ -2070,6 +2387,10 @@ public class LiveCoordinator(
                 if (effect.complete) persistSnapshot(session, effect.ref)
             }
             is InboundEffect.SetJoinState -> {
+                if (effect.state == JoinState.JOINED && isBouncerOwnedSession(session) && channelOrder.isParted(effect.ref.storageKey)) {
+                    channelOrder.clearParted(effect.ref.storageKey)
+                    _orderState.value = channelOrder.snapshot()
+                }
                 updateBuffer(effect.ref) { it.copy(joinState = effect.state) }
                 if (effect.state == JoinState.JOINED && synchronized(selectionLock) { selectedStorageKey == effect.ref.storageKey }) {
                     ensureMembers(session.config.id, effect.ref.storageKey)
@@ -2118,7 +2439,7 @@ public class LiveCoordinator(
             is InboundEffect.WhoisCompleted -> completeWhois(session, effect.info)
             is InboundEffect.ChannelListed -> _channelList.update { it + effect.entry }
             is InboundEffect.ChannelListFinished -> _channelList.update { list -> list.sortedByDescending { it.users } }
-            is InboundEffect.BouncerNetworksChanged -> bumpBouncerVersion()
+            is InboundEffect.BouncerNetworksChanged -> refreshNetworkStates()
             is InboundEffect.NetworkFeaturesChanged -> refreshNetworkStates()
         }
     }
@@ -2483,82 +2804,17 @@ public class LiveCoordinator(
 
     private fun ensureBaseBuffers(session: Session) {
         buffer(ConversationRef.server(session.config.id))
+        if (managementMode(session) == NetworkMode.SOJU && session.config.bouncerBinding == null) return
         for (channel in session.config.autojoin) {
             val ref = ConversationRef.channel(session.config.id, channel, session.state.casemapping)
             if (!channelOrder.isParted(ref.storageKey)) {
                 updateBuffer(ref) {
-                    it.copy(joinState = if (session.recovery.desiredConnection) JoinState.JOINING else JoinState.IDLE)
+                    it.copy(joinState = if (session.recovery.desiredConnection && upstreamEligible(session.config)) JoinState.JOINING else JoinState.IDLE)
                 }
             }
         }
     }
 
-    public data class BouncerEntry(
-        public val networkId: String,
-        public val netId: String,
-        public val attributes: dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.Attributes,
-        public val isBoundToThisConnection: Boolean,
-    )
-
-    private val _bouncerVersion = MutableStateFlow(0)
-    public val bouncerVersion: StateFlow<Int> = _bouncerVersion.asStateFlow()
-
-    private fun bumpBouncerVersion() {
-        _bouncerVersion.value += 1
-    }
-
-    public fun hasBouncerSession(): Boolean =
-        sessions.values.any { it.state.isBouncerDiscovery }
-
-    public fun bouncerSessionIds(): List<String> =
-        sessions.values.filter { it.state.isBouncerDiscovery }.map { it.config.id }
-
-    public fun bouncerEntries(): List<BouncerEntry> =
-        sessions.values.filter { it.state.isBouncerDiscovery }.flatMap { session ->
-            session.state.bouncerStore.all().map { (netId, attrs) ->
-                BouncerEntry(
-                    networkId = session.config.id,
-                    netId = netId,
-                    attributes = attrs,
-                    isBoundToThisConnection = session.state.bouncerStore.boundNetId == netId,
-                )
-            }
-        }
-
-    public fun addBouncerNetwork(networkId: String, draft: dev.brentdevs.yardhal.core.data.BouncerNetworkDraft) {
-        val session = sessions[networkId] ?: return
-        if (!session.state.isBouncerDiscovery) {
-            appendSystem(session, ConversationRef.server(networkId), "soju mgmt: not a discovery connection")
-            return
-        }
-        val validationError = draft.addrValidationError()
-        if (validationError != null) {
-            appendSystem(session, ConversationRef.server(networkId), "soju mgmt: $validationError")
-            return
-        }
-        val line = dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.addNetworkCommand(
-            draft.toAttributes(),
-        )
-        appendSystem(session, ConversationRef.server(networkId), "soju mgmt: → $line")
-        sendRaw(session, line)
-    }
-
-    public fun deleteBouncerNetwork(networkId: String, netId: String) {
-        sessions[networkId]?.let { sendRaw(it, dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.delNetworkCommand(netId)) }
-    }
-
-    public fun setBouncerEnabled(networkId: String, networkName: String, enabled: Boolean) {
-        sessions[networkId]?.let {
-            sendRaw(it, "PRIVMSG BouncerServ :${dev.brentdevs.yardhal.core.data.BouncerServCommand.networkUpdate(networkName, enabled)}")
-        }
-    }
-
-    public fun connectBouncerNetwork(networkId: String, netId: String, connect: Boolean) {
-        sessions[networkId]?.let {
-            val verb = if (connect) "CONNECTNETWORK" else "DISCONNECTNETWORK"
-            sendRaw(it, "BOUNCER $verb $netId")
-        }
-    }
 
     public data class RawFrame(public val outbound: Boolean, public val line: String)
 
@@ -3257,6 +3513,7 @@ public class LiveCoordinator(
             networkStore.all().map { config ->
                 val session = sessions[config.id]
                 val live = session?.takeUnless { it.quitRequested }
+                val binding = session?.config?.bouncerBinding ?: config.bouncerBinding
                 UiNetwork(
                     id = config.id,
                     name = config.name,
@@ -3266,10 +3523,13 @@ public class LiveCoordinator(
                     hasBotMode = live?.state?.botModeLetter != null,
                     accountBanAvailable = live?.state?.accountExtban != null,
                     iconUrl = live?.state?.networkIconUrl,
-                    connectionPhase = session?.recovery?.phase ?: if (config.userDisconnected) {
-                        RecoveryPhase.USER_DISCONNECTED
-                    } else {
-                        RecoveryPhase.DISCONNECTED
+                    connectionPhase = when {
+                        binding?.rejectionReason != null -> RecoveryPhase.AUTHENTICATION_REJECTED
+                        binding?.enabled == false -> RecoveryPhase.DISCONNECTED
+                        binding != null && !upstreamEligible(session?.config ?: config) -> RecoveryPhase.USER_DISCONNECTED
+                        else -> session?.recovery?.phase ?: if (config.userDisconnected) {
+                            RecoveryPhase.USER_DISCONNECTED
+                        } else RecoveryPhase.DISCONNECTED
                     },
                     connectionError = session?.connectionError,
                     rejectedCertificate = session?.rejectedCertificate,

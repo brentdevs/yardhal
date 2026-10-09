@@ -320,8 +320,8 @@ private fun isHardFailure(error: Throwable?): Boolean {
     val visited = HashSet<Throwable>()
     var current = error
     while (current != null && visited.add(current)) {
-        if (current is AuthenticationRejectedException || current is CertificateException ||
-            current is SSLPeerUnverifiedException ||
+        if (current is AuthenticationRejectedException || current is BouncerBindRejectedException ||
+            current is CertificateException || current is SSLPeerUnverifiedException ||
             current is TlsIdentityUnavailableException || (current is Socks5Exception && current.authenticationRejected)) return true
         current = current.cause
     }

@@ -18,9 +18,17 @@ class IrcBouncerNetworksTests {
         )
         val wire = attrs.attributeString()
         assertEquals(
-            "host=irc.libera.chat;name=libera;nickname=nick\\;with\\;semis\\\\and;port=6697;tls=1",
+            "host=irc.libera.chat;name=libera;nickname=nick\\:with\\:semis\\\\and;port=6697;tls=1",
             wire,
         )
+    }
+
+    @Test
+    fun actualMessageTagEscapesDecodeSpacesAndSemicolons() {
+        val attrs = IrcBouncerNetworks.parseAttributes("name=My\\sAwesome\\sNetwork;realname=A\\:B\\\\C")
+        assertEquals("My Awesome Network", attrs.name)
+        assertEquals("A;B\\C", attrs.realname)
+        assertEquals("name=My\\sAwesome\\sNetwork;realname=A\\:B\\\\C", attrs.attributeString())
     }
 
     @Test
@@ -61,6 +69,15 @@ class IrcBouncerNetworksTests {
         assertNull(IrcBouncerNetworks.parseNetwork(listOf("ADDNETWORK", "x")))
         assertNull(IrcBouncerNetworks.parseNetwork(listOf("NETWORK")))
         assertNull(IrcBouncerNetworks.parseNetwork(listOf("NETWORK", "")))
+    }
+
+    @Test
+    fun networkDeletionRequiresExplicitAsteriskAndExactParameterCount() {
+        assertNull(IrcBouncerNetworks.parseNetwork(listOf("NETWORK", "id")))
+        assertNull(IrcBouncerNetworks.parseNetwork(listOf("NETWORK", "id", "*", "unexpected")))
+        assertEquals(IrcBouncerNetworks.NetworkUpdate("id", IrcBouncerNetworks.Change.Deleted),
+            IrcBouncerNetworks.parseNetwork(listOf("NETWORK", "id", "*")))
+        assertTrue(IrcBouncerNetworks.parseNetwork(listOf("NETWORK", "id", ""))?.change is IrcBouncerNetworks.Change.Upsert)
     }
 
     @Test

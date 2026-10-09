@@ -622,7 +622,26 @@ class PerNetworkStateTests {
         assertTrue(InboundEffect.BouncerNetworksChanged in state.feed(":srv 005 me BOUNCER_NETID=42 :are supported"))
         assertEquals("42", state.bouncerStore.boundNetId)
         assertEquals(listOf<InboundEffect>(InboundEffect.BouncerNetworksChanged), state.feed(":srv BOUNCER NETWORK 7 name=libera;state=connected"))
-        assertEquals("soju mgmt: network created (9)", state.feed(":srv BOUNCER ADDNETWORK 9").appended().single().text)
+        assertTrue(state.feed(":srv BOUNCER ADDNETWORK 9").appended().isEmpty())
+    }
+
+    @Test
+    fun discoveryAccountsNeverJoinButBoundUpstreamsKeepTheirOwnAutojoinAndIgnorePlaybackDiscovery() {
+        val capabilities = setOf("soju.im/bouncer-networks", "batch")
+        val context = InboundContext(nowMs = now)
+        val account = state(listOf("#account"))
+        account.apply(IrcEvent.CapabilitiesNegotiated(capabilities), context)
+        assertTrue(account.apply(IrcEvent.Registered("me", "Welcome"), context).sent().none { it.startsWith("JOIN ") })
+        val bound = PerNetworkState("net", "me", listOf("#bound"), bouncerNetId = "42")
+        bound.apply(IrcEvent.CapabilitiesNegotiated(capabilities), context)
+        assertFalse(bound.isBouncerDiscovery)
+        assertTrue("JOIN #bound" in bound.apply(IrcEvent.Registered("me", "Welcome"), context).sent())
+        bound.feed(":srv BOUNCER NETWORK 42 :name=Live")
+        bound.feed(":srv BATCH +history znc.in/playback")
+        assertTrue(bound.feed("@batch=history :srv BOUNCER NETWORK 42 *").isEmpty())
+        assertEquals("Live", bound.bouncerStore.get("42")?.name)
+        assertTrue(bound.feed("@draft/chathistory-context :srv BOUNCER NETWORK 42 *").isEmpty())
+        assertTrue(bound.feed(":attacker!u@h BOUNCER NETWORK 42 *").isEmpty())
     }
 
 

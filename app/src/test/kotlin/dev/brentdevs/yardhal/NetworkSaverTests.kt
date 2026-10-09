@@ -760,6 +760,42 @@ class NetworkSaverTests {
         }
     }
 
+    @Test
+    fun sojuSaveDropsHiddenServerPasswordWithoutStagingItOrDeletingSharedSaslSecret() {
+        Harness().use { harness ->
+            val account = offlineConfig().copy(
+                mode = dev.brentdevs.yardhal.core.data.NetworkMode.SOJU,
+                serverPasswordRef = "old-sasl",
+            )
+            seedAllCredentials(harness, account)
+            val storedBefore = harness.vault.storedKeys.toList()
+            assertTrue(harness.saver.save(draft(account).copy(serverPassword = "inapplicable-hidden-secret")))
+            val saved = harness.saved()
+            assertNull(saved.serverPasswordRef)
+            assertEquals("old-sasl", saved.saslPasswordRef)
+            assertNotNull(harness.vault.readPassword("old-sasl"))
+            assertEquals(storedBefore, harness.vault.storedKeys.toList())
+        }
+    }
+
+    @Test
+    fun sojuSaveRetiresOnlyUnreferencedInapplicableServerCredentials() {
+        Harness().use { harness ->
+            val account = offlineConfig().copy(mode = dev.brentdevs.yardhal.core.data.NetworkMode.SOJU)
+            seedAllCredentials(harness, account)
+            val other = NetworkConfig(
+                id = "other", name = "Other", host = "other.example", nick = "tester",
+                autoConnect = false, serverPasswordRef = account.serverPasswordRef,
+            )
+            assertTrue(harness.networks.add(other))
+            assertTrue(harness.saver.save(draft(account)))
+            assertNull(harness.networks.byId(account.id)?.serverPasswordRef)
+            assertEquals("old-server", harness.networks.byId(other.id)?.serverPasswordRef)
+            assertNotNull(harness.vault.readPassword("old-server"))
+            assertNotNull(harness.vault.readPassword("old-sasl"))
+        }
+    }
+
     private fun offlineConfig(): NetworkConfig = NetworkConfig(
         id = "network",
         name = "Saved network",

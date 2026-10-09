@@ -34,6 +34,22 @@ public class NetworkStore(directory: File) {
         persist(next)
     }
 
+    public fun upsertAll(configs: Collection<NetworkConfig>): Boolean = synchronized(mutationLock) {
+        if (configs.map { it.id }.distinct().size != configs.size) return@synchronized false
+        val replacements = configs.associateBy { it.id }
+        val next = networks.map { replacements[it.id] ?: it } + configs.filter { config -> networks.none { it.id == config.id } }
+        if (next == networks) return@synchronized true
+        persist(next)
+    }
+
+    public fun dependents(parentId: String): List<NetworkConfig> =
+        networks.filter { it.bouncerBinding?.parentId == parentId }
+
+    public fun removeAll(ids: Set<String>): Boolean = synchronized(mutationLock) {
+        if (ids.isEmpty() || networks.none { it.id in ids }) return@synchronized false
+        persist(networks.filterNot { it.id in ids })
+    }
+
     public fun setUserDisconnected(id: String, disconnected: Boolean): Boolean = synchronized(mutationLock) {
         val index = networks.indexOfFirst { it.id == id }
         if (index < 0) return@synchronized false

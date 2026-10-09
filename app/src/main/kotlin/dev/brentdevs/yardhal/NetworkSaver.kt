@@ -3,8 +3,10 @@ package dev.brentdevs.yardhal
 import dev.brentdevs.yardhal.coordinator.LiveCoordinator
 import dev.brentdevs.yardhal.core.data.CredentialVault
 import dev.brentdevs.yardhal.core.data.NetworkConfig
+import dev.brentdevs.yardhal.core.data.NetworkMode
 import dev.brentdevs.yardhal.core.data.SocksProxyConfig
 import dev.brentdevs.yardhal.ui.screens.NetworkDraft
+import dev.brentdevs.yardhal.ui.screens.bouncerSetupErrors
 import java.util.UUID
 
 public class NetworkSaver(
@@ -14,6 +16,9 @@ public class NetworkSaver(
     @Synchronized
     public fun save(draft: NetworkDraft): Boolean {
         val existing = draft.networkId?.let { coordinator.networkStore.byId(it) ?: return false }
+        if (existing?.bouncerBinding != null || bouncerSetupErrors(draft, existing).isNotEmpty()) return false
+        val mode = draft.mode ?: existing?.mode ?: NetworkMode.DIRECT
+        if (existing != null && existing.mode != mode) return false
         val id = existing?.id ?: UUID.randomUUID().toString()
         val staged = linkedMapOf<String, String>()
 
@@ -26,7 +31,7 @@ public class NetworkSaver(
         }
 
         val config = try {
-            val passwordRef = passwordReference(
+            val passwordRef = if (mode == NetworkMode.ZNC) null else passwordReference(
                 "sasl", existing?.saslPasswordRef, draft.saslPassword, draft.clearSaslPassword,
             )
             val proxy = if (draft.proxyEnabled == false) {
@@ -57,6 +62,11 @@ public class NetworkSaver(
             )
             base.copy(
                 name = draft.displayName,
+                mode = mode,
+                zncNetwork = if (mode == NetworkMode.ZNC) {
+                    draft.zncNetwork?.trim()?.takeIf(String::isNotEmpty) ?: base.zncNetwork
+                        .takeIf { draft.zncNetwork == null }
+                } else null,
                 host = draft.host,
                 port = draft.port,
                 tls = draft.tls,
@@ -64,23 +74,24 @@ public class NetworkSaver(
                 realName = draft.realName ?: base.realName,
                 alternateNicks = draft.alternateNicks ?: base.alternateNicks,
                 autoConnect = draft.autoConnect ?: base.autoConnect,
-                autojoin = draft.autojoin,
+                autojoin = if (mode == NetworkMode.DIRECT) draft.autojoin else emptyList(),
                 saslAuthcid = draft.saslAuthcid ?: passwordRef?.let { draft.nick },
-                saslMode = draft.saslMode ?: base.saslMode,
+                saslMode = if (mode == NetworkMode.ZNC) dev.brentdevs.yardhal.core.data.SaslMode.AUTO
+                    else draft.saslMode ?: base.saslMode,
                 saslPasswordRef = passwordRef,
-                serverPasswordRef = passwordReference(
+                serverPasswordRef = if (mode == NetworkMode.SOJU) null else passwordReference(
                     "server", base.serverPasswordRef, draft.serverPassword, draft.clearServerPassword,
                 ),
-                nickServAccount = if (draft.nickServAccount != null) {
+                nickServAccount = if (mode != NetworkMode.DIRECT) null else if (draft.nickServAccount != null) {
                     draft.nickServAccount.takeIf(String::isNotEmpty)
                 } else {
                     base.nickServAccount
                 },
-                nickServPasswordRef = passwordReference(
+                nickServPasswordRef = if (mode != NetworkMode.DIRECT) null else passwordReference(
                     "nickserv", base.nickServPasswordRef, draft.nickServPassword, draft.clearNickServPassword,
                 ),
                 nickServService = draft.nickServService ?: base.nickServService,
-                waitForNickServ = draft.waitForNickServ ?: base.waitForNickServ,
+                waitForNickServ = mode == NetworkMode.DIRECT && (draft.waitForNickServ ?: base.waitForNickServ),
                 proxy = proxy,
                 tlsClientAlias = when {
                     draft.clearTlsClientAlias -> null

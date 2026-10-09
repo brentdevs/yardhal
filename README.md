@@ -24,8 +24,9 @@ architecture of the Halyard iOS client.
   member sheet with role sections (operators/voices/bots/users) and per-member
   kick/ban/ignore; network collapse state survives navigation and rotation
 - **Search** — SQLite FTS4 index over all history with snippet results
-- **Bouncers** — ZNC playback handling; soju `bouncer-networks` add/edit/
-  connect/disconnect via the `BouncerServ` service commands
+- **Bouncers** — tailored soju/ZNC setup, automatically bound soju upstreams with
+  durable identities, network/channel management, ZNC server/settings controls,
+  explicit service availability and acknowledged partial-apply outcomes
 - **Media** — file uploads through the IRCv3 filehost extension; tap-to-load image
   previews for `+draft/attachment` messages, with an external-open fallback when
   previews are unavailable (ordinary image URLs remain text links)
@@ -65,6 +66,42 @@ in ~15 seconds (KVM):
 ```sh
 make play              # build + boot a windowed emulator + install + launch
 ```
+
+### Connecting a bouncer
+
+Choose **soju** or **ZNC** in **Add network**, rather than treating the account
+as a direct IRC server. Use the bouncer's endpoint and verified TLS.
+
+- **soju:** supply the bouncer account and SASL password, or select SASL EXTERNAL
+  with a TLS client identity. One account discovers its upstreams automatically.
+  Each upstream receives a separate authenticated, bound connection; do not add
+  those upstream endpoints manually.
+- **ZNC:** supply the account, optional network name and ZNC password. Yardhal
+  constructs `account/network:password` (or `account:password`) internally.
+  The account field must not already contain slash/colon syntax.
+- Configure joins on the bouncer. The soju/ZNC setup forms do not save a second
+  client-owned autojoin list.
+- Open **App options → Bouncer networks** to manage remote networks and settings.
+  Editing a discovered soju upstream opens these controls rather than changing
+  its inherited transport or authentication. Channel controls use a bound
+  upstream/network connection.
+- ZNC detailed settings require `controlpanel`; creation/deletion and connection
+  controls use `*status` independently. Only settings actually reported by the
+  service are editable. Server lists belong to the currently selected ZNC
+  network. Unreported soju channel policy values remain unknown.
+- ZNC catch-up and older history require the optional
+  [playback module](https://wiki.znc.in/Playback), unless the downstream connection
+  negotiates CHATHISTORY itself. Stock ZNC's join-time buffer replay and forwarded
+  upstream ISUPPORT do not establish archive support. Buffer clipping keeps
+  missing-range warnings visible rather than inventing recovery.
+- Apply results count acknowledged changes, not commands sent. Partial results
+  retain accepted changes and refresh actual state; they do not imply rollback.
+  After an uncertain unlabeled timeout, the next operation first waits for an
+  actual ordered PONG fence; reconnect if the bouncer cannot establish it.
+- Disconnect preserves cached history and each upstream's saved connection
+  intent. Disabled/rejected upstreams remain offline without blocking siblings.
+  Removing a soju account explicitly confirms removal of its dependent local
+  upstreams and metadata; it does not delete the remote soju account.
 
 ## Test
 

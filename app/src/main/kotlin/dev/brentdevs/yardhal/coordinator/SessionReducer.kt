@@ -8,7 +8,7 @@ import dev.brentdevs.yardhal.core.protocol.IrcMessage
 internal fun Reduction.handleCapabilities(capabilities: Set<String>, values: Map<String, String> = emptyMap()) {
     state.supportedCaps = capabilities
     applyMetadataCapability(capabilities, values)
-    val discovery = IrcBouncerNetworks.CAPABILITY in capabilities
+    val discovery = IrcBouncerNetworks.CAPABILITY in capabilities && state.bouncerNetId == null
     if (state.isBouncerDiscovery != discovery) {
         state.isBouncerDiscovery = discovery
         emit(InboundEffect.BouncerNetworksChanged)
@@ -22,6 +22,7 @@ internal fun Reduction.handleRegistered(nickname: String) {
     emit(InboundEffect.StatusChanged(ConnectionStatus.REGISTERED))
     emit(InboundEffect.OwnNickChanged(nickname))
     subscribeMetadata()
+    if (state.isBouncerDiscovery) return
     val channels = LinkedHashSet<String>()
     channels.addAll(state.autojoin)
     channels.addAll(context.openChannels())
@@ -58,13 +59,12 @@ internal fun Reduction.applyIsupportTokens(message: IrcMessage) {
 }
 
 internal fun Reduction.handleBouncerMessage(message: IrcMessage) {
+    if (isPlayback(message) || "draft/chathistory-context" in message.tags || message.prefix?.user != null) return
     val update = IrcBouncerNetworks.parseNetwork(message.parameters)
     if (update != null) {
         if (state.bouncerStore.apply(update)) emit(InboundEffect.BouncerNetworksChanged)
         return
     }
-    val addedId = IrcBouncerNetworks.parseAddNetworkReply(message.parameters) ?: return
-    system(state.server, "soju mgmt: network created ($addedId)")
 }
 
 internal fun Reduction.requestHistory(ref: ConversationRef) {

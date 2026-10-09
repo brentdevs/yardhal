@@ -109,6 +109,7 @@ public class PerNetworkState(
     public val networkId: String,
     configuredNick: String,
     autojoin: List<String> = emptyList(),
+    public val bouncerNetId: String? = null,
 ) {
     public var autojoin: List<String> = autojoin
         internal set

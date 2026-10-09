@@ -20,6 +20,15 @@ class IrcChatHistoryTests {
     }
 
     @Test
+    fun forwardedIsupportCannotEnableHistoryWithoutDownstreamCapability() {
+        val forwarded = ISupport.parse(listOf("CHATHISTORY=50", "MSGREFTYPES=timestamp"))
+        val unsupported = IrcChatHistory.support(forwarded, emptySet(), allowIsupportDiscovery = false)
+        assertNull(IrcChatHistory.latest("#room", null, unsupported))
+        val negotiated = IrcChatHistory.support(forwarded, setOf("draft/chathistory"), allowIsupportDiscovery = false)
+        assertEquals("CHATHISTORY LATEST #room * 50", IrcChatHistory.latest("#room", null, negotiated))
+    }
+
+    @Test
     fun requestLimitsStayPositiveAndBoundedIncludingUnlimitedServers() {
         for ((token, expected) in listOf("1" to 1, "20" to 20, "1000" to 100, "0" to 100, "-1" to 100, "invalid" to 100)) {
             val support = IrcChatHistory.support(ISupport.parse(listOf("CHATHISTORY=$token")), emptySet())

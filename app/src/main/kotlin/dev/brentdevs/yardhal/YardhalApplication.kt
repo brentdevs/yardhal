@@ -133,12 +133,8 @@ class YardhalApplication : Application() {
                             config.tls && it.host.equals(config.host, ignoreCase = true) && it.port == config.port
                         }?.sha256,
                         nickServService = config.nickServService,
-                        knownSecrets = setOfNotNull(
-                            config.saslPassword,
-                            config.serverPassword,
-                            config.nickServPassword,
-                            config.proxyPassword,
-                        ),
+                        bouncerNetId = config.bouncerBinding?.netId,
+                        knownSecrets = config.knownSecrets,
                     ),
                     rawTap = { outbound, line -> coordinator.ingestRaw(config.id, outbound, line) },
                     stsPolicyStore = stsPolicies,
