@@ -90,6 +90,7 @@ public class LiveCoordinator(
         throw TlsIdentityUnavailableException("The selected TLS client identity is unavailable. Select it again in network settings.")
     },
     private val offlineStore: OfflineStore? = null,
+    public val relayStore: dev.brentdevs.yardhal.core.data.RelayConfigurationStore? = null,
 ) {
     public fun interface HighlightNotifier {
         public fun onHighlight(networkName: String, sender: String, conversationName: String, text: String)
@@ -2904,6 +2905,25 @@ public class LiveCoordinator(
         val session = sessions[networkId] ?: return@withNetworkState
         if (!session.state.registered || session.statusFlow.value != ConnectionStatus.REGISTERED) return@withNetworkState
         val buffer = _buffers.value[storageKey]?.takeIf { it.ref.networkId == networkId } ?: return@withNetworkState
+        if (!buffer.messages.any { it.msgid == msgid && !it.redacted } || emoji.isBlank() ||
+            emoji.length > 64 || emoji.any { it.isISOControl() }) return@withNetworkState
+        val policy = session.state.clientTagPolicy
+        val removing = ownReaction(buffer, msgid, emoji, session.state.ownNick)
+        val reactionTag = (if (removing) policy.unreact else policy.react)
+        val refsTag = policy.reactionReference
+        if (!policy.reactionsAvailable || reactionTag == null || refsTag == null) {
+            _operationError.value = "Reactions are unavailable: this server has not enabled the required client tags."
+            return@withNetworkState
+        }
+        val frame = IrcMessage(tags = buildMap {
+            put(reactionTag, emoji)
+            put(refsTag, msgid)
+            policy.refs?.let { put(it, msgid) }
+        }, command = "TAGMSG", parameters = listOf(buffer.ref.rawTarget))
+        if (session.reconnector?.send(frame) != true) {
+            _operationError.value = "Reaction was not sent. Reconnect and try again."
+            return@withNetworkState
+        }
         val own = session.state.ownNick
         var reactionVerb: String? = null
         var reactionRevision: Long? = null
@@ -2912,7 +2932,7 @@ public class LiveCoordinator(
             if (!current.messages.any { it.msgid == msgid && !it.redacted }) return@updateBufferKey current
             val perMessage = (reactions[msgid] ?: emptyMap()).toMutableMap()
             when {
-                perMessage[emoji].orEmpty().contains(own) -> {
+                removing -> {
                     val remaining = perMessage[emoji].orEmpty().toMutableSet().apply { remove(own) }
                     reactionVerb = "unreact"
                     if (remaining.isEmpty()) perMessage.remove(emoji) else perMessage[emoji] = remaining
@@ -2928,7 +2948,6 @@ public class LiveCoordinator(
             current.copy(reactions = reactions)
         }
         reactionVerb?.let { verb ->
-            sendRaw(session, "@+draft/$verb=$emoji;+draft/refs=$msgid TAGMSG ${buffer.ref.rawTarget}")
             enqueuePersistence {
                 var affectedRows: Set<Long> = emptySet()
                 try {
@@ -2944,7 +2963,20 @@ public class LiveCoordinator(
     }
 
     public fun setReplyDraft(networkId: String, storageKey: String, message: ChatMessage?) {
-        updateBufferKey(storageKey) { it.copy(replyDraft = message) }
+        updateBufferKey(storageKey) { buffer ->
+            if (buffer.ref.networkId != networkId) buffer else buffer.copy(
+                replyDraft = message?.let { requested ->
+                    buffer.messages.firstOrNull { it.localId == requested.localId }?.takeUnless { it.redacted }
+                },
+            )
+        }
+    }
+
+    public fun relayPresentation(networkId: String, message: ChatMessage): ChatMessage {
+        if (message.redacted || message.sentByUs || message.kind != MessageKind.PRIVMSG) return message
+        val mapping = sessions[networkId]?.state?.casemapping ?: restoredCasemapping[networkId] ?: CaseMapping.RFC1459
+        val relay = relayStore?.parse(networkId, message.sender, message.text, mapping) ?: return message
+        return message.copy(relayedSender = relay.sender, relaySource = relay.source, relayedBody = relay.body)
     }
 
     public fun directMessageKey(networkId: String, fromKey: String, nick: String): String = synchronized(sessionLifecycleLock) {
@@ -3122,60 +3154,26 @@ public class LiveCoordinator(
         _orderState.value = channelOrder.snapshot()
     }
 
-    public fun uploadAndShare(
-        networkId: String,
-        storageKey: String,
-        fileName: String,
-        mimeType: String,
-        bytes: ByteArray,
-    ) {
-        val session = sessions[networkId] ?: return
-        val originalRef = _buffers.value[storageKey]?.ref?.takeIf { it.networkId == networkId } ?: return
-        val endpoint = session.state.filehostEndpoint ?: run {
-            appendSystem(session, originalRef, "This network does not advertise a filehost (soju.im/FILEHOST).")
-            return
-        }
-        val config = session.effective ?: return
-        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
-            val uploaded = try {
-                dev.brentdevs.yardhal.core.client.FilehostUploader.upload(
-                    endpointUrl = endpoint,
-                    file = dev.brentdevs.yardhal.core.client.OutgoingFile(fileName, mimeType, bytes),
-                    ircConnectionIsTls = config.tls,
-                    saslUser = config.saslAuthcid,
-                    saslPassword = config.saslPassword,
-                )
-            } catch (error: dev.brentdevs.yardhal.core.client.FilehostException) {
-                _operationError.value = redactPresentation(session, "Upload failed: ${error.message}")
-                return@launch
-            }
-            synchronized(sessionLifecycleLock) {
-                val current = sessions[networkId]
-                val target = currentRef(originalRef)
-                if (current == null || networkStore.byId(networkId) == null || target.storageKey !in _buffers.value) {
-                    _operationError.value = redactPresentation(session,
-                        "Upload completed, but the conversation is no longer open. Save or share this URL: ${uploaded.url}")
-                    return@synchronized
-                }
-                synchronized(current.state) share@{
-                    if (!current.state.registered || current.statusFlow.value != ConnectionStatus.REGISTERED || current.quitRequested) {
-                        _operationError.value = redactPresentation(current, redactPresentation(session,
-                            "Upload completed, but the network is disconnected. Save or share this URL after reconnecting: ${uploaded.url}"))
-                        return@share
-                    }
-                    sendMessage(
-                        session = current,
-                        ref = target,
-                        wireText = uploaded.url,
-                        optimisticText = uploaded.url,
-                        attachmentUrl = uploaded.url,
-                        attachmentName = fileName,
-                        attachmentMimeType = mimeType,
-                        attachmentSizeBytes = bytes.size.toLong(),
-                    )
-                }
-            }
-        }
+    public fun secureUploadTransport(networkId: String): Boolean {
+        val config = networkStore.byId(networkId) ?: return true
+        val transport = config.bouncerBinding?.let { networkStore.byId(it.parentId) ?: return true } ?: config
+        val session = sessions[networkId]
+        val nowSeconds = clock() / 1_000
+        return config.tls || transport.tls || session?.effective?.tls == true || session?.stsUpgradePort != null ||
+            stsPolicies.load(config.host)?.let { !it.isExpired(nowSeconds) } == true ||
+            stsPolicies.load(transport.host)?.let { !it.isExpired(nowSeconds) } == true
+    }
+
+    public fun negotiatedFilehost(networkId: String): dev.brentdevs.yardhal.core.data.NegotiatedFilehost? {
+        val session = sessions[networkId] ?: return null
+        val endpoint = session.state.filehostEndpoint ?: return null
+        val effective = session.effective ?: return null
+        return dev.brentdevs.yardhal.core.data.NegotiatedFilehost(
+            endpointUrl = endpoint,
+            ircConnectionIsTls = secureUploadTransport(networkId),
+            saslUser = effective.saslAuthcid,
+            saslPassword = effective.saslPassword,
+        )
     }
 
     private fun appendSystem(session: Session, ref: ConversationRef, text: String, kind: MessageKind = MessageKind.SYSTEM) {
@@ -3494,10 +3492,12 @@ public class LiveCoordinator(
         val session = sessions[networkId] ?: return
         val buffer = _buffers.value[storageKey] ?: return
         if (buffer.ref.kind == ConversationKind.SERVER) return
+        if (!session.state.registered || session.statusFlow.value != ConnectionStatus.REGISTERED) return
+        val tag = session.state.clientTagPolicy.typing ?: return
         val now = clock()
         if (now - lastTypingSentAt < TYPING_SEND_INTERVAL_MS) return
         lastTypingSentAt = now
-        sendRaw(session, "@+typing=active TAGMSG ${buffer.ref.rawTarget}")
+        sendRaw(session, IrcMessage(tags = mapOf(tag to "active"), command = "TAGMSG", parameters = listOf(buffer.ref.rawTarget)).toWire())
     }
 
     private fun updateBufferKey(storageKey: String, transform: (ConversationBuffer) -> ConversationBuffer) =
@@ -3523,6 +3523,10 @@ public class LiveCoordinator(
                     hasBotMode = live?.state?.botModeLetter != null,
                     accountBanAvailable = live?.state?.accountExtban != null,
                     iconUrl = live?.state?.networkIconUrl,
+                    taggedRepliesAvailable = live?.state?.clientTagPolicy?.reply != null,
+                    reactionsAvailable = live?.state?.clientTagPolicy?.reactionsAvailable == true,
+                    typingAvailable = live?.state?.clientTagPolicy?.typing != null,
+                    attachmentTagsAvailable = live?.state?.clientTagPolicy?.attachment != null,
                     connectionPhase = when {
                         binding?.rejectionReason != null -> RecoveryPhase.AUTHENTICATION_REJECTED
                         binding?.enabled == false -> RecoveryPhase.DISCONNECTED
@@ -3541,7 +3545,11 @@ public class LiveCoordinator(
     }
 
     private fun sendRaw(session: Session, line: String) {
-        if (sessions[session.config.id] === session) session.reconnector?.sendLine(line)
+        if (sessions[session.config.id] !== session) return
+        val message = IrcMessage.parse(line)
+        val filtered = message?.takeIf { it.tags.keys.any { tag -> !session.state.clientTagPolicy.allows(tag) } }
+            ?.let { it.copy(tags = it.tags.filterKeys(session.state.clientTagPolicy::allows)).toWire() }
+        session.reconnector?.sendLine(filtered ?: line)
     }
 
     private fun sendLabeled(session: Session, origin: ConversationRef, command: LabeledCommand, line: String) {
@@ -3553,17 +3561,45 @@ public class LiveCoordinator(
         this is SlashCommand.Query || this is SlashCommand.IgnoreAdd || this is SlashCommand.Whois ||
             this is SlashCommand.IgnoreRemove || this is SlashCommand.Help
 
-    public fun sendText(networkId: String, storageKey: String, input: String): Boolean = synchronized(sessionLifecycleLock) send@{
+    public fun sendText(
+        networkId: String,
+        storageKey: String,
+        input: String,
+        attachments: List<dev.brentdevs.yardhal.core.data.UploadedAttachment> = emptyList(),
+    ): Boolean = synchronized(sessionLifecycleLock) send@{
         val session = sessions[networkId] ?: return@send false
         synchronized(session.state) compose@{
             val activeBuffer = _buffers.value[storageKey]?.takeIf { it.ref.networkId == networkId } ?: return@compose false
             val command = SlashCommandParser.parse(input, activeBuffer.ref.rawTarget) ?: return@compose false
-            if ((!session.state.registered || session.statusFlow.value != ConnectionStatus.REGISTERED) && !command.isLocal()) return@compose false
-            val replyTo = activeBuffer.replyDraft?.takeIf { command is SlashCommand.PlainMessage }
-            if (replyTo != null) {
-                updateBufferKey(storageKey) { it.copy(replyDraft = null) }
+            if ((!session.state.registered || session.statusFlow.value != ConnectionStatus.REGISTERED || session.quitRequested) && !command.isLocal()) return@compose false
+            if (command is SlashCommand.PlainMessage || command is SlashCommand.EscapedMessage) {
+                val parent = activeBuffer.replyDraft?.let { draft ->
+                    relayPresentation(networkId, activeBuffer.messages.firstOrNull { it.localId == draft.localId } ?: draft)
+                }
+                val text = when (command) {
+                    is SlashCommand.PlainMessage -> command.text
+                    is SlashCommand.EscapedMessage -> "/" + command.text
+                    else -> return@compose false
+                }
+                val replyId = parent?.msgid?.takeIf { session.state.clientTagPolicy.reply != null && !parent.redacted }
+                val portable = if (parent != null && replyId == null) portableQuote(parent, text) else text
+                val sent = sendComposed(session, activeBuffer.ref, portable, replyId, parent, attachments)
+                if (sent && parent != null) updateBufferKey(storageKey) { it.copy(replyDraft = null) }
+                if (!sent) _operationError.value = "Message was not fully queued. Your draft and quote were retained; reconnect before retrying."
+                return@compose sent
             }
-            dispatchCommand(session, activeBuffer.ref, command, replyToMsgid = replyTo?.msgid, quoteParent = replyTo)
+            if (command is SlashCommand.Action) {
+                val sent = sendMessage(
+                    session,
+                    activeBuffer.ref,
+                    "\u0001ACTION ${command.description}\u0001",
+                    optimisticKind = MessageKind.ACTION,
+                    optimisticText = command.description,
+                )
+                if (!sent) _operationError.value = "Message was not fully queued. Your draft was retained; reconnect before retrying."
+                return@compose sent
+            }
+            dispatchCommand(session, activeBuffer.ref, command)
             true
         }
     }
@@ -3754,50 +3790,61 @@ public class LiveCoordinator(
         }
     }
 
-    private fun sendComposed(session: Session, ref: ConversationRef, text: String, replyToMsgid: String?, quoteParent: ChatMessage? = null) {
+    private fun sendComposed(
+        session: Session,
+        ref: ConversationRef,
+        text: String,
+        replyToMsgid: String?,
+        quoteParent: ChatMessage? = null,
+        attachments: List<dev.brentdevs.yardhal.core.data.UploadedAttachment> = emptyList(),
+    ): Boolean {
         val normalized = IrcMultiline.normalize(text)
+        fun attachmentFor(body: String): dev.brentdevs.yardhal.core.data.UploadedAttachment? =
+            attachments.firstOrNull { it.url in body.split(Regex("\\s+")) }
         if ('\n' !in normalized) {
-            sendMessage(session, ref, normalized, replyToMsgid = replyToMsgid, quoteParent = quoteParent)
-            return
+            val attachment = attachmentFor(normalized)
+            return sendMessage(session, ref, normalized, replyToMsgid = replyToMsgid, quoteParent = quoteParent,
+                attachmentUrl = attachment?.url, attachmentName = attachment?.name,
+                attachmentMimeType = attachment?.mimeType, attachmentSizeBytes = attachment?.sizeBytes)
         }
         val limits = session.state.outboundMultilineLimits()
         if (limits == null) {
-            normalized.split('\n').filter { it.isNotBlank() }.forEachIndexed { index, line ->
-                sendMessage(session, ref, line, replyToMsgid = replyToMsgid.takeIf { index == 0 },
-                    quoteParent = quoteParent.takeIf { index == 0 })
+            for ((index, line) in normalized.split('\n').filter { it.isNotBlank() }.withIndex()) {
+                val attachment = attachmentFor(line)
+                if (!sendMessage(session, ref, line, replyToMsgid = replyToMsgid.takeIf { index == 0 },
+                        quoteParent = quoteParent.takeIf { index == 0 }, attachmentUrl = attachment?.url,
+                        attachmentName = attachment?.name, attachmentMimeType = attachment?.mimeType,
+                        attachmentSizeBytes = attachment?.sizeBytes)) return false
             }
-            return
+            return true
         }
         val echoed = "echo-message" in session.state.supportedCaps
         val budget = IrcMultiline.lineBudget(session.state.ownNick, ref.rawTarget)
-        IrcMultiline.split(normalized, limits, budget).forEachIndexed { index, lines ->
+        for ((index, lines) in IrcMultiline.split(normalized, limits, budget).withIndex()) {
             val reply = replyToMsgid.takeIf { index == 0 }
-            val label = synchronized(session.state) { session.state.issueLabel(ref, LabeledCommand.PRIVMSG, clock()) }
-            appendChat(
-                session = session,
-                ref = ref,
-                sender = session.state.ownNick,
-                kind = MessageKind.PRIVMSG,
-                text = IrcMultiline.combine(lines),
-                msgid = null,
-                timestampMs = clock(),
-                sentByUs = true,
-                highlightsMe = false,
-                replyToMsgid = reply,
-                pendingEcho = echoed,
-                quoteParent = quoteParent.takeIf { index == 0 },
-                echoLabel = label,
-                optimistic = true,
-            )
+            val label = session.state.issueLabel(ref, LabeledCommand.PRIVMSG, clock())
+            val body = IrcMultiline.combine(lines)
+            val attachment = attachmentFor(body)
+            val policy = session.state.clientTagPolicy
             val batchTags = buildMap {
                 if (label != null) put("label", label)
-                if (reply != null) put("+draft/reply", reply)
+                if (reply != null) policy.reply?.let { put(it, reply) }
+                if (attachment != null) policy.attachment?.let { put(it, attachment.url) }
             }
             val reference = "yml" + idGenerator.getAndIncrement()
             for (frame in IrcMultiline.frame(reference, "PRIVMSG", ref.rawTarget, lines, batchTags)) {
-                session.reconnector?.send(frame)
+                if (session.reconnector?.send(frame) != true) return false
             }
+            appendChat(
+                session = session, ref = ref, sender = session.state.ownNick, kind = MessageKind.PRIVMSG,
+                text = body, msgid = null, timestampMs = clock(), sentByUs = true, highlightsMe = false,
+                replyToMsgid = reply, pendingEcho = echoed, quoteParent = quoteParent.takeIf { index == 0 },
+                echoLabel = label, optimistic = true, attachmentUrl = attachment?.url,
+                attachmentName = attachment?.name, attachmentMimeType = attachment?.mimeType,
+                attachmentSizeBytes = attachment?.sizeBytes,
+            )
         }
+        return true
     }
 
     private fun sendMessage(
@@ -3814,10 +3861,18 @@ public class LiveCoordinator(
         attachmentName: String? = null,
         attachmentMimeType: String? = null,
         attachmentSizeBytes: Long? = null,
-    ) {
+    ): Boolean {
         val safeWireText = sanitizeOutboundText(wireText)
         val echoExpected = "echo-message" in session.state.supportedCaps
         val label = synchronized(session.state) { session.state.issueLabel(origin, LabeledCommand.PRIVMSG, clock()) }
+        val policy = session.state.clientTagPolicy
+        val tags = buildMap {
+            if (label != null) put("label", label)
+            if (replyToMsgid != null) policy.reply?.let { put(it, replyToMsgid) }
+            if (attachmentUrl != null) policy.attachment?.let { put(it, attachmentUrl) }
+        }
+        if (session.reconnector?.send(IrcMessage(tags = tags, command = "PRIVMSG",
+                parameters = listOf(ref.rawTarget, safeWireText))) != true) return false
         if (!suppressOptimistic) {
             appendChat(
                 session = session,
@@ -3840,18 +3895,7 @@ public class LiveCoordinator(
                 optimistic = true,
             )
         }
-        val tags = buildMap {
-            if (label != null) put("label", label)
-            if (replyToMsgid != null) put("+draft/reply", replyToMsgid)
-            if (attachmentUrl != null) put("+draft/attachment", attachmentUrl)
-        }
-        if (tags.isNotEmpty()) {
-            session.reconnector?.send(
-                IrcMessage(tags = tags, command = "PRIVMSG", parameters = listOf(ref.rawTarget, safeWireText)),
-            )
-        } else {
-            sendRaw(session, "PRIVMSG ${ref.rawTarget} :$safeWireText")
-        }
+        return true
     }
 }
 

@@ -36,6 +36,19 @@ class ImageUrlPolicyTests {
     }
 
     @Test
+    fun urlLengthAndPortBoundsAreEnforcedAfterTemplateAndAsciiExpansion() {
+        val prefix = "https://example.com/"
+        val boundary = prefix + "a".repeat(ImageUrlPolicy.MAX_URL_LENGTH - prefix.length)
+        assertEquals(boundary, ImageUrlPolicy.resolve(boundary, 64))
+        assertNull(ImageUrlPolicy.resolve(boundary + "a", 64))
+        assertNull(ImageUrlPolicy.resolve(prefix + "{size}".repeat((ImageUrlPolicy.MAX_URL_LENGTH - prefix.length) / 6), Int.MAX_VALUE))
+        assertNull(ImageUrlPolicy.resolve(prefix + "é".repeat(400), 64))
+        assertTrue(ImageUrlPolicy.isAllowed("https://example.com:65535/image.png"))
+        assertNull(ImageUrlPolicy.resolve("https://example.com:65536/image.png", 64))
+        assertNull(ImageUrlPolicy.resolve("https://example.com:0/image.png", 64))
+    }
+
+    @Test
     fun sizeTemplateIsExpanded() {
         assertEquals("https://example.net/icon.png?size=96", ImageUrlPolicy.resolve("https://example.net/icon.png?size={size}", 96))
         assertEquals("https://example.com/avatar/64/x.jpg", ImageUrlPolicy.resolve("https://example.com/avatar/{size}/x.jpg", 64))

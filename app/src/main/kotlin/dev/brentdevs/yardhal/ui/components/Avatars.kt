@@ -11,6 +11,10 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -20,6 +24,8 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
@@ -27,6 +33,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.brentdevs.yardhal.coordinator.ConnectionStatus
 import dev.brentdevs.yardhal.coordinator.RecoveryPhase
+import dev.brentdevs.yardhal.ui.image.DefaultMediaSignals
+import dev.brentdevs.yardhal.ui.image.ImageCacheCategory
+import dev.brentdevs.yardhal.ui.image.LocalMediaEnvironment
 import dev.brentdevs.yardhal.ui.image.LocalRemoteImageLoader
 import dev.brentdevs.yardhal.ui.image.RemoteImageState
 import dev.brentdevs.yardhal.ui.image.rememberRemoteImage
@@ -38,15 +47,26 @@ public fun NickAvatar(
     modifier: Modifier = Modifier,
     size: Dp = 38.dp,
     avatarUrl: String? = null,
+    mediaVisible: Boolean = true,
 ) {
-    val image by rememberRemoteImage(LocalRemoteImageLoader.current, avatarUrl, size.roundToPxInt())
+    val environment = LocalMediaEnvironment.current
+    val preferences by (environment?.preferences?.preferences ?: DefaultMediaSignals.preferences).collectAsState()
+    var inViewport by remember { mutableStateOf(false) }
+    val visibleModifier = modifier.onGloballyPositioned { coordinates ->
+        val bounds = coordinates.boundsInWindow()
+        inViewport = bounds.width > 0 && bounds.height > 0
+    }
+    val image by rememberRemoteImage(
+        LocalRemoteImageLoader.current, avatarUrl, size.roundToPxInt(),
+        category = ImageCacheCategory.AVATAR, enabled = preferences.loadAvatars, visible = mediaVisible && inViewport,
+    )
     val loaded = (image as? RemoteImageState.Success)?.bitmap
     if (loaded != null) {
         Image(
             bitmap = loaded,
             contentDescription = null,
             contentScale = ContentScale.Crop,
-            modifier = modifier
+            modifier = visibleModifier
                 .size(size)
                 .clip(CircleShape),
         )
@@ -55,7 +75,7 @@ public fun NickAvatar(
     val color = nickColor(nick)
     val initial = nick.firstOrNull { it.isLetterOrDigit() }?.uppercase() ?: "?"
     Box(
-        modifier = modifier
+        modifier = visibleModifier
             .size(size)
             .clip(CircleShape)
             .background(color.copy(alpha = 0.22f)),
@@ -76,14 +96,25 @@ public fun NetworkBadge(
     iconUrl: String?,
     modifier: Modifier = Modifier,
     size: Dp = 22.dp,
+    mediaVisible: Boolean = true,
 ) {
-    val image by rememberRemoteImage(LocalRemoteImageLoader.current, iconUrl, size.roundToPxInt())
+    val environment = LocalMediaEnvironment.current
+    val preferences by (environment?.preferences?.preferences ?: DefaultMediaSignals.preferences).collectAsState()
+    var inViewport by remember { mutableStateOf(false) }
+    val visibleModifier = modifier.onGloballyPositioned { coordinates ->
+        val bounds = coordinates.boundsInWindow()
+        inViewport = bounds.width > 0 && bounds.height > 0
+    }
+    val image by rememberRemoteImage(
+        LocalRemoteImageLoader.current, iconUrl, size.roundToPxInt(),
+        category = ImageCacheCategory.AVATAR, enabled = preferences.loadAvatars, visible = mediaVisible && inViewport,
+    )
     val loaded = (image as? RemoteImageState.Success)?.bitmap
     if (loaded == null) {
-        RecoveryStatusDot(phase, modifier)
+        RecoveryStatusDot(phase, visibleModifier)
         return
     }
-    Box(modifier = modifier.size(size)) {
+    Box(modifier = visibleModifier.size(size)) {
         Image(
             bitmap = loaded,
             contentDescription = null,

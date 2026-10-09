@@ -15,7 +15,6 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.foundation.isSystemInDarkTheme
-import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -34,14 +33,23 @@ import dev.brentdevs.yardhal.core.data.NetworkPresets
 import dev.brentdevs.yardhal.core.data.ThemeDefinition
 import dev.brentdevs.yardhal.core.data.ThemeFileParser
 import dev.brentdevs.yardhal.ui.YardhalAppRoot
-import dev.brentdevs.yardhal.ui.image.LocalRemoteImageLoader
+import dev.brentdevs.yardhal.ui.image.MediaEnvironmentProvider
 import dev.brentdevs.yardhal.ui.screens.NetworkPresetUi
 import dev.brentdevs.yardhal.ui.theme.YardhalTheme
+import dev.brentdevs.yardhal.media.IncomingShareIntake
+import java.util.UUID
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 
 class MainActivity : ComponentActivity() {
+    private var shareRequestId: String = UUID.randomUUID().toString()
+    private var shareHandled = false
+
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        shareRequestId = savedInstanceState?.getString("share-request-id") ?: UUID.randomUUID().toString()
+        shareHandled = savedInstanceState?.getBoolean("share-handled") ?: false
         enableEdgeToEdge()
         val app = application as YardhalApplication
 
@@ -78,14 +86,23 @@ class MainActivity : ComponentActivity() {
                 dynamicColor = useDynamic,
                 amoledDark = appearance.amoledDark,
             ) {
-                CompositionLocalProvider(LocalRemoteImageLoader provides app.remoteImages) {
+                MediaEnvironmentProvider(app.mediaEnvironment) {
                     YardhalAppRoot(
                         coordinator = coordinator,
                         appearanceStore = app.chatAppearanceStore,
+                        mediaEnvironment = app.mediaEnvironment,
+                        attachmentStages = app.attachmentStages,
+                        uploadSettings = app.uploadSettings,
+                        recentEmojiStore = app.recentEmoji,
+                        relayConfigurations = app.relayConfigurations,
                         presets = presets,
                         onNetworkSaved = networkSaver::save,
                         sharedTextProvider = { (application as YardhalApplication).sharedText },
                         onSharedConsumed = { (application as YardhalApplication).sharedText = null },
+                        incomingShareError = app.sharedAttachmentError,
+                        onSharedErrorConsumed = { error ->
+                            if (app.sharedAttachmentError == error) app.sharedAttachmentError = null
+                        },
                         onAppearanceChanged = { appearance = it },
                         modifier = Modifier,
                     )
@@ -106,13 +123,56 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
+        shareRequestId = UUID.randomUUID().toString()
+        shareHandled = false
         consumeShareIntent(intent)
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putString("share-request-id", shareRequestId)
+        outState.putBoolean("share-handled", shareHandled)
+        super.onSaveInstanceState(outState)
+    }
+
     private fun consumeShareIntent(incoming: Intent?) {
-        if (incoming?.action != Intent.ACTION_SEND) return
-        val text = incoming.getStringExtra(Intent.EXTRA_TEXT) ?: return
-        (application as YardhalApplication).sharedText = text
+        if (incoming?.action != Intent.ACTION_SEND && incoming?.action != Intent.ACTION_SEND_MULTIPLE) return
+        if (shareHandled) return
+        val app = application as YardhalApplication
+        val share = try {
+            IncomingShareIntake.fromIntent(incoming)
+        } catch (_: RuntimeException) {
+            app.sharedAttachmentError = "Unable to read this share. Select the files with the Android document picker or share them again."
+            return
+        }
+        if (share == null) {
+            if (!shareHandled) {
+                val text = incoming.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()
+                if (text != null) app.sharedText = text
+                else app.sharedAttachmentError = "The share contained no readable files or text. Select files with the Android document picker."
+            }
+            shareHandled = true
+            return
+        }
+        val requestId = shareRequestId
+        app.appScope.launch(Dispatchers.Main.immediate) {
+            if (!app.awaitInitialization()) {
+                app.sharedAttachmentError = "Local storage is unavailable. Reopen Yardhal and share the files again."
+                return@launch
+            }
+            try {
+                app.attachmentStages.stageIncoming(share.uris, share.caption, requestId = requestId)
+                if (shareRequestId == requestId) {
+                    shareHandled = true
+                    incoming.action = Intent.ACTION_MAIN
+                    setIntent(incoming)
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                app.sharedAttachmentError = "Unable to stage shared files. Free local storage or select the files again."
+            }
+        }
     }
 
     private fun loadBundledTheme(): ThemeDefinition? = runCatching {

@@ -74,6 +74,19 @@ import dev.brentdevs.yardhal.ui.screens.NetworkDraft
 import dev.brentdevs.yardhal.ui.screens.NetworkOverviewScreen
 import dev.brentdevs.yardhal.ui.screens.NetworkPresetUi
 import dev.brentdevs.yardhal.ui.screens.WelcomeScreen
+import dev.brentdevs.yardhal.ui.image.MediaEnvironment
+import dev.brentdevs.yardhal.ui.image.MediaSettingsSheet
+import androidx.compose.runtime.CompositionLocalProvider
+import dev.brentdevs.yardhal.core.data.AttachmentDestination
+import dev.brentdevs.yardhal.core.data.AttachmentStageStatus
+import dev.brentdevs.yardhal.core.data.RecentEmojiStore
+import dev.brentdevs.yardhal.core.data.RelayConfigurationStore
+import dev.brentdevs.yardhal.core.data.UploadSettingsStore
+import dev.brentdevs.yardhal.media.AttachmentStageManager
+import dev.brentdevs.yardhal.media.AttachmentStagingPanel
+import dev.brentdevs.yardhal.media.UploadSettingsSheet
+import dev.brentdevs.yardhal.ui.components.LocalRecentEmojiStore
+import dev.brentdevs.yardhal.ui.screens.RelaySettingsSheet
 
 private val NETWORK_ID_SET_SAVER = listSaver<Set<String>, String>(
     save = { it.toList() },
@@ -85,15 +98,23 @@ private val NETWORK_ID_SET_SAVER = listSaver<Set<String>, String>(
 public fun YardhalAppRoot(
     coordinator: LiveCoordinator,
     appearanceStore: ChatAppearanceStore,
+    mediaEnvironment: MediaEnvironment,
+    attachmentStages: AttachmentStageManager,
+    uploadSettings: UploadSettingsStore,
+    recentEmojiStore: RecentEmojiStore,
+    relayConfigurations: RelayConfigurationStore,
     presets: List<NetworkPresetUi>,
     onNetworkSaved: (NetworkDraft) -> Boolean,
     sharedTextProvider: () -> String? = { null },
     onSharedConsumed: () -> Unit = {},
+    incomingShareError: String? = null,
+    onSharedErrorConsumed: (String) -> Unit = {},
     onAppearanceChanged: (ChatAppearancePreferences) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val networks by coordinator.networks.collectAsStateWithLifecycle()
     val buffers by coordinator.buffers.collectAsStateWithLifecycle()
+    val stagedAttachments by attachmentStages.attachments.collectAsStateWithLifecycle()
     val whoisPresentation by coordinator.whoisPresentation.collectAsStateWithLifecycle()
     val restoredSelection by coordinator.restoredSelection.collectAsStateWithLifecycle()
     val restorationReady by coordinator.restorationReady.collectAsStateWithLifecycle()
@@ -116,6 +137,12 @@ public fun YardhalAppRoot(
         val error = operationError ?: return@LaunchedEffect
         operationSnackbarState.showSnackbar(error, withDismissAction = true)
         coordinator.dismissOperationError(error)
+    }
+    LaunchedEffect(incomingShareError) {
+        incomingShareError?.let {
+            operationSnackbarState.showSnackbar(it, withDismissAction = true)
+            onSharedErrorConsumed(it)
+        }
     }
 
     var networkEditorVisible by rememberSaveable { mutableStateOf(false) }
@@ -170,8 +197,36 @@ public fun YardhalAppRoot(
     var bouncerInitialId by remember { mutableStateOf<String?>(null) }
     var removingAccountId by remember { mutableStateOf<String?>(null) }
     var appearanceVisible by remember { mutableStateOf(false) }
+    var mediaSettingsVisible by rememberSaveable { mutableStateOf(false) }
+    var uploadSettingsVisible by rememberSaveable { mutableStateOf(false) }
+    var relaySettingsVisible by rememberSaveable { mutableStateOf(false) }
+    var relaySettingsRevision by remember { mutableStateOf(0) }
+    var shareChooserBatchId by rememberSaveable { mutableStateOf<String?>(null) }
+    var dismissedShareBatches by remember { mutableStateOf(emptySet<String>()) }
+    var attachmentPickerKey by rememberSaveable { mutableStateOf<String?>(null) }
+    var attachmentError by remember { mutableStateOf<String?>(null) }
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val drawerScope = rememberCoroutineScope()
+    LaunchedEffect(attachmentError) {
+        attachmentError?.let { operationSnackbarState.showSnackbar(it, withDismissAction = true) }
+        attachmentError = null
+    }
+    LaunchedEffect(stagedAttachments) {
+        val unbound = stagedAttachments.firstOrNull { it.destination == null && it.batchId !in dismissedShareBatches }
+        if (shareChooserBatchId == null && unbound != null) shareChooserBatchId = unbound.batchId
+        val uploaded = stagedAttachments.filter {
+            it.status == AttachmentStageStatus.UPLOADED && it.insertionToken == null && it.destination != null
+        }.groupBy { it.destination }
+        for (entries in uploaded.values) {
+            try {
+                attachmentStages.prepareInsertion(entries.map { it.id })
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                attachmentError = "Upload completed. Its URL remains in staged attachments, but could not be inserted. Reopen the original conversation or retry insertion."
+            }
+        }
+    }
 
     val configuration = LocalConfiguration.current
     val context = LocalContext.current
@@ -191,24 +246,34 @@ public fun YardhalAppRoot(
     }
 
     val pickLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
-        androidx.activity.result.contract.ActivityResultContracts.OpenDocument(),
-    ) { uri ->
-        if (uri != null) {
-            val key = selectedKey ?: return@rememberLauncherForActivityResult
-            val networkId = key.substringBefore("|")
-            val resolver = context.contentResolver
-            val mime = resolver.getType(uri) ?: "application/octet-stream"
-            val name = queryDisplayName(resolver, uri)
-            val bytes: ByteArray? = runCatching {
-                resolver.openInputStream(uri)?.use { input -> input.readBytes() }
-            }.getOrNull()
-            if (bytes != null) {
-                coordinator.uploadAndShare(networkId, key, name, mime, bytes)
+        androidx.activity.result.contract.ActivityResultContracts.OpenMultipleDocuments(),
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            val key = attachmentPickerKey
+            attachmentPickerKey = null
+            val original = key?.let { buffers[it] }
+            val destination = original?.let {
+                AttachmentDestination(it.ref.networkId, it.key, "${networks.firstOrNull { network -> network.id == it.ref.networkId }?.name.orEmpty()} · ${it.displayName}")
+            }
+            uris.forEach { uri ->
+                runCatching {
+                    context.contentResolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+            }
+            drawerScope.launch {
+                try {
+                    attachmentStages.stageIncoming(uris, destination = destination)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    attachmentError = "Unable to preserve selected files. Free local storage or select the files again."
+                }
             }
         }
     }
 
-    fun launchAttachmentPicker() {
+    fun launchAttachmentPicker(key: String) {
+        attachmentPickerKey = key
         pickLauncher.launch(arrayOf("*/*"))
     }
 
@@ -299,6 +364,12 @@ public fun YardhalAppRoot(
         { key, buffer, networkName, connected, onOpenBuffers ->
             val networkId = key.substringBefore("|")
             val networkFeatures = networks.firstOrNull { it.id == networkId }
+            val insertion = pendingAttachmentInsertion(key, attachmentStages.pendingInsertions())
+            val incomingDraft = listOfNotNull(sharedDraft, insertion?.let(::attachmentInsertionDraft)).joinToString("\n").takeIf { it.isNotEmpty() }
+            val destination = AttachmentDestination(networkId, key, "$networkName · ${buffer.displayName}")
+            val relayPresenter = remember(networkId, relaySettingsRevision) {
+                { message: dev.brentdevs.yardhal.coordinator.ChatMessage -> coordinator.relayPresentation(networkId, message) }
+            }
             conversationStateHolder.SaveableStateProvider(key) {
                 ConversationScreen(
                     buffer = buffer,
@@ -316,7 +387,13 @@ public fun YardhalAppRoot(
                     onRemoveCertificateTrust = { coordinator.removeCertificateTrust(networkId) },
                     canSendOffline = { text -> coordinator.canSendOffline(networkId, key, text) },
                     onSend = { text ->
-                        val sent = coordinator.sendText(networkId, key, text)
+                        val uploads = messageUploads(key, text, stagedAttachments)
+                        val sent = coordinator.sendText(networkId, key, text, attachments = uploads)
+                        if (sent && uploads.isNotEmpty()) {
+                            val urls = uploads.map { it.url }.toSet()
+                            stagedAttachments.filter { it.destination?.storageKey == key && it.uploaded?.url in urls }
+                                .forEach { attachmentStages.remove(it.id) }
+                        }
                         if (sent && connected && !coordinator.canSendOffline(networkId, key, text)) {
                             coordinator.sendTyping(networkId, key)
                         }
@@ -367,10 +444,24 @@ public fun YardhalAppRoot(
                             joinDialogVisible = true
                         }
                     },
-                    sharedDraft = sharedDraft,
-                    onSharedConsumed = onSharedConsumed,
+                    sharedDraft = incomingDraft,
+                    sharedDraftToken = insertion?.token ?: sharedDraft,
+                    onSharedConsumed = {
+                        if (sharedTextProvider() == sharedDraft) onSharedConsumed()
+                        insertion?.let { attachmentStages.ackInserted(it.token) }
+                    },
                     profiles = profiles[networkId] ?: NetworkProfiles.EMPTY,
-                    onPickFile = { launchAttachmentPicker() },
+                    onPickFile = { launchAttachmentPicker(key) },
+                    relayPresentation = relayPresenter,
+                    stagingContent = {
+                        AttachmentStagingPanel(
+                            manager = attachmentStages,
+                            destination = destination,
+                            onInsert = { attachmentError = "Uploaded URL ready for ${it.destination.label}. Review the draft and send explicitly." },
+                            onChooseDestination = { shareChooserBatchId = it },
+                            onOpenSettings = { uploadSettingsVisible = true },
+                        )
+                    },
                     modifier = Modifier.fillMaxSize(),
                 )
             }
@@ -570,7 +661,18 @@ public fun YardhalAppRoot(
                     }
                 }
             }
-            Box(Modifier.weight(1f)) { mainContent() }
+            if (selectedKey == null && stagedAttachments.any { it.destination == null }) {
+                AttachmentStagingPanel(
+                    manager = attachmentStages,
+                    destination = null,
+                    onInsert = { attachmentError = "Uploaded URL ready for ${it.destination.label}. Open that conversation to review and send." },
+                    onChooseDestination = { shareChooserBatchId = it },
+                    onOpenSettings = { uploadSettingsVisible = true },
+                )
+            }
+            Box(Modifier.weight(1f)) {
+                CompositionLocalProvider(LocalRecentEmojiStore provides recentEmojiStore) { mainContent() }
+            }
         }
     }
 
@@ -624,6 +726,17 @@ public fun YardhalAppRoot(
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
                 Text("Chat appearance", style = MaterialTheme.typography.titleLarge)
+                TextButton(onClick = { appearanceVisible = false; mediaSettingsVisible = true }) {
+                    Text("Media and privacy")
+                }
+                TextButton(onClick = { appearanceVisible = false; uploadSettingsVisible = true }) {
+                    Text("Uploads and photo privacy")
+                }
+                if (selectedKey != null) {
+                    TextButton(onClick = { appearanceVisible = false; relaySettingsVisible = true }) {
+                        Text("Configured relay senders")
+                    }
+                }
 
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -729,6 +842,49 @@ public fun YardhalAppRoot(
             }
         }
     }
+    if (mediaSettingsVisible) {
+        MediaSettingsSheet(environment = mediaEnvironment, onDismiss = { mediaSettingsVisible = false })
+    }
+    if (uploadSettingsVisible) {
+        UploadSettingsSheet(
+            settings = uploadSettings,
+            networks = coordinator.networkStore.all(),
+            initialNetworkId = selectedKey?.substringBefore('|'),
+            onDismiss = { uploadSettingsVisible = false },
+        )
+    }
+    if (relaySettingsVisible) {
+        val relayNetworkId = selectedKey?.substringBefore('|')
+        val relayNetwork = networks.firstOrNull { it.id == relayNetworkId }
+        if (relayNetwork != null) {
+            RelaySettingsSheet(
+                networkId = relayNetwork.id,
+                networkName = relayNetwork.name,
+                store = relayConfigurations,
+                onDismiss = { relaySettingsVisible = false },
+                onChanged = { relaySettingsRevision += 1 },
+            )
+        }
+    }
+    shareChooserBatchId?.let { batchId ->
+        ShareDestinationDialog(
+            batchId = batchId,
+            staged = stagedAttachments,
+            buffers = buffers.values,
+            networks = networks,
+            onChoose = { destination ->
+                attachmentStages.assignDestination(batchId, destination)
+                dismissedShareBatches = dismissedShareBatches + batchId
+                shareChooserBatchId = null
+                selectConversation(destination.storageKey)
+            },
+            onDismiss = {
+                dismissedShareBatches = dismissedShareBatches + batchId
+                shareChooserBatchId = null
+            },
+        )
+    }
+
 
     if (bouncerVisible) {
         BouncerManagementSheet(
@@ -878,11 +1034,3 @@ public fun YardhalAppRoot(
         )
     }
 }
-
-private fun queryDisplayName(resolver: android.content.ContentResolver, uri: android.net.Uri): String =
-    runCatching {
-        resolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
-            val index = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
-            if (index >= 0 && cursor.moveToFirst()) cursor.getString(index) else null
-        }
-    }.getOrNull() ?: uri.lastPathSegment ?: "upload.bin"

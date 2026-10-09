@@ -24,6 +24,7 @@ import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.FormatBold
 import androidx.compose.material.icons.filled.FormatItalic
+import androidx.compose.material.icons.filled.EmojiEmotions
 import androidx.compose.material.icons.filled.FormatStrikethrough
 import androidx.compose.material.icons.filled.FormatUnderlined
 import androidx.compose.material.icons.filled.Tag
@@ -53,6 +54,7 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import dev.brentdevs.yardhal.core.protocol.IrcFormatting
 import dev.brentdevs.yardhal.ui.components.NickAvatar
+import dev.brentdevs.yardhal.ui.components.EmojiPicker
 
 private const val BOLD_CHAR = '\u0002'
 private const val ITALIC_CHAR = '\u001D'
@@ -123,6 +125,7 @@ public fun ComposerBar(
     channels: List<String> = emptyList(),
     onAttach: () -> Unit = {},
     initialDraft: String? = null,
+    initialDraftToken: String? = null,
     onInitialDraftCaptured: () -> Unit = {},
     onSend: (String) -> Boolean,
     modifier: Modifier = Modifier,
@@ -132,8 +135,9 @@ public fun ComposerBar(
     }
     var sendError by rememberSaveable { mutableStateOf(false) }
     var showFormattingBar by rememberSaveable { mutableStateOf(false) }
+    var emojiPickerVisible by remember { mutableStateOf(false) }
 
-    LaunchedEffect(initialDraft) {
+    LaunchedEffect(initialDraft, initialDraftToken) {
         if (initialDraft != null) {
             val separator = if (draft.text.isBlank() || initialDraft.isBlank()) "" else "\n"
             val updated = draft.text + separator + initialDraft
@@ -474,14 +478,16 @@ public fun ComposerBar(
         ) {
             IconButton(
                 onClick = onAttach,
-                enabled = enabled,
                 modifier = Modifier.size(48.dp),
             ) {
                 Icon(
                     imageVector = Icons.Filled.AttachFile,
                     contentDescription = "Attach file",
-                    tint = if (enabled) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.outline,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+            }
+            IconButton(onClick = { emojiPickerVisible = true }, modifier = Modifier.size(48.dp)) {
+                Icon(Icons.Filled.EmojiEmotions, contentDescription = "Choose emoji")
             }
             TextField(
                 value = draft,
@@ -535,5 +541,18 @@ public fun ComposerBar(
                 )
             }
         }
+    }
+    if (emojiPickerVisible) {
+        EmojiPicker(
+            onDismiss = { emojiPickerVisible = false },
+            onSelect = { emoji ->
+                val start = draft.selection.min.coerceIn(0, draft.text.length)
+                val end = draft.selection.max.coerceIn(start, draft.text.length)
+                val updated = draft.text.replaceRange(start, end, emoji)
+                draft = TextFieldValue(updated, TextRange(start + emoji.length))
+                sendError = false
+                emojiPickerVisible = false
+            },
+        )
     }
 }

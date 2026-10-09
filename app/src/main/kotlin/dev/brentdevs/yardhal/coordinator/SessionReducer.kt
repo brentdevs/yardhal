@@ -6,7 +6,9 @@ import dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks
 import dev.brentdevs.yardhal.core.protocol.IrcMessage
 
 internal fun Reduction.handleCapabilities(capabilities: Set<String>, values: Map<String, String> = emptyMap()) {
+    val tagsChanged = ("message-tags" in state.supportedCaps) != ("message-tags" in capabilities)
     state.supportedCaps = capabilities
+    if (tagsChanged) emit(InboundEffect.NetworkFeaturesChanged)
     applyMetadataCapability(capabilities, values)
     val discovery = IrcBouncerNetworks.CAPABILITY in capabilities && state.bouncerNetId == null
     if (state.isBouncerDiscovery != discovery) {
@@ -37,10 +39,10 @@ internal fun Reduction.applyIsupportTokens(message: IrcMessage) {
     val tokens = message.parameters.drop(1).dropLast(1).filter { it.isNotEmpty() }
     val previousBot = state.botModeLetter
     val previousExtban = state.accountExtban
+    val previousDeny = state.isupport["CLIENTTAGDENY"]
     state.isupport = state.isupport.mergedWith(ISupport.parse(tokens))
-    if (state.botModeLetter != previousBot || state.accountExtban != previousExtban) {
-        emit(InboundEffect.NetworkFeaturesChanged)
-    }
+    if (state.botModeLetter != previousBot || state.accountExtban != previousExtban ||
+        state.isupport["CLIENTTAGDENY"] != previousDeny) emit(InboundEffect.NetworkFeaturesChanged)
     val previousMapping = state.casemapping
     state.casemapping = state.isupport.casemapping
     state.rekey(previousMapping)

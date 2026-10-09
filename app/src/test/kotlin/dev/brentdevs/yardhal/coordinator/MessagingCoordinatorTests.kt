@@ -25,11 +25,16 @@ import java.nio.file.Files
 import java.time.Instant
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -149,6 +154,7 @@ class MessagingCoordinatorTests {
         val historyCoverage = dev.brentdevs.yardhal.core.data.HistoryCoverageStore(directory)
         val mutes = MuteStore(directory)
         val channelOrder = ChannelOrderStore(directory)
+        val connections = CopyOnWriteArrayList<IrcConnection>()
         val coordinator = LiveCoordinator(
             scope = scope,
             networkStore = networks,
@@ -176,7 +182,7 @@ class MessagingCoordinatorTests {
                         ),
                     ),
                     onStsUpgrade = onStsUpgrade,
-                )
+                ).also { connections.add(it) }
             },
             stsPolicies = InMemoryStsPolicyStore(),
             clock = clock,
@@ -187,10 +193,11 @@ class MessagingCoordinatorTests {
         advertised: String,
         echoText: (String) -> String = { it },
         clock: () -> Long = System::currentTimeMillis,
+        dispatcher: CoroutineDispatcher = Dispatchers.IO,
         body: suspend (Server, Harness) -> Unit,
     ) = runBlocking {
         val directory = Files.createTempDirectory("yardhal-messaging").toFile()
-        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val scope = CoroutineScope(SupervisorJob() + dispatcher)
         Server(advertised, echoText).use { server ->
             server.start()
             val harness = Harness(directory, server, scope, clock)
@@ -211,6 +218,31 @@ class MessagingCoordinatorTests {
                 scope.cancel()
                 harness.database.close()
                 directory.deleteRecursively()
+            }
+        }
+    }
+
+    @Test
+    fun closedTransportRejectsActionsBeforeDisconnectPresentationArrives() {
+        Executors.newSingleThreadExecutor().asCoroutineDispatcher().use { dispatcher ->
+            withHarness("server-time", dispatcher = dispatcher) { _, harness ->
+                val blocked = CountDownLatch(1)
+                val release = CountDownLatch(1)
+                val blocker = harness.scope.launch {
+                    blocked.countDown()
+                    check(release.await(5, TimeUnit.SECONDS))
+                }
+                try {
+                    assertTrue(blocked.await(5, TimeUnit.SECONDS))
+                    harness.connections.single().disconnect()
+                    assertEquals(ConnectionStatus.REGISTERED, harness.coordinator.networks.value.single().status)
+                    val ref = ConversationRef.channel(harness.config.id, "#room")
+                    assertFalse(harness.coordinator.sendText(harness.config.id, ref.storageKey, "/me shares https://files.example/completed.jpg"))
+                    assertTrue(harness.coordinator.buffers.value.getValue(ref.storageKey).messages.none { it.kind == MessageKind.ACTION && it.sentByUs })
+                } finally {
+                    release.countDown()
+                    blocker.join()
+                }
             }
         }
     }
@@ -470,10 +502,12 @@ class MessagingCoordinatorTests {
     fun multilineComposerTextFallsBackToSeparatePrivmsgsWithoutTheCap() =
         withHarness("echo-message server-time batch") { server, harness ->
             val ref = ConversationRef.channel(harness.config.id, "#room")
-            harness.coordinator.sendText(harness.config.id, ref.storageKey, "alpha\n\nbeta")
-            await { server.received.contains("PRIVMSG #room :beta") }
-            assertTrue(server.received.contains("PRIVMSG #room :alpha"))
-            assertTrue(server.received.none { it.startsWith("BATCH") })
+            assertTrue(harness.coordinator.sendText(harness.config.id, ref.storageKey, "alpha\n\nbeta"))
+            await { server.received.mapNotNull(IrcMessage::parse).count { it.command == "PRIVMSG" } == 2 }
+            val messages = server.received.mapNotNull(IrcMessage::parse)
+            assertEquals(listOf(listOf("#room", "alpha"), listOf("#room", "beta")),
+                messages.filter { it.command == "PRIVMSG" }.map { it.parameters })
+            assertTrue(messages.none { it.command == "BATCH" })
         }
 
     @Test

@@ -1,6 +1,7 @@
 package dev.brentdevs.yardhal.core.client
 
 import com.sun.net.httpserver.HttpServer
+import java.io.ByteArrayInputStream
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.util.concurrent.atomic.AtomicReference
@@ -48,7 +49,8 @@ class FilehostUploaderTests {
     private fun file(): OutgoingFile = OutgoingFile(
         name = "picture.jpeg",
         mimeType = "image/jpeg",
-        bytes = ByteArray(128) { it.toByte() },
+        sizeBytes = 128,
+        openStream = { ByteArrayInputStream(ByteArray(128) { it.toByte() }) },
     )
 
     @Test
@@ -66,14 +68,11 @@ class FilehostUploaderTests {
     }
 
     @Test
-    fun basicAuthAppliedWhenSaslCredentialsPresent() {
-        responder = { exchange ->
-            assertEquals("Basic amlsbGVzOnNlc2FtZQ==", exchange.requestHeaders.getFirst("Authorization"))
-            exchange.responseHeaders.add("Location", "/f/x")
-            exchange.sendResponseHeaders(201, -1)
-            exchange.close()
+    fun credentialsAreNeverSentOverPlainHttp() {
+        assertFailsWith<FilehostException.InsecureTransport> {
+            FilehostUploader.upload(endpoint(), file(), ircConnectionIsTls = false, saslUser = "jilles", saslPassword = "sesame")
         }
-        FilehostUploader.upload(endpoint(), file(), ircConnectionIsTls = false, saslUser = "jilles", saslPassword = "sesame")
+        assertNull(lastRequest.get())
     }
 
     @Test
@@ -99,7 +98,7 @@ class FilehostUploaderTests {
                 exchange.sendResponseHeaders(415, -1)
                 exchange.close()
             } else {
-                assertEquals("multipart/form-data", exchange.requestHeaders.getFirst("Content-Type")!!.substringBefore(';'))
+                assertEquals("multipart/form-data", exchange.requestHeaders.getFirst("Content-Type")?.substringBefore(';'))
                 val body = lastBody.get().toString(Charsets.UTF_8)
                 assertTrue(body.contains("name=\"file\"; filename=\"picture.jpeg\""))
                 exchange.responseHeaders.add("Location", "/f/multi.bin")
@@ -153,5 +152,58 @@ class FilehostUploaderTests {
         assertFailsWith<FilehostException.InsecureTransport> {
             FilehostUploader.upload(endpoint(tls = false), file(), ircConnectionIsTls = true)
         }
+    }
+
+    @Test
+    fun redirectsAreNotFollowedOrCredentialForwarded() {
+        responder = { exchange ->
+            exchange.responseHeaders.add("Location", "http://127.0.0.1:$port/elsewhere")
+            exchange.sendResponseHeaders(307, -1)
+            exchange.close()
+        }
+        val failure = assertFailsWith<FilehostException.HttpStatus> {
+            FilehostUploader.upload(endpoint(), file(), false)
+        }
+        assertEquals(307, failure.code)
+    }
+
+    @Test
+    fun cancellationBeforeUploadDoesNotOpenSourceOrConnection() {
+        val cancellation = UploadCancellation()
+        cancellation.cancel()
+        val source = OutgoingFile("x", "application/octet-stream", 1) { error("source must not open") }
+        assertFailsWith<FilehostException.Cancelled> { FilehostUploader.upload(endpoint(), source, false, cancellation = cancellation) }
+        assertNull(lastRequest.get())
+    }
+
+    @Test
+    fun cancellationDuringStreamingDisconnectsAndRetainsCancelledOutcome() {
+        val cancellation = UploadCancellation()
+        val source = OutgoingFile("x", "application/octet-stream", 65536) { ByteArrayInputStream(ByteArray(65536)) }
+        assertFailsWith<FilehostException.Cancelled> {
+            FilehostUploader.upload(endpoint(), source, false, cancellation = cancellation, onProgress = { sent, _ -> if (sent > 0) cancellation.cancel() })
+        }
+    }
+
+    @Test
+    fun mismatchedStreamSizeIsRejectedWithoutSendingExtraBytes() {
+        val source = OutgoingFile("x", "application/octet-stream", 1) { ByteArrayInputStream(ByteArray(2)) }
+        assertFailsWith<FilehostException.SizeMismatch> { FilehostUploader.upload(endpoint(), source, false) }
+    }
+
+    @Test
+    fun rawAndMultipartEachReopenTheSameStreamingSource() {
+        var attempts = 0
+        var opens = 0
+        responder = { exchange ->
+            attempts++
+            if (attempts == 1) exchange.sendResponseHeaders(415, -1)
+            else { exchange.responseHeaders.add("Location", "/f/streamed"); exchange.sendResponseHeaders(201, -1) }
+            exchange.close()
+        }
+        val source = OutgoingFile("x", "application/octet-stream", 3) { opens++; ByteArrayInputStream(byteArrayOf(1, 2, 3)) }
+        FilehostUploader.upload(endpoint(), source, false)
+        assertEquals(2, opens)
+        assertEquals(2, attempts)
     }
 }

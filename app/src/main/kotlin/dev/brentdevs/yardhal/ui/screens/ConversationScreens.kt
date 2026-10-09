@@ -67,6 +67,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -132,8 +133,12 @@ internal sealed interface TranscriptEntry {
 
 public enum class MemberAction { MESSAGE, WHOIS, KICK, BAN, BAN_ACCOUNT, IGNORE }
 
-internal fun buildTranscript(buffer: ConversationBuffer, zone: ZoneId = ZoneId.systemDefault()): List<TranscriptEntry> {
-    val ordered = buffer.messages.asReversed()
+internal fun buildTranscript(
+    buffer: ConversationBuffer,
+    zone: ZoneId = ZoneId.systemDefault(),
+    messages: List<ChatMessage> = buffer.messages,
+): List<TranscriptEntry> {
+    val ordered = messages.asReversed()
     val gapsAtBoundary = buffer.history.gaps.groupBy { gap ->
         val fromIndex = gap.from.msgid?.let { msgid -> ordered.indexOfFirst { it.msgid == msgid } }
             ?.takeIf { it >= 0 }
@@ -154,7 +159,10 @@ internal fun buildTranscript(buffer: ConversationBuffer, zone: ZoneId = ZoneId.s
                 else -> true
             }
         },
-        senderOf = { index -> ordered[index].sender },
+        senderOf = { index ->
+            val message = ordered[index]
+            message.relayedSender?.let { "${message.sender}\u0000${message.relaySource}\u0000$it" } ?: message.sender
+        },
     )
     val entries = ArrayList<TranscriptEntry>(ordered.size + 4)
     val unreadFrom = buffer.unreadFromTimestampMs
@@ -365,7 +373,9 @@ internal fun replyPreviewText(message: ChatMessage, buffer: ConversationBuffer):
         return "${preview.sender}: $text"
     }
     return message.replyToMsgid?.let { target ->
-        buffer.messages.firstOrNull { it.msgid == target }?.let { "${it.sender}: ${it.text.take(60)}" }
+        buffer.messages.firstOrNull { it.msgid == target }?.let {
+            if (it.redacted) "Deleted message" else "${it.sender}: ${it.text.take(60)}"
+        }
     }
 }
 
@@ -418,12 +428,16 @@ public fun ConversationScreen(
     accountBanAvailable: Boolean = false,
     onOpenChannel: (String) -> Unit = {},
     sharedDraft: String? = null,
+    sharedDraftToken: String? = null,
     onSharedConsumed: () -> Unit = {},
     profiles: NetworkProfiles = NetworkProfiles.EMPTY,
     onPickFile: () -> Unit = {},
+    stagingContent: @Composable () -> Unit = {},
+    relayPresentation: (ChatMessage) -> ChatMessage = { it },
     modifier: Modifier = Modifier,
 ) {
     var actionTarget by remember { mutableStateOf<ChatMessage?>(null) }
+    var emojiTarget by remember { mutableStateOf<ChatMessage?>(null) }
     var membersVisible by remember { mutableStateOf(false) }
     var memberTarget by remember { mutableStateOf<String?>(null) }
     var memberQuery by rememberSaveable { mutableStateOf("") }
@@ -440,7 +454,12 @@ public fun ConversationScreen(
         }
     }
     val listState = androidx.compose.foundation.lazy.rememberLazyListState()
-    val entries = remember(buffer) { buildTranscript(buffer) }
+    val visibleMediaKeys by remember(listState) {
+        derivedStateOf { listState.layoutInfo.visibleItemsInfo.filter { it.size > 0 }.map { it.key }.toSet() }
+    }
+    val entries = remember(buffer, relayPresentation) {
+        buildTranscript(buffer, messages = buffer.messages.map(relayPresentation))
+    }
     val unreadIndex = entries.indexOfFirst { it is TranscriptEntry.UnreadDivider }
     val coroutineScope = androidx.compose.runtime.rememberCoroutineScope()
     var focusedRowId by remember { mutableStateOf<Long?>(null) }
@@ -605,7 +624,8 @@ public fun ConversationScreen(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text(
-                            text = "↩ Replying to ${reply.sender}: ${reply.text.take(48)}",
+                            text = if (reply.redacted) "↩ Deleted message" else
+                                "↩ ${if (reply.msgid != null && network?.taggedRepliesAvailable == true) "Replying" else "Quoting"} ${reply.sender}: ${reply.text.take(48)}",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.weight(1f),
@@ -614,6 +634,7 @@ public fun ConversationScreen(
                         TextButton(onClick = { onSetReplyDraft(null) }) { Text("Cancel") }
                     }
                 }
+                stagingContent()
                 ComposerBar(
                     enabled = connected,
                     canSendOffline = canSendOffline,
@@ -621,6 +642,7 @@ public fun ConversationScreen(
                     channels = channels,
                     onAttach = onPickFile,
                     initialDraft = sharedDraft,
+                    initialDraftToken = sharedDraftToken,
                     onInitialDraftCaptured = onSharedConsumed,
                     onSend = onSend,
                 )
@@ -749,6 +771,8 @@ public fun ConversationScreen(
                                 val message = entry.value
                                 MessageRow(
                                     message = message,
+                                    mediaIdentity = dev.brentdevs.yardhal.coordinator.messageMediaIdentity(buffer, message),
+                                    mediaVisible = entry.key in visibleMediaKeys,
                                     groupedWithPrevious = entry.groupedWithPrevious,
                                     focused = message.storedRowId != null && message.storedRowId == focusedRowId,
                                     appearance = appearance,
@@ -759,13 +783,13 @@ public fun ConversationScreen(
                                         actionTarget = message
                                     },
                                     onToggleReaction = { emoji ->
-                                        message.msgid?.let { msgid -> onReact(msgid, emoji) }
+                                        if (connected && network?.reactionsAvailable == true) message.msgid?.let { msgid -> onReact(msgid, emoji) }
                                     },
                                     onOpenAttachment = ::openLink,
                                     onOpenChannel = onOpenChannel,
                                     onOpenNick = onOpenDm,
                                     onOpenUrl = ::openLink,
-                                    profile = message.sender.takeIf { it.isNotEmpty() }?.let(profiles::forNick),
+                                    profile = message.sender.takeIf { it.isNotEmpty() && message.relayedSender == null }?.let(profiles::forNick),
                                 )
                             }
                         }
@@ -831,12 +855,12 @@ public fun ConversationScreen(
                     NickAvatar(nick = target.sender, size = 36.dp)
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = target.sender.ifEmpty { "Message" },
+                            text = target.relayedSender?.let { "$it · via ${target.relaySource}" } ?: target.sender.ifEmpty { "Message" },
                             style = MaterialTheme.typography.titleSmall,
                             fontWeight = FontWeight.SemiBold,
                         )
                         Text(
-                            text = target.text,
+                            text = target.relayedBody ?: target.text,
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 2,
@@ -855,7 +879,7 @@ public fun ConversationScreen(
                         Text(if (connected) "WHOIS" else "Stored WHOIS")
                     }
                 }
-                if (target.msgid != null) {
+                if (target.msgid != null && !target.redacted && connected && network?.reactionsAvailable == true) {
                     Surface(
                         shape = RoundedCornerShape(16.dp),
                         color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
@@ -884,12 +908,20 @@ public fun ConversationScreen(
                             }
                         }
                     }
+                    TextButton(onClick = {
+                        emojiTarget = target
+                        actionTarget = null
+                    }) { Text("All emoji · search, categories & recent") }
+                }
+                if (target.msgid == null || !connected || network?.reactionsAvailable != true) {
+                    Text("Reactions unavailable · requires a message ID and permitted server client tags",
+                        style = MaterialTheme.typography.bodySmall)
                 }
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    if (!target.sentByUs && target.msgid != null) {
+                    if (!target.redacted) {
                         FilledTonalButton(
                             onClick = {
                                 onSetReplyDraft(target)
@@ -900,7 +932,7 @@ public fun ConversationScreen(
                         ) {
                             Icon(Icons.AutoMirrored.Filled.Reply, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(modifier = Modifier.width(4.dp))
-                            Text("Reply", maxLines = 1)
+                            Text(if (target.msgid != null && network?.taggedRepliesAvailable == true) "Reply" else "Quote reply", maxLines = 1)
                         }
                     }
                     FilledTonalButton(
@@ -970,6 +1002,16 @@ public fun ConversationScreen(
                 Spacer(modifier = Modifier.height(12.dp))
             }
         }
+    }
+
+    emojiTarget?.let { target ->
+        dev.brentdevs.yardhal.ui.components.EmojiPicker(
+            onDismiss = { emojiTarget = null },
+            onSelect = { emoji ->
+                if (connected && network?.reactionsAvailable == true) target.msgid?.let { onReact(it, emoji) }
+                emojiTarget = null
+            },
+        )
     }
 
     if (membersVisible) {
@@ -1044,7 +1086,7 @@ public fun ConversationScreen(
                 val sections = listOf(
                     Triple("ops", "${if (staleRoster) "Previously observed operators" else "Operators"} (${filteredOps.size})", filteredOps),
                     Triple("voices", "${if (staleRoster) "Previously observed voices" else "Voices"} (${filteredVoices.size})", filteredVoices),
-                    Triple("bots", "Bots & Relays (${filteredBots.size})", filteredBots),
+                    Triple("bots", "Bots (${filteredBots.size})", filteredBots),
                     Triple("users", "Users (${filteredPlain.size})", filteredPlain),
                 )
                 for ((id, title, section) in sections) {

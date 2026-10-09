@@ -67,7 +67,7 @@ import org.robolectric.RobolectricTestRunner
 
 @RunWith(RobolectricTestRunner::class)
 class OfflineCoordinatorTests {
-    private class Server(private val capabilities: String = "server-time draft/read-marker echo-message") : AutoCloseable {
+    private class Server(private val capabilities: String = "server-time draft/read-marker echo-message message-tags") : AutoCloseable {
         private val listener = ServerSocket(0, 4, InetAddress.getLoopbackAddress())
         private val executor = Executors.newCachedThreadPool()
         private val clients = CopyOnWriteArrayList<Socket>()
@@ -164,7 +164,7 @@ class OfflineCoordinatorTests {
                     onCreate(coordinator)
                     IrcConnection(IrcConnectionConfig(host = config.host, port = config.port, tls = false, nick = config.nick,
                         serverPassword = config.serverPassword,
-                        capabilities = setOf("server-time", "draft/read-marker", "echo-message", "draft/channel-rename",
+                        capabilities = setOf("server-time", "message-tags", "draft/read-marker", "echo-message", "draft/channel-rename",
                             "draft/message-redaction", "soju.im/filehost", IrcMetadata.CAPABILITY)),
                         onStsUpgrade = onStsUpgrade)
                 },
@@ -512,14 +512,20 @@ class OfflineCoordinatorTests {
                 await { harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
                 val quoted = harness.coordinator.buffers.value.getValue(harness.room.storageKey).messages.first { it.storedRowId == parent }
                 harness.coordinator.setReplyDraft(harness.config.id, harness.room.storageKey, quoted)
+                val quotedBody = "> alice: local quote — quoted response"
                 assertTrue(harness.coordinator.sendText(harness.config.id, harness.room.storageKey, "quoted response"))
-                await { harness.messages.recent(harness.room, 10).any { it.sentByUs && it.text == "quoted response" } }
+                await { harness.messages.recent(harness.room, 10).any { it.sentByUs && it.text == quotedBody } }
                 val optimistic = harness.messages.recent(harness.room, 10).first { it.sentByUs }
                 assertEquals(parent, optimistic.replyParentRowId)
+                assertTrue(optimistic.pendingEcho)
+                val pending = harness.coordinator.buffers.value.getValue(harness.room.storageKey).messages.first { it.sentByUs && it.text == quotedBody }
                 await { server.received.any { IrcMessage.parse(it)?.command == "PRIVMSG" } }
                 val outbound = server.received.mapNotNull(IrcMessage::parse).first { it.command == "PRIVMSG" }
+                assertEquals(listOf("#room", quotedBody), outbound.parameters)
+                assertNull(outbound.tag("+reply"))
+                assertNull(outbound.tag("+draft/reply"))
                 val label = outbound.tags["label"]?.let { ";label=$it" }.orEmpty()
-                server.send("@msgid=echo$label :tester!u@h PRIVMSG #room :quoted response")
+                server.send("@msgid=echo$label :tester!u@h PRIVMSG #room :${outbound.parameters.last()}")
                 await { harness.messages.recent(harness.room, 10).any { it.msgid == "echo" } }
                 val rows = harness.messages.recent(harness.room, 10).filter { it.sentByUs }
                 assertEquals(1, rows.size)
@@ -527,6 +533,9 @@ class OfflineCoordinatorTests {
                 assertEquals(parent, rows.single().replyParentRowId)
                 val rendered = harness.coordinator.buffers.value.getValue(harness.room.storageKey).messages.first { it.msgid == "echo" }
                 assertFalse(rendered.pendingEcho)
+                assertEquals(pending.localId, rendered.localId)
+                assertEquals(optimistic.rowId, rendered.storedRowId)
+                assertEquals(quotedBody, rendered.text)
                 assertEquals(ReplyPreview("alice", "local quote"), rendered.replyPreview)
             }
         }
@@ -892,7 +901,9 @@ class OfflineCoordinatorTests {
                 await { harness.messages.knownConversations(harness.config.id).any { it.storageKey == renamed.storageKey } &&
                     harness.offline.selection()?.storageKey == renamed.storageKey && calls.get() >= 3L }
                 assertTrue(harness.coordinator.sendText(harness.config.id, renamed.storageKey, "case-remap-barrier"))
-                await { server.received.any { it == "PRIVMSG #room[one] :case-remap-barrier" } }
+                await { server.received.any { IrcMessage.parse(it)?.let { message ->
+                    message.command == "PRIVMSG" && message.parameters == listOf("#room[one]", "case-remap-barrier")
+                } == true } }
                 assertEquals(1, server.received.count { it.startsWith("MARKREAD #room[one] ") })
                 assertFalse(harness.coordinator.buffers.value.containsKey(old.storageKey))
                 val restored = harness.coordinator.buffers.value.getValue(renamed.storageKey)
@@ -1081,6 +1092,10 @@ class OfflineCoordinatorTests {
                 await { harness.messages.recent(target, 20).any { it.sentByUs && it.text == "queued quoted reply" } }
                 val stored = harness.messages.recent(target, 20).first { it.sentByUs }
                 assertEquals(canonical, stored.replyParentRowId)
+                await { server.received.any { IrcMessage.parse(it)?.let { message ->
+                    message.command == "PRIVMSG" && message.parameters == listOf("#destination", "queued quoted reply") &&
+                        message.tag("+reply") == "shared"
+                } == true } }
                 assertTrue(stored.pendingEcho)
                 harness.coordinator.leaveConversation(harness.config.id, target.storageKey)
                 harness.coordinator.ensureConversation(harness.config.id, target.rawTarget)
@@ -1095,74 +1110,114 @@ class OfflineCoordinatorTests {
     }
 
     @Test
-    fun completedUploadUsesReplacementVisibleIdentityAndDisconnectedCompletionRetainsUrl() = runBlocking {
-        for (disconnect in listOf(false, true)) Server("server-time echo-message soju.im/filehost").use { server ->
-            val entered = CountDownLatch(1)
-            val release = CountDownLatch(1)
-            val http = ServerSocket(0, 1, InetAddress.getLoopbackAddress())
-            val httpWorker = Executors.newSingleThreadExecutor()
-            val response = httpWorker.submit {
-                http.accept().use { socket ->
-                    socket.soTimeout = 10_000
-                    val input = socket.getInputStream().buffered()
-                    val headers = StringBuilder()
-                    var tail = 0
-                    while (tail != 0x0d0a0d0a) {
-                        val byte = input.read()
-                        check(byte >= 0)
-                        headers.append(byte.toChar())
-                        tail = (tail shl 8) or byte
-                    }
-                    val contentLength = Regex("(?i)content-length: (\\d+)").find(headers)?.groupValues?.get(1)?.toInt()
-                        ?: error("Upload must declare its body length")
-                    repeat(contentLength) { check(input.read() >= 0) }
-                    entered.countDown()
-                    check(release.await(10, TimeUnit.SECONDS))
-                    socket.getOutputStream().write(
-                        "HTTP/1.1 201 Created\r\nLocation: /file.png\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray(),
-                    )
-                }
+    fun uploadedUrlsRequireExplicitSendAndDisconnectedSendDoesNotLoseMetadata() = runBlocking {
+        Server("server-time echo-message message-tags").use { server ->
+            Harness(server).use { harness ->
+                harness.coordinator.connectNetwork(harness.config.id)
+                await { harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                val endpoint = "http://127.0.0.1/upload"
+                val url = "http://127.0.0.1/file.png"
+                server.send(":srv 005 tester soju.im/FILEHOST=$endpoint CLIENTTAGDENY=*,-draft/attachment :are supported")
+                server.send("@msgid=filehost-ready :alice!u@h PRIVMSG #room :filehost ready")
+                await { harness.coordinator.buffers.value[harness.room.storageKey]?.messages?.any { it.msgid == "filehost-ready" } == true }
+                val context = assertNotNull(harness.coordinator.negotiatedFilehost(harness.config.id))
+                assertEquals(endpoint, context.endpointUrl)
+                assertFalse(context.ircConnectionIsTls)
+                val uploaded = dev.brentdevs.yardhal.core.data.UploadedAttachment(url, "file.png", "image/png", 3)
+                assertTrue(server.received.none { IrcMessage.parse(it)?.parameters?.contains(url) == true })
+                assertTrue(harness.coordinator.sendText(harness.config.id, harness.room.storageKey, url, listOf(uploaded)))
+                await { server.received.any { IrcMessage.parse(it)?.let { message ->
+                    message.command == "PRIVMSG" && message.tag("+draft/attachment") == url
+                } == true } }
+                val sent = harness.coordinator.buffers.value.getValue(harness.room.storageKey).messages.first { it.attachmentUrl == url }
+                assertEquals("file.png", sent.attachmentName)
+                assertTrue(sent.pendingEcho)
+                assertEquals("image/png", sent.attachmentMimeType)
+                assertEquals(3L, sent.attachmentSizeBytes)
+                val sentCount = harness.coordinator.buffers.value.getValue(harness.room.storageKey).messages.count { it.attachmentUrl == url }
+                harness.coordinator.disconnect(harness.config.id)
+                assertFalse(harness.coordinator.sendText(harness.config.id, harness.room.storageKey, url, listOf(uploaded)))
+                val retained = harness.coordinator.buffers.value.getValue(harness.room.storageKey).messages.single { it.localId == sent.localId }
+                assertEquals(sentCount, harness.coordinator.buffers.value.getValue(harness.room.storageKey).messages.count { it.attachmentUrl == url })
+                assertEquals(url, retained.attachmentUrl)
+                assertEquals("file.png", retained.attachmentName)
+                assertEquals("image/png", retained.attachmentMimeType)
+                assertEquals(3L, retained.attachmentSizeBytes)
+                assertTrue(harness.coordinator.secureUploadTransport("unknown"))
             }
-            try {
-                Harness(server).use { harness ->
-                    harness.coordinator.connectNetwork(harness.config.id)
-                    await { harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
-                    val endpoint = "http://127.0.0.1:${http.localPort}/upload"
-                    val url = "http://127.0.0.1:${http.localPort}/file.png"
-                    server.send(":srv 005 tester soju.im/FILEHOST=$endpoint :are supported")
-                    server.send("@msgid=filehost-ready :alice!u@h PRIVMSG #room :filehost ready")
-                    await { harness.coordinator.buffers.value[harness.room.storageKey]?.messages?.any { it.msgid == "filehost-ready" } == true }
-                    harness.coordinator.uploadAndShare(harness.config.id, harness.room.storageKey, "file.png", "image/png", byteArrayOf(1, 2, 3))
-                    assertTrue(entered.await(10, TimeUnit.SECONDS))
-                    if (disconnect) harness.coordinator.disconnect(harness.config.id) else {
-                        server.holdRegistration = true
-                        assertTrue(harness.coordinator.updateNetwork(harness.config.copy(nick = "replacement")))
-                        await { server.received.any { it == "NICK replacement" } && server.received.count { it.startsWith("USER ") } == 2 }
-                        server.register(nickname = "replacement")
-                        await { harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED &&
-                            harness.coordinator.networks.value.single().ownNick == "replacement" }
-                    }
-                    release.countDown()
-                    if (disconnect) {
-                        await { harness.coordinator.operationError.value?.contains(url) == true }
-                        assertTrue(harness.coordinator.operationError.value.orEmpty().contains("Upload completed"))
-                        assertTrue(server.received.none { it == "PRIVMSG #room :$url" })
-                    } else {
-                        await { server.received.any { IrcMessage.parse(it)?.let { message ->
-                            message.command == "PRIVMSG" && message.parameters == listOf("#room", url)
-                        } == true } }
-                        val sent = harness.coordinator.buffers.value.getValue(harness.room.storageKey).messages.first { it.attachmentUrl == url }
-                        assertEquals("replacement", sent.sender)
-                        assertEquals("file.png", sent.attachmentName)
-                        assertTrue(sent.pendingEcho)
-                    }
-                }
-                response.get(10, TimeUnit.SECONDS)
-            } finally {
-                release.countDown()
-                http.close()
-                httpWorker.shutdownNow()
-                check(httpWorker.awaitTermination(10, TimeUnit.SECONDS))
+        }
+    }
+
+    @Test
+    fun portableQuoteWithoutMsgidPersistsParentAndFailedSendKeepsDraft() = runBlocking {
+        Server("server-time echo-message").use { server ->
+            Harness(server).use { harness ->
+                val parentRow = harness.record(msgid = null, text = "portable parent")
+                harness.offline.select(harness.room, harness.now.get())
+                harness.coordinator.startAll()
+                await { harness.coordinator.restorationReady.value }
+                val parent = harness.coordinator.buffers.value.getValue(harness.room.storageKey).messages.single()
+                harness.coordinator.setReplyDraft(harness.config.id, harness.room.storageKey, parent)
+                assertFalse(harness.coordinator.sendText(harness.config.id, harness.room.storageKey, "offline answer"))
+                assertEquals(parent, harness.coordinator.buffers.value.getValue(harness.room.storageKey).replyDraft)
+                harness.coordinator.connectNetwork(harness.config.id)
+                await { harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                assertTrue(harness.coordinator.sendText(harness.config.id, harness.room.storageKey, "portable answer"))
+                await { harness.messages.recent(harness.room, 20).any { it.sentByUs && it.replyParentRowId == parentRow } }
+                assertNull(harness.coordinator.buffers.value.getValue(harness.room.storageKey).replyDraft)
+                await { server.received.any { it == "PRIVMSG #room :> alice: portable parent — portable answer" } }
+                assertTrue(server.received.none { IrcMessage.parse(it)?.tags?.keys?.any { tag -> tag.startsWith('+') } == true })
+                val quoted = harness.messages.recent(harness.room, 20).first { it.sentByUs && it.replyParentRowId == parentRow }
+                assertEquals("> alice: portable parent — portable answer", quoted.text)
+            }
+        }
+    }
+
+    @Test
+    fun deniedReactionsDoNotEmitOrOptimisticallyMutateAndTaggedParentUsesPortableQuote() = runBlocking {
+        Server().use { server ->
+            Harness(server).use { harness ->
+                harness.coordinator.connectNetwork(harness.config.id)
+                await { harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                server.send(":srv 005 tester CLIENTTAGDENY=* :are supported")
+                server.send("@msgid=parent :alice!u@h PRIVMSG #room :tag denied parent")
+                await { harness.coordinator.buffers.value[harness.room.storageKey]?.messages?.any { it.msgid == "parent" } == true }
+                val parent = harness.coordinator.buffers.value.getValue(harness.room.storageKey).messages.first { it.msgid == "parent" }
+                harness.coordinator.react(harness.config.id, harness.room.storageKey, "parent", "👍")
+                assertTrue(harness.coordinator.buffers.value.getValue(harness.room.storageKey).reactions.isEmpty())
+                assertTrue(server.received.none { IrcMessage.parse(it)?.command == "TAGMSG" })
+                harness.coordinator.setReplyDraft(harness.config.id, harness.room.storageKey, parent)
+                assertTrue(harness.coordinator.sendText(harness.config.id, harness.room.storageKey, "answer"))
+                await { server.received.any { it == "PRIVMSG #room :> alice: tag denied parent — answer" } }
+                assertFalse(harness.coordinator.networks.value.single().taggedRepliesAvailable)
+            }
+        }
+    }
+
+    @Test
+    fun permittedDraftReactionAlternativesUseEscapedWireAndDeniedTypingDoesNotEmit() = runBlocking {
+        Server().use { server ->
+            Harness(server).use { harness ->
+                harness.coordinator.connectNetwork(harness.config.id)
+                await { harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                server.send(":srv 005 tester CLIENTTAGDENY=*,-draft/react,-draft/unreact,-draft/reply :are supported")
+                server.send("@msgid=parent :alice!u@h PRIVMSG #room :parent")
+                await { harness.coordinator.buffers.value[harness.room.storageKey]?.messages?.any { it.msgid == "parent" } == true }
+                assertTrue(harness.coordinator.networks.value.single().reactionsAvailable)
+                assertFalse(harness.coordinator.networks.value.single().typingAvailable)
+                val reaction = "👍; 😃\\🫠"
+                harness.coordinator.sendTyping(harness.config.id, harness.room.storageKey)
+                harness.coordinator.react(harness.config.id, harness.room.storageKey, "parent", reaction)
+                await { server.received.any { IrcMessage.parse(it)?.tag("+draft/react") == reaction } }
+                harness.coordinator.react(harness.config.id, harness.room.storageKey, "parent", reaction)
+                await { server.received.any { IrcMessage.parse(it)?.tag("+draft/unreact") == reaction } }
+                val frames = server.received.mapNotNull(IrcMessage::parse).filter { it.command == "TAGMSG" }
+                assertEquals(2, frames.size)
+                assertTrue(frames.all { it.tag("+draft/reply") == "parent" })
+                assertTrue(frames.all { it.tags.keys.all { tag -> tag in setOf("+draft/react", "+draft/unreact", "+draft/reply") } })
+                assertTrue(server.received.any { "+draft/react=👍\\:\\s😃\\\\🫠" in it })
+                assertTrue(server.received.any { "+draft/unreact=👍\\:\\s😃\\\\🫠" in it })
+                assertTrue(harness.coordinator.buffers.value.getValue(harness.room.storageKey).reactions["parent"]?.get(reaction).orEmpty().isEmpty())
             }
         }
     }
@@ -1355,6 +1410,7 @@ class OfflineCoordinatorTests {
                 val parent = harness.coordinator.buffers.value.getValue(source.storageKey).messages.first { it.msgid == "message" }
                 harness.coordinator.setReplyDraft(harness.config.id, source.storageKey, parent)
                 assertTrue(harness.coordinator.sendText(harness.config.id, source.storageKey, "quote queued before migration"))
+                assertTrue(harness.coordinator.networks.value.single().reactionsAvailable)
                 harness.coordinator.react(harness.config.id, source.storageKey, "message", "👍")
                 server.send(":srv 005 tester CASEMAPPING=ascii :are supported")
                 await { harness.coordinator.buffers.value.containsKey(target.storageKey) }

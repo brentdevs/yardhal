@@ -164,6 +164,9 @@ public class PerNetworkState(
 
     public val accountExtban: AccountExtban? get() = isupport.accountExtban
 
+    public val clientTagPolicy: dev.brentdevs.yardhal.core.protocol.ClientTagPolicy
+        get() = dev.brentdevs.yardhal.core.protocol.ClientTagPolicy(supportedCaps, isupport["CLIENTTAGDENY"])
+
     public val server: ConversationRef get() = ConversationRef.server(networkId)
 
     public fun fold(nick: String): String = casemapping.fold(nick)

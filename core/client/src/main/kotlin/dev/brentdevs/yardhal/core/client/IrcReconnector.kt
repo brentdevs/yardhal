@@ -153,13 +153,10 @@ public class IrcReconnector internal constructor(
         wakeups.trySend(Unit)
     }
 
-    public fun sendLine(line: String) {
-        currentConnection?.sendLine(line)
-    }
+    public fun sendLine(line: String): Boolean = currentConnection?.sendLine(line) == true
 
-    public fun send(message: dev.brentdevs.yardhal.core.protocol.IrcMessage) {
-        currentConnection?.send(message)
-    }
+    public fun send(message: dev.brentdevs.yardhal.core.protocol.IrcMessage): Boolean =
+        currentConnection?.send(message) == true
 
     private fun eligible(): Boolean = desiredRunning && networkAvailable && !hardBlocked && consecutiveFailures < policy.maxAttempts
 

@@ -590,10 +590,10 @@ public class IrcConnection(
         }
     }
 
-    public fun sendLine(line: String) {
-        if (closed.get()) return
+    public fun sendLine(line: String): Boolean {
+        if (closed.get()) return false
         trafficRedactor.rememberOutbound(line)
-        outbound.trySend(line)
+        return outbound.trySend(line).isSuccess
     }
 
     public fun redactPresentation(text: String): String = trafficRedactor.redactPresentation(text)
@@ -630,9 +630,7 @@ public class IrcConnection(
         return withTimeoutOrNull(timeoutMillis) { result.await() } ?: false
     }
 
-    public fun send(message: IrcMessage) {
-        sendLine(message.toWire())
-    }
+    public fun send(message: IrcMessage): Boolean = sendLine(message.toWire())
 
     public fun disconnect() {
         shutdown(null)
