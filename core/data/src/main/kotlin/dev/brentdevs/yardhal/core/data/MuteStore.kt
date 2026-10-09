@@ -31,6 +31,16 @@ public class MuteStore(directory: File) {
         true
     }
 
+    public fun deleteNetwork(networkId: String): Boolean = synchronized(mutes) {
+        val prefix = "$networkId|"
+        val next = mutes.filterNot { it.startsWith(prefix) }.toSet()
+        if (next.size == mutes.size) return@synchronized false
+        store.save(next)
+        mutes.clear()
+        mutes.addAll(next)
+        true
+    }
+
     public fun rename(fromKey: String, toKey: String): Boolean = synchronized(mutes) {
         if (fromKey == toKey || !mutes.remove(fromKey)) return false
         mutes.add(toKey)

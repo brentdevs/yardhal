@@ -22,6 +22,10 @@ import dev.brentdevs.yardhal.core.data.NetworkConfig
 import dev.brentdevs.yardhal.core.data.NetworkStore
 import dev.brentdevs.yardhal.core.data.ReadMarkerStore
 import dev.brentdevs.yardhal.core.data.SaslMode
+import dev.brentdevs.yardhal.core.data.NetworkMode
+import dev.brentdevs.yardhal.core.data.SojuUpstreamConfig
+import dev.brentdevs.yardhal.core.data.OfflineStore
+import dev.brentdevs.yardhal.core.data.OfflineConversationShell
 import java.io.DataInputStream
 import dev.brentdevs.yardhal.core.data.SocksProxyConfig
 import dev.brentdevs.yardhal.core.data.StoredMessage
@@ -92,6 +96,9 @@ class NetworkEditLifecycleTests {
         tlsFixture: String? = null,
         private val advertisedSasl: String = "PLAIN",
         requireClientIdentity: Boolean = false,
+        private val bouncer: Boolean = false,
+        private val rejectedBindings: Set<String> = emptySet(),
+        private val additionalCapabilities: Set<String> = emptySet(),
     ) : AutoCloseable {
         private val listener = if (tlsFixture == null) {
             ServerSocket(0, 10, InetAddress.getLoopbackAddress())
@@ -112,6 +119,7 @@ class NetworkEditLifecycleTests {
         private val executor = Executors.newCachedThreadPool()
         val clients: MutableList<Client> = CopyOnWriteArrayList()
         val port: Int get() = listener.localPort
+        val bouncerNetworkLines: MutableList<String> = CopyOnWriteArrayList()
 
         inner class Client(private val socket: Socket) : AutoCloseable {
             var peerCertificates: List<X509Certificate> = emptyList()
@@ -125,6 +133,10 @@ class NetworkEditLifecycleTests {
             @Volatile var closed: Boolean = false
                 private set
             private var historyResponses = 0
+            @Volatile var boundNetId: String? = null
+                private set
+            private var bindingRejected = false
+            private var bouncerListings = 0
 
             fun read() {
                 try {
@@ -146,6 +158,8 @@ class NetworkEditLifecycleTests {
                             line.startsWith("CAP LS") -> send(
                                 ":srv CAP * LS :server-time sasl=$advertisedSasl draft/channel-rename away-notify" +
                                     (if (historyAvailable) " batch draft/chathistory" else "") +
+                                    (if (bouncer) " batch soju.im/bouncer-networks soju.im/bouncer-networks-notify" else "") +
+                                    (if (additionalCapabilities.isEmpty()) "" else " ${additionalCapabilities.joinToString(" ")}") +
                                     (if (stsPort != null) " sts=port=$stsPort,duration=3600" else
                                         if (publishProfiles) " draft/metadata-2=max-subs=10" else ""),
                             )
@@ -162,6 +176,20 @@ class NetworkEditLifecycleTests {
                                     else ":srv $failure $nick :SASL authentication failed",
                                 )
                             }
+                            line.startsWith("BOUNCER BIND ") -> {
+                                boundNetId = line.substringAfter("BOUNCER BIND ")
+                                if (boundNetId in rejectedBindings) {
+                                    bindingRejected = true
+                                    send(":srv FAIL BOUNCER INVALID_NETID $boundNetId :Unknown network ID")
+                                }
+                            }
+                            line == "BOUNCER LISTNETWORKS" -> {
+                                val batch = "bouncer-${bouncerListings++}"
+                                send(":srv BATCH +$batch soju.im/bouncer-networks")
+                                for (network in bouncerNetworkLines) send("@batch=$batch :srv BOUNCER NETWORK $network")
+                                send(":srv BATCH -$batch")
+                            }
+                            line.startsWith("PRIVMSG BouncerServ ") -> send(":srv 401 $nick BouncerServ :No such nick")
                             line.startsWith("PASS ") && rejectServerPassword -> send(":srv 464 * :Password incorrect")
                             line.startsWith("PING ") && acknowledgeProbes -> send(":srv PONG srv :${line.substringAfter(':')}")
                             line.startsWith("CHATHISTORY ") && acknowledgeHistory -> {
@@ -173,7 +201,7 @@ class NetworkEditLifecycleTests {
                                 send(":srv BATCH -$reference")
                             }
                             line.startsWith("NICK ") -> nick = line.substringAfter("NICK ")
-                            line.startsWith("USER ") && welcomeAutomatically -> welcome()
+                            line.startsWith("USER ") && welcomeAutomatically && !bindingRejected -> welcome()
                             line.startsWith("JOIN ") -> {
                                 val channel = line.substringAfter("JOIN ")
                                 send(":$nick!u@h JOIN $channel")
@@ -399,6 +427,7 @@ class NetworkEditLifecycleTests {
         val vault: CredentialVault = InMemoryCredentialVault(),
         private val beforeCreate: ((NetworkConfig) -> Unit)? = null,
         private val clock: () -> Long = System::currentTimeMillis,
+        private val restoreOffline: Boolean = false,
     ) : AutoCloseable {
         private val scopeJob = SupervisorJob()
         private val scope = CoroutineScope(scopeJob + dispatcher)
@@ -418,6 +447,7 @@ class NetworkEditLifecycleTests {
         val readMarkers = ReadMarkerStore(directory)
         val mutes = MuteStore(directory)
         val channelOrder = ChannelOrderStore(directory)
+        val offline = OfflineStore(database.offlineDao())
         val createdConfigs: MutableList<NetworkConfig> = CopyOnWriteArrayList()
         val stsCallbacks = CopyOnWriteArrayList<(Int) -> Unit>()
         private val connectionFactory: ConnectionFactory = ConnectionFactory { updated, onStsUpgrade ->
@@ -440,9 +470,11 @@ class NetworkEditLifecycleTests {
                     proxy = updated.proxy?.let { Socks5Config(it.host, it.port, it.username, updated.proxyPassword) },
                     tlsClientIdentity = updated.tlsClientIdentity,
                     trustedCertificateSha256 = updated.certificatePin?.sha256,
-                    knownSecrets = setOfNotNull(updated.saslPassword, updated.serverPassword, updated.nickServPassword, updated.proxyPassword),
+                    knownSecrets = updated.knownSecrets,
                     nickServService = updated.nickServService,
-                    capabilities = setOf("server-time", "sasl", "draft/metadata-2", "draft/channel-rename", "away-notify", "batch", "draft/chathistory"),
+                    bouncerNetId = updated.bouncerBinding?.netId,
+                    capabilities = setOf("server-time", "sasl", "draft/metadata-2", "draft/channel-rename", "away-notify", "batch",
+                        "draft/chathistory", "soju.im/bouncer-networks", "soju.im/bouncer-networks-notify", "znc.in/playback"),
                     connectTimeoutMillis = 1_000,
                 ),
                 stsPolicyStore = policies,
@@ -464,6 +496,7 @@ class NetworkEditLifecycleTests {
             clientIdentityProvider = identityProvider,
             clock = clock,
             historyElapsedClock = { (dispatcher as? TestDispatcher)?.scheduler?.currentTime ?: System.nanoTime() / 1_000_000 },
+            offlineStore = offline.takeIf { restoreOffline },
         )
             private set
 
@@ -485,6 +518,7 @@ class NetworkEditLifecycleTests {
                 clientIdentityProvider = identityProvider,
                 clock = clock,
                 historyElapsedClock = { (scope.coroutineContext[kotlin.coroutines.ContinuationInterceptor] as? TestDispatcher)?.scheduler?.currentTime ?: System.nanoTime() / 1_000_000 },
+                offlineStore = offline.takeIf { restoreOffline },
             )
             return coordinator
         }
@@ -530,13 +564,490 @@ class NetworkEditLifecycleTests {
         vault: CredentialVault = InMemoryCredentialVault(),
         beforeCreate: ((NetworkConfig) -> Unit)? = null,
         clock: () -> Long = System::currentTimeMillis,
+        restoreOffline: Boolean = false,
     ): Harness {
         val effectiveDispatcher = dispatcher ?: StandardTestDispatcher()
         scheduler = (effectiveDispatcher as? TestDispatcher)?.scheduler
         return Harness(
             Files.createTempDirectory("yardhal-network-edit").toFile(), config, effectiveDispatcher,
-            afterDiscovery, identityProvider, vault, beforeCreate, clock,
+            afterDiscovery, identityProvider, vault, beforeCreate, clock, restoreOffline,
         )
+    }
+
+    @Test
+    fun sojuDiscoveryCreatesStableBoundSessionsDeduplicatesDeltasAndPrunesOnlyCompleteSnapshots() = runBlocking {
+        Server(bouncer = true).use { server ->
+            server.bouncerNetworkLines.addAll(listOf("1 :name=Alpha;nickname=alpha", "2 :name=Beta;nickname=beta", "1 :name=Alpha;nickname=alpha"))
+            val account = config(server).copy(mode = NetworkMode.SOJU, autojoin = emptyList())
+            harness(account).use { harness ->
+                val coordinator = harness.coordinator
+                coordinator.startAll()
+                await { coordinator.dependentNetworks(account.id).size == 2 && coordinator.networks.value.all { it.status == ConnectionStatus.REGISTERED } }
+                val children = coordinator.dependentNetworks(account.id).associateBy { it.bouncerBinding?.netId }
+                val alpha = requireNotNull(children["1"])
+                val beta = requireNotNull(children["2"])
+                assertEquals(1, harness.createdConfigs.count { it.id == alpha.id })
+                assertEquals(1, harness.createdConfigs.count { it.id == beta.id })
+                val discovery = server.clients.first { it.boundNetId == null }
+                assertTrue(discovery.received.none { it.startsWith("JOIN ") })
+                assertEquals(setOf("1", "2"), server.clients.mapNotNull { it.boundNetId }.toSet())
+                discovery.send(":srv BOUNCER NETWORK 1 :name=Renamed")
+                await { harness.networks.byId(alpha.id)?.name == "Renamed" }
+                assertEquals("alpha", harness.networks.byId(alpha.id)?.nick)
+                assertEquals(1, harness.createdConfigs.count { it.id == alpha.id })
+                discovery.send(":srv BATCH +partial soju.im/bouncer-networks")
+                discovery.send("@batch=partial :srv BOUNCER NETWORK 1 :name=Renamed")
+                discovery.send(":srv BOUNCER NETWORK 3 :name=Delta")
+                await { coordinator.dependentNetworks(account.id).size == 3 }
+                assertNotNull(harness.networks.byId(beta.id))
+                server.bouncerNetworkLines.clear()
+                server.bouncerNetworkLines.add("1 :name=Renamed;nickname=alpha")
+                discovery.send(":srv BATCH -partial")
+                await { coordinator.dependentNetworks(account.id).map { it.bouncerBinding?.netId }.toSet() == setOf("1", "3") }
+                assertEquals(null, harness.networks.byId(beta.id))
+                discovery.send(":srv BATCH +complete soju.im/bouncer-networks")
+                discovery.send("@batch=complete :srv BOUNCER NETWORK 1 :name=Renamed")
+                discovery.send(":srv BATCH -complete")
+                await { coordinator.dependentNetworks(account.id).size == 1 }
+                assertEquals(alpha.id, coordinator.dependentNetworks(account.id).single().id)
+                assertEquals(1, harness.createdConfigs.count { it.id == alpha.id })
+            }
+        }
+    }
+
+    @Test
+    fun manuallyConnectedSojuAccountStartsNewChildrenWithoutChangingSavedAutoConnectOrExistingIntent() = runBlocking {
+        Server(bouncer = true).use { server ->
+            server.bouncerNetworkLines.addAll(listOf("1 :name=New Alpha", "2 :name=New Beta", "3 :name=Saved disconnected", "4 :name=Saved not wanted"))
+            val account = config(server).copy(mode = NetworkMode.SOJU, autojoin = emptyList(), autoConnect = false)
+            harness(account).use { harness ->
+                val disconnected = SojuUpstreamConfig.reconcile(account, "3",
+                    dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.Attributes(name = "Saved disconnected")).copy(userDisconnected = true)
+                val notWanted = SojuUpstreamConfig.reconcile(account, "4",
+                    dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.Attributes(name = "Saved not wanted"))
+                assertTrue(harness.networks.upsertAll(listOf(disconnected, notWanted)))
+                val coordinator = harness.coordinator
+                coordinator.startAll()
+                await { coordinator.restorationReady.value }
+                assertTrue(harness.createdConfigs.isEmpty())
+                coordinator.connectNetwork(account.id)
+                await {
+                    coordinator.dependentNetworks(account.id).size == 4 &&
+                        coordinator.networks.value.count { it.name.startsWith("New ") && it.status == ConnectionStatus.REGISTERED } == 2
+                }
+                val newChildren = coordinator.dependentNetworks(account.id).filter { it.bouncerBinding?.netId in setOf("1", "2") }
+                assertTrue(newChildren.all { !it.autoConnect && !it.userDisconnected })
+                assertFalse(requireNotNull(NetworkStore(harness.directory).byId(account.id)).autoConnect)
+                assertEquals(ConnectionStatus.DISCONNECTED, coordinator.networks.value.first { it.id == disconnected.id }.status)
+                assertEquals(ConnectionStatus.DISCONNECTED, coordinator.networks.value.first { it.id == notWanted.id }.status)
+                assertTrue(harness.createdConfigs.none { it.id == disconnected.id || it.id == notWanted.id })
+                coordinator.disconnect(account.id)
+                coordinator.connectNetwork(account.id)
+                await { newChildren.all { child -> coordinator.networks.value.first { it.id == child.id }.status == ConnectionStatus.REGISTERED } }
+                assertTrue(NetworkStore(harness.directory).dependents(account.id).all { !it.autoConnect })
+                assertTrue(requireNotNull(harness.networks.byId(disconnected.id)).userDisconnected)
+                assertTrue(harness.createdConfigs.none { it.id == disconnected.id || it.id == notWanted.id })
+            }
+        }
+    }
+
+    @Test
+    fun incompleteNetworkFramesRetainDurableChildrenHistoryOfflineShellsPinsGroupsReadsAndMutes() = runBlocking {
+        Server(bouncer = true).use { server ->
+            server.bouncerNetworkLines.addAll(listOf("1 :name=Retained", "2 :name=Other"))
+            val account = config(server).copy(mode = NetworkMode.SOJU, autojoin = emptyList())
+            harness(account, restoreOffline = true, clock = { 1_000_000 }).use { harness ->
+                val coordinator = harness.coordinator
+                coordinator.startAll()
+                await { coordinator.dependentNetworks(account.id).size == 2 && coordinator.networks.value.all { it.status == ConnectionStatus.REGISTERED } }
+                val child = coordinator.dependentNetworks(account.id).first { it.bouncerBinding?.netId == "1" }
+                val room = ConversationRef.channel(child.id, "#retained")
+                record(harness, room, "retained-anchor", "Retained history", 999_000)
+                harness.offline.saveConversation(OfflineConversationShell(room, "#retained", 999_000, CaseMapping.RFC1459,
+                    topic = "Retained topic", topicObservedAtMs = 999_000))
+                harness.channelOrder.togglePin(room.storageKey)
+                harness.channelOrder.createGroup("retained-group", "Retained group")
+                harness.channelOrder.addToGroup("retained-group", room.storageKey)
+                coordinator.ensureConversation(child.id, room.rawTarget)
+                assertTrue(coordinator.loadPersistedHistory(room.storageKey))
+                await { coordinator.buffers.value[room.storageKey]?.messages?.any { it.msgid == "retained-anchor" } == true }
+                coordinator.markRead(room.storageKey)
+                coordinator.toggleMute(room.storageKey)
+                val marker = harness.readMarkers.marker(room.storageKey)
+                val client = server.clients.first { it.boundNetId == null }
+                client.send(":srv BOUNCER NETWORK 1")
+                client.send(":srv BOUNCER NETWORK 1 * unexpected")
+                client.send(":srv BATCH +malformed soju.im/bouncer-networks")
+                client.send("@batch=malformed :srv BOUNCER NETWORK 1")
+                client.send("@batch=malformed :srv BOUNCER NETWORK 2 :name=Other")
+                client.send(":srv BATCH -malformed")
+                client.send(":srv PONG srv :malformed-finished")
+                await { coordinator.rawLog(account.id).any { "malformed-finished" in it.line } }
+                assertNotNull(scheduler).runCurrent()
+                assertEquals(child.id, coordinator.dependentNetworks(account.id).first { it.bouncerBinding?.netId == "1" }.id)
+                assertEquals(child, NetworkStore(harness.directory).byId(child.id))
+                assertEquals("Retained history", harness.messages.recent(room, 10).single().text)
+                assertEquals("Retained topic", harness.offline.shell(room)?.topic)
+                assertTrue(room.storageKey in ChannelOrderStore(harness.directory).snapshot().pinnedKeys)
+                assertEquals("retained-group", ChannelOrderStore(harness.directory).snapshot().groupOf(room.storageKey)?.id)
+                assertEquals(marker, ReadMarkerStore(harness.directory).marker(room.storageKey))
+                assertTrue(MuteStore(harness.directory).isMuted(room.storageKey))
+                assertEquals(ConnectionStatus.REGISTERED, coordinator.networks.value.first { it.id == child.id }.status)
+            }
+        }
+    }
+
+    @Test
+    fun serverManagedBouncerPartAndReattachRetainConversationAndDurableIntentUntilExplicitUserPart() = runBlocking {
+        for (mode in listOf(NetworkMode.SOJU, NetworkMode.ZNC, NetworkMode.DIRECT)) {
+            Server(bouncer = mode == NetworkMode.SOJU,
+                additionalCapabilities = if (mode == NetworkMode.DIRECT) setOf("znc.in/playback") else emptySet()).use { server ->
+                server.bouncerNetworkLines.add("1 :name=Attached upstream")
+                val account = config(server).copy(
+                    mode = mode, autojoin = emptyList(),
+                    saslAuthcid = "account".takeIf { mode == NetworkMode.ZNC },
+                    zncNetwork = "network".takeIf { mode == NetworkMode.ZNC },
+                    serverPasswordRef = "znc-password".takeIf { mode == NetworkMode.ZNC },
+                )
+                val vault = InMemoryCredentialVault().also { it.storePassword("znc-password", "znc-secret") }
+                harness(account, restoreOffline = true, clock = { 1_000_000 }, vault = vault).use { harness ->
+                    val coordinator = harness.coordinator
+                    coordinator.startAll()
+                    await {
+                        coordinator.networks.value.any { it.id == account.id && it.status == ConnectionStatus.REGISTERED } &&
+                            coordinator.networks.value.all { it.status == ConnectionStatus.REGISTERED } &&
+                            (mode != NetworkMode.SOJU || coordinator.dependentNetworks(account.id).size == 1)
+                    }
+                    val network = if (mode == NetworkMode.SOJU) coordinator.dependentNetworks(account.id).single() else account
+                    val client = server.clients.first { it.boundNetId == network.bouncerBinding?.netId }
+                    val room = ConversationRef.channel(network.id, "#attached")
+                    record(harness, room, "attached-anchor", "Retained through detach", 999_000)
+                    assertEquals(room.storageKey, coordinator.openChannel(network.id, room.rawTarget))
+                    coordinator.loadPersistedHistory(room.storageKey)
+                    await {
+                        val buffer = coordinator.buffers.value[room.storageKey]
+                        buffer?.joinState == JoinState.JOINED && buffer.members.size == 2 &&
+                            buffer.messages.any { it.msgid == "attached-anchor" }
+                    }
+                    coordinator.togglePin(room.storageKey)
+                    val group = coordinator.createGroup("Attached conversations")
+                    coordinator.addToGroup(group, room.storageKey)
+                    coordinator.toggleMute(room.storageKey)
+                    coordinator.markRead(room.storageKey)
+                    val marker = harness.readMarkers.marker(room.storageKey)
+                    client.send("@+typing=active :alice!u@h TAGMSG ${room.rawTarget}")
+                    await { coordinator.buffers.value[room.storageKey]?.typingUsers?.containsKey("alice") == true }
+                    client.send(":${client.nick}!u@h PART ${room.rawTarget} :Detached by bouncer")
+                    await { coordinator.buffers.value[room.storageKey]?.joinState == JoinState.IDLE }
+                    val detached = requireNotNull(coordinator.buffers.value[room.storageKey])
+                    assertTrue(detached.members.isEmpty())
+                    assertTrue(detached.memberPresence.isEmpty())
+                    assertTrue(detached.typingUsers.isEmpty())
+                    assertTrue(detached.messages.any { it.msgid == "attached-anchor" })
+                    assertFalse(detached.hasUnread)
+                    assertFalse(ChannelOrderStore(harness.directory).isParted(room.storageKey))
+                    assertTrue(room.storageKey in coordinator.orderState.value.pinnedKeys)
+                    assertEquals(group, coordinator.orderState.value.groupOf(room.storageKey)?.id)
+                    assertTrue(room.storageKey in coordinator.mutedState.value)
+                    assertEquals(marker, ReadMarkerStore(harness.directory).marker(room.storageKey))
+                    assertTrue(harness.messages.recent(room, 10).any { it.msgid == "attached-anchor" })
+                    assertNotNull(harness.offline.shell(room))
+                    client.send(":${client.nick}!u@h JOIN ${room.rawTarget}")
+                    client.send(":srv 353 ${client.nick} = ${room.rawTarget} :${client.nick} bob")
+                    client.send(":srv 366 ${client.nick} ${room.rawTarget} :End of NAMES")
+                    await {
+                        val buffer = coordinator.buffers.value[room.storageKey]
+                        buffer?.joinState == JoinState.JOINED && buffer.members.any { it.nick == "bob" }
+                    }
+                    assertTrue(requireNotNull(coordinator.buffers.value[room.storageKey]).messages.any { it.msgid == "attached-anchor" })
+                    assertTrue(room.storageKey in ChannelOrderStore(harness.directory).snapshot().pinnedKeys)
+                    assertEquals(group, ChannelOrderStore(harness.directory).snapshot().groupOf(room.storageKey)?.id)
+                    assertTrue(MuteStore(harness.directory).isMuted(room.storageKey))
+                    assertEquals(marker, ReadMarkerStore(harness.directory).marker(room.storageKey))
+                    assertTrue(coordinator.sendText(network.id, room.storageKey, "/part ${room.rawTarget}"))
+                    await { room.storageKey !in coordinator.buffers.value }
+                    assertTrue(ChannelOrderStore(harness.directory).isParted(room.storageKey))
+                    client.send(":${client.nick}!u@h JOIN ${room.rawTarget}")
+                    await { coordinator.buffers.value[room.storageKey]?.joinState == JoinState.JOINED }
+                    assertFalse(ChannelOrderStore(harness.directory).isParted(room.storageKey))
+                    client.send(":${client.nick}!u@h PART ${room.rawTarget} :Detached again")
+                    await { coordinator.buffers.value[room.storageKey]?.joinState == JoinState.IDLE }
+                    assertFalse(ChannelOrderStore(harness.directory).isParted(room.storageKey))
+                }
+            }
+        }
+    }
+
+    @Test
+    fun disabledUpstreamsAndAccountDisconnectKeepIndependentDesiredIntentAndSiblingTransports() = runBlocking {
+        Server(bouncer = true).use { server ->
+            server.bouncerNetworkLines.addAll(listOf("1 :name=Alpha", "2 :name=Beta"))
+            val account = config(server).copy(mode = NetworkMode.SOJU, autojoin = emptyList())
+            harness(account).use { harness ->
+                val coordinator = harness.coordinator
+                coordinator.startAll()
+                await { coordinator.dependentNetworks(account.id).size == 2 && coordinator.networks.value.all { it.status == ConnectionStatus.REGISTERED } }
+                val alpha = coordinator.dependentNetworks(account.id).first { it.bouncerBinding?.netId == "1" }
+                val beta = coordinator.dependentNetworks(account.id).first { it.bouncerBinding?.netId == "2" }
+                val alphaClient = server.clients.first { it.boundNetId == "1" }
+                assertTrue(coordinator.setDiscoveredUpstreamEnabled(account.id, "2", false))
+                assertEquals(ConnectionStatus.DISCONNECTED, coordinator.networks.value.first { it.id == beta.id }.status)
+                assertFalse(requireNotNull(NetworkStore(harness.directory).byId(beta.id)?.bouncerBinding).enabled)
+                assertFalse(requireNotNull(harness.networks.byId(beta.id)).userDisconnected)
+                assertEquals(ConnectionStatus.REGISTERED, coordinator.networks.value.first { it.id == alpha.id }.status)
+                assertFalse(alphaClient.closed)
+                assertTrue(coordinator.setDiscoveredUpstreamEnabled(account.id, "2", true))
+                await { coordinator.networks.value.first { it.id == beta.id }.status == ConnectionStatus.REGISTERED }
+                assertEquals(2, harness.createdConfigs.count { it.id == beta.id })
+                assertEquals(1, harness.createdConfigs.count { it.id == alpha.id })
+                coordinator.disconnect(beta.id)
+                assertTrue(coordinator.setDiscoveredUpstreamEnabled(account.id, "2", false))
+                assertTrue(coordinator.setDiscoveredUpstreamEnabled(account.id, "2", true))
+                assertEquals(2, harness.createdConfigs.count { it.id == beta.id })
+                coordinator.disconnect(account.id)
+                assertTrue(coordinator.networks.value.all { it.status == ConnectionStatus.DISCONNECTED })
+                assertFalse(requireNotNull(harness.networks.byId(alpha.id)).userDisconnected)
+                assertTrue(requireNotNull(harness.networks.byId(beta.id)).userDisconnected)
+                coordinator.connectNetwork(account.id)
+                await { coordinator.networks.value.first { it.id == alpha.id }.status == ConnectionStatus.REGISTERED }
+                assertEquals(ConnectionStatus.DISCONNECTED, coordinator.networks.value.first { it.id == beta.id }.status)
+                assertEquals(2, harness.createdConfigs.count { it.id == beta.id })
+            }
+        }
+    }
+
+    @Test
+    fun rejectedBindPersistsAnIsolatedOfflineShellAndNeverRetriesOnConnectivityOrResume() = runBlocking {
+        Server(bouncer = true, rejectedBindings = setOf("2")).use { server ->
+            server.bouncerNetworkLines.addAll(listOf("1 :name=Alpha", "2 :name=Rejected"))
+            val account = config(server).copy(mode = NetworkMode.SOJU, autojoin = emptyList())
+            harness(account).use { harness ->
+                val coordinator = harness.coordinator
+                coordinator.startAll()
+                await {
+                    coordinator.dependentNetworks(account.id).size == 2 &&
+                        coordinator.networks.value.any { it.name == "Rejected" && it.connectionPhase == RecoveryPhase.AUTHENTICATION_REJECTED } &&
+                        coordinator.networks.value.any { it.name == "Alpha" && it.status == ConnectionStatus.REGISTERED }
+                }
+                val rejected = coordinator.dependentNetworks(account.id).first { it.bouncerBinding?.netId == "2" }
+                assertNotNull(rejected.bouncerBinding?.rejectionReason)
+                assertNotNull(coordinator.buffers.value[ConversationRef.server(rejected.id).storageKey])
+                coordinator.updateConnectivity(false)
+                coordinator.updateConnectivity(true, 41)
+                repeat(3) { coordinator.onForegroundResume() }
+                assertNotNull(scheduler).advanceTimeBy(60_000)
+                assertNotNull(scheduler).runCurrent()
+                await { coordinator.networks.value.any { it.name == "Alpha" && it.status == ConnectionStatus.REGISTERED } }
+                assertEquals(1, harness.createdConfigs.count { it.id == rejected.id })
+                assertEquals(rejected.bouncerBinding, NetworkStore(harness.directory).byId(rejected.id)?.bouncerBinding)
+            }
+        }
+    }
+
+    @Test
+    fun offlineRestartRestoresBoundIdentityHistoryPinsGroupsReadsMutesAndCachedShellBeforeTransport() = runBlocking {
+        Server(bouncer = true).use { server ->
+            val account = config(server).copy(mode = NetworkMode.SOJU, autojoin = emptyList())
+            harness(account, restoreOffline = true, clock = { 1_000_000 }).use { harness ->
+                val child = SojuUpstreamConfig.reconcile(account, "1",
+                    dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.Attributes(name = "Saved upstream"))
+                assertTrue(harness.networks.add(child))
+                val room = ConversationRef.channel(child.id, "#saved")
+                record(harness, room, "saved-anchor", "Saved transcript", 999_000)
+                harness.offline.saveConversation(OfflineConversationShell(room, "#saved", 999_000, CaseMapping.RFC1459,
+                    topic = "Cached topic", topicObservedAtMs = 999_000))
+                harness.channelOrder.togglePin(room.storageKey)
+                harness.channelOrder.createGroup("group", "Saved group")
+                harness.channelOrder.addToGroup("group", room.storageKey)
+                harness.mutes.mute(room.storageKey)
+                val coordinator = harness.coordinator
+                coordinator.updateConnectivity(false)
+                coordinator.startAll()
+                await { coordinator.restorationReady.value && room.storageKey in coordinator.buffers.value }
+                assertTrue(coordinator.loadPersistedHistory(room.storageKey))
+                await { coordinator.buffers.value[room.storageKey]?.messages?.any { it.msgid == "saved-anchor" } == true }
+                coordinator.markRead(room.storageKey)
+                coordinator.trackSelection(room.storageKey)
+                await { harness.offline.selection() == room }
+                val marker = harness.readMarkers.marker(room.storageKey)
+                val reloaded = harness.reloadCoordinator()
+                reloaded.updateConnectivity(false)
+                reloaded.startAll()
+                await { reloaded.restorationReady.value && room.storageKey in reloaded.buffers.value }
+                assertTrue(harness.createdConfigs.isEmpty())
+                assertEquals(child.id, reloaded.dependentNetworks(account.id).single().id)
+                assertEquals("Cached topic", reloaded.buffers.value[room.storageKey]?.topic)
+                assertTrue(room.storageKey in reloaded.orderState.value.pinnedKeys)
+                assertEquals("group", reloaded.orderState.value.groupOf(room.storageKey)?.id)
+                assertTrue(room.storageKey in reloaded.mutedState.value)
+                assertEquals(marker, ReadMarkerStore(harness.directory).marker(room.storageKey))
+                await {
+                    reloaded.buffers.value[room.storageKey]?.messages?.any { it.msgid == "saved-anchor" } == true &&
+                        reloaded.buffers.value[room.storageKey]?.history?.initial?.status != HistoryLoadStatus.LOADING
+                }
+                assertFalse(reloaded.buffers.value[room.storageKey]?.hasUnread == true)
+            }
+        }
+    }
+
+    @Test
+    fun parentSettingsAndCascadeRemovalAreAtomicAndSharedCredentialsSurviveUntilTheirLastReference() = runBlocking {
+        Server(bouncer = true).use { server ->
+            server.bouncerNetworkLines.addAll(listOf("1 :name=Alpha", "2 :name=Beta"))
+            val vault = InMemoryCredentialVault().also { it.storePassword("shared", "account-secret") }
+            val account = config(server).copy(mode = NetworkMode.SOJU, autojoin = emptyList(), saslAuthcid = "account", saslPasswordRef = "shared")
+            harness(account, vault = vault).use { harness ->
+                val coordinator = harness.coordinator
+                coordinator.startAll()
+                await { coordinator.dependentNetworks(account.id).size == 2 && coordinator.networks.value.all { it.status == ConnectionStatus.REGISTERED } }
+                val originals = harness.networks.all()
+                val attempts = harness.createdConfigs.size
+                withBlockedNetworkFile(harness) {
+                    assertFalse(coordinator.updateNetwork(account.copy(host = "changed.example")))
+                    assertFalse(coordinator.removeNetwork(account.id))
+                    assertEquals(originals, harness.networks.all())
+                    assertEquals(attempts, harness.createdConfigs.size)
+                    assertEquals("account-secret", vault.readPassword("shared"))
+                }
+                assertTrue(coordinator.updateNetwork(account.copy(realName = "Updated inherited name")))
+                await { coordinator.networks.value.all { it.status == ConnectionStatus.REGISTERED } }
+                assertTrue(coordinator.dependentNetworks(account.id).all { it.realName == "Updated inherited name" })
+                assertEquals(originals.map { it.id }.toSet(), harness.networks.all().map { it.id }.toSet())
+                val unrelated = account.copy(id = "unrelated", name = "Shared credential owner", mode = NetworkMode.DIRECT, autoConnect = false)
+                assertTrue(harness.networks.add(unrelated))
+                assertTrue(coordinator.removeNetwork(account.id))
+                await { coordinator.networks.value.map { it.id } == listOf(unrelated.id) }
+                assertEquals(listOf(unrelated), NetworkStore(harness.directory).all())
+                assertEquals("account-secret", vault.readPassword("shared"))
+                assertTrue(coordinator.removeNetwork(unrelated.id))
+                await { vault.readPassword("shared") == null }
+                assertTrue(coordinator.networks.value.isEmpty())
+            }
+        }
+    }
+
+    @Test
+    fun remotelyDisabledAndDeletedUpstreamsStopEvenWhenTheirObservedStateCannotBeSaved() = runBlocking {
+        Server(bouncer = true).use { server ->
+            server.bouncerNetworkLines.addAll(listOf("1 :name=Alpha", "2 :name=Beta"))
+            val account = config(server).copy(mode = NetworkMode.SOJU, autojoin = emptyList())
+            harness(account).use { harness ->
+                val coordinator = harness.coordinator
+                coordinator.startAll()
+                await { coordinator.dependentNetworks(account.id).size == 2 && coordinator.networks.value.all { it.status == ConnectionStatus.REGISTERED } }
+                val alpha = coordinator.dependentNetworks(account.id).first { it.bouncerBinding?.netId == "1" }
+                val beta = coordinator.dependentNetworks(account.id).first { it.bouncerBinding?.netId == "2" }
+                val discovery = server.clients.first { it.boundNetId == null }
+                withBlockedNetworkFile(harness) {
+                    assertFalse(coordinator.setDiscoveredUpstreamEnabled(account.id, "2", false))
+                    assertEquals(ConnectionStatus.DISCONNECTED, coordinator.networks.value.first { it.id == beta.id }.status)
+                    assertTrue(requireNotNull(harness.networks.byId(beta.id)?.bouncerBinding).enabled)
+                    discovery.send(":srv BOUNCER NETWORK 2 :state=connected")
+                    discovery.send(":srv PONG srv :disabled-fenced")
+                    await { coordinator.rawLog(account.id).any { "disabled-fenced" in it.line } }
+                    assertNotNull(scheduler).runCurrent()
+                    assertEquals(ConnectionStatus.DISCONNECTED, coordinator.networks.value.first { it.id == beta.id }.status)
+                    assertEquals(1, harness.createdConfigs.count { it.id == beta.id })
+                    discovery.send(":srv BOUNCER NETWORK 1 *")
+                    await { coordinator.networks.value.first { it.id == alpha.id }.connectionPhase == RecoveryPhase.AUTHENTICATION_REJECTED }
+                    assertNotNull(harness.networks.byId(alpha.id))
+                    assertNotNull(coordinator.buffers.value[ConversationRef.server(alpha.id).storageKey])
+                    assertEquals(ConnectionStatus.REGISTERED, coordinator.networks.value.first { it.id == account.id }.status)
+                }
+                discovery.send(":srv BOUNCER NETWORK 1 *")
+                await { harness.networks.byId(alpha.id) == null }
+                assertTrue(coordinator.setDiscoveredUpstreamEnabled(account.id, "2", true))
+                await { coordinator.networks.value.first { it.id == beta.id }.status == ConnectionStatus.REGISTERED }
+                assertEquals(2, harness.createdConfigs.count { it.id == beta.id })
+            }
+        }
+    }
+
+    @Test
+    fun bouncerManagementAndHistoricalDiscoveryTrafficNeverCreateServiceDmsUnreadOrExtraSessions() = runBlocking {
+        Server(bouncer = true).use { server ->
+            server.bouncerNetworkLines.add("1 :name=Alpha")
+            val account = config(server).copy(mode = NetworkMode.SOJU, autojoin = emptyList())
+            harness(account).use { harness ->
+                val coordinator = harness.coordinator
+                coordinator.startAll()
+                await { coordinator.dependentNetworks(account.id).size == 1 && coordinator.networks.value.all { it.status == ConnectionStatus.REGISTERED } }
+                val client = server.clients.first { it.boundNetId == null }
+                client.send(":BouncerServ!service@bouncer PRIVMSG tester :tester management response")
+                client.send(":srv BATCH +history chathistory #room")
+                client.send("@batch=history :srv BATCH +old soju.im/bouncer-networks")
+                client.send("@batch=old :srv BOUNCER NETWORK 99 :name=Historical")
+                client.send("@batch=old :srv BOUNCER NETWORK 1 *")
+                client.send(":srv BATCH -old")
+                client.send(":srv BATCH -history")
+                client.send("@draft/chathistory-context :srv BOUNCER NETWORK 1 *")
+                client.send("@draft/chathistory-context :srv BOUNCER NETWORK 1 :name=Historical context")
+                client.send("@batch=undeclared :srv BOUNCER NETWORK 1 *")
+                client.send("@batch=undeclared :srv BOUNCER NETWORK 1 :name=Undeclared context")
+                client.send(":srv PONG srv :history-finished")
+                await { coordinator.rawLog(account.id).any { "history-finished" in it.line } }
+                assertNotNull(scheduler).runCurrent()
+                val managed = requireNotNull(coordinator.bouncerManagement.accounts.value[account.id])
+                assertEquals(setOf("1"), managed.sojuNetworks.keys)
+                assertEquals("Alpha", managed.sojuNetworks["1"]?.name)
+                assertEquals(setOf("1"), coordinator.dependentNetworks(account.id).map { it.bouncerBinding?.netId }.toSet())
+                assertFalse(coordinator.buffers.value.values.any { it.ref.rawTarget.equals("BouncerServ", true) })
+                assertTrue(coordinator.buffers.value.values.all { !it.hasUnread })
+            }
+        }
+        Server().use { server ->
+            val account = config(server).copy(mode = NetworkMode.ZNC, autojoin = emptyList(), saslAuthcid = "account",
+                zncNetwork = "network", serverPasswordRef = "znc-password")
+            val vault = InMemoryCredentialVault().also { it.storePassword("znc-password", "znc-secret") }
+            harness(account, vault = vault).use { harness ->
+                val coordinator = harness.coordinator
+                coordinator.startAll()
+                await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                val client = server.clients.single()
+                assertTrue(client.received.contains("PASS :account/network:znc-secret"))
+                assertTrue(client.received.none { it.startsWith("AUTHENTICATE ") })
+                client.send(":*controlpanel!service@znc PRIVMSG tester :tester control response")
+                client.send(":*status!service@znc NOTICE tester :tester status response")
+                client.send(":srv PONG srv :znc-finished")
+                await { coordinator.rawLog(account.id).any { "znc-finished" in it.line } }
+                assertFalse(coordinator.buffers.value.values.any { it.ref.rawTarget in setOf("*controlpanel", "*status") })
+                assertTrue(coordinator.buffers.value.values.all { !it.hasUnread })
+                client.send(":srv NOTICE tester :Authentication diagnostic znc-secret")
+                client.send(":srv PONG srv :diagnostic-finished")
+                await { coordinator.rawLog(account.id).any { "diagnostic-finished" in it.line } }
+                await { coordinator.buffers.value.values.any { buffer ->
+                    buffer.messages.any { it.text == "Authentication diagnostic <redacted>" }
+                } }
+                assertTrue(coordinator.rawLog(account.id).none { "znc-secret" in it.line })
+            }
+        }
+    }
+
+    @Test
+    fun zncWithoutPlaybackKeepsStoredReadingButRejectsForwardedUpstreamHistoryAvailability() = runBlocking {
+        Server().use { server ->
+            val account = config(server).copy(mode = NetworkMode.ZNC, autojoin = emptyList(), saslAuthcid = "account",
+                zncNetwork = "network", serverPasswordRef = "znc-password")
+            val vault = InMemoryCredentialVault().also { it.storePassword("znc-password", "znc-secret") }
+            harness(account, vault = vault).use { harness ->
+                val coordinator = harness.coordinator
+                val room = ConversationRef.channel(account.id, "#cached")
+                record(harness, room, "cached-anchor", "Stored before bouncer reconnect", 999_000)
+                coordinator.startAll()
+                await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                val client = server.clients.single()
+                client.send(":srv 005 tester CHATHISTORY=1000 MSGREFTYPES=msgid,timestamp :Forwarded upstream support")
+                client.send(":srv PONG srv :forwarded-support")
+                await { coordinator.rawLog(account.id).any { "forwarded-support" in it.line } }
+                assertEquals(room.storageKey, coordinator.openChannel(account.id, room.rawTarget))
+                coordinator.loadPersistedHistory(room.storageKey)
+                await { coordinator.buffers.value[room.storageKey]?.messages?.any { it.msgid == "cached-anchor" } == true }
+                coordinator.loadOlderHistory(room.storageKey)
+                await { coordinator.buffers.value[room.storageKey]?.history?.older?.status == HistoryLoadStatus.UNSUPPORTED }
+                assertEquals("Stored before bouncer reconnect", harness.messages.recent(room, 10).single().text)
+                assertTrue(client.received.none { it.startsWith("CHATHISTORY ") })
+            }
+        }
     }
 
     @Test

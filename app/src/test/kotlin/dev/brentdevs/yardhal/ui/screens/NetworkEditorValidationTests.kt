@@ -1,6 +1,7 @@
 package dev.brentdevs.yardhal.ui.screens
 
 import dev.brentdevs.yardhal.core.data.NetworkConfig
+import dev.brentdevs.yardhal.core.data.NetworkMode
 import dev.brentdevs.yardhal.core.data.SaslMode
 import dev.brentdevs.yardhal.core.data.SocksProxyConfig
 import kotlin.test.assertEquals
@@ -85,5 +86,35 @@ class NetworkEditorValidationTests {
         assertTrue(networkEditorErrors(proxy.copy(proxyUsername = "", clearProxyPassword = true), withSavedProxy).isEmpty())
         assertTrue(networkEditorErrors(proxy.copy(proxyUsername = "", proxyPassword = "orphan"), null).isNotEmpty())
         assertTrue(networkEditorErrors(proxy.copy(proxyEnabled = false), null).isEmpty())
+    }
+
+    @Test
+    fun sojuRequiresItsAccountCredentialsUnlessUsingExternalIdentity() {
+        val soju = draft.copy(mode = NetworkMode.SOJU, saslAuthcid = "bouncer-user")
+        assertTrue(bouncerSetupErrors(soju, null).isNotEmpty())
+        assertEquals(emptyList(), bouncerSetupErrors(soju.copy(saslPassword = "account secret"), null))
+        assertTrue(bouncerSetupErrors(soju.copy(saslAuthcid = "", saslPassword = "secret"), null).isNotEmpty())
+        val retained = saved.copy(mode = NetworkMode.SOJU, saslAuthcid = "bouncer-user", saslPasswordRef = "vault-key")
+        assertEquals(emptyList(), bouncerSetupErrors(soju, retained))
+        assertTrue(bouncerSetupErrors(soju.copy(clearSaslPassword = true), retained).isNotEmpty())
+        assertEquals(emptyList(), networkEditorErrors(soju.copy(
+            saslMode = SaslMode.EXTERNAL, tlsClientAlias = "keychain-identity",
+        ), null))
+        assertTrue(networkEditorErrors(soju.copy(saslMode = SaslMode.EXTERNAL, tls = false), null).isNotEmpty())
+    }
+
+    @Test
+    fun zncCredentialRulesProtectPassAccountAndNetworkSeparators() {
+        val znc = draft.copy(mode = NetworkMode.ZNC, saslAuthcid = "account", serverPassword = "secret: with / punctuation")
+        assertEquals(emptyList(), bouncerSetupErrors(znc, null))
+        assertEquals(emptyList(), bouncerSetupErrors(znc.copy(zncNetwork = "network"), null))
+        for (separator in listOf(" ", "/", ":", "\u0000", "\r", "\n")) {
+            assertTrue(bouncerSetupErrors(znc.copy(saslAuthcid = "account${separator}other"), null).isNotEmpty())
+            assertTrue(bouncerSetupErrors(znc.copy(zncNetwork = "network${separator}other"), null).isNotEmpty())
+        }
+        assertTrue(bouncerSetupErrors(znc.copy(serverPassword = null), null).isNotEmpty())
+        val retained = saved.copy(mode = NetworkMode.ZNC, saslAuthcid = "account", serverPasswordRef = "vault-key")
+        assertEquals(emptyList(), bouncerSetupErrors(znc.copy(serverPassword = null), retained))
+        assertTrue(bouncerSetupErrors(znc.copy(serverPassword = null, clearServerPassword = true), retained).isNotEmpty())
     }
 }

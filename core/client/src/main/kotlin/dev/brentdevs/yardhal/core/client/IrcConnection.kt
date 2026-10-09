@@ -43,6 +43,7 @@ public data class IrcConnectionConfig(
     public val trustedCertificateSha256: String? = null,
     public val knownSecrets: Set<String> = emptySet(),
     public val nickServService: String = "NickServ",
+    public val bouncerNetId: String? = null,
 ) {
     init {
         require(nick.isNotBlank()) { "nick must not be blank" }
@@ -54,6 +55,9 @@ public data class IrcConnectionConfig(
         }
         require(initialAway == null || (initialAway.isNotEmpty() && initialAway.none { it in "\r\n\u0000" })) {
             "initialAway must be a non-empty single line"
+        }
+        require(bouncerNetId == null || (bouncerNetId.isNotBlank() && bouncerNetId.none { it.isWhitespace() || it in "\u0000\r\n:" })) {
+            "bouncer network ID must be a single IRC token"
         }
     }
 
@@ -119,6 +123,8 @@ public sealed interface IrcEvent {
 
 public class AuthenticationRejectedException(message: String) : IOException(message)
 
+public class BouncerBindRejectedException(message: String) : IOException(message)
+
 public class IrcConnection(
     private val config: IrcConnectionConfig,
     private val keepAlive: KeepAliveConfig = KeepAliveConfig(),
@@ -171,6 +177,8 @@ public class IrcConnection(
     private var awaySent: Boolean = false
     private val saslRequired = config.saslMode.uppercase() != "AUTO" || config.saslAuthcid != null || config.saslPassword != null
     private var saslSucceeded = false
+    private var bouncerBindSent = false
+    private var serverPasswordSent = false
     private var pendingProbe: Probe? = null
 
     private data class Probe(
@@ -289,12 +297,14 @@ public class IrcConnection(
 
     private fun beginRegistration() {
         synchronized(stateLock) {
-            if (config.capabilities.isEmpty() && !saslRequired) {
+            if (config.capabilities.isEmpty() && !saslRequired && config.bouncerNetId == null) {
                 sendNickUser()
                 return
             }
+            val bouncerCaps = if (config.bouncerNetId == null) config.capabilities else
+                config.capabilities + dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.CAPABILITY
             val effectiveWanted =
-                if (saslRequired) config.capabilities + CapabilityNegotiator.SASL_CAP else config.capabilities - CapabilityNegotiator.SASL_CAP
+                if (saslRequired) bouncerCaps + CapabilityNegotiator.SASL_CAP else bouncerCaps - CapabilityNegotiator.SASL_CAP
             val created = CapabilityNegotiator(
                 wanted = effectiveWanted,
                 sendRaw = ::sendLine,
@@ -307,9 +317,15 @@ public class IrcConnection(
                 },
                 beforeCapEnd = ::sendPreRegistrationRequests,
                 onDeleted = ::handleCapabilitiesDeleted,
-                required = if (saslRequired) setOf(CapabilityNegotiator.SASL_CAP) else emptySet(),
+                required = buildSet {
+                    if (saslRequired) add(CapabilityNegotiator.SASL_CAP)
+                    if (config.bouncerNetId != null) add(dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.CAPABILITY)
+                },
                 onRequiredUnavailable = {
-                    handleAuthenticationFailure(SaslOutcome.Failure(0, "Server did not offer or accept required SASL authentication; check authentication settings"))
+                    if (config.bouncerNetId != null &&
+                        dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.CAPABILITY !in createdCapabilities()
+                    ) shutdown(BouncerBindRejectedException("The bouncer does not support network binding. Check the account settings, then Connect to retry."))
+                    else handleAuthenticationFailure(SaslOutcome.Failure(0, "Server did not offer or accept required SASL authentication; check authentication settings"))
                 },
             )
             negotiator = created
@@ -319,6 +335,7 @@ public class IrcConnection(
 
     private fun startSasl(): Boolean {
         if (!saslRequired || closed.get()) return false
+        sendServerPassword()
         val authcid = config.saslAuthcid ?: ""
         val password = config.saslPassword ?: ""
         val authenticator = SaslAuthenticator(
@@ -354,8 +371,20 @@ public class IrcConnection(
         }
     }
 
+    private fun createdCapabilities(): Set<String> = negotiator?.acknowledged.orEmpty()
+
     private fun sendPreRegistrationRequests() {
         val acknowledged = negotiator?.acknowledged ?: return
+        sendServerPassword()
+        val netId = config.bouncerNetId
+        if (netId != null && !bouncerBindSent && (!saslRequired || saslSucceeded)) {
+            if (dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.CAPABILITY !in acknowledged) {
+                shutdown(BouncerBindRejectedException("The bouncer did not accept network binding. Connect to retry after correcting account settings."))
+                return
+            }
+            bouncerBindSent = true
+            sendLine("BOUNCER BIND $netId")
+        }
         if (IrcConnectionConfig.EXTENDED_ISUPPORT_CAP in acknowledged) sendLine("ISUPPORT")
         val away = config.initialAway
         if (away != null && IrcConnectionConfig.PRE_AWAY_CAP in acknowledged) sendAway(away)
@@ -379,10 +408,16 @@ public class IrcConnection(
         publishCapabilities()
     }
 
+    private fun sendServerPassword() {
+        if (serverPasswordSent || closed.get()) return
+        serverPasswordSent = true
+        config.serverPassword?.let { sendLine("PASS :$it") }
+    }
+
     private fun sendNickUser() {
         if (nickUserSent || closed.get() || (saslRequired && !saslSucceeded)) return
         nickUserSent = true
-        config.serverPassword?.let { sendLine("PASS :$it") }
+        sendServerPassword()
         sendLine("NICK ${config.nick}")
         sendLine("USER ${config.username} 0 * :${config.realName}")
     }
@@ -402,6 +437,13 @@ public class IrcConnection(
 
     private fun applyToSession(message: IrcMessage) {
         val numeric = message.numeric
+        if (bouncerBindSent && registeredNickname == null &&
+            ((message.command.equals("FAIL", true) && message.parameters.firstOrNull().equals("BOUNCER", true)) ||
+                ((numeric == 421 || numeric == 461) && message.parameters.getOrNull(1).equals("BOUNCER", true)))
+        ) {
+            shutdown(BouncerBindRejectedException("The bouncer rejected network ${config.bouncerNetId}. Check that the upstream exists and is enabled, then Connect to retry."))
+            return
+        }
         if (registeredNickname == null && (numeric == 464 || (config.serverPassword != null &&
                 ((numeric == 461 && message.parameters.getOrNull(1).equals("PASS", ignoreCase = true)) ||
                     (message.command.equals("FAIL", ignoreCase = true) && message.parameters.firstOrNull().equals("PASS", ignoreCase = true)))))) {

@@ -32,20 +32,51 @@ public data class NetworkConfig(
     public val proxy: SocksProxyConfig? = null,
     public val tlsClientAlias: String? = null,
     public val certificatePin: CertificatePin? = null,
+    public val mode: NetworkMode = NetworkMode.DIRECT,
+    public val bouncerBinding: BouncerBinding? = null,
+    public val zncNetwork: String? = null,
     @kotlinx.serialization.Transient public val serverPassword: String? = null,
     @kotlinx.serialization.Transient public val nickServPassword: String? = null,
     @kotlinx.serialization.Transient public val proxyPassword: String? = null,
     @kotlinx.serialization.Transient public val tlsClientIdentity: TlsClientIdentity? = null,
+    @kotlinx.serialization.Transient public val knownSecrets: Set<String> = emptySet(),
 ) {
     init {
         if (id.isBlank()) throw NetworkConfigValidationException("Network ID must not be blank")
         if (host.isBlank()) throw NetworkConfigValidationException("Network host must not be blank")
         if (nick.isBlank()) throw NetworkConfigValidationException("Network nickname must not be blank")
         if (port !in 1..65535) throw NetworkConfigValidationException("Network port must be between 1 and 65535")
+        if (bouncerBinding != null && mode != NetworkMode.SOJU) {
+            throw NetworkConfigValidationException("Only soju upstreams can have a bouncer binding")
+        }
+        if (bouncerBinding?.parentId == id) throw NetworkConfigValidationException("A bouncer cannot be its own parent")
+        if (zncNetwork != null && mode != NetworkMode.ZNC) {
+            throw NetworkConfigValidationException("Only ZNC connections can select a ZNC network")
+        }
     }
 
     override fun toString(): String =
         "NetworkConfig(id=$id, name=$name, host=$host, port=$port, tls=$tls, nick=$nick, saslMode=$saslMode)"
+}
+
+@Serializable
+public enum class NetworkMode { DIRECT, SOJU, ZNC }
+
+@Serializable
+public data class BouncerBinding(
+    public val parentId: String,
+    public val netId: String,
+    public val enabled: Boolean = true,
+    public val nickname: String? = null,
+    public val realName: String? = null,
+    public val rejectionReason: String? = null,
+) {
+    init {
+        require(parentId.isNotBlank()) { "Bouncer parent ID must not be blank" }
+        require(netId.isNotBlank() && netId.none { it.isWhitespace() || it in "\u0000\r\n:" }) {
+            "Bouncer network ID must be a single IRC token"
+        }
+    }
 }
 
 @Serializable

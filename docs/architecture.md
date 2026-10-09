@@ -455,13 +455,115 @@ evidence acknowledgement survived cold launch without deleting evidence. An actu
 SAF upload to a controlled HTTPS filehost completed with HTTP 201 after disconnect
 and visibly reported its recoverable URL.
 
+## Bouncer accounts and bound sessions
+
+[Halyard parity phase 4 / issue 15](https://github.com/brentdevs/yardhal/issues/15)
+adds explicit `DIRECT`, `SOJU` and `ZNC` account modes without renumbering the
+roadmap. Setup validates mode-specific account/password rules and retains phase
+2's vault, TLS, proxy and client-identity controls. ZNC constructs PASS internally
+from the separate account, optional network and vault password; it does not
+attempt SASL or NickServ authentication. Bouncer setup saves no client-owned
+autojoin list. Discovered soju upstreams inherit transport/authentication rather
+than exposing independent endpoint editors.
+
+### Discovery, identity and lifecycle
+
+`SojuDiscoveryTracker` accepts current-generation, server-origin live discovery
+only. Explicit `BOUNCER NETWORK <id> *` deletes one upstream; complete valid
+listing batches reconcile absence. Malformed, interrupted, overlapping,
+historical, contextual, undeclared or stale batches cannot prune restored state.
+Duplicate pushes upsert the same child rather than create another session.
+
+`DerivedNetworkIdentity` matches Halyard's UUIDv5 namespace
+`C40D04F5-6B4E-4E37-9C79-6F1B2A6E5A31`, using the uppercase canonical parent UUID
+plus `:` and the opaque netID. Legacy non-UUID parent IDs are canonicalized
+deterministically. `BouncerBinding` persists parent/netID, observed enabled state,
+upstream identity and bind rejection independently of cached conversation data.
+Relaunch restores child shells before connections; each child keeps its own
+auto-connect/disconnect intent. A manually connected parent can open newly
+discovered children even when its startup preference is off.
+
+The client authenticates each child, sends `BOUNCER BIND` once after successful
+SASL/PASS and before `CAP END`/registration, and fails closed on missing binding
+support or rejection. STS upgrade precedes password transmission. Inherited
+credentials remain vault references; resolved redaction secrets are shared
+without rebuilding their set when composing ZNC PASS.
+
+Parent disconnect retires child transports without overwriting individual saved
+intent; reconnect starts eligible children. Disabled/rejected children remain
+offline and do not spin retries or block siblings. Remote enablement comes from
+BouncerServ's observed status, not an invented discovery attribute. Observed
+disable/delete stops transport even if persisting the change fails; retained
+state and the storage error remain visible.
+
+Parent edits propagate inherited settings transactionally. Removing a parent
+explicitly confirms its dependent local upstreams and cascades configuration,
+history and metadata removal without deleting unrelated networks. Shared vault
+references retire only after the last owner disappears.
+
+Server-managed self-PART on bouncers means detached membership, not permanent
+user-leave intent. It retains the cached buffer/history and persistent
+pins/groups/mutes/markers, publishes IDLE membership and clears live roster/typing.
+Explicit user PART still closes the buffer; confirmed live reattach JOIN clears
+stale leave intent. Historical JOIN does not change it.
+
+### Management and history boundaries
+
+`BouncerManagement` serializes operations per connection generation. Native
+BOUNCER acknowledgements and service replies establish success; sending a command
+does not. Negotiated labels and nested labeled batches correlate replies.
+Unlabeled services use an ordered nonce PING/PONG fence. Timeout, cancellation
+with uncertain outcome or disconnect quarantines late replies; reconnect is
+required before another same-generation operation can claim an acknowledgement.
+
+Soju edits use escaped IRC tag attributes and draft/baseline diffs. Native rename
+acknowledgement precedes enabled-state service commands addressed to the new
+name. Channel status, detach/reattach, timer, detached relay and reattach policy
+operate on bound upstreams. Unreported policy values stay unknown.
+
+ZNC `*status` lists/creates/deletes networks and controls the bound connection;
+optional `controlpanel` handles supported network settings, servers and channels.
+Only actually returned settings are editable, and server lists are scoped to
+the bound network. Replacing an endpoint with an unknown masked password requires
+explicit password intent. Detail/channel caches reset on connection replacement;
+held baselines cannot apply to a new binding. Apply outcomes count acknowledged
+changes, retain accepted changes on partial failure and refetch actual state.
+
+Control replies and their own echoes, including historical service traffic, stay
+out of ordinary DM discovery, unread and notification paths. Raw logs redact
+authentication and management secrets even when a diagnostic repeats them.
+
+History retains phase 1's overlap reconciliation, gaps and replay suppression.
+ZNC's forwarded upstream CHATHISTORY ISUPPORT is not downstream support:
+negotiated CHATHISTORY remains usable, otherwise `znc.in/playback` selects the
+actual optional playback module, or history remains local-only. Direct IRC still
+accepts ISUPPORT-only history support. Native playback buffer clipping and
+timestamp-only soju archive boundaries do not manufacture coverage or archive end.
+
+Verification: `nix develop --command make check`; native Android 15 with real soju
+0.10.1, ZNC 1.10.2, pinned `znc-playback` revision
+`8dd128bfe2b24b2cc6a9ea2e2d28bfaa28d2a833` and Ergo 2.14. Offline cold launch with
+soju stopped retains the selected transcript, cached roster and identical
+network IDs/order/groups/pins/mutes/read markers; restart rediscovery creates no
+duplicate bindings. Native deletion removes only the disabled upstream;
+confirmed account cascade leaves unrelated ZNC connected and no removed-network
+message/metadata keys.
+
+A real 180-message offline interval yields 180 unique stored soju rows through
+catch-up and fresh LATEST/BEFORE paging, and 75 unique ZNC rows under its configured
+75-message buffer. Repeated playback retains canonical rows, with zero service
+conversation rows or plaintext fixture passwords in Room/WAL. Android notification
+permission is granted: a live mention posts one message notification, while
+replaying it and a separately sent offline mention posts none.
+
 ## Network configuration
 
 Each network's overview and transcript expose **Edit network**, Connect and
-Disconnect. The shared form edits endpoint/TLS, nickname and configured alternates,
-realname, display name, channels, startup preference, SASL mode/account,
-server password, NickServ, SOCKS5 and per-network client identity. Editing retains
-the network ID, hidden USER username, transcripts, selection, read markers,
+Disconnect. The direct IRC form edits endpoint/TLS, nickname and configured
+alternates, realname, display name, channels, startup preference, SASL
+mode/account, server password, NickServ, SOCKS5 and per-network client identity.
+Bouncer forms tailor these fields as described above. Editing retains the
+network ID, hidden USER username, transcripts, selection, read markers,
 pins, groups and mutes.
 
 `LiveCoordinator.updateNetwork` persists an existing ID through `NetworkStore`.
@@ -499,10 +601,11 @@ Failure cleanup removes owned temporary files. A post-rename directory-sync fail
 retains the prior cache and reports failure without destructively rolling the disk
 back; retry completes publication. Removed-network vault-cleanup failures surface in
 the root snackbar, including after the last network disappears.
-The SASL account is independent of nickname and can remain saved without a
-password: AUTO then disables password SASL, while explicit PLAIN/SCRAM fails
-closed and EXTERNAL uses its selected identity. Nonsecret drafts survive rotation;
-plaintext password drafts do not.
+For direct IRC, the SASL account is independent of nickname and can remain saved
+without a password: AUTO then disables password SASL, while explicit PLAIN/SCRAM
+fails closed and EXTERNAL uses its selected identity. Bouncer credential rules
+remain mode-specific. Nonsecret drafts survive rotation; plaintext password
+drafts do not.
 The editor validates explicit password SASL, paired proxy credentials, alternate
 nicknames separated by commas or whitespace, and realnames without wire delimiters
 before saving or attempting a connection.
@@ -625,16 +728,13 @@ Phases land in order; each phase ships with tests and updated docs.
   identity-preserving network editing with credential-vault updates.
   Remaining: moderation surfaces beyond these actions and slash verbs,
   per-message link auto-open polish.
-- **Phase 7 — Bouncers**: ZNC `znc.in/playback` uses bounded discovery,
-  older windows and coverage-aware gap filling; replay suppresses live
-  notification effects. soju
-  `soju.im/bouncer-networks` ported from Halyard: attribute model with
-  escape-aware tokenizer, BOUNCER NETWORK upsert/delete parsing,
-  ADDNETWORK/DELNETWORK/CONNECTNETWORK/DISCONNECTNETWORK, BouncerServ
-  service commands, draft-vs-baseline diffing, and a management dialog.
-  Known channels are re-joined on every connect so membership (and hence
-  NAMES/WHO) survives restarts. Full soju editor edge cases want a live
-  bouncer.
+- **Phase 7 — Bouncers**: ✅ bounded ZNC playback/gap recovery and complete parity
+  phase 4 account/session management: authenticated soju binding, stable derived
+  identity and offline restoration; ADDNETWORK/CHANGENETWORK/DELNETWORK,
+  BouncerServ network/channel controls; ZNC status/controlpanel network, server,
+  settings and channel controls with honest availability and partial outcomes.
+  Service/history traffic does not create live notification effects. Native
+  soju/ZNC Android verification covers real registration, edits and rejection.
 - **Phase 8 — Extras**: media uploads landed via the soju.im/FILEHOST
   ISUPPORT extension (endpoint discovered from 005, HTTPS enforced on TLS
   connections, SASL credentials reused as HTTP Basic, 201+Location resolved,

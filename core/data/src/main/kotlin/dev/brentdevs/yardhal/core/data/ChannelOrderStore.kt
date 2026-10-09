@@ -126,6 +126,19 @@ public class ChannelOrderStore(directory: File) {
     }
 
     @Synchronized
+    public fun forgetNetwork(networkId: String) {
+        val prefix = "$networkId|"
+        val next = state.copy(
+            pinnedKeys = state.pinnedKeys.filterNot { it.startsWith(prefix) },
+            groups = state.groups.map { it.copy(memberKeys = it.memberKeys.filterNot { key -> key.startsWith(prefix) }) },
+            partedKeys = state.partedKeys.filterNot { it.startsWith(prefix) },
+        )
+        if (next == state) return
+        store.save(next)
+        state = next
+    }
+
+    @Synchronized
     public fun rename(fromKey: String, toKey: String) {
         if (fromKey == toKey) return
         fun List<String>.renamed(): List<String> = map { if (it == fromKey) toKey else it }.distinct()

@@ -110,17 +110,18 @@ class NetworkStoreTests {
                 serverPassword = "resolved-server-secret",
                 nickServPassword = "resolved-nickserv-secret",
                 proxyPassword = "resolved-proxy-secret",
+                knownSecrets = setOf("resolved-znc-account-secret"),
             )
             assertTrue(store.add(config))
             val reopened = assertNotNull(NetworkStore(tmp.root).byId(mode.name))
             assertEquals(
-                config.copy(saslPassword = null, serverPassword = null, nickServPassword = null, proxyPassword = null),
+                config.copy(saslPassword = null, serverPassword = null, nickServPassword = null, proxyPassword = null, knownSecrets = emptySet()),
                 reopened,
             )
             assertNull(reopened.tlsClientIdentity)
         }
         val serialized = File(tmp.root, "networks.json").readText()
-        for (secret in listOf("resolved-sasl-secret", "resolved-server-secret", "resolved-nickserv-secret", "resolved-proxy-secret")) {
+        for (secret in listOf("resolved-sasl-secret", "resolved-server-secret", "resolved-nickserv-secret", "resolved-proxy-secret", "resolved-znc-account-secret")) {
             assertFalse(serialized.contains(secret))
         }
         assertFalse(serialized.contains("\"tlsClientIdentity\""))
@@ -128,6 +129,7 @@ class NetworkStoreTests {
         assertFalse(serialized.contains("\"serverPassword\""))
         assertFalse(serialized.contains("\"nickServPassword\""))
         assertFalse(serialized.contains("\"proxyPassword\""))
+        assertFalse(serialized.contains("\"knownSecrets\""))
     }
 
     @Test

@@ -56,6 +56,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.brentdevs.yardhal.NetworkIdentitySelectionModel
 import dev.brentdevs.yardhal.core.data.NetworkConfig
+import dev.brentdevs.yardhal.core.data.NetworkMode
 import dev.brentdevs.yardhal.core.data.SaslMode
 import java.io.IOException
 import java.util.UUID
@@ -149,6 +150,8 @@ public fun NetworkEditorSheet(
     BackHandler(onBack = onDismiss)
     key(initialConfig?.id, initialPreset?.id) {
         val editing = initialConfig != null
+        var networkMode by rememberSaveable { mutableStateOf(initialConfig?.mode ?: NetworkMode.DIRECT) }
+        var zncNetwork by rememberSaveable { mutableStateOf(initialConfig?.zncNetwork ?: "") }
         val editorId = rememberSaveable { UUID.randomUUID().toString() }
         val suggestedIdentityName = suggestedTlsIdentityName(initialConfig?.id, editorId)
         val hasSavedPassword = initialConfig?.saslPasswordRef != null
@@ -276,15 +279,17 @@ public fun NetworkEditorSheet(
             tls = tls,
             nick = nick.trim(),
             saslPassword = if (clearPassword) null else password.takeIf(String::isNotEmpty),
-            autojoin = channels.split(',').mapNotNull { it.trim().takeIf(String::isNotEmpty) },
+            autojoin = if (networkMode == NetworkMode.DIRECT) {
+                channels.split(',').mapNotNull { it.trim().takeIf(String::isNotEmpty) }
+            } else emptyList(),
             displayName = name.trim().ifBlank { host.trim() },
             networkId = initialConfig?.id,
-            saslAuthcid = account.trim().takeIf(String::isNotEmpty),
+            saslAuthcid = if (networkMode == NetworkMode.DIRECT) account.trim().takeIf(String::isNotEmpty) else account.trim(),
             clearSaslPassword = clearPassword,
             realName = realName,
             alternateNicks = parseAlternateNicknames(alternateNicks),
             autoConnect = autoConnect,
-            saslMode = saslMode,
+            saslMode = if (networkMode == NetworkMode.ZNC) SaslMode.AUTO else saslMode,
             serverPassword = if (clearServerPassword) null else serverPassword.takeIf(String::isNotEmpty),
             clearServerPassword = clearServerPassword,
             nickServAccount = nickServAccount.trim(),
@@ -300,6 +305,8 @@ public fun NetworkEditorSheet(
             clearProxyPassword = clearProxyPassword,
             tlsClientAlias = tlsClientAlias,
             clearTlsClientAlias = clearTlsClientAlias,
+            mode = networkMode,
+            zncNetwork = zncNetwork.trim(),
         )
         val validationErrors = networkEditorErrors(draft, initialConfig)
 
@@ -313,6 +320,26 @@ public fun NetworkEditorSheet(
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             Text(if (editing) "Edit network" else "New network", style = MaterialTheme.typography.titleLarge)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                NetworkMode.entries.forEach { candidate ->
+                    FilterChip(
+                        selected = networkMode == candidate,
+                        enabled = !editing,
+                        onClick = { networkMode = candidate },
+                        label = { Text(networkModeLabel(candidate)) },
+                    )
+                }
+            }
+            if (networkMode != NetworkMode.DIRECT) {
+                Text(
+                    if (networkMode == NetworkMode.SOJU) {
+                        "Add your soju account once. Upstream networks are discovered and opened automatically. soju owns channel joins and playback."
+                    } else {
+                        "Use your ZNC account and optional network name. ZNC owns channel joins and playback; manage them through Bouncer settings."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
             if (editing) {
                 Text(
                     "Changing connection settings reconnects this network. Existing conversations and history remain.",
@@ -357,11 +384,18 @@ public fun NetworkEditorSheet(
                 )
             }
             EditorCheckbox("Connect automatically on startup", autoConnect) { autoConnect = it }
-            EditorPassword(
-                "Server password", serverPassword, { serverPassword = it },
-                initialConfig?.serverPasswordRef != null, clearServerPassword,
-                { clearServerPassword = it; if (it) serverPassword = "" },
-            )
+            if (networkMode != NetworkMode.SOJU) {
+                if (networkMode == NetworkMode.ZNC) {
+                    EditorTextField("ZNC account", account) { account = it }
+                    EditorTextField("ZNC network (optional)", zncNetwork) { zncNetwork = it }
+                }
+                EditorPassword(
+                    if (networkMode == NetworkMode.ZNC) "ZNC password" else "Server password",
+                    serverPassword, { serverPassword = it },
+                    initialConfig?.serverPasswordRef != null, clearServerPassword,
+                    { clearServerPassword = it; if (it) serverPassword = "" },
+                )
+            }
             Text("Identity", style = MaterialTheme.typography.titleSmall)
             OutlinedTextField(
                 value = nick,
@@ -372,45 +406,49 @@ public fun NetworkEditorSheet(
             )
             EditorTextField("Alternate nicknames (commas or whitespace)", alternateNicks) { alternateNicks = it }
             EditorTextField("Real name", realName) { realName = it }
-            Text("SASL authentication", style = MaterialTheme.typography.titleSmall)
-            Row(
-                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                SaslMode.entries.forEach { mode ->
-                    FilterChip(
-                        selected = saslMode == mode,
-                        onClick = { saslMode = mode },
-                        label = { Text(mode.name.replace('_', '-')) },
-                    )
+            if (networkMode != NetworkMode.ZNC) {
+                Text("SASL authentication", style = MaterialTheme.typography.titleSmall)
+                Row(
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    SaslMode.entries.forEach { mode ->
+                        FilterChip(
+                            selected = saslMode == mode,
+                            onClick = { saslMode = mode },
+                            label = { Text(mode.name.replace('_', '-')) },
+                        )
+                    }
                 }
+                if (saslMode == SaslMode.EXTERNAL) {
+                    Text("EXTERNAL authenticates with the selected Android KeyChain identity and requires TLS. Saved password settings are kept but not used.")
+                }
+                OutlinedTextField(
+                    value = account,
+                    onValueChange = { account = it },
+                    label = { Text(if (networkMode == NetworkMode.SOJU) "soju account" else "SASL account (optional)") },
+                    supportingText = {
+                        Text(if (networkMode == NetworkMode.SOJU) "Your soju account, not an upstream IRC nickname." else "Leave blank to use your nickname for SASL.")
+                    },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                EditorPassword(
+                    "SASL password", password, { password = it }, hasSavedPassword, clearPassword,
+                    { clearPassword = it; if (it) password = "" },
+                )
             }
-            if (saslMode == SaslMode.EXTERNAL) {
-                Text("EXTERNAL authenticates with the selected Android KeyChain identity and requires TLS. Saved password settings are kept but not used.")
+            if (networkMode == NetworkMode.DIRECT) {
+                Text("NickServ identification", style = MaterialTheme.typography.titleSmall)
+                EditorTextField("NickServ account (optional)", nickServAccount) { nickServAccount = it }
+                EditorTextField("NickServ service", nickServService) { nickServService = it }
+                EditorPassword(
+                    "NickServ password", nickServPassword, { nickServPassword = it },
+                    initialConfig?.nickServPasswordRef != null, clearNickServPassword,
+                    { clearNickServPassword = it; if (it) nickServPassword = "" },
+                )
+                EditorCheckbox("Wait for NickServ identification before joining", waitForNickServ) { waitForNickServ = it }
             }
-            OutlinedTextField(
-                value = account,
-                onValueChange = { account = it },
-                label = { Text("SASL account (optional)") },
-                supportingText = {
-                    Text("Leave blank to use your nickname for SASL.")
-                },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            EditorPassword(
-                "SASL password", password, { password = it }, hasSavedPassword, clearPassword,
-                { clearPassword = it; if (it) password = "" },
-            )
-            Text("NickServ identification", style = MaterialTheme.typography.titleSmall)
-            EditorTextField("NickServ account (optional)", nickServAccount) { nickServAccount = it }
-            EditorTextField("NickServ service", nickServService) { nickServService = it }
-            EditorPassword(
-                "NickServ password", nickServPassword, { nickServPassword = it },
-                initialConfig?.nickServPasswordRef != null, clearNickServPassword,
-                { clearNickServPassword = it; if (it) nickServPassword = "" },
-            )
-            EditorCheckbox("Wait for NickServ identification before joining", waitForNickServ) { waitForNickServ = it }
             Text("SOCKS5 proxy", style = MaterialTheme.typography.titleSmall)
             EditorCheckbox("Use SOCKS5 proxy", proxyEnabled) { proxyEnabled = it }
             if (proxyEnabled) {
@@ -455,14 +493,16 @@ public fun NetworkEditorSheet(
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
-            Text("Channels", style = MaterialTheme.typography.titleSmall)
-            OutlinedTextField(
-                value = channels,
-                onValueChange = { channels = it },
-                label = { Text("Autojoin channels (#a,#b)") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
+            if (networkMode == NetworkMode.DIRECT) {
+                Text("Channels", style = MaterialTheme.typography.titleSmall)
+                OutlinedTextField(
+                    value = channels,
+                    onValueChange = { channels = it },
+                    label = { Text("Autojoin channels (#a,#b)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
             if (saveFailed) {
                 Text(
                     "Couldn't save this network. Your changes are still here; try again or cancel.",
@@ -513,9 +553,17 @@ public data class NetworkDraft(
     public val clearProxyPassword: Boolean = false,
     public val tlsClientAlias: String? = null,
     public val clearTlsClientAlias: Boolean = false,
+    public val mode: NetworkMode? = null,
+    public val zncNetwork: String? = null,
 ) {
     override fun toString(): String =
         "NetworkDraft(networkId=$networkId, host=$host, port=$port, tls=$tls, nick=$nick, saslMode=$saslMode)"
+}
+
+internal fun networkModeLabel(mode: NetworkMode): String = when (mode) {
+    NetworkMode.DIRECT -> "Direct IRC"
+    NetworkMode.SOJU -> "soju"
+    NetworkMode.ZNC -> "ZNC"
 }
 
 @Composable

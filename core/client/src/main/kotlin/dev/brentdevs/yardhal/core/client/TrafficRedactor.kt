@@ -71,6 +71,24 @@ internal fun redactSensitiveOutbound(line: String, nickServService: String = "Ni
     val message = IrcMessage.parse(line.trimStart(' ')) ?: return line
     val parameters = message.parameters
     val redactedParameters = when (message.command.uppercase()) {
+        "BOUNCER" -> {
+            if (parameters.firstOrNull().equals("BIND", true)) return line
+            listOfNotNull(parameters.firstOrNull(), REDACTION_MARKER)
+        }
+        "FAIL", "WARN", "NOTE" -> {
+            if (!parameters.firstOrNull().equals("BOUNCER", true)) return line
+            parameters.take(2) + REDACTION_MARKER
+        }
+        "PRIVMSG", "NOTICE" -> {
+            val target = parameters.firstOrNull().orEmpty()
+            val sender = message.prefix?.nick.orEmpty()
+            if (target.equals("BouncerServ", true) || sender.equals("BouncerServ", true) ||
+                target.startsWith('*') || sender.startsWith('*')
+            ) listOf(target, REDACTION_MARKER) else {
+                val authentication = serviceAuthentication(message, nickServService) ?: return line
+                listOf(target, "${authentication.command} $REDACTION_MARKER")
+            }
+        }
         "PASS" -> listOf("<redacted>")
         "AUTHENTICATE" -> {
             if (parameters.size == 1 && parameters.first() in VISIBLE_AUTHENTICATE_ARGUMENTS) return line

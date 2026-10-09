@@ -123,7 +123,7 @@ class HistoryCoordinatorIntegrationTests {
                     }
                     "USER" -> {
                         if (registrationNotice) peer.send("@time=${iso(NOW)} :srv NOTICE tester :registration notice")
-                        if (history) peer.send(":srv 005 tester CHATHISTORY=5 MSGREFTYPES=$referenceTypes :supported")
+                        if (history || znc) peer.send(":srv 005 tester CHATHISTORY=5 MSGREFTYPES=$referenceTypes :supported")
                         peer.send(":srv 001 tester :Welcome")
                     }
                     "JOIN" -> {

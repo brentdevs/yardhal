@@ -15,8 +15,7 @@ public object BouncerServCommand {
     }
 
     public fun networkUpdate(name: String, enabled: Boolean): String {
-        val flag = if (enabled) "-enabled" else "-disabled"
-        return "network update ${posixQuote(name)} $flag"
+        return "network update ${posixQuote(name)} -enabled ${if (enabled) "true" else "false"}"
     }
 
     public fun channelUpdate(
@@ -24,18 +23,21 @@ public object BouncerServCommand {
         detachAfterSeconds: Long? = null,
         relayDetached: RelayMode? = null,
         reattachOn: RelayMode? = null,
+        detached: Boolean? = null,
     ): String {
         val parts = mutableListOf("channel", "update", posixQuote(name))
+        detached?.let { parts.add("-detached"); parts.add(it.toString()) }
         detachAfterSeconds?.let { parts.add("-detach-after"); parts.add(formatDuration(it)) }
         relayDetached?.let { parts.add("-relay-detached"); parts.add(it.wireName) }
         reattachOn?.let { parts.add("-reattach-on"); parts.add(it.wireName) }
         return parts.joinToString(" ")
     }
 
-    public fun channelStatus(name: String? = null): String =
-        if (name == null) "channel status" else "channel status ${posixQuote(name)}"
+    public fun channelStatus(network: String? = null): String =
+        if (network == null) "channel status" else "channel status -network ${posixQuote(network)}"
 
     public fun posixQuote(value: String): String {
+        require(value.none { it == '\r' || it == '\n' || it == '\u0000' }) { "Invalid service argument." }
         if (value.isEmpty()) return "''"
         var needsQuoting = false
         for (ch in value) {
@@ -52,15 +54,10 @@ public object BouncerServCommand {
     }
 
     public fun formatDuration(secondsTotal: Long): String {
+        require(secondsTotal >= 0) { "Detach duration cannot be negative." }
         if (secondsTotal == 0L) return "0"
-        val absolute = if (secondsTotal < 0) -secondsTotal else secondsTotal
-        val units = listOf(86400L to "d", 3600L to "h", 60L to "m", 1L to "s")
-        for ((unit, suffix) in units) {
-            if (absolute % unit == 0L) {
-                val n = absolute / unit
-                val sign = if (secondsTotal < 0) "-" else ""
-                return "$sign$n$suffix"
-            }
+        for ((unit, suffix) in listOf(3600L to "h", 60L to "m", 1L to "s")) {
+            if (secondsTotal % unit == 0L) return "${secondsTotal / unit}$suffix"
         }
         return "${secondsTotal}s"
     }

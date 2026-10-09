@@ -100,6 +100,7 @@ internal class HistoryCoordinator(
         var nick: String,
         var support: ChatHistorySupport,
         var capabilities: Set<String>,
+        val allowIsupportDiscovery: Boolean,
     ) {
         val tracker = HistoryRequestTracker({ mapping.fold(it) }, { nick })
         val queue = ArrayDeque<Work>()
@@ -302,9 +303,11 @@ internal class HistoryCoordinator(
     }
 
     fun registered(networkId: String, generation: Long, epoch: Long, mapping: CaseMapping, nick: String,
-                   isupport: ISupport, capabilities: Set<String>) {
+                   isupport: ISupport, capabilities: Set<String>, allowIsupportDiscovery: Boolean = true) {
         reset(networkId, "Connection replaced")
-        val network = Network(networkId, generation, epoch, mapping, nick, IrcChatHistory.support(isupport, capabilities), capabilities)
+        val network = Network(networkId, generation, epoch, mapping, nick,
+            IrcChatHistory.support(isupport, capabilities, allowIsupportDiscovery && "znc.in/playback" !in capabilities),
+            capabilities, allowIsupportDiscovery)
         synchronized(lock) { networks[networkId] = network }
         for (buffer in host.historyBuffers.values) {
             if (buffer.ref.networkId != networkId) continue
@@ -367,7 +370,8 @@ internal class HistoryCoordinator(
             }
             network.mapping = mapping
             network.nick = nick
-            network.support = IrcChatHistory.support(isupport, capabilities)
+            network.support = IrcChatHistory.support(isupport, capabilities,
+                network.allowIsupportDiscovery && "znc.in/playback" !in capabilities)
             network.capabilities = capabilities
             activate = network.seeded && !previous && (network.support.enabled || "znc.in/playback" in network.capabilities)
         }
