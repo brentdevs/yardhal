@@ -96,7 +96,8 @@ as a direct IRC server. Use the bouncer's endpoint and verified TLS.
   missing-range warnings visible rather than inventing recovery.
 - Apply results count acknowledged changes, not commands sent. Partial results
   retain accepted changes and refresh actual state; they do not imply rollback.
-  An uncertain timeout requires reconnect before another operation.
+  After an uncertain unlabeled timeout, the next operation first waits for an
+  actual ordered PONG fence; reconnect if the bouncer cannot establish it.
 - Disconnect preserves cached history and each upstream's saved connection
   intent. Disabled/rejected upstreams remain offline without blocking siblings.
   Removing a soju account explicitly confirms removal of its dependent local

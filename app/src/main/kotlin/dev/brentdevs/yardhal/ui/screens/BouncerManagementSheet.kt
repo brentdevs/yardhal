@@ -22,6 +22,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -34,6 +35,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.brentdevs.yardhal.coordinator.BouncerAccountState
 import dev.brentdevs.yardhal.coordinator.BouncerManagement
+import dev.brentdevs.yardhal.coordinator.BouncerOperationOutcome
 import dev.brentdevs.yardhal.coordinator.BouncerOperationStatus
 import dev.brentdevs.yardhal.coordinator.BouncerServiceAvailability
 import dev.brentdevs.yardhal.coordinator.SojuChannelSettings
@@ -96,7 +98,7 @@ public fun BouncerManagementSheet(
                     outcome.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                     outcome.refreshError?.let { Text("Refresh failed: $it", color = MaterialTheme.colorScheme.error) }
                 }
-                key(id) {
+                key(id, state.generation) {
                     if (state.mode == NetworkMode.SOJU) SojuManagement(management, state, busy)
                     if (state.mode == NetworkMode.ZNC) ZncManagement(management, state, busy)
                 }
@@ -133,10 +135,12 @@ private fun SojuManagement(management: BouncerManagement, state: BouncerAccountS
                         onCancel = { editingId = null; adding = false },
                         onApply = { draft ->
                             val netId = editingId
-                            scope.launch {
-                                if (netId == null) management.addSojuNetwork(state.networkId, draft)
+                            val outcome = if (netId == null) management.addSojuNetwork(state.networkId, draft)
                                 else management.updateSojuNetwork(state.networkId, netId, draft)
-                            }
+                            val refreshed = netId?.let { management.accounts.value[state.networkId]?.sojuNetworks?.get(it) }
+                                ?.let(BouncerNetworkDraft::fromAttributes)
+                                ?: if (netId == null) BouncerNetworkDraft(addr = "ircs://") else null
+                            outcome to refreshed
                         },
                     )
                 }
@@ -146,9 +150,10 @@ private fun SojuManagement(management: BouncerManagement, state: BouncerAccountS
         Text("Bound upstream ${state.boundNetwork}. Network settings are managed from the parent account.")
         BouncerChannelLookup(!busy, "soju") { channel -> scope.launch { management.fetchSojuChannel(state.networkId, channel) } }
         state.sojuChannels.values.forEach { baseline ->
-            key(baseline.name, baseline) {
-                SojuChannelEditor(baseline, !busy && state.sojuService == BouncerServiceAvailability.AVAILABLE) { draft ->
-                    scope.launch { management.updateSojuChannel(state.networkId, baseline, draft) }
+            key(baseline.name) {
+                SojuChannelEditor(baseline, !busy && state.sojuService == BouncerServiceAvailability.AVAILABLE) { submittedBaseline, draft ->
+                    val outcome = management.updateSojuChannel(state.networkId, submittedBaseline, draft)
+                    outcome to management.accounts.value[state.networkId]?.sojuChannels?.get(baseline.name)
                 }
             }
         }
@@ -165,8 +170,16 @@ private fun SojuManagement(management: BouncerManagement, state: BouncerAccountS
 }
 
 @Composable
-private fun SojuNetworkEditor(initial: BouncerNetworkDraft, enabled: Boolean, onCancel: () -> Unit, onApply: (BouncerNetworkDraft) -> Unit) {
-    var draft by remember(initial) { mutableStateOf(initial) }
+private fun SojuNetworkEditor(
+    initial: BouncerNetworkDraft,
+    enabled: Boolean,
+    onCancel: () -> Unit,
+    onApply: suspend (BouncerNetworkDraft) -> Pair<BouncerOperationOutcome, BouncerNetworkDraft?>,
+) {
+    val editor = remember { BouncerEditorDraft(initial, ::rebaseSojuDraft) }
+    var draft by editor::draft
+    val scope = rememberCoroutineScope()
+    val addressUnreported = initial.addr.isEmpty() && draft.addr.isEmpty()
     HorizontalDivider()
     Text("Upstream settings", style = MaterialTheme.typography.titleMedium)
     BouncerField("Upstream name", draft.name) { draft = draft.copy(name = it) }
@@ -177,23 +190,52 @@ private fun SojuNetworkEditor(initial: BouncerNetworkDraft, enabled: Boolean, on
     BouncerToggle("Upstream enabled", draft.enabled) { draft = draft.copy(enabled = it) }
     BouncerToggle("Replace or clear upstream password", draft.passwordChanged) { draft = draft.copy(passwordChanged = it, password = "") }
     if (draft.passwordChanged) BouncerField("New upstream password (empty clears)", draft.password, secret = true) { draft = draft.copy(password = it) }
-    draft.addrValidationError()?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+    if (!addressUnreported) draft.addrValidationError()?.let { Text(it, color = MaterialTheme.colorScheme.error) }
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         TextButton(onClick = onCancel) { Text("Close editor") }
-        Button(enabled = enabled && draft.isValid(), onClick = { onApply(draft) }) { Text("Apply upstream changes") }
+        Button(enabled = enabled && (addressUnreported || draft.isValid()), onClick = {
+            val submitted = draft
+            scope.launch {
+                val (outcome, refreshed) = onApply(submitted)
+                editor.acknowledge(submitted, refreshed, outcome)
+            }
+        }) { Text("Apply upstream changes") }
     }
 }
 
 @Composable
-private fun SojuChannelEditor(baseline: SojuChannelSettings, enabled: Boolean, onApply: (SojuChannelSettings) -> Unit) {
-    var draft by remember { mutableStateOf(baseline) }
+private fun SojuChannelEditor(
+    baseline: SojuChannelSettings,
+    enabled: Boolean,
+    onApply: suspend (SojuChannelSettings, SojuChannelSettings) -> Pair<BouncerOperationOutcome, SojuChannelSettings?>,
+) {
+    val editor = remember { BouncerEditorDraft(baseline, ::rebaseSojuChannelDraft) }
+    var draft by editor::draft
     var timer by remember { mutableStateOf(baseline.detachAfterSeconds?.toString().orEmpty()) }
+    val scope = rememberCoroutineScope()
+    SideEffect { editor.observeBaseline(baseline) }
+    fun submit(submitted: SojuChannelSettings) {
+        val submittedTimer = timer
+        scope.launch {
+            val (outcome, refreshed) = onApply(editor.baseline, submitted)
+            editor.acknowledge(submitted, refreshed, outcome)
+            if (outcome.status == BouncerOperationStatus.SUCCESS && timer == submittedTimer &&
+                draft.detachAfterSeconds == submitted.detachAfterSeconds
+            ) timer = draft.detachAfterSeconds?.toString().orEmpty()
+        }
+    }
     HorizontalDivider()
     Text(baseline.name, style = MaterialTheme.typography.titleMedium)
     Text(baseline.status.ifEmpty { "Channel status not reported" })
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        Button(enabled = enabled, onClick = { onApply(baseline.copy(detached = true)) }) { Text("Detach") }
-        Button(enabled = enabled, onClick = { onApply(baseline.copy(detached = false)) }) { Text("Reattach") }
+        Button(enabled = enabled, onClick = {
+            draft = draft.copy(detached = true)
+            submit(editor.baseline.copy(detached = true))
+        }) { Text("Detach") }
+        Button(enabled = enabled, onClick = {
+            draft = draft.copy(detached = false)
+            submit(editor.baseline.copy(detached = false))
+        }) { Text("Reattach") }
     }
     BouncerField("Detach after seconds (blank keeps current)", timer) {
         timer = it
@@ -211,7 +253,7 @@ private fun SojuChannelEditor(baseline: SojuChannelSettings, enabled: Boolean, o
             FilterChip(selected = draft.reattachOn == mode, onClick = { draft = draft.copy(reattachOn = mode) }, label = { Text(mode.wireName) })
         }
     }
-    Button(enabled = enabled && (timer.isBlank() || timer.toLongOrNull()?.let { it >= 0 } == true), onClick = { onApply(draft) }) { Text("Apply channel changes") }
+    Button(enabled = enabled && (timer.isBlank() || timer.toLongOrNull()?.let { it >= 0 } == true), onClick = { submit(draft) }) { Text("Apply channel changes") }
 }
 
 @Composable
@@ -245,13 +287,20 @@ private fun ZncManagement(management: BouncerManagement, state: BouncerAccountSt
         }
     }
     BouncerField("New ZNC network name", newName) { newName = it }
-    Button(enabled = statusEditable && newName.isNotBlank(), onClick = { scope.launch { management.addZncNetwork(state.networkId, newName.trim()) } }) { Text("Add ZNC network") }
+    Button(enabled = statusEditable && newName.isNotBlank(), onClick = {
+        val submitted = newName
+        scope.launch {
+            val outcome = management.addZncNetwork(state.networkId, submitted.trim())
+            if (outcome.status == BouncerOperationStatus.SUCCESS && newName == submitted) newName = ""
+        }
+    }) { Text("Add ZNC network") }
     editingName?.let { name ->
         val baseline = state.zncNetworkDetails[name]
         if (baseline != null) {
-            key(name, baseline) {
-                ZncNetworkEditor(baseline, editable, state.boundNetwork == name, { editingName = null }) { draft ->
-                    scope.launch { management.applyZncNetwork(state.networkId, baseline, draft) }
+            key(name) {
+                ZncNetworkEditor(baseline, editable, state.boundNetwork == name, { editingName = null }) { submittedBaseline, draft ->
+                    val outcome = management.applyZncNetwork(state.networkId, submittedBaseline, draft)
+                    outcome to management.accounts.value[state.networkId]?.zncNetworkDetails?.get(name)
                 }
             }
         } else Text("Network settings have not been retrieved.")
@@ -259,8 +308,11 @@ private fun ZncManagement(management: BouncerManagement, state: BouncerAccountSt
     if (state.boundNetwork != null) {
         BouncerChannelLookup(!busy, "ZNC") { channel -> scope.launch { management.fetchZncChannel(state.networkId, channel) } }
         state.zncChannels.values.forEach { baseline ->
-            key(baseline.name, baseline) {
-                ZncChannelEditor(baseline, editable) { draft -> scope.launch { management.applyZncChannel(state.networkId, baseline, draft) } }
+            key(baseline.name) {
+                ZncChannelEditor(baseline, editable) { submittedBaseline, draft ->
+                    val outcome = management.applyZncChannel(state.networkId, submittedBaseline, draft)
+                    outcome to management.accounts.value[state.networkId]?.zncChannels?.get(baseline.name)
+                }
             }
         }
     } else Text("Select a ZNC network in connection settings to manage its channels and servers.")
@@ -276,8 +328,22 @@ private fun ZncManagement(management: BouncerManagement, state: BouncerAccountSt
 }
 
 @Composable
-private fun ZncNetworkEditor(baseline: ZncNetworkDraft, enabled: Boolean, serversEditable: Boolean, onCancel: () -> Unit, onApply: (ZncNetworkDraft) -> Unit) {
-    var draft by remember { mutableStateOf(baseline) }
+private fun ZncNetworkEditor(
+    baseline: ZncNetworkDraft,
+    enabled: Boolean,
+    serversEditable: Boolean,
+    onCancel: () -> Unit,
+    onApply: suspend (ZncNetworkDraft, ZncNetworkDraft) -> Pair<BouncerOperationOutcome, ZncNetworkDraft?>,
+) {
+    val editor = remember { BouncerEditorDraft(baseline, ::rebaseZncNetworkDraft) }
+    var draft by editor::draft
+    var servers by remember { mutableStateOf(baseline.servers.map { ZncServerEditorDraft(it) }) }
+    val scope = rememberCoroutineScope()
+    SideEffect { editor.observeBaseline(baseline) }
+    fun updateServers(replacement: List<ZncServerEditorDraft>) {
+        servers = replacement
+        draft = draft.copy(servers = replacement.map { it.server })
+    }
     HorizontalDivider()
     Text("ZNC settings · ${baseline.name}", style = MaterialTheme.typography.titleMedium)
     baseline.settings.forEach { (variable, value) ->
@@ -285,39 +351,61 @@ private fun ZncNetworkEditor(baseline: ZncNetworkDraft, enabled: Boolean, server
     }
     if (serversEditable) {
         Text("Servers", style = MaterialTheme.typography.titleSmall)
-        draft.servers.forEachIndexed { index, server ->
-            key(index) {
-                ZncServerEditor(server) { replacement ->
-                    draft = draft.copy(servers = if (replacement == null) draft.servers.filterIndexed { position, _ -> position != index }
-                        else draft.servers.mapIndexed { position, entry -> if (position == index) replacement else entry })
-                }
+        servers.forEachIndexed { index, server ->
+            ZncServerEditor(server) { replacement ->
+                updateServers(if (replacement == null) servers.filterIndexed { position, _ -> position != index }
+                    else servers.mapIndexed { position, entry -> if (position == index) replacement else entry })
             }
         }
-        TextButton(onClick = { draft = draft.copy(servers = draft.servers + ZncServerDraft("")) }) { Text("Add server") }
+        TextButton(onClick = { updateServers(servers + ZncServerEditorDraft(ZncServerDraft(""))) }) { Text("Add server") }
     } else Text("Connect to ${baseline.name} before fetching or editing its server list.")
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         TextButton(onClick = onCancel) { Text("Close settings") }
-        Button(enabled = enabled && draft.servers.all { it.host.isNotBlank() && it.port in 1..65535 }, onClick = { onApply(draft) }) { Text("Apply ZNC changes") }
+        Button(enabled = enabled && draft.servers.all { it.host.isNotBlank() && it.port in 1..65535 }, onClick = {
+            val submitted = draft
+            val submittedServers = servers
+            scope.launch {
+                val (outcome, refreshed) = onApply(editor.baseline, submitted)
+                editor.acknowledge(submitted, refreshed, outcome)
+                if (outcome.status == BouncerOperationStatus.SUCCESS) {
+                    servers = if (servers == submittedServers) editor.draft.servers.map { ZncServerEditorDraft(it) }
+                    else servers.mapIndexed { index, input ->
+                        if (input.server == submittedServers.getOrNull(index)?.server) {
+                            ZncServerEditorDraft(editor.draft.servers.getOrNull(index) ?: input.server)
+                        } else input
+                    }
+                }
+            }
+        }) { Text("Apply ZNC changes") }
     }
 }
 
 @Composable
-private fun ZncServerEditor(server: ZncServerDraft, onChange: (ZncServerDraft?) -> Unit) {
-    var port by remember(server.host, server.port) { mutableStateOf(server.port.toString()) }
-    BouncerField("Server host", server.host) { onChange(server.copy(host = it)) }
-    BouncerField("Server port", port) { port = it; onChange(server.copy(port = it.toIntOrNull() ?: 0)) }
-    BouncerToggle("Server TLS", server.tls) { onChange(server.copy(tls = it)) }
+private fun ZncServerEditor(input: ZncServerEditorDraft, onChange: (ZncServerEditorDraft?) -> Unit) {
+    val server = input.server
+    BouncerField("Server host", server.host) { onChange(input.copy(server = server.copy(host = it))) }
+    BouncerField("Server port", input.port) { onChange(input.withPort(it)) }
+    BouncerToggle("Server TLS", server.tls) { onChange(input.copy(server = server.copy(tls = it))) }
     BouncerToggle("Replace or clear server password", server.passwordChanged) {
-        onChange(server.copy(passwordChanged = it, password = if (it) "" else null))
+        onChange(input.copy(server = server.copy(passwordChanged = it, password = if (it) "" else null)))
     }
-    if (server.passwordChanged) BouncerField("New server password (empty clears)", server.password.orEmpty(), secret = true) { onChange(server.copy(password = it)) }
+    if (server.passwordChanged) BouncerField("New server password (empty clears)", server.password.orEmpty(), secret = true) {
+        onChange(input.copy(server = server.copy(password = it)))
+    }
     TextButton(onClick = { onChange(null) }) { Text("Remove server") }
 }
 
 @Composable
-private fun ZncChannelEditor(baseline: ZncChannelDraft, enabled: Boolean, onApply: (ZncChannelDraft) -> Unit) {
-    var draft by remember { mutableStateOf(baseline) }
+private fun ZncChannelEditor(
+    baseline: ZncChannelDraft,
+    enabled: Boolean,
+    onApply: suspend (ZncChannelDraft, ZncChannelDraft) -> Pair<BouncerOperationOutcome, ZncChannelDraft?>,
+) {
+    val editor = remember { BouncerEditorDraft(baseline, ::rebaseZncChannelDraft) }
+    var draft by editor::draft
     var size by remember { mutableStateOf(baseline.bufferSize?.toString().orEmpty()) }
+    val scope = rememberCoroutineScope()
+    SideEffect { editor.observeBaseline(baseline) }
     HorizontalDivider()
     Text("ZNC channel · ${baseline.name}", style = MaterialTheme.typography.titleMedium)
     BouncerToggle("Detached", draft.detached) { draft = draft.copy(detached = it) }
@@ -329,7 +417,17 @@ private fun ZncChannelEditor(baseline: ZncChannelDraft, enabled: Boolean, onAppl
         FilterChip(selected = draft.autoClearChanBuffer == true, onClick = { draft = draft.copy(autoClearChanBuffer = true) }, label = { Text("Yes") })
         FilterChip(selected = draft.autoClearChanBuffer == false, onClick = { draft = draft.copy(autoClearChanBuffer = false) }, label = { Text("No") })
     }
-    Button(enabled = enabled && (size.isBlank() || size.toIntOrNull()?.let { it >= 0 } == true), onClick = { onApply(draft) }) { Text("Apply ZNC channel changes") }
+    Button(enabled = enabled && (size.isBlank() || size.toIntOrNull()?.let { it >= 0 } == true), onClick = {
+        val submitted = draft
+        val submittedSize = size
+        scope.launch {
+            val (outcome, refreshed) = onApply(editor.baseline, submitted)
+            editor.acknowledge(submitted, refreshed, outcome)
+            if (outcome.status == BouncerOperationStatus.SUCCESS && size == submittedSize) {
+                size = editor.draft.bufferSize?.toString().orEmpty()
+            }
+        }
+    }) { Text("Apply ZNC channel changes") }
 }
 
 @Composable

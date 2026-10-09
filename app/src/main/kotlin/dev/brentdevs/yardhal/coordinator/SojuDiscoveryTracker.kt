@@ -71,8 +71,9 @@ internal class SojuDiscoveryTracker {
             is IrcBouncerNetworks.Change.Upsert -> {
                 val merged = (known[update.netId] ?: IrcBouncerNetworks.Attributes()).merged(change.attributes)
                 known[update.netId] = merged
-                val snapshots = if (reference == null) batches.values.filter { it.type == IrcBouncerNetworks.BATCH_TYPE } else snapshots(reference)
-                snapshots.forEach { it.seen.add(update.netId) }
+                batches.values.forEach {
+                    if (it.type == IrcBouncerNetworks.BATCH_TYPE && !playback(it.parent)) it.seen.add(update.netId)
+                }
                 listOf(SojuDiscoveryChange.Upsert(update.netId, merged))
             }
             IrcBouncerNetworks.Change.Deleted -> {

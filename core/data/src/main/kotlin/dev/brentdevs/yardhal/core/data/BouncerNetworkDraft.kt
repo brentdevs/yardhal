@@ -31,11 +31,12 @@ public data class BouncerNetworkDraft(
         val schemeSeparator = trimmed.indexOf("://")
         if (schemeSeparator <= 0) return null
         val scheme = Scheme.fromPrefix(trimmed.substring(0, schemeSeparator)) ?: return null
-        val remainder = trimmed.substring(schemeSeparator + 3)
+        var remainder = trimmed.substring(schemeSeparator + 3)
         if (scheme == Scheme.UNIX) {
             if (remainder.isEmpty()) return null
             return ParsedAddr(scheme, remainder, null)
         }
+        remainder = remainder.substringAfterLast('@')
         if (remainder.isEmpty() || remainder.any { it in "/@?#" || it.isWhitespace() }) return null
         return if (remainder.startsWith("[")) {
             val close = remainder.indexOf(']')
@@ -113,19 +114,26 @@ public data class BouncerNetworkDraft(
     }
 
     override fun toString(): String =
-        "BouncerNetworkDraft(addr=$addr, name=$name, nick=$nick, username=$username, realname=$realname, password=<redacted>, enabled=$enabled, passwordChanged=$passwordChanged)"
+        "BouncerNetworkDraft(addr=${addressWithoutUserInfo()}, name=$name, nick=$nick, username=$username, realname=$realname, password=<redacted>, enabled=$enabled, passwordChanged=$passwordChanged)"
+
+    public fun addressWithoutUserInfo(): String {
+        val schemeSeparator = addr.indexOf("://")
+        if (schemeSeparator < 0 || Scheme.fromPrefix(addr.substring(0, schemeSeparator)) == Scheme.UNIX || '@' !in addr) return addr
+        return addr.substring(0, schemeSeparator + 3) + addr.substringAfterLast('@')
+    }
 
     public companion object {
         public fun fromAttributes(attrs: IrcBouncerNetworks.Attributes): BouncerNetworkDraft {
             val addr = buildString {
                 val host = attrs.host.orEmpty()
                 when {
-                    attrs.unknown["addr"]?.startsWith("irc+unix://") == true -> append(attrs.unknown.getValue("addr"))
                     host.startsWith("irc+unix://") -> append(host)
                     host.startsWith("/") -> {
                         append("irc+unix://")
                         append(host)
                     }
+                    attrs.unknown["addr"]?.startsWith("irc+unix://") == true -> append(attrs.unknown.getValue("addr"))
+                    host.isEmpty() -> Unit
                     else -> {
                         append(if (attrs.tls ?: true) "ircs://" else "irc+insecure://")
                         append(if (':' in host) "[$host]" else host)

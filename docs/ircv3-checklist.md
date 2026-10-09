@@ -79,9 +79,9 @@ Phase numbers refer to `docs/architecture.md`.
 
 ## Bouncer extensions and management
 
-- [x] soju.im/bouncer-networks + notify: live escape-aware NETWORK upsert/explicit deletion, complete-list reconciliation, authenticated BIND before CAP END, ADDNETWORK/CHANGENETWORK/DELNETWORK (P7; parity phase 4)
+- [x] soju.im/bouncer-networks + notify: live escape-aware NETWORK upsert/explicit deletion, concurrent live-batch deltas retained through complete-list reconciliation, SASL-authenticated BIND before CAP END, ADDNETWORK/CHANGENETWORK/DELNETWORK (P7; parity phase 4)
 - [x] Stable parent/netID upstream UUIDs, persisted bindings, offline shells and independent saved intent; disabled/deleted/rejected isolation and parent cascade (parity phase 4)
-- [x] BouncerServ network enabled-state and bound-channel status/detach/timer/relay/reattach controls; changed-field diffs, labeled replies or ordered nonce fences, acknowledged partial outcomes (parity phase 4)
+- [x] BouncerServ network enabled-state and bound-channel status/detach/timer/relay/reattach controls; changed-field diffs, labeled replies or ordered nonce fences, fresh PONG recovery after uncertain unlabeled replies, dismissal-safe submitted operations and acknowledged partial outcomes (parity phase 4)
 - [x] ZNC mode-specific PASS, independent *status/*controlpanel availability, network/server/settings/channel management, masked-secret retention and freshly scoped baselines (parity phase 4)
 - [x] Historical/current management and own service echoes cannot create ordinary DMs, unread or live notifications; late generations and uncertain replies cannot acknowledge another operation (parity phase 4)
 - [x] Bouncer-aware history provider selection: forwarded ZNC upstream ISUPPORT alone is not downstream CHATHISTORY; use negotiated CHATHISTORY or actual znc.in/playback, otherwise retain local-only history (parity phase 4)
@@ -149,6 +149,7 @@ Ergo and runs all real-server tests without skips.
 | soju.im/bouncer-networks / binding | `IrcBouncerNetworksTests.actualMessageTagEscapesDecodeSpacesAndSemicolons`; `IrcBouncerNetworksTests.networkDeletionRequiresExplicitAsteriskAndExactParameterCount`; `IrcBouncerBindingTests.bindingFollowsSuccessfulSaslAndPrecedesCapEndNickAndUserExactlyOnce`; `IrcBouncerBindingTests.actualSojuInvalidNetidWithoutBindContextHardBlocksRecoveryNudges`; `SojuDiscoveryTrackerTests` |
 | Stable upstream lifecycle (parity phase 4) | `SojuUpstreamConfigTests`; `NetworkEditLifecycleTests.manuallyConnectedSojuAccountStartsNewChildrenWithoutChangingSavedAutoConnectOrExistingIntent`; `NetworkEditLifecycleTests.disabledUpstreamsAndAccountDisconnectKeepIndependentDesiredIntentAndSiblingTransports`; `NetworkEditLifecycleTests.rejectedBindPersistsAnIsolatedOfflineShellAndNeverRetriesOnConnectivityOrResume`; `NetworkEditLifecycleTests.serverManagedBouncerPartAndReattachRetainConversationAndDurableIntentUntilExplicitUserPart` |
 | Bouncer management (parity phase 4) | `BouncerManagementTests.nestedLabeledResponseBatchesCorrelateToTheOperation`; `BouncerManagementTests.changedFieldOnlyCommandsReportRejectedAndPartialApplyWithoutLeakingSecrets`; `BouncerManagementTests.renameAndDisableUsesTheAcknowledgedNewNameAndEscapesRealnames`; `BouncerManagementTests.missingControlpanelIsObservedFromRealStatusReplyNotFromSending`; `BouncerManagementTests.bindingChangesClearDetailsAndRejectHeldChannelAndNetworkDrafts`; `BouncerZncManagementTests` |
+| Bouncer review boundaries (parity phase 4) | `IrcBouncerBindingTests`; `ManualAuthenticationRedactionTests`; `SojuDiscoveryTrackerTests.concurrentIndependentLiveBatchDeltasSurviveListingClosureWithoutRevivingDeletes`; `NetworkEditLifecycleTests.remotelyDisabledAndDeletedUpstreamsStopEvenWhenTheirObservedStateCannotBeSaved`; `NetworkEditLifecycleTests.manualConnectWithUnchangedDurableIntentDoesNotRequireWritableConfiguration`; `BouncerManagementTests`; `BouncerEditorDraftTests`; `NetworkEditorValidationTests`; `NetworkSaverTests`; `BouncerPortTests`; `BouncerZncManagementTests` |
 | Bouncer history availability (parity phase 4) | `IrcChatHistoryTests.forwardedIsupportCannotEnableHistoryWithoutDownstreamCapability`; `NetworkEditLifecycleTests.zncWithoutPlaybackKeepsStoredReadingButRejectsForwardedUpstreamHistoryAvailability`; native-playback integration fixtures now forward upstream CHATHISTORY ISUPPORT while retaining downstream ZNC capabilities |
 | znc.in/playback | `HistoryRequestTrackerTests.bareZncPlaybackRequiresTimestampBoundsAndCorrectDmIdentity`; `HistoryCoordinatorIntegrationTests.clippedNativePlaybackRetainsGapUntilClosedRangeWitnessesCachedLowerBoundary`; `HistoryCoordinatorIntegrationTests.timedOutWildcardPlaybackCannotInjectLateBatchesBareMessagesOrNotifications`; `HistoryCoordinatorIntegrationTests.invalidNativeMetadataCannotInventGapOrPersistFallbackClockMessage`; `HistoryCoordinatorIntegrationTests.repeatedBoundedPlaybackReconnectsMergeDurableGapsWithoutOpeningClosedConversations`; `HistoryCoordinatorIntegrationTests.inclusivePlaybackUpperBoundaryAdvancesFiniteEmptyWindowsWithoutInventingGapsOrArchiveEnd` |
 | Offline snapshot inputs (parity phase 3) | `OfflineStoreTests`; `OfflineSnapshotMappingTests`; `OfflineCoordinatorTests`; `OfflinePresentationTests`; `OfflineConversationPresentationTests` |
@@ -189,6 +190,24 @@ LATEST/BEFORE and catch-up retain all 180 distinct seeded soju rows, while repea
 ZNC playback retains 75 distinct buffered rows. Room contains zero service DM rows.
 With notification permission granted, a live mention produces one message
 notification; real replay of live/offline mentions produces none.
+
+Review fixes were exercised on native Android 15 with real soju 0.10.1 and ZNC
+1.10.2. A transparent relay delayed actual soju deletion replies five seconds:
+the sheet was dismissed before acknowledgement, and reopening showed successful
+completion with the upstream removed. ZNC's typed `017779` port survived host
+editing; native server replacement refetched the changed endpoint and reset
+secret intent, then a second Apply performed zero changes. Mode switching saved
+soju without a hidden direct-server password reference; invalid soju whitespace
+and ZNC `@` accounts were rejected by the actual form. Standalone JVM smokes prove
+live-batch discovery preservation and actual `IrcConnection.rawTap` wildcard
+diagnostic retention without decoded/escaped upstream or composed/raw ZNC secrets.
+ZNC 1.9.1 deletion compatibility is based on its native `*status` grammar and
+consumer regressions, not a claimed native 1.9.1 run.
+The latest APK also applies a real remote disable while configuration writes are
+blocked: the child stops despite saved `enabled=true`, stays stopped across parent
+Disconnect/Connect, then a parent name edit preserves and durably saves
+`enabled=false` once storage is restored. The parent and unrelated ZNC remain
+connected.
 
 Parity phase 1 was also exercised on actual Android 15 transcripts against
 Ergo 2.14.0 with persistent history capped at five messages, ZNC 1.10.3 with native

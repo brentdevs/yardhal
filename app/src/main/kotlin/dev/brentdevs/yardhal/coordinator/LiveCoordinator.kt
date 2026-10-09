@@ -1084,7 +1084,7 @@ public class LiveCoordinator(
                 if (sessions[parent.id]?.recovery?.desiredConnection != true) return
             }
             val config = saved.copy(userDisconnected = false, bouncerBinding = binding?.copy(rejectionReason = null))
-            if (!networkStore.update(config)) {
+            if (config != saved && !networkStore.update(config)) {
                 showConnectionError(networkId, "Could not save Connect intent. Check device storage and retry; the saved disconnect preference is unchanged.")
                 return
             }
@@ -1113,7 +1113,7 @@ public class LiveCoordinator(
         for (config in networkStore.dependents(parentId)) {
             val current = sessions[config.id]
             if (current == null) startSession(config)
-            else if (upstreamEligible(config) && current.recovery.desiredConnection) launchSession(current)
+            else if (upstreamEligible(current.config) && current.recovery.desiredConnection) launchSession(current)
         }
     }
 
@@ -1327,7 +1327,8 @@ public class LiveCoordinator(
                 return@update false
             }
             val resetRejectedUpstreams = credentialsChanged || !saved.connectionSettingsMatch(updated)
-            val children = networkStore.dependents(config.id).map { child ->
+            val children = networkStore.dependents(config.id).map { savedChild ->
+                val child = sessions[savedChild.id]?.config ?: savedChild
                 val binding = child.bouncerBinding
                 SojuUpstreamConfig.inherit(updated, if (resetRejectedUpstreams) child.copy(
                     bouncerBinding = binding?.copy(rejectionReason = null),
@@ -1507,7 +1508,7 @@ public class LiveCoordinator(
                 for (child in networkStore.dependents(networkId)) {
                     val dependent = sessions[child.id] ?: continue
                     val wanted = dependent.recovery.desiredConnection
-                    restartSession(child, manuallyWanted = wanted)
+                    restartSession(dependent.config, manuallyWanted = wanted)
                 }
             }
         }
@@ -1731,6 +1732,10 @@ public class LiveCoordinator(
         if (!znc && (config.saslMode == SaslMode.PLAIN || config.saslMode == SaslMode.SCRAM_SHA_256) &&
             saslPassword.isNullOrEmpty()
         ) throw AuthenticationRejectedException("The selected SASL mechanism requires a saved password. Replace it in network settings.")
+        if (config.mode == NetworkMode.SOJU &&
+            (config.saslAuthcid?.any { it.isWhitespace() || it == '\u0000' } == true ||
+                saslPassword?.contains('\u0000') == true)
+        ) throw AuthenticationRejectedException("The soju account or password contains an invalid authentication value. Correct account settings.")
         val savedServerPassword = resolvePassword(config.serverPasswordRef, config.serverPassword, if (znc) "ZNC account" else "server")
         val nickServPassword = resolvePassword(config.nickServPasswordRef, config.nickServPassword, "NickServ")
         val proxyPassword = resolvePassword(config.proxy?.passwordRef, config.proxyPassword, "proxy")

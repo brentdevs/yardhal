@@ -79,7 +79,7 @@ public class NetworkSaver(
                 saslMode = if (mode == NetworkMode.ZNC) dev.brentdevs.yardhal.core.data.SaslMode.AUTO
                     else draft.saslMode ?: base.saslMode,
                 saslPasswordRef = passwordRef,
-                serverPasswordRef = passwordReference(
+                serverPasswordRef = if (mode == NetworkMode.SOJU) null else passwordReference(
                     "server", base.serverPasswordRef, draft.serverPassword, draft.clearServerPassword,
                 ),
                 nickServAccount = if (mode != NetworkMode.DIRECT) null else if (draft.nickServAccount != null) {

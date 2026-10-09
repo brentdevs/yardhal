@@ -101,6 +101,22 @@ class NetworkEditorValidationTests {
             saslMode = SaslMode.EXTERNAL, tlsClientAlias = "keychain-identity",
         ), null))
         assertTrue(networkEditorErrors(soju.copy(saslMode = SaslMode.EXTERNAL, tls = false), null).isNotEmpty())
+        val external = soju.copy(saslMode = SaslMode.EXTERNAL, saslAuthcid = "")
+        assertEquals(emptyList(), bouncerSetupErrors(external, null))
+        for (account in listOf("account other", "account\u0000other")) {
+            assertTrue(bouncerSetupErrors(external.copy(saslAuthcid = account), null).isNotEmpty())
+        }
+    }
+
+    @Test
+    fun sojuRejectsAccountSeparatorsAndPlainCredentialNulWithoutRestrictingPasswordSpaces() {
+        val soju = draft.copy(mode = NetworkMode.SOJU, saslAuthcid = "account", saslPassword = " secret with spaces ")
+        assertEquals(emptyList(), bouncerSetupErrors(soju, null))
+        for (separator in listOf(" ", "\t", "\r", "\n", "\u0000")) {
+            assertTrue(bouncerSetupErrors(soju.copy(saslAuthcid = "account${separator}other"), null).isNotEmpty())
+        }
+        assertTrue(bouncerSetupErrors(soju.copy(saslPassword = "secret\u0000extra"), null).isNotEmpty())
+        assertEquals(emptyList(), bouncerSetupErrors(soju.copy(saslAuthcid = "account@example.org"), null))
     }
 
     @Test
@@ -108,7 +124,7 @@ class NetworkEditorValidationTests {
         val znc = draft.copy(mode = NetworkMode.ZNC, saslAuthcid = "account", serverPassword = "secret: with / punctuation")
         assertEquals(emptyList(), bouncerSetupErrors(znc, null))
         assertEquals(emptyList(), bouncerSetupErrors(znc.copy(zncNetwork = "network"), null))
-        for (separator in listOf(" ", "/", ":", "\u0000", "\r", "\n")) {
+        for (separator in listOf(" ", "/", ":", "@", "\u0000", "\r", "\n")) {
             assertTrue(bouncerSetupErrors(znc.copy(saslAuthcid = "account${separator}other"), null).isNotEmpty())
             assertTrue(bouncerSetupErrors(znc.copy(zncNetwork = "network${separator}other"), null).isNotEmpty())
         }
@@ -116,5 +132,8 @@ class NetworkEditorValidationTests {
         val retained = saved.copy(mode = NetworkMode.ZNC, saslAuthcid = "account", serverPasswordRef = "vault-key")
         assertEquals(emptyList(), bouncerSetupErrors(znc.copy(serverPassword = null), retained))
         assertTrue(bouncerSetupErrors(znc.copy(serverPassword = null, clearServerPassword = true), retained).isNotEmpty())
+        for (separator in listOf("\u0000", "\r", "\n")) {
+            assertTrue(bouncerSetupErrors(znc.copy(serverPassword = "secret${separator}extra"), null).isNotEmpty())
+        }
     }
 }

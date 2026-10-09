@@ -112,7 +112,12 @@ class BouncerZncManagementTests {
         assertEquals("GetChan Detached \$user libera #room", BouncerZncCommands.getChan("libera", "#room", ZncChannelVariable.Detached).text)
         assertEquals("SetChan BufferSize \$user libera #room 200", BouncerZncCommands.setChan("libera", "#room", ZncChannelVariable.BufferSize, "200").text)
         assertEquals("AddServer \$user libera irc.example +6697 two words", BouncerZncCommands.addServer("libera", ZncServerDraft("irc.example", password = "two words")).text)
-        assertEquals("DelServer \$user libera irc.example +6697", BouncerZncCommands.deleteServer("libera", ZncServerDraft("irc.example", password = null)).text)
+        val deletion = BouncerZncCommands.deleteServer("libera", ZncServerDraft("irc.example", password = null))
+        assertEquals("DelServer irc.example 6697", deletion.text)
+        assertEquals(ZncCommandTarget.Status, deletion.target)
+        assertTrue(deletion.boundOnly)
+        assertTrue(deletion.matchesAcknowledgement("Server removed"))
+        assertFalse(deletion.matchesAcknowledgement("No such server"))
         assertEquals(ZncCommandTarget.ControlPanel, BouncerZncCommands.addServer("libera", ZncServerDraft("host")).target)
         assertTrue(BouncerZncCommands.listServers().boundOnly)
         assertTrue(BouncerZncCommands.listChans().boundOnly)
@@ -134,6 +139,13 @@ class BouncerZncManagementTests {
         val roundedFlood = BouncerZncCommands.setNetwork("libera", ZncNetworkVariable.FloodRate, "2.675")
         assertTrue(roundedFlood.matchesAcknowledgement("FloodRate = 2.67"))
         assertFalse(roundedFlood.matchesAcknowledgement("FloodRate = 2.68"))
+        val halfEvenFlood = BouncerZncCommands.setNetwork("libera", ZncNetworkVariable.FloodRate, "0.125")
+        assertEquals("SetNetwork FloodRate \$user libera 0.125", halfEvenFlood.text)
+        assertTrue(halfEvenFlood.matchesAcknowledgement("FloodRate = 0.12"))
+        assertFalse(halfEvenFlood.matchesAcknowledgement("FloodRate = 0.13"))
+        val binaryFlood = BouncerZncCommands.setNetwork("libera", ZncNetworkVariable.FloodRate, "0.135")
+        assertTrue(binaryFlood.matchesAcknowledgement("FloodRate = 0.14"))
+        assertFalse(binaryFlood.matchesAcknowledgement("FloodRate = 0.13"))
         val detached = BouncerZncCommands.setChan("libera", "#room", ZncChannelVariable.Detached, "true")
         assertTrue(detached.matchesAcknowledgement("#room: Detached = 1"))
         assertFalse(detached.matchesAcknowledgement("#other: Detached = 1"))
@@ -163,11 +175,11 @@ class BouncerZncManagementTests {
         val second = ZncServerDraft("second", password = null)
         val third = ZncServerDraft("third", password = "", passwordChanged = true)
         assertEquals(
-            listOf("DelServer \$user libera second +6697", "AddServer \$user libera third +6697"),
+            listOf("DelServer second 6697", "AddServer \$user libera third +6697"),
             BouncerZncCommands.serverDiff("libera", listOf(first, second), listOf(first, third)).map { it.text },
         )
         assertEquals(
-            listOf("DelServer \$user libera first +6697"),
+            listOf("DelServer first 6697"),
             BouncerZncCommands.serverDiff("libera", listOf(first, second), listOf(second)).map { it.text },
         )
     }
@@ -177,7 +189,7 @@ class BouncerZncManagementTests {
         val first = ZncServerDraft("first", password = "secret")
         val second = ZncServerDraft("second", password = null)
         assertEquals(
-            listOf("DelServer \$user libera first +6697", "AddServer \$user libera first +6697 secret"),
+            listOf("DelServer first 6697", "AddServer \$user libera first +6697 secret"),
             BouncerZncCommands.serverDiff("libera", listOf(first, second), listOf(second, first)).map { it.text },
         )
     }
@@ -193,11 +205,11 @@ class BouncerZncManagementTests {
             BouncerZncCommands.serverDiff("libera", listOf(first), listOf(first.copy(tls = false)))
         }
         assertEquals(
-            listOf("DelServer \$user libera first +6697", "AddServer \$user libera first 6697 replacement"),
+            listOf("DelServer first 6697", "AddServer \$user libera first 6697 replacement"),
             BouncerZncCommands.serverDiff("libera", listOf(first), listOf(first.copy(tls = false, passwordChanged = true, password = "replacement"))).map { it.text },
         )
         assertEquals(
-            listOf("DelServer \$user libera first +6697", "AddServer \$user libera first +6697"),
+            listOf("DelServer first 6697", "AddServer \$user libera first +6697"),
             BouncerZncCommands.serverDiff("libera", listOf(first), listOf(first.copy(passwordChanged = true, password = ""))).map { it.text },
         )
     }
@@ -225,6 +237,20 @@ class BouncerZncManagementTests {
         assertFailsWith<IllegalArgumentException> {
             BouncerZncCommands.serverDiff("libera", listOf(retained, retained.copy(tls = false)), listOf(retained))
         }
+    }
+
+    @Test
+    fun boundStatusDeletionUsesPortAndRemovesOnlyTheFirstMatchingDuplicate() {
+        val first = ZncServerDraft("same", port = 7000, tls = true, password = null)
+        val second = ZncServerDraft("same", port = 7001, tls = false, password = null)
+        assertEquals(
+            listOf("DelServer same 7001"),
+            BouncerZncCommands.serverDiff("libera", listOf(first, second), listOf(first)).map { it.text },
+        )
+        assertEquals(
+            listOf("DelServer same 7000"),
+            BouncerZncCommands.serverDiff("libera", listOf(first, first.copy(tls = false)), listOf(first.copy(tls = false))).map { it.text },
+        )
     }
 
     @Test
@@ -292,6 +318,38 @@ class BouncerZncManagementTests {
             listOf("1", "#café", "Joined", "yes", "50", "yes", "+nt", "2"),
         )
         assertEquals("#café", assertNotNull(BouncerZncParser.channels(lines)).single().name)
+    }
+
+    @Test
+    fun permissionStrippingNeverSearchesTheChannelBody() {
+        val names = listOf("+foo#bar", "+foo&bar", "&local#body", "&+#room", "&+modeless", "@&local", "~&@%+#room", "&&local")
+        val channels = assertNotNull(BouncerZncParser.channels(table(
+            listOf("Index", "Name", "Status", "In config", "Buffer", "Clear", "Modes", "Users"),
+            *names.mapIndexed { index, name -> listOf((index + 1).toString(), name, "Joined", "yes", "50", "yes", "", "1") }.toTypedArray(),
+        )))
+        assertEquals(listOf("+foo#bar", "+foo&bar", "&local#body", "#room", "+modeless", "&local", "#room", "&local"), channels.map { it.name })
+    }
+
+    @Test
+    fun utf8ByteWidthTablesPreserveUnicodeAndEmbeddedColumnMarkers() {
+        val channels = assertNotNull(BouncerZncParser.channels(table(
+            listOf("Index", "Name", "Status", "In config", "Buffer", "Clear", "Modes", "Users"),
+            listOf("1", "@#日本語😀|café", "Joined", "yes", "*50", "*yes", "+nt", "2"),
+            listOf("2", "+é&日本語", "Detached", "yes", "20", "", "", "0"),
+        )))
+        assertEquals(listOf("#日本語😀|café", "+é&日本語"), channels.map { it.name })
+        val servers = assertNotNull(BouncerZncParser.servers(table(
+            listOf("Host", "Port", "SSL", "Password"),
+            listOf("irc.例え.test*", "6697", "SSL", "******"),
+            listOf("2001:db8::1", "7000", "", ""),
+        )))
+        assertEquals(listOf("irc.例え.test", "2001:db8::1"), servers.map { it.host })
+        assertTrue(servers.first().current)
+        val networks = assertNotNull(BouncerZncParser.networks(table(
+            listOf("Network", "On IRC", "IRC Server", "IRC User", "Channels"),
+            listOf("libera", "Yes", "irc.例え.test", "é😀|nick!ident@例え.test", "1"),
+        )))
+        assertEquals("é😀|nick!ident@例え.test", networks.single().ircUser)
     }
 
     private fun table(headers: List<String>, vararg rows: List<String>): List<String> {

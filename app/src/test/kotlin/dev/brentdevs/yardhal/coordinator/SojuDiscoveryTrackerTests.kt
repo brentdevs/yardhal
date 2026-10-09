@@ -82,6 +82,19 @@ class SojuDiscoveryTrackerTests {
         assertEquals(listOf(SojuDiscoveryChange.Snapshot(setOf("2"))), tracker.feed(":srv BATCH -listing"))
     }
 
+    @Test fun concurrentIndependentLiveBatchDeltasSurviveListingClosureWithoutRevivingDeletes() {
+        val tracker = SojuDiscoveryTracker().also { it.begin(1) }
+        tracker.feed(":srv BATCH +listing soju.im/bouncer-networks")
+        tracker.feed("@batch=listing :srv BOUNCER NETWORK 1 :name=First")
+        tracker.feed(":srv BATCH +independent labeled-response")
+        tracker.feed("@batch=independent :srv BOUNCER NETWORK 2 :name=Concurrent")
+        tracker.feed("@batch=independent :srv BOUNCER NETWORK 1 *")
+        tracker.feed(":srv BATCH -independent")
+        assertEquals(listOf(SojuDiscoveryChange.Snapshot(setOf("2"))), tracker.feed(":srv BATCH -listing"))
+        val retained = assertIs<SojuDiscoveryChange.Upsert>(tracker.feed(":srv BOUNCER NETWORK 2 :state=connected").single())
+        assertEquals("Concurrent", retained.attributes.name)
+    }
+
     @Test fun playbackNestedDiscoveryAndUserOriginatedFramesCannotCreateOrRemoveLiveUpstreams() {
         val tracker = SojuDiscoveryTracker().also { it.begin(1) }
         tracker.feed(":srv BATCH +history chathistory #room")

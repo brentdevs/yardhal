@@ -1,6 +1,7 @@
 package dev.brentdevs.yardhal.core.client
 
 import dev.brentdevs.yardhal.core.protocol.IrcMessage
+import dev.brentdevs.yardhal.core.protocol.IrcTags
 
 private val VISIBLE_AUTHENTICATE_ARGUMENTS = SaslAuthenticator.PREFERRED_MECHANISMS.toSet() +
     SaslAuthenticator.EXTERNAL + SaslAuthenticator.CONTINUATION_MARKER + SaslAuthenticator.ABORT_MARKER
@@ -16,6 +17,22 @@ internal class TrafficRedactor(initialSecrets: Collection<String>, private val n
         when (message.command.uppercase()) {
             "PASS" -> parameters.firstOrNull()?.let(::rememberCredential)
             "AUTHENTICATE" -> parameters.firstOrNull()?.takeUnless { it in VISIBLE_AUTHENTICATE_ARGUMENTS }?.let(::remember)
+            "BOUNCER" -> {
+                val subcommand = parameters.firstOrNull()
+                val attributes = when {
+                    subcommand.equals("ADDNETWORK", true) -> parameters.getOrNull(1)
+                    subcommand.equals("CHANGENETWORK", true) -> parameters.getOrNull(2)
+                    else -> null
+                }
+                attributes?.let { source ->
+                    for ((key, value) in IrcTags.parseSection(source)) {
+                        if (key.equals("pass", true) && !value.isNullOrEmpty()) {
+                            rememberCredential(value)
+                            remember(IrcTags.escape(value))
+                        }
+                    }
+                }
+            }
             "REGISTER" -> parameters.getOrNull(2)?.let(::rememberCredential)
             "OPER" -> passwordAfterFirstArgument(parameters.joinToString(" "))?.let(::rememberCredential)
             else -> serviceAuthentication(message, nickServService)?.let { authentication ->
@@ -83,7 +100,7 @@ internal fun redactSensitiveOutbound(line: String, nickServService: String = "Ni
             val target = parameters.firstOrNull().orEmpty()
             val sender = message.prefix?.nick.orEmpty()
             if (target.equals("BouncerServ", true) || sender.equals("BouncerServ", true) ||
-                target.startsWith('*') || sender.startsWith('*')
+                (target.length > 1 && target.startsWith('*')) || (sender.length > 1 && sender.startsWith('*'))
             ) listOf(target, REDACTION_MARKER) else {
                 val authentication = serviceAuthentication(message, nickServService) ?: return line
                 listOf(target, "${authentication.command} $REDACTION_MARKER")

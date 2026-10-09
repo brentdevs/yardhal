@@ -148,9 +148,9 @@ public object BouncerZncParser {
         val rows = table(lines, channelColumns) ?: return null
         return rows.map { row ->
             val rawName = row.getValue("name")
-            val prefix = rawName.indexOfFirst { it == '#' || it == '&' || it == '!' }
-                .takeIf { it >= 0 } ?: rawName.indexOf('+')
-            if (prefix < 0) return null
+            var prefix = 0
+            while (prefix + 1 < rawName.length && rawName[prefix] in "~&@%+" && rawName[prefix + 1] in "~&@%+#!") prefix++
+            if (rawName.getOrNull(prefix)?.let { it in "#&+!" } != true) return null
             val name = rawName.substring(prefix)
             val status = row.getValue("status").takeIf { it == "Joined" || it == "Detached" || it == "Disabled" || it == "Trying" } ?: return null
             val buffer = row.getValue("buffer")
@@ -304,9 +304,9 @@ public object BouncerZncCommands {
 
     public fun deleteServer(network: String, server: ZncServerDraft): ZncCommand {
         validateNetwork(network)
-        val arguments = serverArguments(server, includePassword = false)
-        return ZncCommand("DelServer \$user $network $arguments", ZncCommandTarget.ControlPanel) {
-            it.startsWith("Deleted IRC Server $arguments from network $network for user ") && it.endsWith('.')
+        validateServer(server)
+        return ZncCommand("DelServer ${server.host} ${server.port}", ZncCommandTarget.Status, boundOnly = true) {
+            it == "Server removed"
         }
     }
 

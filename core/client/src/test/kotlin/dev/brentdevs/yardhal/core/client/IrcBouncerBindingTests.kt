@@ -59,26 +59,23 @@ class IrcBouncerBindingTests {
         }
     }
 
-    @Test fun passAuthenticationIsSentBeforeBindingAndDoesNotInventSasl() = runBlocking {
+    @Test fun passOnlyBindingFailsBeforeConnectingOrSendingCredentials() = runBlocking {
         LoopbackIrcServer().use { server ->
             server.start()
-            server.lineListener = { line ->
-                when {
-                    server.negotiate(line) -> Unit
-                    line.startsWith("USER ") -> server.sendLine(":srv 001 tester :Welcome")
-                }
-            }
             val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-            val connection = IrcConnection(config(server.port, sasl = false).copy(serverPassword = "account:secret"))
+            val tapped = java.util.concurrent.CopyOnWriteArrayList<String>()
+            val connection = IrcConnection(
+                config(server.port, sasl = false).copy(serverPassword = "account:secret"),
+                rawTap = { _, line -> tapped += line },
+            )
             try {
                 val collector = EventCollector(scope, connection.events)
                 connection.start()
-                collector.awaitRegistered()
-                val lines = server.receivedLines.toList()
-                assertTrue(lines.indexOf("PASS :account:secret") < lines.indexOf("BOUNCER BIND 42"))
-                assertTrue(lines.indexOf("BOUNCER BIND 42") < lines.indexOf("CAP END"))
-                assertFalse(lines.any { it.startsWith("AUTHENTICATE ") })
-                assertEquals(1, lines.count { it.startsWith("PASS ") })
+                val events = collector.drainUntilDisconnected()
+                assertIs<AuthenticationRejectedException>((events.last() as IrcEvent.Disconnected).cause)
+                assertFalse(events.any { it is IrcEvent.ConnectionOpened || it is IrcEvent.Registered })
+                assertTrue(server.receivedLines.isEmpty())
+                assertTrue(tapped.isEmpty())
             } finally {
                 connection.disconnect()
                 scope.cancel()
@@ -91,7 +88,7 @@ class IrcBouncerBindingTests {
             server.start()
             server.lineListener = { line -> server.negotiate(line, "server-time") }
             val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-            val connection = IrcConnection(config(server.port, sasl = false).copy(capabilities = emptySet()))
+            val connection = IrcConnection(config(server.port).copy(capabilities = emptySet()))
             try {
                 val collector = EventCollector(scope, connection.events)
                 connection.start()
@@ -99,6 +96,98 @@ class IrcBouncerBindingTests {
                 assertIs<BouncerBindRejectedException>((events.last() as IrcEvent.Disconnected).cause)
                 assertFalse(events.any { it is IrcEvent.Registered })
                 assertFalse(server.receivedLines.any { it.startsWith("NICK ") || it.startsWith("USER ") || it.startsWith("BOUNCER BIND ") })
+            } finally {
+                connection.disconnect()
+                scope.cancel()
+            }
+        }
+    }
+
+    @Test fun missingOrDeclinedSaslWithAvailableBindingIsAuthenticationRejection() = runBlocking {
+        for (declined in listOf(false, true)) {
+            LoopbackIrcServer().use { server ->
+                server.start()
+                server.lineListener = { line ->
+                    when {
+                        line.startsWith("CAP LS") -> server.sendLine(
+                            ":srv CAP * LS :${if (declined) "sasl=PLAIN " else ""}soju.im/bouncer-networks",
+                        )
+                        line.startsWith("CAP REQ :") -> {
+                            server.sendLine(":srv CAP * ACK * :soju.im/bouncer-networks")
+                            server.sendLine(":srv CAP * NAK :sasl")
+                        }
+                    }
+                }
+                val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+                val connection = IrcConnection(config(server.port))
+                try {
+                    val collector = EventCollector(scope, connection.events)
+                    connection.start()
+                    val events = collector.drainUntilDisconnected()
+                    assertIs<AuthenticationRejectedException>((events.last() as IrcEvent.Disconnected).cause)
+                    assertTrue(events.filterIsInstance<IrcEvent.SaslResult>().single().outcome is SaslOutcome.Failure)
+                    assertFalse(events.any { it is IrcEvent.Registered })
+                    assertFalse(server.receivedLines.any {
+                        it.startsWith("PASS ") || it.startsWith("AUTHENTICATE ") || it.startsWith("BOUNCER BIND ") ||
+                            it.startsWith("NICK ") || it.startsWith("USER ")
+                    })
+                } finally {
+                    connection.disconnect()
+                    scope.cancel()
+                }
+            }
+        }
+    }
+
+    @Test fun failedSaslNeverSendsBindingOrRegistration() = runBlocking {
+        LoopbackIrcServer().use { server ->
+            server.start()
+            server.lineListener = { line ->
+                when {
+                    line.startsWith("AUTHENTICATE ") && line != "AUTHENTICATE PLAIN" ->
+                        server.sendLine(":srv 904 * :Bad credentials")
+                    server.negotiate(line) -> Unit
+                }
+            }
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            val connection = IrcConnection(config(server.port))
+            try {
+                val collector = EventCollector(scope, connection.events)
+                connection.start()
+                val events = collector.drainUntilDisconnected()
+                assertIs<AuthenticationRejectedException>((events.last() as IrcEvent.Disconnected).cause)
+                assertFalse(events.any { it is IrcEvent.Registered })
+                assertFalse(server.receivedLines.any {
+                    it.startsWith("BOUNCER BIND ") || it == "CAP END" || it.startsWith("NICK ") || it.startsWith("USER ")
+                })
+            } finally {
+                connection.disconnect()
+                scope.cancel()
+            }
+        }
+    }
+
+    @Test fun prematureWelcomeWithoutSaslSuccessNeverBinds() = runBlocking {
+        LoopbackIrcServer().use { server ->
+            server.start()
+            server.lineListener = { line ->
+                when {
+                    line.startsWith("AUTHENTICATE ") && line != "AUTHENTICATE PLAIN" ->
+                        server.sendLine(":srv 001 tester :Premature welcome")
+                    server.negotiate(line) -> Unit
+                }
+            }
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            val connection = IrcConnection(config(server.port))
+            try {
+                val collector = EventCollector(scope, connection.events)
+                connection.start()
+                val events = collector.drainUntilDisconnected()
+                assertIs<AuthenticationRejectedException>((events.last() as IrcEvent.Disconnected).cause)
+                assertFalse(events.any { it is IrcEvent.Registered })
+                assertFalse(server.receivedLines.any {
+                    it.startsWith("BOUNCER BIND ") || it == "CAP END" || it.startsWith("NICK ") || it.startsWith("USER ")
+                })
             } finally {
                 connection.disconnect()
                 scope.cancel()
@@ -137,6 +226,57 @@ class IrcBouncerBindingTests {
             } finally {
                 reconnector.stop()
                 scope.cancel()
+            }
+        }
+    }
+
+    @Test fun definitiveBindFailureAfterWelcomeStopsRecoveryButManagementFailureDoesNot() = runBlocking {
+        val failures = listOf(
+            ":srv FAIL BOUNCER INVALID_NETID 42 :Unknown network ID",
+            ":srv FAIL BOUNCER ACCOUNT_REQUIRED BIND :Authentication needed",
+            ":srv FAIL BOUNCER REGISTRATION_IS_COMPLETED BIND :Cannot bind after registration",
+        )
+        for (failure in failures) {
+            LoopbackIrcServer().use { server ->
+                server.start()
+                server.lineListener = { line ->
+                    when {
+                        server.negotiate(line) -> Unit
+                        line.startsWith("USER ") -> server.sendLine(":srv 001 tester :Welcome")
+                    }
+                }
+                val attempts = AtomicInteger()
+                val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+                val reconnector = IrcReconnector(scope, ReconnectPolicy(initialDelayMillis = 1, maxDelayMillis = 1), {
+                    attempts.incrementAndGet()
+                    IrcConnection(config(server.port))
+                })
+                val collector = EventCollector(scope, kotlinx.coroutines.flow.flow {
+                    reconnector.events.collect { emit(it.event) }
+                })
+                try {
+                    reconnector.start()
+                    collector.awaitRegistered()
+                    val managementFailure = ":srv FAIL BOUNCER INVALID_NETID CHANGENETWORK 42 :Unknown network ID"
+                    server.sendLine(managementFailure)
+                    while (true) {
+                        val event = collector.awaitInstance<IrcEvent.MessageReceived>()
+                        if (event.message.command == "FAIL") {
+                            assertEquals("CHANGENETWORK", event.message.parameters.getOrNull(2))
+                            break
+                        }
+                    }
+                    server.sendLine(failure)
+                    val events = collector.drainUntilDisconnected()
+                    assertIs<BouncerBindRejectedException>((events.last() as IrcEvent.Disconnected).cause)
+                    repeat(10) { reconnector.nudge() }
+                    delay(100)
+                    assertEquals(1, attempts.get())
+                    assertIs<ReconnectState.Stopped>(reconnector.state.value)
+                } finally {
+                    reconnector.stop()
+                    scope.cancel()
+                }
             }
         }
     }

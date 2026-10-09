@@ -142,6 +142,55 @@ class BouncerNetworkDraftTests {
     }
 
     @Test
+    fun acceptedAddressUserinfoIsIgnoredAndNeverForwardedOrPrinted() {
+        val draft = BouncerNetworkDraft(addr = "ircs://user:address-secret@[2001:db8::1]:7000")
+        assertTrue(draft.isValid())
+        assertEquals(
+            BouncerNetworkDraft.ParsedAddr(BouncerNetworkDraft.Scheme.TLS, "2001:db8::1", 7000),
+            draft.parseAddr(),
+        )
+        val attributes = draft.toAttributes()
+        assertEquals("2001:db8::1", attributes.host)
+        assertNull(attributes.pass)
+        assertFalse(IrcBouncerNetworks.addNetworkCommand(attributes).contains("address-secret"))
+        assertFalse(draft.toString().contains("address-secret"))
+        assertFalse(BouncerNetworkDraft(addr = "ircs://user:secret@").isValid())
+    }
+
+    @Test
+    fun omittedNativeUnixEndpointRemainsOmittedWhenEditingOtherAttributes() {
+        val native = IrcBouncerNetworks.parseAttributes("name=unix;nickname=old;state=disconnected")
+        val draft = BouncerNetworkDraft.fromAttributes(native)
+        assertEquals("", draft.addr)
+        val diff = draft.copy(nick = "new").attributesChangedAgainst(native)
+        assertEquals("nickname=new", diff.attributeString())
+        assertNull(draft.toAttributes().host)
+        assertNull(draft.toAttributes().port)
+        assertNull(draft.toAttributes().tls)
+    }
+
+    @Test
+    fun nativeUnixHostTakesPrecedenceOverStaleStatusAddress() {
+        val native = IrcBouncerNetworks.Attributes(
+            host = "irc+unix:///run/new.sock", unknown = mapOf("addr" to "irc+unix:///run/old.sock"),
+        )
+        val draft = BouncerNetworkDraft.fromAttributes(native)
+        assertEquals("irc+unix:///run/new.sock", draft.addr)
+        assertEquals("", draft.attributesChangedAgainst(native).attributeString())
+    }
+
+    @Test
+    fun maskedPasswordIsKeptUnlessClearWasExplicitlySelected() {
+        val baseline = IrcBouncerNetworks.Attributes(host = "h", name = "n", pass = "saved-secret")
+        val unchanged = BouncerNetworkDraft.fromAttributes(baseline)
+        assertEquals("", unchanged.password)
+        assertNull(unchanged.copy(name = "renamed").attributesChangedAgainst(baseline).pass)
+        assertEquals("", unchanged.copy(passwordChanged = true).attributesChangedAgainst(baseline).pass)
+        assertEquals("replacement", unchanged.copy(passwordChanged = true, password = "replacement").attributesChangedAgainst(baseline).pass)
+        assertFalse(unchanged.toString().contains("saved-secret"))
+    }
+
+    @Test
     fun fromAttributesRoundTripsAddress() {
         val draft = BouncerNetworkDraft.fromAttributes(
             IrcBouncerNetworks.Attributes(host = "h", port = 16667, tls = true),

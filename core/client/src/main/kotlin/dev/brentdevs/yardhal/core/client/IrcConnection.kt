@@ -230,6 +230,9 @@ public class IrcConnection(
         if (config.serverPassword?.any { it in "\r\n\u0000" } == true) {
             throw AuthenticationRejectedException("The saved server password contains an invalid IRC parameter. Replace it in network settings.")
         }
+        if (config.bouncerNetId != null && !saslRequired) {
+            throw AuthenticationRejectedException("Binding a bouncer network requires SASL authentication; configure an account and password or SASL EXTERNAL")
+        }
         if (!saslRequired) return
         if (config.saslMode.equals("EXTERNAL", ignoreCase = true)) {
             if (config.tlsClientIdentity == null) {
@@ -321,11 +324,12 @@ public class IrcConnection(
                     if (saslRequired) add(CapabilityNegotiator.SASL_CAP)
                     if (config.bouncerNetId != null) add(dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.CAPABILITY)
                 },
-                onRequiredUnavailable = {
-                    if (config.bouncerNetId != null &&
-                        dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.CAPABILITY !in createdCapabilities()
-                    ) shutdown(BouncerBindRejectedException("The bouncer does not support network binding. Check the account settings, then Connect to retry."))
-                    else handleAuthenticationFailure(SaslOutcome.Failure(0, "Server did not offer or accept required SASL authentication; check authentication settings"))
+                onRequiredUnavailable = { missing ->
+                    if (dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.CAPABILITY in missing) {
+                        shutdown(BouncerBindRejectedException("The bouncer does not support network binding. Check the account settings, then Connect to retry."))
+                    } else {
+                        handleAuthenticationFailure(SaslOutcome.Failure(0, "Server did not offer or accept required SASL authentication; check authentication settings"))
+                    }
                 },
             )
             negotiator = created
@@ -371,13 +375,11 @@ public class IrcConnection(
         }
     }
 
-    private fun createdCapabilities(): Set<String> = negotiator?.acknowledged.orEmpty()
-
     private fun sendPreRegistrationRequests() {
         val acknowledged = negotiator?.acknowledged ?: return
         sendServerPassword()
         val netId = config.bouncerNetId
-        if (netId != null && !bouncerBindSent && (!saslRequired || saslSucceeded)) {
+        if (netId != null && !bouncerBindSent && saslSucceeded) {
             if (dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.CAPABILITY !in acknowledged) {
                 shutdown(BouncerBindRejectedException("The bouncer did not accept network binding. Connect to retry after correcting account settings."))
                 return
@@ -437,9 +439,13 @@ public class IrcConnection(
 
     private fun applyToSession(message: IrcMessage) {
         val numeric = message.numeric
-        if (bouncerBindSent && registeredNickname == null &&
-            ((message.command.equals("FAIL", true) && message.parameters.firstOrNull().equals("BOUNCER", true)) ||
-                ((numeric == 421 || numeric == 461) && message.parameters.getOrNull(1).equals("BOUNCER", true)))
+        val parameters = message.parameters
+        val bouncerFailure = message.command.equals("FAIL", true) && parameters.firstOrNull().equals("BOUNCER", true)
+        val definitiveBindFailure = parameters.getOrNull(2).equals("BIND", true) ||
+            (parameters.getOrNull(1).equals("INVALID_NETID", true) && parameters.size == 4 && parameters[2] == config.bouncerNetId)
+        if (bouncerBindSent &&
+            ((bouncerFailure && (registeredNickname == null || definitiveBindFailure)) ||
+                (registeredNickname == null && (numeric == 421 || numeric == 461) && parameters.getOrNull(1).equals("BOUNCER", true)))
         ) {
             shutdown(BouncerBindRejectedException("The bouncer rejected network ${config.bouncerNetId}. Check that the upstream exists and is enabled, then Connect to retry."))
             return

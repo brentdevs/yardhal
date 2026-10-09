@@ -16,6 +16,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -38,9 +39,14 @@ public class BouncerManagement(
     private val historyBatches = mutableSetOf<Pair<String, String>>()
     private val nativeBatches = mutableSetOf<Pair<String, String>>()
     private val unresolvedGenerations = mutableSetOf<Pair<String, Long>>()
+    private val recoveryFences = mutableMapOf<Pair<String, Long>, RecoveryFence>()
     private var serial = 0L
 
     private class Failure(val safeReason: String) : Exception(safeReason)
+
+    private class RecoveryFence(val token: String) {
+        val result = CompletableDeferred<Unit>()
+    }
 
     private class Reply(
         val generation: Long,
@@ -48,10 +54,15 @@ public class BouncerManagement(
         val target: String?,
         val nativeCommand: String?,
         val nativeId: String?,
+        val labeled: Boolean,
+        val snapshotBaseline: Map<String, IrcBouncerNetworks.Attributes>,
     ) {
         val result = CompletableDeferred<List<IrcMessage>>()
         val messages = mutableListOf<IrcMessage>()
         var rootBatch: String? = null
+        var snapshotBatch: String? = null
+        var snapshotClosed = false
+        val liveDeltas = mutableListOf<IrcBouncerNetworks.NetworkUpdate>()
         var invalidSnapshot = false
         override fun toString(): String = "Reply(generation=$generation, label=$label, target=$target)"
     }
@@ -72,6 +83,9 @@ public class BouncerManagement(
             batches.keys.removeAll { it.first == networkId }
             historyBatches.removeAll { it.first == networkId }
             nativeBatches.removeAll { it.first == networkId }
+            recoveryFences.keys.filter { it.first == networkId }.forEach { key ->
+                recoveryFences.remove(key)?.result?.completeExceptionally(Failure("Connection replaced."))
+            }
             unresolvedGenerations.removeAll { it.first == networkId && it.second != generation }
             managedModes[networkId] = mode
             val previous = mutableAccounts.value[networkId]
@@ -113,6 +127,7 @@ public class BouncerManagement(
             batches.keys.removeAll { it.first == networkId }
             historyBatches.removeAll { it.first == networkId }
             nativeBatches.removeAll { it.first == networkId }
+            recoveryFences.remove(networkId to generation)?.result?.completeExceptionally(Failure("Disconnected."))
             update(networkId, generation) { it.copy(connected = false, sojuService = BouncerServiceAvailability.UNKNOWN, zncStatus = BouncerServiceAvailability.UNKNOWN, zncControlPanel = BouncerServiceAvailability.UNKNOWN) }
         }
     }
@@ -123,6 +138,10 @@ public class BouncerManagement(
             batches.keys.removeAll { it.first == networkId }
             historyBatches.removeAll { it.first == networkId }
             nativeBatches.removeAll { it.first == networkId }
+            recoveryFences.keys.filter { it.first == networkId }.forEach { key ->
+                recoveryFences.remove(key)?.result?.completeExceptionally(Failure("Account removed."))
+            }
+            unresolvedGenerations.removeAll { it.first == networkId }
             mutableAccounts.value = mutableAccounts.value - networkId
             operationLocks.remove(networkId)
         }
@@ -169,9 +188,18 @@ public class BouncerManagement(
             if (historyBatches.remove(networkId to batchId)) return@synchronized consumed
         }
         if (historical || !consumed) return@synchronized consumed
+        if (pong) {
+            val fence = recoveryFences[networkId to generation]
+            if (fence != null && params.lastOrNull() == fence.token && label == null) {
+                unresolvedGenerations.remove(networkId to generation)
+                fence.result.complete(Unit)
+                return@synchronized true
+            }
+        }
         val reply = pending[networkId]?.takeIf { it.generation == generation }
         if (native && batchContext == null && (label == null || reply?.label == label) && params.firstOrNull().equals("NETWORK", true)) {
             IrcBouncerNetworks.parseNetwork(params)?.let { change ->
+                if (reply?.nativeCommand == "LISTNETWORKS") reply.liveDeltas.add(change)
                 update(networkId, generation) { state ->
                     val networks = when (val delta = change.change) {
                         is IrcBouncerNetworks.Change.Upsert -> state.sojuNetworks + (change.netId to (state.sojuNetworks[change.netId] ?: IrcBouncerNetworks.Attributes()).merged(delta.attributes.copy(pass = null)))
@@ -183,15 +211,28 @@ public class BouncerManagement(
         }
         if (command == "BATCH") {
             if (batchToken.startsWith("+")) {
-                val routed = label ?: reply?.label?.takeIf { networkBatch && reply.nativeCommand == "LISTNETWORKS" }
+                val routed = label ?: reply?.label?.takeIf { networkBatch && reply.nativeCommand == "LISTNETWORKS" && !reply.labeled }
                 if (routed != null) {
                     batches[networkId to batchId] = routed
-                    if (reply?.label == routed && reply.rootBatch == null) reply.rootBatch = batchId
+                    if (reply?.label == routed) {
+                        if (reply.rootBatch == null) reply.rootBatch = batchId
+                        if (networkBatch && reply.nativeCommand == "LISTNETWORKS") {
+                            if (reply.snapshotBatch != null) reply.invalidSnapshot = true else reply.snapshotBatch = batchId
+                        }
+                    }
                 }
             } else if (batchToken.startsWith("-")) {
                 val routed = batches.remove(networkId to batchId)
-                if (reply != null && routed == reply.label && reply.rootBatch == batchId) {
-                    if (reply.invalidSnapshot) reply.result.completeExceptionally(Failure("Malformed bouncer network snapshot.")) else reply.result.complete(reply.messages.toList())
+                if (reply != null && routed == reply.label) {
+                    if (reply.nativeCommand == "LISTNETWORKS" && reply.snapshotBatch == batchId) {
+                        reply.snapshotClosed = true
+                        if (reply.rootBatch == batchId) completeSnapshot(networkId, generation, reply)
+                    } else if (reply.rootBatch == batchId) {
+                        if (reply.nativeCommand == "LISTNETWORKS") {
+                            if (reply.snapshotClosed) completeSnapshot(networkId, generation, reply)
+                            else reply.result.completeExceptionally(Failure("Unsupported bouncer network snapshot response."))
+                        } else reply.result.complete(reply.messages.toList())
+                    }
                 }
             }
             return@synchronized consumed
@@ -199,6 +240,7 @@ public class BouncerManagement(
         if (reply == null) return@synchronized consumed
         val hasForeignLabel = label != null && label != reply.label
         if (hasForeignLabel) return@synchronized true
+        if (reply.labeled && label != reply.label) return@synchronized consumed
         if (pong && params.lastOrNull() == reply.label) {
             if (reply.target != null && label == null) reply.result.complete(reply.messages.toList())
             return@synchronized true
@@ -226,13 +268,71 @@ public class BouncerManagement(
         if (service && sender.equals(reply.target, true) && command in setOf("NOTICE", "PRIVMSG")) {
             reply.messages.add(message)
             if (label == reply.label && message.tag("batch") == null) reply.result.complete(reply.messages.toList())
-        } else if (native && (label == reply.label || label == null)) {
-            reply.messages.add(message)
-            if (params.firstOrNull().equals(reply.nativeCommand, true) && reply.nativeCommand != "LISTNETWORKS" && (reply.nativeId == null || params.getOrNull(1) == reply.nativeId)) reply.result.complete(reply.messages.toList())
+        } else if (native && (label == reply.label || !reply.labeled && label == null)) {
+            if (reply.nativeCommand == "LISTNETWORKS") {
+                if (params.firstOrNull().equals("NETWORK", true) && batchContext == reply.snapshotBatch && batchContext != null) reply.messages.add(message)
+            } else {
+                reply.messages.add(message)
+                if (params.firstOrNull().equals(reply.nativeCommand, true) && (reply.nativeId == null || params.getOrNull(1) == reply.nativeId)) reply.result.complete(reply.messages.toList())
+            }
         } else if (command == "ACK" && label == reply.label) {
             reply.result.complete(reply.messages.toList())
         }
         consumed
+    }
+
+    private fun completeSnapshot(networkId: String, generation: Long, reply: Reply) {
+        val discovered = mutableMapOf<String, IrcBouncerNetworks.Attributes>()
+        for (message in reply.messages) {
+            val change = IrcBouncerNetworks.parseNetwork(message.parameters)
+            val attributes = (change?.change as? IrcBouncerNetworks.Change.Upsert)?.attributes
+            if (change == null || attributes == null || discovered.containsKey(change.netId)) {
+                reply.invalidSnapshot = true
+                break
+            }
+            discovered[change.netId] = attributes.copy(
+                pass = null,
+                unknown = reply.snapshotBaseline[change.netId]?.unknown.orEmpty().filterKeys { it == "enabled" } + attributes.unknown,
+            )
+        }
+        if (reply.invalidSnapshot) {
+            reply.result.completeExceptionally(Failure("Malformed bouncer network snapshot."))
+            return
+        }
+        val fallback = reply.snapshotBaseline.toMutableMap()
+        for (change in reply.liveDeltas) {
+            when (val delta = change.change) {
+                is IrcBouncerNetworks.Change.Upsert -> discovered[change.netId] =
+                    (discovered[change.netId] ?: fallback[change.netId] ?: IrcBouncerNetworks.Attributes()).merged(delta.attributes.copy(pass = null))
+                IrcBouncerNetworks.Change.Deleted -> {
+                    discovered.remove(change.netId)
+                    fallback.remove(change.netId)
+                }
+            }
+        }
+        update(networkId, generation) { it.copy(sojuNetworks = discovered.toMap()) }
+        reply.result.complete(reply.messages.toList())
+    }
+
+    private suspend fun recover(networkId: String, generation: Long) {
+        val key = networkId to generation
+        val fence = synchronized(lock) {
+            RecoveryFence("$LABEL_PREFIX${++serial}").also { recoveryFences[key] = it }
+        }
+        try {
+            send(networkId, generation, "PING :${fence.token}")
+            withTimeout(timeoutMs) { fence.result.await() }
+        } catch (error: TimeoutCancellationException) {
+            throw Failure("Reconnect before issuing another management request: the reply recovery fence timed out.")
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Failure) {
+            throw error
+        } catch (error: Exception) {
+            throw Failure("Could not establish a safe management reply boundary.")
+        } finally {
+            synchronized(lock) { if (recoveryFences[key] === fence) recoveryFences.remove(key) }
+        }
     }
 
     private fun safeCode(value: String?): String = value?.takeIf { it.length <= 64 && it.all { ch -> ch.isLetterOrDigit() || ch == '_' } } ?: "REJECTED"
@@ -258,18 +358,19 @@ public class BouncerManagement(
     private suspend fun request(networkId: String, generation: Long, step: Step): List<IrcMessage> {
         val state = state(networkId)
         if (state.generation != generation) throw Failure("Connection replaced.")
-        if (synchronized(lock) { networkId to generation in unresolvedGenerations }) throw Failure("Reconnect before issuing another management request after an unresolved reply.")
+        val labeled = "labeled-response" in state.capabilities && "message-tags" in state.capabilities
+        if (!labeled && synchronized(lock) { networkId to generation in unresolvedGenerations }) recover(networkId, generation)
         require(step.wire.none { it == '\r' || it == '\n' || it == '\u0000' }) { "Invalid management input." }
         val reply = synchronized(lock) {
             if (pending.containsKey(networkId)) throw Failure("Another management request is running.")
-            Reply(generation, "$LABEL_PREFIX${++serial}", step.target, step.nativeCommand, step.nativeId).also { pending[networkId] = it }
+            val current = mutableAccounts.value[networkId]?.takeIf { it.generation == generation && it.connected } ?: throw Failure("Connection replaced.")
+            Reply(generation, "$LABEL_PREFIX${++serial}", step.target, step.nativeCommand, step.nativeId, labeled, current.sojuNetworks).also { pending[networkId] = it }
         }
         try {
-            val labeled = "labeled-response" in state.capabilities && "message-tags" in state.capabilities
             send(networkId, generation, if (labeled) "@label=${reply.label} ${step.wire}" else step.wire)
-            if (!labeled && step.target != null) send(networkId, generation, "PING :${reply.label}")
+            if (!labeled) send(networkId, generation, "PING :${reply.label}")
             val messages = withTimeout(timeoutMs) { reply.result.await() }
-            if (reply.nativeCommand == "LISTNETWORKS" && reply.rootBatch == null) throw Failure("Unsupported bouncer network snapshot response.")
+            if (reply.nativeCommand == "LISTNETWORKS" && reply.snapshotBatch == null) throw Failure("Unsupported bouncer network snapshot response.")
             if (step.target != null && lines(messages).any { it.trim().equals("Access denied!", true) }) {
                 availability(networkId, generation, step.target, BouncerServiceAvailability.AVAILABLE)
                 throw Failure("Access denied by the bouncer.")
@@ -278,14 +379,15 @@ public class BouncerManagement(
             if (step.target != null) availability(networkId, generation, step.target, BouncerServiceAvailability.AVAILABLE)
             return messages
         } catch (error: TimeoutCancellationException) {
-            synchronized(lock) { unresolvedGenerations.add(networkId to generation) }
+            if (!labeled) synchronized(lock) { unresolvedGenerations.add(networkId to generation) }
             throw Failure("Management request timed out.")
         } catch (error: CancellationException) {
-            synchronized(lock) { unresolvedGenerations.add(networkId to generation) }
+            if (!labeled) synchronized(lock) { unresolvedGenerations.add(networkId to generation) }
             throw error
         } catch (error: Failure) {
             throw error
         } catch (error: Exception) {
+            if (!labeled) synchronized(lock) { unresolvedGenerations.add(networkId to generation) }
             throw Failure("Could not send management request.")
         } finally {
             synchronized(lock) {
@@ -303,13 +405,17 @@ public class BouncerManagement(
 
     private fun lines(messages: List<IrcMessage>): List<String> = messages.filter { it.command.equals("NOTICE", true) || it.command.equals("PRIVMSG", true) }.mapNotNull { it.parameters.lastOrNull() }
 
-    private suspend fun operate(networkId: String, build: (BouncerAccountState) -> List<Step>, refresh: suspend (Long) -> Unit): BouncerOperationOutcome {
+    private suspend fun operate(networkId: String, build: (BouncerAccountState) -> List<Step>, refresh: suspend (Long) -> Unit): BouncerOperationOutcome =
+        scope.async { operateOwned(networkId, build, refresh) }.await()
+
+    private suspend fun operateOwned(networkId: String, build: (BouncerAccountState) -> List<Step>, refresh: suspend (Long) -> Unit): BouncerOperationOutcome {
         val mutex = synchronized(lock) { operationLocks.getOrPut(networkId) { Mutex() } }
         if (!mutex.tryLock()) return BouncerOperationOutcome(BouncerOperationStatus.ERROR, error = "Another management operation is running.")
         var applied = 0
         var total = 0
         var failure: String? = null
         var refreshFailure: String? = null
+        var cancellation: CancellationException? = null
         var outcome = BouncerOperationOutcome(BouncerOperationStatus.RUNNING)
         val generation = accounts.value[networkId]?.generation ?: 0
         update(networkId, generation) { it.copy(operation = outcome) }
@@ -323,16 +429,19 @@ public class BouncerManagement(
             }
         } catch (error: CancellationException) {
             failure = "Management operation cancelled."
-            throw error
+            cancellation = error
         } catch (error: Failure) {
             failure = error.safeReason
         } catch (error: IllegalArgumentException) {
             failure = "Invalid or unsupported management input."
+        } catch (error: Exception) {
+            failure = "Could not complete the management operation."
         } finally {
             try {
-                if (accounts.value[networkId]?.let { it.connected && it.generation == generation } == true) refresh(generation)
+                if (cancellation == null && accounts.value[networkId]?.let { it.connected && it.generation == generation } == true) refresh(generation)
             } catch (error: CancellationException) {
                 refreshFailure = "Refresh cancelled."
+                cancellation = error
             } catch (error: Exception) {
                 refreshFailure = "Could not refresh current bouncer state."
             }
@@ -341,6 +450,7 @@ public class BouncerManagement(
             update(networkId, generation) { it.copy(operation = outcome) }
             mutex.unlock()
         }
+        cancellation?.let { throw it }
         return outcome
     }
 
@@ -355,17 +465,7 @@ public class BouncerManagement(
     private suspend fun refreshSoju(networkId: String, generation: Long) {
         val account = state(networkId)
         if (IrcBouncerNetworks.CAPABILITY !in account.capabilities) throw Failure("Bouncer network management was not advertised.")
-        val snapshot = request(networkId, generation, native("LISTNETWORKS", wire = "BOUNCER LISTNETWORKS"))
-        val discovered = snapshot.map { message ->
-            val change = IrcBouncerNetworks.parseNetwork(message.parameters) ?: throw Failure("Malformed bouncer network snapshot.")
-            val attrs = (change.change as? IrcBouncerNetworks.Change.Upsert)?.attributes ?: throw Failure("Malformed bouncer network snapshot.")
-            change.netId to attrs.copy(pass = null)
-        }.toMap()
-        update(networkId, generation) { previous ->
-            previous.copy(sojuNetworks = discovered.mapValues { (id, attrs) ->
-                attrs.copy(unknown = previous.sojuNetworks[id]?.unknown.orEmpty().filterKeys { it == "enabled" } + attrs.unknown)
-            })
-        }
+        request(networkId, generation, native("LISTNETWORKS", wire = "BOUNCER LISTNETWORKS"))
         availability(networkId, generation, "BouncerServ", BouncerServiceAvailability.PROBING)
         try {
             request(networkId, generation, service("BouncerServ", "help channel update") { it.any { line -> line.contains("channel update") && line.contains("detach") } })
@@ -398,7 +498,7 @@ public class BouncerManagement(
     public suspend fun addSojuNetwork(networkId: String, draft: BouncerNetworkDraft): BouncerOperationOutcome = operate(networkId, { account ->
         requireMode(account, NetworkMode.SOJU)
         if (draft.addrValidationError() != null) throw Failure("Invalid upstream address.")
-        val attributes = draft.toAttributes().let { if (!draft.enabled && it.name == null) it.copy(name = draft.addr.trim()) else it }
+        val attributes = draft.toAttributes().let { if (!draft.enabled && it.name == null) it.copy(name = draft.addressWithoutUserInfo().trim()) else it }
         val steps = mutableListOf(native("ADDNETWORK", wire = IrcBouncerNetworks.addNetworkCommand(attributes)))
         if (!draft.enabled) steps.add(service("BouncerServ", BouncerServCommand.networkUpdate(attributes.name.orEmpty(), false)) { it.any { line -> line.startsWith("updated network ") } })
         steps
@@ -406,14 +506,17 @@ public class BouncerManagement(
 
     public suspend fun updateSojuNetwork(networkId: String, netId: String, draft: BouncerNetworkDraft): BouncerOperationOutcome = operate(networkId, { account ->
         requireMode(account, NetworkMode.SOJU)
-        if (draft.addrValidationError() != null) throw Failure("Invalid upstream address.")
         val baseline = account.sojuNetworks[netId] ?: throw Failure("Upstream network is no longer available.")
+        val unchangedUnknownAddress = draft.addr.isEmpty() && baseline.host.isNullOrEmpty() && baseline.unknown["addr"].isNullOrEmpty()
+        if (!unchangedUnknownAddress && draft.addrValidationError() != null) throw Failure("Invalid upstream address.")
         val steps = mutableListOf<Step>()
         val diff = draft.attributesChangedAgainst(baseline)
         if (diff.attributeString().isNotEmpty()) steps.add(native("CHANGENETWORK", netId, IrcBouncerNetworks.changeNetworkCommand(netId, diff)))
         val enabled = baseline.unknown["enabled"] != "0"
         if (draft.enabled != enabled) {
-            val name = if (diff.name != null) draft.name.trim().ifEmpty { baseline.unknown["addr"] ?: draft.addr.trim() } else baseline.name.orEmpty()
+            val name = if (diff.name != null) draft.name.trim().ifEmpty {
+                BouncerNetworkDraft(addr = baseline.unknown["addr"] ?: draft.addr).addressWithoutUserInfo().trim()
+            } else baseline.name.orEmpty()
             if (name.isEmpty()) throw Failure("Upstream network name is unavailable.")
             steps.add(service("BouncerServ", BouncerServCommand.networkUpdate(name, draft.enabled)) { it.any { line -> line.startsWith("updated network ") } })
         }
@@ -514,6 +617,7 @@ public class BouncerManagement(
         if (account.zncNetworkDetails[baseline.name] !== baseline) throw Failure("Network settings changed or this connection was replaced. Fetch current settings before applying.")
         val commands = BouncerZncCommands.networkDiff(baseline, draft)
         if (commands.any { it.text.startsWith("AddServer ") || it.text.startsWith("DelServer ") } && account.boundNetwork != draft.name) throw Failure("Connect to this upstream network to fetch and verify its server list before editing servers.")
+        if (commands.any { it.target == ZncCommandTarget.Status } && account.zncStatus != BouncerServiceAvailability.AVAILABLE) throw Failure("The status service is unavailable.")
         if (commands.any { it.target == ZncCommandTarget.ControlPanel } && account.zncControlPanel != BouncerServiceAvailability.AVAILABLE) throw Failure("The controlpanel module is unavailable.")
         commands.map(::zncStep)
     }) { refreshZncNetwork(networkId, it, draft.name) }

@@ -62,8 +62,15 @@ internal fun bouncerSetupErrors(draft: NetworkDraft, saved: NetworkConfig?): Lis
     when (draft.mode ?: saved?.mode ?: NetworkMode.DIRECT) {
         NetworkMode.DIRECT -> Unit
         NetworkMode.SOJU -> {
-            if ((draft.saslMode ?: saved?.saslMode ?: SaslMode.AUTO) != SaslMode.EXTERNAL) {
-                if ((draft.saslAuthcid ?: saved?.saslAuthcid).isNullOrBlank()) add("Enter your soju account.")
+            val external = (draft.saslMode ?: saved?.saslMode ?: SaslMode.AUTO) == SaslMode.EXTERNAL
+            val account = draft.saslAuthcid ?: saved?.saslAuthcid.orEmpty()
+            if ((!external && account.isBlank()) || account.any { it.isWhitespace() || it == '\u0000' }) {
+                add("Enter a soju account without whitespace or NUL.")
+            }
+            if (!external) {
+                if (draft.saslPassword?.contains('\u0000') == true) {
+                    add("Soju account passwords cannot contain NUL.")
+                }
                 if (!hasPassword(draft.saslPassword, saved?.saslPasswordRef, draft.clearSaslPassword)) {
                     add("Enter a soju account password or retain the saved one.")
                 }
@@ -71,14 +78,17 @@ internal fun bouncerSetupErrors(draft: NetworkDraft, saved: NetworkConfig?): Lis
         }
         NetworkMode.ZNC -> {
             val account = draft.saslAuthcid ?: saved?.saslAuthcid.orEmpty()
-            if (account.isBlank() || account.any { it.isWhitespace() || it in "/:\u0000" }) {
-                add("Enter a ZNC account without whitespace, slash, colon or NUL.")
+            if (account.isBlank() || account.any { it.isWhitespace() || it in "/:@\u0000" }) {
+                add("Enter a ZNC account without whitespace, slash, colon, at sign or NUL.")
             }
-            if (draft.zncNetwork.orEmpty().any { it.isWhitespace() || it in "/:\u0000" }) {
-                add("ZNC network names cannot contain whitespace, slash, colon or NUL.")
+            if (draft.zncNetwork.orEmpty().any { it.isWhitespace() || it in "/:@\u0000" }) {
+                add("ZNC network names cannot contain whitespace, slash, colon, at sign or NUL.")
             }
             if (!hasPassword(draft.serverPassword, saved?.serverPasswordRef, draft.clearServerPassword)) {
                 add("Enter a ZNC password or retain the saved one.")
+            }
+            if (draft.serverPassword?.any { it in "\r\n\u0000" } == true) {
+                add("ZNC passwords cannot contain line breaks or NUL.")
             }
         }
     }

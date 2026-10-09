@@ -96,7 +96,7 @@ class NetworkEditLifecycleTests {
         tlsFixture: String? = null,
         private val advertisedSasl: String = "PLAIN",
         requireClientIdentity: Boolean = false,
-        private val bouncer: Boolean = false,
+        val bouncer: Boolean = false,
         private val rejectedBindings: Set<String> = emptySet(),
         private val additionalCapabilities: Set<String> = emptySet(),
     ) : AutoCloseable {
@@ -552,6 +552,8 @@ class NetworkEditLifecycleTests {
         tls = false,
         nick = "tester",
         autojoin = listOf("#room"),
+        saslAuthcid = "account".takeIf { server.bouncer },
+        saslPasswordRef = "bouncer-password".takeIf { server.bouncer },
     )
 
     private fun harness(
@@ -568,10 +570,30 @@ class NetworkEditLifecycleTests {
     ): Harness {
         val effectiveDispatcher = dispatcher ?: StandardTestDispatcher()
         scheduler = (effectiveDispatcher as? TestDispatcher)?.scheduler
+        if (config.saslPasswordRef == "bouncer-password" && vault.readPassword("bouncer-password") == null) {
+            vault.storePassword("bouncer-password", "bouncer-secret")
+        }
         return Harness(
             Files.createTempDirectory("yardhal-network-edit").toFile(), config, effectiveDispatcher,
             afterDiscovery, identityProvider, vault, beforeCreate, clock, restoreOffline,
         )
+    }
+
+    @Test
+    fun restoredSojuCredentialsRejectInvalidAccountOrNulPasswordBeforeOpeningTransport() = runBlocking {
+        for ((account, password) in listOf("bad account" to "secret", "bad\u0000account" to "secret", "account" to "bad\u0000secret")) {
+            Server().use { server ->
+                val config = config(server).copy(mode = NetworkMode.SOJU, saslAuthcid = account, saslPasswordRef = "sasl")
+                harness(config).use { harness ->
+                    harness.vault.storePassword("sasl", password)
+                    harness.coordinator.startAll()
+                    await { harness.coordinator.networks.value.single().connectionPhase == RecoveryPhase.AUTHENTICATION_REJECTED }
+                    assertTrue(harness.createdConfigs.isEmpty())
+                    assertTrue(server.clients.isEmpty())
+                    assertEquals(null, harness.networks.byId(config.id)?.bouncerBinding)
+                }
+            }
+        }
     }
 
     @Test
@@ -705,7 +727,7 @@ class NetworkEditLifecycleTests {
                 server.bouncerNetworkLines.add("1 :name=Attached upstream")
                 val account = config(server).copy(
                     mode = mode, autojoin = emptyList(),
-                    saslAuthcid = "account".takeIf { mode == NetworkMode.ZNC },
+                    saslAuthcid = "account".takeIf { mode != NetworkMode.DIRECT },
                     zncNetwork = "network".takeIf { mode == NetworkMode.ZNC },
                     serverPasswordRef = "znc-password".takeIf { mode == NetworkMode.ZNC },
                 )
@@ -953,8 +975,26 @@ class NetworkEditLifecycleTests {
                     assertNotNull(harness.networks.byId(alpha.id))
                     assertNotNull(coordinator.buffers.value[ConversationRef.server(alpha.id).storageKey])
                     assertEquals(ConnectionStatus.REGISTERED, coordinator.networks.value.first { it.id == account.id }.status)
+                    server.bouncerNetworkLines.removeAll { it.startsWith("1 ") }
+                    coordinator.disconnect(account.id)
+                    coordinator.connectNetwork(account.id)
+                    await { coordinator.networks.value.first { it.id == account.id }.status == ConnectionStatus.REGISTERED }
+                    val reconnected = server.clients.last { it.boundNetId == null && !it.closed }
+                    reconnected.send(":srv PONG srv :parent-reconnected-fenced")
+                    await { coordinator.rawLog(account.id).any { "parent-reconnected-fenced" in it.line } }
+                    assertNotNull(scheduler).runCurrent()
+                    assertEquals(ConnectionStatus.DISCONNECTED, coordinator.networks.value.first { it.id == alpha.id }.status)
+                    assertEquals(ConnectionStatus.DISCONNECTED, coordinator.networks.value.first { it.id == beta.id }.status)
+                    assertEquals(1, harness.createdConfigs.count { it.id == alpha.id })
+                    assertEquals(1, harness.createdConfigs.count { it.id == beta.id })
+                    assertNotNull(coordinator.buffers.value[ConversationRef.server(alpha.id).storageKey])
                 }
-                discovery.send(":srv BOUNCER NETWORK 1 *")
+                assertTrue(coordinator.updateNetwork(account.copy(name = "Renamed account")))
+                assertFalse(requireNotNull(harness.networks.byId(beta.id)?.bouncerBinding).enabled)
+                assertNotNull(harness.networks.byId(alpha.id)?.bouncerBinding?.rejectionReason)
+                assertEquals(1, harness.createdConfigs.count { it.id == alpha.id })
+                assertEquals(1, harness.createdConfigs.count { it.id == beta.id })
+                server.clients.last { it.boundNetId == null && !it.closed }.send(":srv BOUNCER NETWORK 1 *")
                 await { harness.networks.byId(alpha.id) == null }
                 assertTrue(coordinator.setDiscoveredUpstreamEnabled(account.id, "2", true))
                 await { coordinator.networks.value.first { it.id == beta.id }.status == ConnectionStatus.REGISTERED }
@@ -2677,7 +2717,6 @@ class NetworkEditLifecycleTests {
                 coordinator.startAll()
                 withBlockedNetworkFile(harness) {
                     coordinator.connectNetwork(config.id)
-                    assertTrue(assertNotNull(coordinator.networks.value.single().connectionError).contains("Could not save Connect intent"))
                     assertEquals(RecoveryPhase.USER_DISCONNECTED, coordinator.networks.value.single().connectionPhase)
                     assertTrue(harness.networks.all().single().userDisconnected)
                     assertNotNull(scheduler).runCurrent()
@@ -2689,6 +2728,25 @@ class NetworkEditLifecycleTests {
                 await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
                 assertFalse(NetworkStore(harness.directory).all().single().userDisconnected)
                 assertEquals(1, harness.createdConfigs.size)
+            }
+        }
+    }
+
+    @Test
+    fun manualConnectWithUnchangedDurableIntentDoesNotRequireWritableConfiguration() = runBlocking {
+        Server().use { server ->
+            val config = config(server).copy(autoConnect = false)
+            harness(config).use { harness ->
+                val coordinator = harness.coordinator
+                coordinator.startAll()
+                assertTrue(harness.createdConfigs.isEmpty())
+                withBlockedNetworkFile(harness) {
+                    coordinator.connectNetwork(config.id)
+                    await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                    assertEquals(config, harness.networks.byId(config.id))
+                    assertEquals(1, harness.createdConfigs.size)
+                }
+                assertEquals(config, NetworkStore(harness.directory).byId(config.id))
             }
         }
     }

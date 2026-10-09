@@ -290,8 +290,9 @@ public fun NetworkEditorSheet(
             alternateNicks = parseAlternateNicknames(alternateNicks),
             autoConnect = autoConnect,
             saslMode = if (networkMode == NetworkMode.ZNC) SaslMode.AUTO else saslMode,
-            serverPassword = if (clearServerPassword) null else serverPassword.takeIf(String::isNotEmpty),
-            clearServerPassword = clearServerPassword,
+            serverPassword = if (networkMode == NetworkMode.SOJU || clearServerPassword) null
+                else serverPassword.takeIf(String::isNotEmpty),
+            clearServerPassword = networkMode == NetworkMode.SOJU || clearServerPassword,
             nickServAccount = nickServAccount.trim(),
             nickServService = nickServService.trim(),
             nickServPassword = if (clearNickServPassword) null else nickServPassword.takeIf(String::isNotEmpty),
@@ -325,7 +326,13 @@ public fun NetworkEditorSheet(
                     FilterChip(
                         selected = networkMode == candidate,
                         enabled = !editing,
-                        onClick = { networkMode = candidate },
+                        onClick = {
+                            networkMode = candidate
+                            if (candidate == NetworkMode.SOJU) {
+                                serverPassword = ""
+                                clearServerPassword = false
+                            }
+                        },
                         label = { Text(networkModeLabel(candidate)) },
                     )
                 }

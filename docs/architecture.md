@@ -474,6 +474,11 @@ listing batches reconcile absence. Malformed, interrupted, overlapping,
 historical, contextual, undeclared or stale batches cannot prune restored state.
 Duplicate pushes upsert the same child rather than create another session.
 
+Concurrent live deltas count toward an open listing even when carried by an
+independent non-playback batch. Management snapshots collect their correlated
+listing rows separately and replay concurrent live upsert/delete deltas over
+the completed snapshot.
+
 `DerivedNetworkIdentity` matches Halyard's UUIDv5 namespace
 `C40D04F5-6B4E-4E37-9C79-6F1B2A6E5A31`, using the uppercase canonical parent UUID
 plus `:` and the opaque netID. Legacy non-UUID parent IDs are canonicalized
@@ -484,10 +489,12 @@ auto-connect/disconnect intent. A manually connected parent can open newly
 discovered children even when its startup preference is off.
 
 The client authenticates each child, sends `BOUNCER BIND` once after successful
-SASL/PASS and before `CAP END`/registration, and fails closed on missing binding
-support or rejection. STS upgrade precedes password transmission. Inherited
-credentials remain vault references; resolved redaction secrets are shared
-without rebuilding their set when composing ZNC PASS.
+SASL and before `CAP END`/registration, and fails closed on missing binding
+support or rejection. PASS alone cannot authenticate soju's pre-registration
+BIND handler. Missing SASL is an authentication failure, not a persistent
+upstream-binding rejection. STS upgrade precedes password transmission.
+Inherited credentials remain vault references; resolved redaction secrets are
+shared without rebuilding their set when composing ZNC PASS.
 
 Parent disconnect retires child transports without overwriting individual saved
 intent; reconnect starts eligible children. Disabled/rejected children remain
@@ -495,6 +502,11 @@ offline and do not spin retries or block siblings. Remote enablement comes from
 BouncerServ's observed status, not an invented discovery attribute. Observed
 disable/delete stops transport even if persisting the change fails; retained
 state and the storage error remain visible.
+
+Dependent retirement, resumption and inherited parent edits use current runtime
+bindings rather than stale saved rows, preserving disable/deletion safety fences
+when storage writes fail. Manual Connect does not rewrite unchanged intent;
+clearing a saved opt-out still requires a successful durable save.
 
 Parent edits propagate inherited settings transactionally. Removing a parent
 explicitly confirms its dependent local upstreams and cascades configuration,
@@ -511,15 +523,27 @@ stale leave intent. Historical JOIN does not change it.
 
 `BouncerManagement` serializes operations per connection generation. Native
 BOUNCER acknowledgements and service replies establish success; sending a command
-does not. Negotiated labels and nested labeled batches correlate replies.
-Unlabeled services use an ordered nonce PING/PONG fence. Timeout, cancellation
-with uncertain outcome or disconnect quarantines late replies; reconnect is
-required before another same-generation operation can claim an acknowledgement.
+does not.
+Negotiated labels and nested labeled batches correlate replies; expired labels
+cannot acknowledge newer requests. Unlabeled native commands and services use
+ordered nonce PING/PONG fences. An unresolved reply is quarantined; a subsequent
+operation first waits for an actual fresh recovery PONG with no pending command
+collecting the old reply. If no recovery boundary arrives, reconnect is required.
+Automatic refresh is not exempted from stale-reply safety.
+
+Submitted operations execute in the manager's scope. Dismissing a sheet cancels
+only its wait, not an already submitted destructive operation. Owner cancellation
+and unexpected exceptions publish error/partial outcomes rather than success.
 
 Soju edits use escaped IRC tag attributes and draft/baseline diffs. Native rename
 acknowledgement precedes enabled-state service commands addressed to the new
 name. Channel status, detach/reattach, timer, detached relay and reattach policy
 operate on bound upstreams. Unreported policy values stay unknown.
+
+An unchanged masked password is omitted; an explicitly selected empty replacement
+clears it. TCP userinfo is stripped before endpoint/name commands. Unix endpoints
+omitted by native discovery stay unknown rather than become fabricated TCP
+addresses; editing another field does not write a bogus endpoint.
 
 ZNC `*status` lists/creates/deletes networks and controls the bound connection;
 optional `controlpanel` handles supported network settings, servers and channels.
@@ -529,9 +553,20 @@ explicit password intent. Detail/channel caches reset on connection replacement;
 held baselines cannot apply to a new binding. Apply outcomes count acknowledged
 changes, retain accepted changes on partial failure and refetch actual state.
 
+Bound-network server deletion uses `*status DelServer host port`, compatible with
+ZNC 1.9.1's separate hostname/port parsing as well as current ZNC. Controlpanel
+remains responsible for supported settings and server addition. FloodRate uses
+native fixed-two-decimal binary-double rounding; table widths are UTF-8 bytes.
+Channel parsing removes only leading permission prefixes, never channel-body
+characters.
+
 Control replies and their own echoes, including historical service traffic, stay
 out of ordinary DM discovery, unread and notification paths. Raw logs redact
 authentication and management secrets even when a diagnostic repeats them.
+
+Ordinary `NOTICE *` wildcard diagnostics remain visible. Native upstream draft
+passwords are remembered in decoded and escaped form before outbound raw logging,
+so generic diagnostic echoes cannot disclose them.
 
 History retains phase 1's overlap reconciliation, gaps and replay suppression.
 ZNC's forwarded upstream CHATHISTORY ISUPPORT is not downstream support:
