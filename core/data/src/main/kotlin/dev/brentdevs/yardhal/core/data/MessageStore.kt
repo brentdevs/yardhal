@@ -6,46 +6,52 @@ public class MessageStore(private val dao: MessageDao) {
 
     public suspend fun record(message: StoredMessage): Boolean = recordWithRowId(message) != null
 
-    public suspend fun recordWithRowId(message: StoredMessage): Long? {
-        val hash = contentHash(message)
-        val row = MessageRow(
-            networkId = message.networkId,
-            conversation = message.conversation.normalizedTarget,
-            msgid = message.msgid,
-            contentHash = hash,
-            senderNick = message.senderNick,
-            senderUser = message.senderUser,
-            senderHost = message.senderHost,
-            kind = message.kind.name,
-            text = message.text,
-            sentByUs = message.sentByUs,
-            timestampMs = message.timestampMs,
-            channelContext = message.channelContext,
-            historyContext = message.historyContext,
-        )
-        if (row.msgid != null) {
-            val identified = dao.rowIdByMsgid(row.networkId, row.conversation, row.msgid)
-            if (identified != null) {
-                if (!row.historyContext) dao.promoteHistoryContext(identified)
-                return null
-            }
-            val overlapping = dao.rowIdWithoutMsgidByHash(row.networkId, row.conversation, hash)
-            if (overlapping != null) {
-                dao.healMsgid(overlapping, row.msgid)
-                if (!row.historyContext) dao.promoteHistoryContext(overlapping)
-                return null
-            }
-        } else {
-            val overlapping = dao.rowIdByHash(row.networkId, row.conversation, hash)
-            if (overlapping != null) {
-                if (!row.historyContext) dao.promoteHistoryContext(overlapping)
-                return null
-            }
-        }
-        val inserted = dao.insert(row)
-        if (inserted != -1L) indexForFts(inserted, row.senderNick, row.text)
-        return inserted.takeIf { it != -1L }
+    public suspend fun recordWithRowId(message: StoredMessage): Long? = dao.recordAtomic(message.toRow())
+
+    public suspend fun recordLocalEcho(message: StoredMessage): Long? =
+        dao.recordAtomic(message.toRow(), freshLocal = true)
+
+    public suspend fun healEcho(conversation: ConversationRef, rowId: Long, message: StoredMessage): Long? {
+        require(message.networkId == conversation.networkId && message.conversation.normalizedTarget == conversation.normalizedTarget)
+        val inserted = dao.recordAtomic(message.toRow(), rowId)
+        if (inserted != null) return inserted
+        val msgid = message.msgid
+        if (msgid != null) return dao.byMsgid(conversation.networkId, conversation.normalizedTarget, msgid)?.rowId
+        return dao.byRowId(rowId)?.takeIf {
+            it.networkId == conversation.networkId && it.conversation == conversation.normalizedTarget
+        }?.rowId
     }
+
+    private fun StoredMessage.toRow(): MessageRow = MessageRow(
+        networkId = networkId,
+        conversation = conversation.normalizedTarget,
+        msgid = msgid,
+        contentHash = contentHash(this),
+        senderNick = senderNick,
+        senderUser = senderUser,
+        senderHost = senderHost,
+        kind = kind.name,
+        text = text,
+        sentByUs = sentByUs,
+        timestampMs = timestampMs,
+        channelContext = channelContext,
+        historyContext = historyContext,
+        highlightsMe = highlightsMe,
+        highlightsKnown = highlightsKnown,
+        playback = playback,
+        replyToMsgid = replyToMsgid,
+        replyParentRowId = replyParentRowId,
+        attachmentUrl = attachmentUrl,
+        attachmentName = attachmentName,
+        attachmentMimeType = attachmentMimeType,
+        attachmentSizeBytes = attachmentSizeBytes,
+        attachmentWidth = attachmentWidth,
+        attachmentHeight = attachmentHeight,
+        senderAccount = senderAccount,
+        redacted = redacted,
+        reactionsTruncated = reactionsTruncated,
+        pendingEcho = pendingEcho,
+    )
 
     public suspend fun findStoredMessage(message: StoredMessage): StoredMessage? {
         val conversation = message.conversation.normalizedTarget
@@ -53,13 +59,126 @@ public class MessageStore(private val dao: MessageDao) {
         return (byMsgid ?: dao.byHash(message.networkId, conversation, contentHash(message)))?.toStored(message.conversation)
     }
 
-    private suspend fun indexForFts(rowId: Long, sender: String, body: String) {
-        dao.indexMessageRaw(
-            androidx.sqlite.db.SimpleSQLiteQuery(
-                "INSERT INTO message_fts(rowid, sender, body) VALUES(?, ?, ?)",
-                arrayOf<Any>(rowId, sender, body),
-            ),
+    public suspend fun byRowId(conversation: ConversationRef, rowId: Long): StoredMessage? =
+        dao.byRowId(rowId)?.takeIf {
+            it.networkId == conversation.networkId && it.conversation == conversation.normalizedTarget
+        }?.toStored(conversation)
+
+    public suspend fun byRowIds(conversation: ConversationRef, rowIds: Collection<Long>): List<StoredMessage> = buildList {
+        val seen = hashSetOf<Long>()
+        val batch = ArrayList<Long>(minOf(rowIds.size, 500))
+        suspend fun appendBatch() {
+            for (row in dao.byRowIds(conversation.networkId, conversation.normalizedTarget, batch)) add(row.toStored(conversation))
+            batch.clear()
+        }
+        for (rowId in rowIds) {
+            if (!seen.add(rowId)) continue
+            batch.add(rowId)
+            if (batch.size == 500) appendBatch()
+        }
+        if (batch.isNotEmpty()) appendBatch()
+    }
+
+    public suspend fun replyParents(conversation: ConversationRef, messages: List<StoredMessage>): Map<Long, StoredMessage> =
+        buildMap {
+            for (message in messages) {
+                val parent = message.replyParentRowId?.let { byRowId(conversation, it) }
+                    ?: message.replyToMsgid?.let {
+                        dao.byMsgid(conversation.networkId, conversation.normalizedTarget, it)?.toStored(conversation)
+                    }
+                if (!message.redacted && parent != null) put(message.rowId, parent)
+            }
+        }
+
+    public suspend fun reactions(conversation: ConversationRef): Map<String, Map<String, Set<String>>> {
+        val result = linkedMapOf<String, MutableMap<String, MutableSet<String>>>()
+        for (reaction in dao.visibleReactions(conversation.networkId, conversation.normalizedTarget)) {
+            result.getOrPut(reaction.msgid) { linkedMapOf() }.getOrPut(reaction.emoji) { linkedSetOf() }.add(reaction.sender)
+        }
+        return result
+    }
+
+    public suspend fun reactions(conversation: ConversationRef, msgid: String): Map<String, Set<String>> {
+        val result = linkedMapOf<String, MutableSet<String>>()
+        for (reaction in dao.visibleReactionsForMessage(conversation.networkId, conversation.normalizedTarget, msgid)) {
+            result.getOrPut(reaction.emoji) { linkedSetOf() }.add(reaction.sender)
+        }
+        return result
+    }
+
+    public suspend fun reactions(conversation: ConversationRef, msgids: Collection<String>): Map<String, Map<String, Set<String>>> {
+        val result = linkedMapOf<String, MutableMap<String, MutableSet<String>>>()
+        val seen = hashSetOf<String>()
+        val batch = ArrayList<String>(minOf(msgids.size, 500))
+        suspend fun appendBatch() {
+            for (reaction in dao.visibleReactionsForMessages(conversation.networkId, conversation.normalizedTarget, batch)) {
+                result.getOrPut(reaction.msgid) { linkedMapOf() }.getOrPut(reaction.emoji) { linkedSetOf() }.add(reaction.sender)
+            }
+            batch.clear()
+        }
+        for (msgid in msgids) {
+            if (!seen.add(msgid)) continue
+            batch.add(msgid)
+            if (batch.size == 500) appendBatch()
+        }
+        if (batch.isNotEmpty()) appendBatch()
+        return result
+    }
+
+    public suspend fun applyReaction(
+        conversation: ConversationRef,
+        msgid: String,
+        sender: String,
+        emoji: String,
+        added: Boolean,
+        nowMs: Long = System.currentTimeMillis(),
+        perParentLimit: Int = MESSAGE_REACTIONS_PER_PARENT_LIMIT,
+        networkLimit: Int = MESSAGE_REACTIONS_PER_NETWORK_LIMIT,
+        onRetentionChanged: (Set<Long>) -> Unit = {},
+    ) {
+        val changed = dao.applyReactionAtomic(
+            MessageReactionRow(conversation.networkId, conversation.normalizedTarget, msgid, emoji, sender, nowMs),
+            added, perParentLimit, networkLimit,
         )
+        if (changed.isNotEmpty()) onRetentionChanged(changed)
+    }
+
+    public suspend fun redact(conversation: ConversationRef, msgid: String, nowMs: Long = System.currentTimeMillis()) {
+        dao.redactAtomic(conversation.networkId, conversation.normalizedTarget, msgid, nowMs)
+    }
+
+    public suspend fun unreadCounts(conversation: ConversationRef, cursor: ReadCursor): UnreadCounts =
+        dao.unreadCounts(conversation.networkId, conversation.normalizedTarget, cursor.timestampMs, cursor.rowId)
+
+    public suspend fun newestCursor(conversation: ConversationRef): ReadCursor? =
+        dao.newestUnreadEligible(conversation.networkId, conversation.normalizedTarget)?.let { ReadCursor(it.timestampMs, it.rowId) }
+
+    public suspend fun maintain(nowMs: Long = System.currentTimeMillis()) {
+        dao.pruneOrphanReactions(nowMs)
+        dao.pruneTombstones(nowMs)
+        for (networkId in dao.reactionNetworks()) dao.pruneReactionMemberships(networkId, MESSAGE_REACTIONS_PER_PARENT_LIMIT, MESSAGE_REACTIONS_PER_NETWORK_LIMIT)
+    }
+
+    public suspend fun maintainReactionMemberships(
+        networkId: String,
+        perParentLimit: Int = MESSAGE_REACTIONS_PER_PARENT_LIMIT,
+        networkLimit: Int = MESSAGE_REACTIONS_PER_NETWORK_LIMIT,
+    ) {
+        dao.pruneReactionMemberships(networkId, perParentLimit, networkLimit)
+    }
+
+    public suspend fun maintainNetwork(
+        networkId: String,
+        keepMessages: Int,
+        keepConversations: Int,
+        protectedConversation: String? = null,
+        nowMs: Long = System.currentTimeMillis(),
+        protectedConversations: Set<String> = emptySet(),
+    ) {
+        val protected = linkedSetOf<String>()
+        if (protectedConversation != null) protected.add(protectedConversation)
+        protected.addAll(protectedConversations)
+        dao.maintainNetworkAtomic(networkId, keepMessages, keepConversations, protected.toList(), nowMs)
     }
 
     public suspend fun recent(conversation: ConversationRef, limit: Int): List<StoredMessage> =
@@ -90,8 +209,8 @@ public class MessageStore(private val dao: MessageDao) {
     public suspend fun historyAnchors(networkId: String): List<StoredMessage> =
         dao.historyAnchors(networkId).map { row -> row.toStored(conversationRef(networkId, row.conversation)) }
 
-    public suspend fun trimTo(conversation: ConversationRef, keep: Int) {
-        dao.trim(conversation.networkId, conversation.normalizedTarget, keep)
+    public suspend fun trimTo(conversation: ConversationRef, keep: Int, nowMs: Long = System.currentTimeMillis()) {
+        dao.trimAtomic(conversation.networkId, conversation.normalizedTarget, keep, nowMs)
     }
 
     public suspend fun renameConversation(
@@ -100,50 +219,17 @@ public class MessageStore(private val dao: MessageDao) {
         onRowMerged: (Long, Long) -> Unit = { _, _ -> },
     ): Int {
         if (from.networkId != to.networkId || from.normalizedTarget == to.normalizedTarget) return 0
-        val moving = dao.allIn(from.networkId, from.normalizedTarget)
-        if (moving.isEmpty()) return 0
-        for (row in moving) {
-            val hash = hashOf(row.networkId, to.normalizedTarget, row.senderNick, row.kind, row.text, row.timestampMs)
-            val duplicate = if (row.msgid == null) {
-                dao.rowIdByHash(row.networkId, to.normalizedTarget, hash)
-            } else {
-                dao.rowIdByMsgid(row.networkId, to.normalizedTarget, row.msgid)
-                    ?: dao.rowIdWithoutMsgidByHash(row.networkId, to.normalizedTarget, hash)
-            }
-            if (duplicate != null) {
-                if (row.msgid != null) dao.healMsgid(duplicate, row.msgid)
-                if (!row.historyContext) dao.promoteHistoryContext(duplicate)
-                dao.deleteFtsForNetworkRaw(
-                    androidx.sqlite.db.SimpleSQLiteQuery("DELETE FROM message_fts WHERE rowid = ?", arrayOf<Any>(row.rowId)),
-                )
-                dao.deleteRow(row.rowId)
-                onRowMerged(row.rowId, duplicate)
-            } else {
-                dao.renameRow(row.rowId, to.normalizedTarget, hash)
-            }
-        }
-        return moving.size
+        val merges = dao.renameAtomic(from.networkId, from.normalizedTarget, to.normalizedTarget)
+        for (merge in merges.rows) onRowMerged(merge.removedRowId, merge.survivingRowId)
+        return merges.movedCount
     }
 
     public suspend fun reindexAll() {
-        dao.deleteFtsForNetworkRaw(
-            androidx.sqlite.db.SimpleSQLiteQuery("DELETE FROM message_fts"),
-        )
-        for (row in dao.allRows()) {
-            indexForFts(row.rowId, row.senderNick, row.text)
-        }
+        dao.reindexAtomic()
     }
 
     public suspend fun deleteNetwork(networkId: String) {
-        runCatching {
-            dao.deleteFtsForNetworkRaw(
-                androidx.sqlite.db.SimpleSQLiteQuery(
-                    "DELETE FROM message_fts WHERE rowid IN (SELECT rowId FROM messages WHERE networkId = ?)",
-                    arrayOf<Any>(networkId),
-                ),
-            )
-        }
-        dao.deleteNetwork(networkId)
+        dao.deleteNetworkAtomic(networkId)
     }
 
     public suspend fun search(
@@ -194,6 +280,12 @@ public class MessageStore(private val dao: MessageDao) {
             message.timestampMs,
         )
 
+        internal fun renamedHash(row: MessageRow, target: String): String =
+            hashOf(row.networkId, target, row.senderNick, row.kind, row.text, row.timestampMs)
+
+        internal fun identityHash(row: MessageRow): String =
+            row.originalIdentityHash ?: hashOf("", "", row.senderNick, row.kind, row.text, row.timestampMs)
+
         private fun hashOf(
             networkId: String,
             conversation: String,
@@ -237,6 +329,21 @@ public class MessageStore(private val dao: MessageDao) {
             timestampMs = timestampMs,
             channelContext = channelContext,
             historyContext = historyContext,
+            highlightsMe = highlightsMe,
+            highlightsKnown = highlightsKnown,
+            playback = playback,
+            replyToMsgid = replyToMsgid,
+            replyParentRowId = replyParentRowId,
+            attachmentUrl = attachmentUrl,
+            attachmentName = attachmentName,
+            attachmentMimeType = attachmentMimeType,
+            attachmentSizeBytes = attachmentSizeBytes,
+            attachmentWidth = attachmentWidth,
+            attachmentHeight = attachmentHeight,
+            senderAccount = senderAccount,
+            redacted = redacted,
+            reactionsTruncated = reactionsTruncated,
+            pendingEcho = pendingEcho,
         )
     }
 }

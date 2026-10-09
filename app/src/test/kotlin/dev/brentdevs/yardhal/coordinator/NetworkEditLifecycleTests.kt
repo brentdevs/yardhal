@@ -639,14 +639,18 @@ class NetworkEditLifecycleTests {
                     assertEquals(previous.messages, preserved.messages)
                     assertEquals(previous.readAtMs, preserved.readAtMs)
                     assertEquals(previous.hasUnread, preserved.hasUnread)
-                    assertEquals(null, preserved.topic)
-                    assertTrue(preserved.members.isEmpty())
-                    assertTrue(preserved.memberPresence.isEmpty())
+                    assertEquals(previous.topic, preserved.topic)
+                    assertTrue(preserved.cachedTopic)
+                    assertEquals(previous.members, preserved.members)
+                    assertEquals(previous.memberPresence, preserved.memberPresence)
+                    assertTrue(preserved.cachedRoster)
                     assertTrue(preserved.typingUsers.isEmpty())
                     assertEquals(JoinState.JOINING, preserved.joinState)
                     assertTrue(coordinator.buffers.value.containsKey(direct.storageKey))
                     assertFalse(coordinator.loadPersistedHistory(room.storageKey))
-                    assertFalse(coordinator.profiles.value.containsKey(updated.id))
+                    val cachedProfile = assertNotNull(coordinator.profiles.value[updated.id]?.forNick("alice"))
+                    assertEquals("Old Alice", cachedProfile.displayName)
+                    assertTrue(cachedProfile.cached)
                     assertEquals(null, coordinator.networks.value.single().iconUrl)
                     assertFalse(coordinator.networks.value.single().hasBotMode)
                     assertEquals("Edited network", coordinator.networks.value.single().name)
@@ -663,6 +667,8 @@ class NetworkEditLifecycleTests {
                     client.welcome()
                     await { "JOIN #room" in client.received && "JOIN #edited" in client.received }
                     await { coordinator.buffers.value[room.storageKey]?.joinState == JoinState.JOINED }
+                    await { coordinator.buffers.value[room.storageKey]?.cachedRoster == false }
+                    assertEquals(setOf("editedNick", "alice"), coordinator.buffers.value.getValue(room.storageKey).members.map { it.nick }.toSet())
                     assertEquals(1, replacement.clients.size)
                     assertEquals(1, client.received.count { it == "JOIN #room" })
                     assertEquals(1, client.received.count { it == "JOIN #edited" })
@@ -1165,6 +1171,7 @@ class NetworkEditLifecycleTests {
             harness(config(server).copy(autoConnect = false)).use { harness ->
                 val coordinator = harness.coordinator
                 coordinator.startAll()
+                await { coordinator.restorationReady.value }
                 assertEquals(RecoveryPhase.DISCONNECTED, coordinator.networks.value.single().connectionPhase)
                 val room = ConversationRef.channel(harness.config.id, "#room")
                 assertEquals(JoinState.IDLE, coordinator.buffers.value[room.storageKey]?.joinState)
@@ -1183,6 +1190,7 @@ class NetworkEditLifecycleTests {
                 assertEquals(listOf("saved-pass"), server.clients.single().parameters("PASS"))
                 val reloaded = harness.reloadCoordinator()
                 reloaded.startAll()
+                await { reloaded.restorationReady.value }
                 assertNotNull(scheduler).advanceTimeBy(60_000)
                 assertNotNull(scheduler).runCurrent()
                 assertEquals(RecoveryPhase.DISCONNECTED, reloaded.networks.value.single().connectionPhase)
@@ -1202,6 +1210,7 @@ class NetworkEditLifecycleTests {
                 assertTrue(NetworkStore(harness.directory).all().single().userDisconnected)
                 val reloaded = harness.reloadCoordinator()
                 reloaded.startAll()
+                await { reloaded.restorationReady.value }
                 reloaded.updateConnectivity(true, 2)
                 reloaded.onForegroundResume()
                 assertNotNull(scheduler).advanceTimeBy(60_000)
@@ -1226,6 +1235,7 @@ class NetworkEditLifecycleTests {
                 val coordinator = harness.coordinator
                 coordinator.updateConnectivity(false)
                 coordinator.startAll()
+                await { coordinator.restorationReady.value }
                 assertNotNull(scheduler).advanceTimeBy(60_000)
                 assertNotNull(scheduler).runCurrent()
                 assertEquals(RecoveryPhase.OFFLINE, coordinator.networks.value.single().connectionPhase)
@@ -2096,6 +2106,7 @@ class NetworkEditLifecycleTests {
                 val coordinator = harness.coordinator
                 try {
                     coordinator.startAll()
+                    await { coordinator.restorationReady.value }
                     await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED &&
                         coordinator.buffers.value["network|#room"]?.members?.isNotEmpty() == true }
                     dispatcher.captureNextLaunch()

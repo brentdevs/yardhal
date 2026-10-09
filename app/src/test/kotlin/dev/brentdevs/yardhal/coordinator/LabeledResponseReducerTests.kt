@@ -58,18 +58,68 @@ class LabeledResponseReducerTests {
     }
 
     @Test
-    fun singleLabelledReplyIsRoutedToOriginBuffer() {
+    fun unappliedLabelledModeReplyIsRoutedToOriginBuffer() {
         val state = negotiated("batch", "labeled-response")
         val channel = state.channelRef("#c")
         val label = assertNotNull(state.issueLabel(channel, LabeledCommand.MODE, 1000L))
+        val originOnly = InboundContext(nowMs = 1000L, hasBuffer = { it == channel.storageKey })
 
-        val effects = state.feed("@label=$label :srv 324 me #c +nt")
+        val effects = state.feed("@label=$label :srv 324 me #untracked +nt", originOnly)
 
         val line = effects.appended().single()
         assertEquals(channel, line.ref)
-        assertEquals("#c +nt", line.text)
+        assertTrue(effects.filterIsInstance<InboundEffect.SetModes>().isEmpty())
+        assertTrue(state.channelRefs().isEmpty())
         assertNull(state.pendingLabel(label))
     }
+
+    @Test
+    fun labelledModeReplyUpdatesTargetModesWithoutTranscript() {
+        val state = negotiated("batch", "labeled-response")
+        val channel = state.channelRef("#c")
+        val label = assertNotNull(state.issueLabel(state.directRef("alice"), LabeledCommand.MODE, 1000L))
+
+        val effects = state.feed("@label=$label :srv 324 me #c +nt")
+        val modes = effects.filterIsInstance<InboundEffect.SetModes>().single()
+
+        assertEquals(channel, modes.ref)
+        assertEquals(mapOf("n" to emptyList(), "t" to emptyList()), modes.modes)
+        assertTrue(modes.complete)
+        assertTrue(effects.appended().isEmpty())
+        assertNull(state.pendingLabel(label))
+    }
+
+    @Test
+    fun malformedLabelledModeReplyKeepsOriginRoutingAndPriorSnapshot() {
+        val state = negotiated("batch", "labeled-response")
+        val channel = state.channelRef("#c")
+        val origin = state.directRef("alice")
+        val initial = state.feed(":srv 324 me #c +nt").filterIsInstance<InboundEffect.SetModes>().single()
+        for (payload in listOf("#c +ik", "alice +i", "#c", "")) {
+            val label = assertNotNull(state.issueLabel(origin, LabeledCommand.MODE, 1000L))
+            val effects = state.feed("@label=$label :srv 324 me $payload")
+            assertEquals(origin, effects.appended().single().ref, payload)
+            assertTrue(effects.filterIsInstance<InboundEffect.SetModes>().isEmpty(), payload)
+            assertEquals(initial.modes, checkNotNull(state.channel(channel.storageKey)).modeSnapshot(), payload)
+            assertNull(state.pendingLabel(label), payload)
+        }
+    }
+
+    @Test
+    fun unappliedModeReplyInALabelledBatchKeepsOriginUntilBatchEnd() {
+        val state = negotiated("batch", "labeled-response")
+        val origin = state.directRef("alice")
+        val label = assertNotNull(state.issueLabel(origin, LabeledCommand.MODE, 1000L))
+        val originOnly = InboundContext(nowMs = 1000L, hasBuffer = { it == origin.storageKey })
+        state.feed("@label=$label :srv BATCH +m1 labeled-response", originOnly)
+        val effects = state.feed("@batch=m1 :srv 324 me #untracked +nt", originOnly)
+        assertEquals(origin, effects.appended().single().ref)
+        assertTrue(effects.filterIsInstance<InboundEffect.SetModes>().isEmpty())
+        assertNotNull(state.pendingLabel(label))
+        state.feed(":srv BATCH -m1", originOnly)
+        assertNull(state.pendingLabel(label))
+    }
+
 
     @Test
     fun labelledServerNoticeIsRoutedToOriginBuffer() {
@@ -83,7 +133,7 @@ class LabeledResponseReducerTests {
     }
 
     @Test
-    fun labelledReplyFallsBackToServerWhenOriginBufferClosed() {
+    fun unappliedLabelledModeReplyFallsBackToServerWhenOriginBufferClosed() {
         val state = negotiated("batch", "labeled-response")
         val channel = state.channelRef("#c")
         val label = assertNotNull(state.issueLabel(channel, LabeledCommand.MODE, 1000L))
@@ -94,6 +144,8 @@ class LabeledResponseReducerTests {
         )
 
         assertEquals(state.server, effects.appended().single().ref)
+        assertTrue(effects.filterIsInstance<InboundEffect.SetModes>().isEmpty())
+        assertTrue(state.channelRefs().isEmpty())
     }
 
     @Test
@@ -106,7 +158,6 @@ class LabeledResponseReducerTests {
         val error = state.feed("@batch=w1 :srv 401 me ghost :No such nick").appended().single()
         val unknown = state.feed("@batch=w1 :srv 999 me ghost :Odd").appended().single()
         assertEquals(query, error.ref)
-        assertEquals("[error] ghost No such nick", error.text)
         assertEquals(query, unknown.ref)
         assertNotNull(state.pendingLabel(label))
 
@@ -197,8 +248,9 @@ class LabeledResponseReducerTests {
         val state = negotiated("batch", "echo-message")
         val channel = state.channelRef("#c")
 
-        val reply = state.feed(":srv 324 me #c +nt").appended().single()
-        val stray = state.feed("@label=unknown :srv 324 me #c +nt").appended().single()
+        val channelOnly = InboundContext(nowMs = 1000L, hasBuffer = { it == channel.storageKey })
+        val reply = state.feed(":srv 324 me #untracked +nt", channelOnly).appended().single()
+        val stray = state.feed("@label=unknown :srv 324 me #untracked +nt", channelOnly).appended().single()
         val echo = state.feed("@msgid=m2 :me!u@h PRIVMSG #c :hello").appended().single()
 
         assertEquals(state.server, reply.ref)

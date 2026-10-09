@@ -29,6 +29,7 @@ public class RemoteImageLoader(
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
     private val directory = File(cacheRoot, DIRECTORY_NAME)
+    private val diskLock = Any()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val inFlight = ConcurrentHashMap<String, Deferred<Bitmap?>>()
     private val failedAt = ConcurrentHashMap<String, Long>()
@@ -37,6 +38,12 @@ public class RemoteImageLoader(
     }
 
     public fun cached(url: String, sizePx: Int): Bitmap? = memory.get(memoryKey(url, sizePx))
+
+    public fun maintain() {
+        synchronized(diskLock) { prune() }
+        val now = clock()
+        failedAt.entries.removeIf { now - it.value >= FAILURE_RETRY_MS }
+    }
 
     public suspend fun load(url: String, sizePx: Int): Bitmap? {
         val key = memoryKey(url, sizePx)
@@ -103,21 +110,21 @@ public class RemoteImageLoader(
         return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
     }
 
-    private fun cachedBytes(url: String): ByteArray? {
+    private fun cachedBytes(url: String): ByteArray? = synchronized(diskLock) {
         val file = fileFor(url)
-        if (!file.isFile) return null
+        if (!file.isFile) return@synchronized null
         if (clock() - file.lastModified() > DISK_TTL_MS || file.length() > ImageUrlPolicy.MAX_BYTES) {
             file.delete()
-            return null
+            return@synchronized null
         }
-        return try {
+        try {
             file.readBytes()
         } catch (_: IOException) {
             null
         }
     }
 
-    private fun store(url: String, bytes: ByteArray) {
+    private fun store(url: String, bytes: ByteArray) = synchronized(diskLock) {
         try {
             directory.mkdirs()
             val target = fileFor(url)
@@ -126,16 +133,24 @@ public class RemoteImageLoader(
             if (!temporary.renameTo(target)) temporary.delete()
             prune()
         } catch (_: IOException) {
-            return
+            return@synchronized
         }
     }
 
     private fun prune() {
-        val files = directory.listFiles()?.filter { it.isFile } ?: return
-        var total = files.sumOf { it.length() }
+        val files = directory.listFiles() ?: return
+        val now = clock()
+        var total = 0L
+        for (file in files) {
+            if (!file.isFile) continue
+            if (now - file.lastModified() > DISK_TTL_MS && file.delete()) continue
+            total += file.length()
+        }
         if (total <= DISK_CACHE_BYTES) return
-        for (file in files.sortedBy { it.lastModified() }) {
+        files.sortBy { it.lastModified() }
+        for (file in files) {
             if (total <= DISK_CACHE_BYTES) break
+            if (!file.isFile) continue
             val length = file.length()
             if (file.delete()) total -= length
         }

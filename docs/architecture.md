@@ -34,8 +34,9 @@ Each layer depends only on the ones below it.
   IRCv3 batches are tracked by the app-layer reducer, not here.
 - **`core/data`** — Android library holding persistent stores:
   `NetworkStore` (kotlinx.serialization + file/DataStore),
-  `MessageStore` (Room, dedup by `msgid` or content hash,
-  scrollback trimming), `ReadMarkerStore`, `MuteStore`,
+  `MessageStore` (Room, scoped message identity and interaction retention),
+  `OfflineStore` (Room cached conversation/user observations and selection),
+  `ReadMarkerStore` (durable cursors and pending remote reads), `MuteStore`,
   `SlashCommandParser`, mention matching, network presets.
   Credentials live in Android Keystore-backed storage.
 - **`app`** — Compose UI plus the application-owned `LiveCoordinator`, the
@@ -88,11 +89,13 @@ or pending NAMES replies remain tracked; unshared users and profiles are pruned.
 Profile removals publish immediately unless an open metadata/join batch defers
 publication until its close.
 
-Room schema 3 stores nullable channel context and history-context eligibility
-through transcript reloads and search-hit restoration. The explicit 1→2 migration
-adds channel context; 2→3 adds the context flag and scopes the unique message-ID
-index to `(networkId, conversation, msgid)`. Existing row IDs, content hashes and
-FTS rows survive both migrations. There is no destructive fallback.
+Room schema 4 preserves channel context and history-context eligibility through
+transcript reloads and search-hit restoration. The explicit 1→2 migration adds
+channel context; 2→3 adds the context flag and scopes the unique message-ID index
+to `(networkId, conversation, msgid)`; 3→4 adds durable interaction metadata,
+reaction/tombstone/retention ledgers, offline observations, last selection and
+cache-row quarantine. Existing row IDs, content hashes, message metadata and FTS
+rows survive migration. There is no destructive fallback.
 Rename-following retains only the active selected key and one pending destination,
 retargeted across rapid renames before buffer publication. Consuming a redirect,
 changing selection, reusing its source or removing its destination/network clears
@@ -214,7 +217,8 @@ stored IDs are retained through canonical matching, not invented from wire data.
 keeps Android connectivity and lifecycle handling outside the pure-JVM client.
 `AndroidConnectivityObserver` publishes Internet-capable, unblocked, nonsuspended
 default-network availability and route changes; public Internet validation is not
-a prerequisite for private IRC routes. `MainActivity.onResume` requests validation.
+a prerequisite for private IRC routes. A resumed `MainActivity` requests validation
+after application initialization completes.
 `ConnectionRecoveryPolicy` distinguishes offline, connecting, registered,
 server-unreachable, explicit disconnect, identification and blocked auth/cert states.
 One `IrcReconnector` loop pauses offline retries and wakes eligible recovery immediately.
@@ -277,6 +281,179 @@ authenticated microsocks relay, including changed certificates and real KeyChain
 EXTERNAL. Real TLS/mTLS JVM regressions use PKCS#12 fixtures. Robolectric's
 Conscrypt 2.5.2 needs the app test JVM's `java.base/java.net` opening on JDK 21;
 native Android and production TLS providers are not replaced or bypassed.
+
+## Offline conversation state
+
+[Halyard parity phase 3 / issue 14](https://github.com/brentdevs/yardhal/issues/14)
+extends the existing Room and JSON stores without renumbering the roadmap.
+
+### Durable messages and reads
+
+Schema 4 stores highlight/playback classification, wire reply IDs, resolved local
+quote-parent row IDs, attachment URL/name/MIME/size/dimensions, sender account,
+redaction, unconfirmed delivery and partial-reaction state. Quoted previews can
+resolve parents outside the loaded page. Only authoritative inbound `REDACT`
+scrubs body, attachments, searchable text and reactions; sending a deletion request
+does not create a tombstone, and server rejection leaves the original intact.
+
+Message, FTS and interaction mutations share transactions. Canonical echoes
+retain local quote relationships and heal persisted row identity. Explicit fresh
+optimistic sends remain distinct even with identical text and timestamps.
+Visible echo reconciliation and durable commit are separate publication points;
+an inserted pending row does not prove that its canonical echo has been committed.
+Discovered conversations hydrate independently; another buffer's completed gap
+or an inbound control marker is not a cross-conversation hydration barrier.
+Unconfirmed sends survive restart with a **Delivery unconfirmed** indicator.
+Identified own history heals matching pending sends FIFO when sender, kind, body,
+wire reply and the ±two-minute send/server timestamp window agree. Repeated
+canonical msgids cannot consume another pending send; anonymous or out-of-window
+history does not invent confirmation or trigger a resend.
+
+Rename/CASEMAPPING collisions consume only original destination overlaps, not
+identical fresh source siblings. They retarget parent IDs and visible identities,
+reconcile interactions and move retention floors. Queue-ordered quote resolution
+uses the surviving parent identity after earlier migrations. Publication fences
+preserve pending optimistic reactions through history/search reads and clear
+abandoned revision guards. Network removal deletes snapshots, interactions and
+private `offline_quarantine` payloads, then clears only that network's notices.
+
+Unread/mention counts query retained history, not just the 200-row transcript
+page. Read cursors compare `(timestampMs, rowId)`; legacy numeric markers retain
+their timestamp-inclusive meaning. Migrated messages have unknown highlight
+classification, rather than being reclassified against today's nickname. The UI
+shows unknown or lower-bound mention counts. Offline advances save both the local
+cursor and pending remote cursor. Replay requires the accepted registered,
+authenticated session and negotiated read-marker support; sending does not clear
+pending state. An incoming acknowledgement clears covered pending reads, while
+older markers cannot regress the local cursor.
+Muted conversations retain individual counts but do not contribute to collapsed
+network aggregates. A blocked JSON-preservation gate leaves read cursors and pending
+reads explicitly session-local (`ReadMarkerPersistence.VOLATILE`) with a mandatory
+storage warning; ordinary save failures and cancellation still propagate.
+
+### Cached observations and launch
+
+Configured networks restore bounded shells and the saved selection before
+starting connections; selected history is loaded locally. History-only selection
+survives missing cache metadata, and repeated casemapping changes follow the
+surviving raw target/kind. Selected or explicitly reopened parted history remains
+browsable without an implicit JOIN; reopening a DM clears its close marker.
+Existing Compose rotation/navigation restoration takes precedence.
+
+Roster and user detail hydration is lazy and session-fenced; only successful,
+still-valid publication marks a cache loaded. Disconnect retains user profiles
+explicitly as historical observations. Cached topics, modes, rosters, roles and
+WHOIS carry observation times and cached/stale/offline presentation, not current
+presence or permissions. Cached roles do not authorize moderation or authentication.
+Complete live NAMES/MODE/WHOIS responses replace historical snapshots; incomplete
+updates do not claim completeness. Own JOIN establishes membership, not empty
+end-of-NAMES/WHO numerics; own KICK invalidates roster and mode completeness.
+Numeric 324 preserves incremental class-A list modes, and unapplied snapshots
+retain their normal server/labelled-origin transcript fallback. Colliding cached
+rosters retain bounded historical unions with per-member observation times until
+a complete live response replaces them.
+
+WHOIS is fresh for less than five minutes, only when its observation is not in
+the future. Expired information remains displayable during live refresh. Explicit
+refresh retains the matching sheet and presentation until the response arrives.
+WHOIS and user metadata expire independently after 30 days; equality at the
+retention boundary is retained. Malformed cached payloads preserve the complete
+original row in deduplicated `offline_quarantine` evidence before clearing unusable
+fields. Live observations can repair the active cache; evidence is not automatically
+pruned or presented as restored conversation history.
+
+Pending roster/shell snapshots and post-message durable refreshes coalesce on the
+existing persistence queue, with migration/removal barriers. Roster serialization
+waits for the flush; NICK rewrites only affected roster columns. Completed uploads
+share through the current visible session after replacement, or report the
+completed URL when sharing is unavailable rather than silently discarding it.
+
+### Retention budgets
+
+- Messages: at most 10,000 per target, 250,000 per network and 1,000 conversation
+  slots per network. Selected/last-selected targets and the server buffer have
+  priority within, never in addition to, these budgets.
+- Attached reactions: at most 1,024 sender memberships per parent and 100,000 per
+  network, preferring recent observations with deterministic identity ties.
+  Trimming persists partial-history flags, including when no memberships remain;
+  the transcript displays lower bounds rather than silently advertising completeness.
+- Orphan reactions: 1,000 globally and 30 days. Redaction tombstones: 10,000 per
+  target and 30 days since observation. Retirement folds historical floors into
+  a bounded network ledger before dropping target bookkeeping. Older replay cannot
+  resurrect retired history or deleted parents; a new live event at the timestamp
+  floor remains eligible.
+- Offline shells/users: 1,000 each per network, with selected-shell priority;
+  rosters: 10,000 entries. Cached observations expire after 30 days.
+- Remote images: 32 MiB on disk, oldest-first eviction, seven-day expiry including
+  unrequested files; 8 MiB memory budget. Exact TTL/budget boundaries are retained.
+
+Maintenance runs at startup and every five minutes; coordinator write activity
+also triggers message/interaction maintenance every 100 writes. Cache maintenance
+uses SQL without decoding every hidden roster or profile. Runtime buffers reconcile
+committed removals and partial interactions. Indexed reply-parent cleanup batches
+at most 500 IDs. Retention tombstones block resurrection without turning a surviving
+rename collision into privacy redaction; explicit deletion has monotonic precedence.
+
+Transactional SQLite counters track network membership and global orphan totals,
+including duplicate/upsert/REPLACE, parent attachment and identity moves. Reaction
+publication enforces the orphan cap immediately. Network/orphan victim queries run
+only on overflow and read the oldest indexed rows directly, in batches of at most
+500, rather than skipping the retained prefix. Parent-cap work is bounded by its
+1,024-member limit. Orphan age cleanup remains maintenance-only.
+
+### Recovery and exercised verification
+
+Application initialization opens/validates Room and constructs stores on
+`Dispatchers.IO`. The activity observes loading/ready/failure before accessing them;
+a sticky service promotes to foreground immediately, then awaits initialization
+and coordinator restoration. Session startup is state-locked and rejects retired
+or no-longer-wanted sessions.
+Startup results are consumed asynchronously; publishing ready/failure does not
+mean a waiting activity/service continuation has already run.
+
+Healthy current-schema files receive read-only physical-table checks plus writable
+FTS logical validation, without whole-database backup copies. SQLite before 3.33
+uses one global read-only `quick_check`, not one global scan per table. Newer
+Android FTS4 whole-database checks may attempt an index-validation write, so their
+read-only preflight checks physical tables instead.
+Upgrades, invalid headers and pending rollback journals preserve fsynced original
+DB/WAL/SHM/journal evidence before SQLite can migrate, roll back or delete files.
+Interrupted copying/retirement and post-open failed safeguards resume without
+overwriting preserved copies or rerunning known-failed migrations.
+Retirement atomically retains the current source files too, so a source changed
+after an earlier copy is not discarded.
+Transient locks, read-only access, disk-full and permission failures do not
+misclassify or quarantine valid data. Recovery creates a fresh persistent store
+only after safe retirement; otherwise it uses explicitly temporary memory storage.
+Malformed JSON preserves exact bytes before a writable replacement is permitted.
+The root warning distinguishes evidence from restored messages, empty replacement
+storage and temporary session data. Completed evidence notices support durable
+acknowledgement without deleting evidence; unresolved/temporary warnings remain
+mandatory, and distinct new evidence remains reportable.
+
+Verification: `nix develop --command make check` and `make test-ircd`; native
+Android 15/Ergo process-kill/cold-launch scenes with saved selection, real wire
+reaction/reply restoration, prepared local quote/attachment metadata, cached
+roster/WHOIS/topic/mode presentation and subsequent live refresh. Prepared
+350-mention history exercises offline reads beyond the 200-row window, durable
+pending MARKREAD replay, acknowledgement and an injected older server marker.
+Native v1/v3 upgrades retain IDs/hashes/FTS; native small message/reaction budgets,
+1,000-shell/user caps, 30-day equality and image TTL/disk limits exercise maintenance.
+Isolated invalid-header/sidecar, incomplete/future-schema and denied-write fixtures
+exercise byte-exact quarantine and fresh/temporary-storage UX without user data.
+
+Review verification also exercised actual `Application.onCreate` under a
+disk-read/write death policy with a responsive main-loop heartbeat; a deliberately
+lost own echo followed by canonical same-row history healing; live WHOIS refresh
+without dismissing its sheet and cached WHOIS after disconnect; rejected server
+REDACT without local deletion; real reaction add/duplicate/remove and native Room
+overflow operations with covering-index query plans; and reopened parted history
+surviving cold launch without JOIN. A permission-blocked interrupted JSON fixture
+kept local read updates usable without changing protected bytes, then retained
+both original and changed source versions during resumed recovery. Completed
+evidence acknowledgement survived cold launch without deleting evidence. An actual
+SAF upload to a controlled HTTPS filehost completed with HTTP 201 after disconnect
+and visibly reported its recoverable URL.
 
 ## Network configuration
 

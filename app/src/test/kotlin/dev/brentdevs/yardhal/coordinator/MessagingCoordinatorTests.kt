@@ -216,11 +216,40 @@ class MessagingCoordinatorTests {
     }
 
     @Test
+    fun remergingDurableAnonymousSendsPreservesDistinctRowsAndLocalQuotes() {
+        val first = ChatMessage(
+            localId = 1,
+            sender = "tester",
+            kind = MessageKind.PRIVMSG,
+            text = "same send",
+            timestampMs = 1_000,
+            sentByUs = true,
+            highlightsMe = false,
+            msgid = null,
+            storedRowId = 41,
+            localReplyParentRowId = 40,
+            replyPreview = ReplyPreview("alice", "local quote parent"),
+        )
+        val second = first.copy(localId = 2, storedRowId = 42)
+        val incoming = listOf(
+            first.copy(localId = 11, replyPreview = null),
+            second.copy(localId = 12, replyPreview = null),
+        )
+
+        assertEquals(
+            listOf(first, second),
+            mergeConversationMessages(listOf(first, second), incoming, incomingCanonical = true),
+        )
+        assertEquals(listOf(first, second), mergeConversationMessages(listOf(first), listOf(second)))
+    }
+
+    @Test
     fun clockSkewedOptimisticSendsStayAtTheBottomAndCanonicalEchoesRestoreChronologicalOrder() {
         for (deviceTime in listOf("2023-01-01T00:00:00Z", "2025-01-01T00:00:00Z")) {
+            val deviceTimeMs = Instant.parse(deviceTime).toEpochMilli()
             withHarness(
                 "echo-message server-time batch labeled-response",
-                clock = { Instant.parse(deviceTime).toEpochMilli() },
+                clock = { deviceTimeMs },
             ) { server, harness ->
                 val ref = ConversationRef.channel(harness.config.id, "#room")
                 val coordinator = harness.coordinator
@@ -230,6 +259,11 @@ class MessagingCoordinatorTests {
 
                 assertTrue(coordinator.sendText(harness.config.id, ref.storageKey, "first from us"))
                 assertTrue(coordinator.sendText(harness.config.id, ref.storageKey, "second from us"))
+                await {
+                    coordinator.buffers.value[ref.storageKey]?.messages
+                        ?.filter { it.pendingEcho }
+                        ?.let { it.size == 2 && it.all { message -> message.storedRowId != null } } == true
+                }
                 val before = coordinator.buffers.value.getValue(ref.storageKey).messages
                 val firstPending = before.single { it.text == "first from us" }
                 val secondPending = before.single { it.text == "second from us" }
@@ -246,6 +280,7 @@ class MessagingCoordinatorTests {
                 val secondLabel = assertNotNull(sent.single { it.parameters.last() == "second from us" }.tag("label"))
                 assertEquals(firstLabel, firstPending.echoLabel)
                 assertEquals(secondLabel, secondPending.echoLabel)
+                assertTrue(firstPending.storedRowId != secondPending.storedRowId)
 
                 server.send("@msgid=later;time=2024-01-01T00:00:00.003Z :alice!u@h PRIVMSG #room :later from alice")
                 server.send("@label=$firstLabel;msgid=own-first;time=2024-01-01T00:00:00.001Z :tester!u@h PRIVMSG #room :first from us")
@@ -261,6 +296,8 @@ class MessagingCoordinatorTests {
                 assertEquals(listOf("own-first", "alice-first", "alice-second", "own-second", "later"), chat.map { it.msgid })
                 assertEquals(firstPending.localId, chat.single { it.msgid == "own-first" }.localId)
                 assertEquals(secondPending.localId, chat.single { it.msgid == "own-second" }.localId)
+                assertEquals(firstPending.storedRowId, chat.single { it.msgid == "own-first" }.storedRowId)
+                assertEquals(secondPending.storedRowId, chat.single { it.msgid == "own-second" }.storedRowId)
                 assertTrue(chat.filter { it.sentByUs }.all { !it.pendingEcho && it.echoLabel == null })
                 assertTrue(messages.zipWithNext().all { (left, right) -> left.timestampMs <= right.timestampMs })
                 await { harness.messages.recent(ref, 20).count { it.msgid?.startsWith("own-") == true } == 2 }
@@ -269,6 +306,7 @@ class MessagingCoordinatorTests {
                     listOf(Instant.parse("2024-01-01T00:00:00.001Z").toEpochMilli(), Instant.parse("2024-01-01T00:00:00.002Z").toEpochMilli()),
                     stored.map { it.timestampMs },
                 )
+                assertEquals(listOf(firstPending.storedRowId, secondPending.storedRowId), stored.map { it.rowId })
             }
         }
     }

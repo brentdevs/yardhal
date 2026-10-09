@@ -3,11 +3,26 @@ package dev.brentdevs.yardhal.coordinator
 import dev.brentdevs.yardhal.core.data.MessageKind
 
 internal fun redactInBuffer(buffer: ConversationBuffer, msgid: String): ConversationBuffer {
-    val index = buffer.messages.indexOfFirst { it.msgid == msgid }
-    if (index < 0) return buffer
-    val messages = buffer.messages.toMutableList()
-    messages[index] = messages[index].copy(text = "message deleted", kind = MessageKind.SYSTEM)
-    return buffer.copy(messages = messages)
+    val parent = buffer.messages.firstOrNull { it.msgid == msgid }
+    val messages = buffer.messages.map { message ->
+        when {
+            message.msgid == msgid -> message.asRedacted()
+            message.replyToMsgid == msgid ||
+                parent?.storedRowId != null && message.localReplyParentRowId == parent.storedRowId ->
+                message.withRedactedReply(parent?.sender)
+            else -> message
+        }
+    }
+    val draft = buffer.replyDraft?.let { message ->
+        when {
+            message.msgid == msgid -> null
+            message.replyToMsgid == msgid ||
+                parent?.storedRowId != null && message.localReplyParentRowId == parent.storedRowId ->
+                message.withRedactedReply(parent?.sender)
+            else -> message
+        }
+    }
+    return buffer.copy(messages = messages, reactions = buffer.reactions - msgid, replyDraft = draft)
 }
 
 internal fun reconcileEcho(
@@ -29,13 +44,13 @@ internal fun reconcileEcho(
     val messages = buffer.messages.toMutableList()
     val previous = messages[index]
     val canonical = previous.copy(
-        text = text,
-        msgid = msgid,
+        text = if (previous.redacted) previous.text else text,
+        msgid = msgid ?: previous.msgid,
         timestampMs = timestampMs,
-        attachmentUrl = attachmentUrl,
+        attachmentUrl = if (previous.redacted) null else attachmentUrl ?: previous.attachmentUrl,
         pendingEcho = false,
         echoLabel = null,
-        senderAccount = senderAccount,
+        senderAccount = senderAccount ?: previous.senderAccount,
     )
     val destination = if (previous.timestampMs == timestampMs) index else {
         val firstEqual = chronologicalInsertionIndex(buffer.messages, timestampMs, afterEqual = false)
@@ -51,7 +66,19 @@ internal fun reconcileEcho(
         for (position in index until destination) messages[position] = messages[position + 1]
     }
     messages[destination] = canonical
-    return buffer.copy(messages = messages)
+    val duplicateIndex = if (msgid == null) -1 else messages.indexOfFirst {
+        it.localId != previous.localId && it.msgid == msgid
+    }
+    if (duplicateIndex >= 0) {
+        messages[destination] = mergeChatMessageMetadata(messages[destination], messages[duplicateIndex])
+            .copy(pendingEcho = false, echoLabel = null)
+        messages.removeAt(duplicateIndex)
+    }
+    val redactedMsgid = messages.firstOrNull { it.localId == previous.localId && it.redacted }?.msgid
+    return buffer.copy(
+        messages = sanitizeRedactedMessages(messages),
+        reactions = if (redactedMsgid == null) buffer.reactions else buffer.reactions - redactedMsgid,
+    )
 }
 
 internal fun applyReaction(
@@ -121,41 +148,82 @@ internal fun mergeConversationMessages(
     incoming: List<ChatMessage>,
     incomingCanonical: Boolean = false,
 ): List<ChatMessage> {
-    if (preferred.isEmpty()) return incoming
-    if (incoming.isEmpty()) return preferred
+    if (incoming.isEmpty()) return sanitizeRedactedMessages(preferred)
     val merged = ArrayList<ChatMessage>(preferred.size + incoming.size).also { it.addAll(preferred) }
     val byMsgid = mutableMapOf<String, Int>()
-    for (index in merged.indices) merged[index].msgid?.let { byMsgid[it] = index }
+    val byStoredRowId = mutableMapOf<Long, Int>()
+    for (index in merged.indices) {
+        merged[index].msgid?.let { byMsgid[it] = index }
+        merged[index].storedRowId?.let { byStoredRowId[it] = index }
+    }
     for (message in incoming) {
-        val identified = message.msgid?.let(byMsgid::get) ?: -1
+        val identified = message.msgid?.let(byMsgid::get)
+            ?: message.storedRowId?.let(byStoredRowId::get)
+            ?: -1
         val anonymous = if (identified >= 0) -1 else merged.uniqueHistoryIndex {
-            (it.msgid == null || message.msgid == null) && it.sender == message.sender &&
+            !it.pendingEcho && !message.pendingEcho && (it.storedRowId == null || message.storedRowId == null) &&
+                (it.msgid == null || message.msgid == null) && it.sender == message.sender &&
                 it.kind == message.kind && it.text == message.text && it.timestampMs == message.timestampMs
         }
         val index = if (identified >= 0) identified else anonymous
         if (index < 0) {
             message.msgid?.let { byMsgid[it] = merged.size }
+            message.storedRowId?.let { byStoredRowId[it] = merged.size }
             merged.add(message)
         } else {
-            val previous = merged[index]
-            val base = if (incomingCanonical) message else previous
-            val other = if (incomingCanonical) previous else message
-            merged[index] = base.copy(
-                localId = previous.localId,
-                msgid = base.msgid ?: other.msgid,
-                storedRowId = base.storedRowId ?: other.storedRowId,
-                replyToMsgid = base.replyToMsgid ?: other.replyToMsgid,
-                attachmentUrl = base.attachmentUrl ?: other.attachmentUrl,
-                senderAccount = base.senderAccount ?: other.senderAccount,
-                channelContext = base.channelContext ?: other.channelContext,
-                sentByUs = previous.sentByUs || message.sentByUs,
-                historyContext = previous.historyContext && message.historyContext,
-            )
+            merged[index] = mergeChatMessageMetadata(merged[index], message, incomingCanonical)
             merged[index].msgid?.let { byMsgid[it] = index }
+            merged[index].storedRowId?.let { byStoredRowId[it] = index }
         }
     }
     merged.sortWith(conversationMessageOrder)
-    return merged
+    return sanitizeRedactedMessages(merged)
+}
+
+internal fun mergeChatMessageMetadata(
+    preferred: ChatMessage,
+    incoming: ChatMessage,
+    incomingCanonical: Boolean = false,
+): ChatMessage {
+    val base = if (incomingCanonical) incoming else preferred
+    val other = if (incomingCanonical) preferred else incoming
+    val preview = when {
+        base.replyPreview?.redacted == true -> base.replyPreview
+        other.replyPreview?.redacted == true -> other.replyPreview
+        else -> base.replyPreview ?: other.replyPreview
+    }
+    val pendingEcho = preferred.pendingEcho && incoming.pendingEcho && preferred.msgid == null && incoming.msgid == null
+    val merged = base.copy(
+        localId = preferred.localId,
+        msgid = base.msgid ?: other.msgid,
+        storedRowId = base.storedRowId ?: other.storedRowId,
+        replyToMsgid = base.replyToMsgid ?: other.replyToMsgid,
+        localReplyParentRowId = base.localReplyParentRowId ?: other.localReplyParentRowId,
+        replyPreview = preview,
+        attachmentUrl = base.attachmentUrl ?: other.attachmentUrl,
+        attachmentName = base.attachmentName ?: other.attachmentName,
+        attachmentMimeType = base.attachmentMimeType ?: other.attachmentMimeType,
+        attachmentSizeBytes = base.attachmentSizeBytes ?: other.attachmentSizeBytes,
+        attachmentWidth = base.attachmentWidth ?: other.attachmentWidth,
+        attachmentHeight = base.attachmentHeight ?: other.attachmentHeight,
+        senderAccount = base.senderAccount ?: other.senderAccount,
+        channelContext = base.channelContext ?: other.channelContext,
+        sentByUs = preferred.sentByUs || incoming.sentByUs,
+        highlightsMe = when {
+            preferred.highlightsKnown && incoming.highlightsKnown -> preferred.highlightsMe || incoming.highlightsMe
+            preferred.highlightsKnown -> preferred.highlightsMe
+            incoming.highlightsKnown -> incoming.highlightsMe
+            else -> false
+        },
+        highlightsKnown = preferred.highlightsKnown || incoming.highlightsKnown,
+        pendingEcho = pendingEcho,
+        echoLabel = if (pendingEcho) base.echoLabel ?: other.echoLabel else null,
+        playback = preferred.playback && incoming.playback,
+        historyContext = preferred.historyContext && incoming.historyContext,
+        redacted = preferred.redacted || incoming.redacted,
+        reactionsTruncated = preferred.reactionsTruncated || incoming.reactionsTruncated,
+    )
+    return if (merged.redacted) merged.asRedacted() else merged
 }
 
 private val conversationMessageOrder = compareBy<ChatMessage> { it.timestampMs }

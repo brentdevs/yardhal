@@ -52,6 +52,11 @@ import java.time.format.DateTimeFormatter
 
 private val TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
 
+internal enum class MessageDeliveryStatus { UNCONFIRMED }
+
+internal fun messageDeliveryStatus(message: ChatMessage): MessageDeliveryStatus? =
+    if (message.pendingEcho) MessageDeliveryStatus.UNCONFIRMED else null
+
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 public fun MessageRow(
@@ -224,7 +229,7 @@ private fun ChatLine(
                         }
                     }
                 }
-                if (message.replyToMsgid != null) {
+                if (message.replyToMsgid != null || message.localReplyParentRowId != null || quotedText != null) {
                     Text(
                         text = "↩ ${quotedText ?: "earlier message"}",
                         style = MaterialTheme.typography.labelSmall,
@@ -236,6 +241,9 @@ private fun ChatLine(
                 if (message.attachmentUrl != null) {
                     AttachmentPreview(
                         url = message.attachmentUrl,
+                        name = message.attachmentName,
+                        mimeType = message.attachmentMimeType,
+                        sizeBytes = message.attachmentSizeBytes,
                         onOpen = { onOpenAttachment(message.attachmentUrl) },
                     )
                 }
@@ -273,6 +281,23 @@ private fun ChatLine(
                         ),
                     )
                 }
+                when (messageDeliveryStatus(message)) {
+                    MessageDeliveryStatus.UNCONFIRMED -> Text(
+                        text = "Delivery unconfirmed",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 3.dp),
+                    )
+                    null -> Unit
+                }
+                if (message.reactionsTruncated) {
+                    Text(
+                        text = "Partial reaction history · retained members only",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 3.dp),
+                    )
+                }
                 if (reactions.isNotEmpty()) {
                     Row(
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -290,7 +315,7 @@ private fun ChatLine(
                                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
                                 ) {
                                     Text(
-                                        text = "$emoji ${nicks.size}",
+                                        text = if (message.reactionsTruncated) "$emoji ≥${nicks.size}" else "$emoji ${nicks.size}",
                                         style = MaterialTheme.typography.labelSmall,
                                     )
                                 }
@@ -303,15 +328,29 @@ private fun ChatLine(
     }
 }
 
+internal fun attachmentDisplayName(url: String, name: String?, sizeBytes: Long?): String {
+    val displayName = name?.takeIf { it.isNotBlank() }
+        ?: url.substringBefore('?').substringBefore('#').substringAfterLast('/').ifEmpty { "Attachment" }
+    return if (sizeBytes == null) displayName else "$displayName · $sizeBytes B"
+}
+
+internal fun isImageAttachment(url: String, mimeType: String?): Boolean {
+    if (mimeType != null) return mimeType.startsWith("image/", ignoreCase = true)
+    val cleanUrl = url.substringBefore('?').substringBefore('#')
+    return cleanUrl.endsWith(".png", true) || cleanUrl.endsWith(".jpg", true) ||
+        cleanUrl.endsWith(".jpeg", true) || cleanUrl.endsWith(".gif", true) || cleanUrl.endsWith(".webp", true)
+}
+
 @Composable
 private fun AttachmentPreview(
     url: String,
+    name: String?,
+    mimeType: String?,
+    sizeBytes: Long?,
     onOpen: () -> Unit,
 ) {
-    val cleanUrl = url.substringBefore('?').substringBefore('#')
-    val isImage = cleanUrl.endsWith(".png", true) || cleanUrl.endsWith(".jpg", true) ||
-        cleanUrl.endsWith(".jpeg", true) || cleanUrl.endsWith(".gif", true) || cleanUrl.endsWith(".webp", true)
-    val displayName = cleanUrl.substringAfterLast('/').ifEmpty { "Attachment" }
+    val isImage = isImageAttachment(url, mimeType)
+    val displayName = attachmentDisplayName(url, name, sizeBytes)
 
     if (isImage) {
         var loadPreview by rememberSaveable(url) { mutableStateOf(false) }

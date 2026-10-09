@@ -1,7 +1,9 @@
 package dev.brentdevs.yardhal.core.data
 
 import dev.brentdevs.yardhal.core.protocol.ChannelPrefixModes
+import kotlinx.serialization.Serializable
 
+@Serializable
 public data class ChannelMember(
     public val nick: String,
     public val symbol: Char? = null,

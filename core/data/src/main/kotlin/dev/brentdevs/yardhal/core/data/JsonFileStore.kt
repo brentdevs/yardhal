@@ -5,8 +5,15 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.nio.channels.FileChannel
 import java.nio.file.StandardOpenOption
+import java.nio.ByteBuffer
+import java.nio.charset.CharacterCodingException
+import java.nio.charset.CodingErrorAction
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+
+public class StorageWriteBlockedException internal constructor() :
+    IOException("Storage evidence must be preserved before persisted data can be replaced")
 
 public open class JsonFileStore<T> internal constructor(
     private val file: File,
@@ -23,6 +30,11 @@ public open class JsonFileStore<T> internal constructor(
     private var cachedValue: T? = null
     private var uncommittedReplacement = false
     private var pendingDirectorySync: File? = null
+    private var writesBlocked = false
+    private var evidenceChecked = false
+
+    internal val persistenceBlocked: Boolean
+        @Synchronized get() = writesBlocked
 
     @Synchronized
     public fun loadOrDefault(defaultValue: T): T {
@@ -31,22 +43,16 @@ public open class JsonFileStore<T> internal constructor(
             cachedValue = defaultValue
             return defaultValue
         }
-        val loaded: T = if (!file.exists()) {
-            defaultValue
-        } else {
-            runCatching {
-                json.decodeFromString(serializer, file.readText())
-            }.getOrDefault(defaultValue)
-        }
+        val loaded = readStoredValue() ?: defaultValue
         cachedValue = loaded
         return loaded
     }
 
     @Synchronized
     public fun save(value: T) {
-        if (cachedValue == null && !uncommittedReplacement && file.isFile) {
-            cachedValue = runCatching { json.decodeFromString(serializer, file.readText()) }.getOrNull()
-        }
+        if (cachedValue == null && !uncommittedReplacement) cachedValue = readStoredValue()
+        if (writesBlocked) throw StorageWriteBlockedException()
+        val encoded = json.encodeToString(serializer, value).toByteArray(Charsets.UTF_8)
         val target = file.absoluteFile
         val parent = target.parentFile ?: throw IOException("Persisted data has no parent directory")
         pendingDirectorySync?.let {
@@ -60,7 +66,7 @@ public open class JsonFileStore<T> internal constructor(
         try {
             FileOutputStream(tmp).use { output ->
                 temporaryOwned = true
-                output.write(json.encodeToString(serializer, value).toByteArray(Charsets.UTF_8))
+                output.write(encoded)
                 output.fd.sync()
             }
             if (!tmp.renameTo(target)) throw IOException("Unable to atomically replace persisted data")
@@ -68,13 +74,102 @@ public open class JsonFileStore<T> internal constructor(
             syncDirectory(parent)
             cachedValue = value
             uncommittedReplacement = false
-        } catch (failure: Throwable) {
-            if (renamed) {
-                uncommittedReplacement = true
-            } else if (temporaryOwned && !tmp.delete() && tmp.exists()) {
-                failure.addSuppressed(IOException("Unable to remove persisted data temporary file"))
-            }
+        } catch (failure: IOException) {
+            failedSave(failure, renamed, temporaryOwned, tmp)
             throw failure
+        } catch (failure: SecurityException) {
+            failedSave(failure, renamed, temporaryOwned, tmp)
+            throw failure
+        }
+    }
+
+    private fun readStoredValue(): T? {
+        StorageRecovery.configure(file)
+        try {
+            if (!evidenceChecked) {
+                evidenceChecked = true
+                if (StorageRecovery.announceRetained(file, syncDirectory = syncDirectory)) {
+                    writesBlocked = true
+                    StorageRecovery.report(
+                        StorageRecoveryNotice(
+                            "Earlier ${file.name} recovery was interrupted. Remaining originals and any evidence " +
+                                "copies were left untouched. This store uses temporary empty state, not restored data.",
+                            StorageRecovery.retainedEvidence(file).lastOrNull()?.absolutePath,
+                            temporary = true,
+                        ),
+                    )
+                    return null
+                }
+            }
+            if (!file.exists()) return null
+            val text = Charsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(file.readBytes()))
+                .toString()
+            return json.decodeFromString(serializer, text)
+        } catch (failure: SerializationException) {
+            recoverCorruptFile()
+        } catch (failure: NetworkConfigValidationException) {
+            recoverCorruptFile()
+        } catch (failure: CharacterCodingException) {
+            recoverCorruptFile()
+        } catch (failure: IOException) {
+            unavailableFile()
+        } catch (failure: SecurityException) {
+            unavailableFile()
+        }
+        return null
+    }
+
+    private fun recoverCorruptFile() {
+        try {
+            val evidence = preserveStorageEvidence(file, listOf(file), syncDirectory = syncDirectory)
+            StorageRecovery.report(
+                StorageRecoveryNotice(
+                    "${file.name} could not be decoded. Exact original bytes were retained, not restored. " +
+                        "This store starts with empty state; new changes can be saved persistently.",
+                    evidence.absolutePath,
+                    temporary = false,
+                ),
+            )
+        } catch (failure: EvidencePreservationException) {
+            writesBlocked = true
+            StorageRecovery.report(
+                StorageRecoveryNotice(
+                    "${file.name} could not be decoded and preservation could not finish. Remaining originals " +
+                        "and any evidence copies were not overwritten. This store uses temporary empty state; " +
+                        "changes cannot be saved.",
+                    failure.directory?.absolutePath ?: file.absolutePath,
+                    temporary = true,
+                ),
+            )
+        }
+    }
+
+    private fun unavailableFile() {
+        writesBlocked = true
+        StorageRecovery.report(
+            StorageRecoveryNotice(
+                "${file.name} is unavailable. Existing files were left in place, not quarantined or restored. " +
+                    "This store uses temporary empty state; changes cannot be saved.",
+                quarantinePath = null,
+                temporary = true,
+            ),
+        )
+    }
+
+    private fun failedSave(failure: Exception, renamed: Boolean, temporaryOwned: Boolean, tmp: File) {
+        if (renamed) {
+            uncommittedReplacement = true
+        } else if (temporaryOwned) {
+            try {
+                if (!tmp.delete() && tmp.exists()) {
+                    failure.addSuppressed(IOException("Unable to remove persisted data temporary file"))
+                }
+            } catch (cleanup: SecurityException) {
+                failure.addSuppressed(cleanup)
+            }
         }
     }
 

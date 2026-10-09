@@ -57,6 +57,8 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.brentdevs.yardhal.coordinator.ConnectionStatus
 import dev.brentdevs.yardhal.coordinator.ConversationBuffer
@@ -65,6 +67,7 @@ import dev.brentdevs.yardhal.coordinator.NetworkProfiles
 import dev.brentdevs.yardhal.core.data.ChatAppearancePreferences
 import dev.brentdevs.yardhal.core.data.ChatAppearanceStore
 import dev.brentdevs.yardhal.core.data.ConversationRef
+import dev.brentdevs.yardhal.core.data.StorageRecovery
 import dev.brentdevs.yardhal.ui.screens.NetworkEditorSheet
 import dev.brentdevs.yardhal.ui.screens.ConversationScreen
 import dev.brentdevs.yardhal.ui.screens.MessageSearchScreen
@@ -92,7 +95,16 @@ public fun YardhalAppRoot(
 ) {
     val networks by coordinator.networks.collectAsStateWithLifecycle()
     val buffers by coordinator.buffers.collectAsStateWithLifecycle()
-    val whoisInfo by coordinator.whois.collectAsStateWithLifecycle()
+    val whoisPresentation by coordinator.whoisPresentation.collectAsStateWithLifecycle()
+    val restoredSelection by coordinator.restoredSelection.collectAsStateWithLifecycle()
+    val restorationReady by coordinator.restorationReady.collectAsStateWithLifecycle()
+    val recoveryNotices by StorageRecovery.notices.collectAsStateWithLifecycle()
+    var recoveryDetailsVisible by rememberSaveable { mutableStateOf(false) }
+    var recoveryAcknowledging by remember { mutableStateOf(false) }
+    val recoveryBanner = storageRecoveryBanner(recoveryNotices)
+    LaunchedEffect(recoveryNotices) {
+        if (recoveryNotices.isEmpty()) recoveryDetailsVisible = false
+    }
     val channelList by coordinator.channelList.collectAsStateWithLifecycle()
     val rawLogVersion by coordinator.rawLogVersion.collectAsStateWithLifecycle()
     val bouncerVersion by coordinator.bouncerVersion.collectAsStateWithLifecycle()
@@ -108,10 +120,12 @@ public fun YardhalAppRoot(
     }
 
     var networkEditorVisible by rememberSaveable { mutableStateOf(false) }
+    var selectionSettled by rememberSaveable { mutableStateOf(false) }
     var editingNetworkId by rememberSaveable { mutableStateOf<String?>(null) }
     var pendingPresetId by rememberSaveable { mutableStateOf<String?>(null) }
     fun openNetworkEditor(networkId: String? = null, preset: NetworkPresetUi? = null) {
         editingNetworkId = networkId
+        selectionSettled = true
         pendingPresetId = preset?.id
         networkEditorVisible = true
     }
@@ -125,8 +139,17 @@ public fun YardhalAppRoot(
         mutableStateOf(emptySet<String>())
     }
     fun selectConversation(key: String?) {
+        selectionSettled = true
         coordinator.trackSelection(key)
         selectedKey = key
+    }
+    LaunchedEffect(restorationReady, restoredSelection, buffers.keys) {
+        if (restorationReady && !selectionSettled) {
+            val restored = restoredLaunchSelection(selectedKey, selectionSettled, true, restoredSelection, buffers.keys)
+            selectionSettled = true
+            selectedKey = restored
+            if (restored != null) coordinator.trackSelection(restored)
+        }
     }
     val conversationStateHolder = rememberSaveableStateHolder()
     var joinDialogVisible by remember { mutableStateOf(false) }
@@ -164,7 +187,7 @@ public fun YardhalAppRoot(
         val first = buffers.values
             .filter { it.ref.kind != dev.brentdevs.yardhal.core.data.ConversationKind.SERVER }
             .minByOrNull { it.displayName.lowercase() }
-        selectConversation(first?.key)
+        if (first != null) selectConversation(first.key)
     }
     val renamedSelection = coordinator.followRenamedSelection(selectedKey, buffers.keys)
     if (renamedSelection != null) {
@@ -205,6 +228,7 @@ public fun YardhalAppRoot(
             orderState = orderState,
             collapsedNetworkIds = collapsedNetworkIds,
             onToggleNetwork = { networkId ->
+                selectionSettled = true
                 collapsedNetworkIds = if (networkId in collapsedNetworkIds) {
                     collapsedNetworkIds - networkId
                 } else {
@@ -235,12 +259,16 @@ public fun YardhalAppRoot(
             onTrustCertificate = coordinator::trustCertificate,
             onRemoveCertificateTrust = coordinator::removeCertificateTrust,
             onJoinChannel = { networkId ->
+                selectionSettled = true
                 joinNetworkId = networkId
                 joinSendFailed = false
                 joinDialogVisible = true
             },
             onRemoveNetwork = coordinator::removeNetwork,
-            onBrowseChannels = coordinator::startChannelList,
+            onBrowseChannels = {
+                selectionSettled = true
+                coordinator.startChannelList(it)
+            },
             channelList = channelList,
             onJoinFromList = { networkId, channel ->
                 coordinator.sendText(networkId, ConversationRef.server(networkId).storageKey, "/join $channel")
@@ -248,8 +276,8 @@ public fun YardhalAppRoot(
             rawLogVersion = rawLogVersion,
             rawLogProvider = coordinator::rawLog,
             showBouncerButton = coordinator.hasBouncerSession(),
-            onOpenBouncer = { bouncerVisible = true },
-            onOpenAppearance = { appearanceVisible = true },
+            onOpenBouncer = { selectionSettled = true; bouncerVisible = true },
+            onOpenAppearance = { selectionSettled = true; appearanceVisible = true },
             onMarkRead = coordinator::markRead,
             onToggleMute = coordinator::toggleMute,
             onLeave = { key -> coordinator.leaveConversation(key.substringBefore("|"), key) },
@@ -310,6 +338,7 @@ public fun YardhalAppRoot(
                     appearance = appearance,
                     onOpenAppearance = { appearanceVisible = true },
                     onOpenSearch = {
+                        selectionSettled = true
                         searchVisible = true
                         returnToSearch = false
                     },
@@ -466,7 +495,12 @@ public fun YardhalAppRoot(
                     val networkId = key.substringBefore("|")
                     val network = networks.firstOrNull { it.id == networkId }
                     if (buffer == null || network == null) {
-                        selectConversation(null)
+                        if (restorationReady) {
+                            LaunchedEffect(key) { selectConversation(null) }
+                        }
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text(if (restorationReady) "Conversation unavailable" else "Restoring stored conversation…")
+                        }
                     } else {
                         BackHandler(enabled = drawerState.currentValue == DrawerValue.Closed) {
                             if (returnToSearch) {
@@ -513,8 +547,61 @@ public fun YardhalAppRoot(
         containerColor = MaterialTheme.colorScheme.surface,
         snackbarHost = { SnackbarHost(operationSnackbarState) },
     ) { contentPadding ->
-        Box(Modifier.fillMaxSize().padding(contentPadding).consumeWindowInsets(contentPadding)) {
-            mainContent()
+        Column(Modifier.fillMaxSize().padding(contentPadding).consumeWindowInsets(contentPadding)) {
+            if (recoveryBanner != null) {
+                Surface(color = MaterialTheme.colorScheme.errorContainer) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            when (recoveryBanner) {
+                                StorageRecoveryBanner.TEMPORARY_SESSION -> "Storage warning · temporary session"
+                                StorageRecoveryBanner.WARNING -> "Storage recovery warning · evidence is not restored messages"
+                            },
+                            style = MaterialTheme.typography.labelMedium,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(onClick = { recoveryDetailsVisible = true }) { Text("Details") }
+                    }
+                }
+            }
+            Box(Modifier.weight(1f)) { mainContent() }
+        }
+    }
+
+    if (recoveryDetailsVisible && recoveryNotices.isNotEmpty()) {
+        ModalBottomSheet(onDismissRequest = { recoveryDetailsVisible = false }) {
+            Column(
+                modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(24.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                Text("Storage recovery", style = MaterialTheme.typography.titleLarge)
+                recoveryNotices.forEach { notice ->
+                    Text(storageRecoveryExplanation(notice), style = MaterialTheme.typography.bodyMedium)
+                    if (StorageRecovery.canAcknowledge(notice)) {
+                        TextButton(
+                            enabled = !recoveryAcknowledging,
+                            onClick = {
+                                recoveryAcknowledging = true
+                                drawerScope.launch {
+                                    val acknowledged = try {
+                                        withContext(Dispatchers.IO) { StorageRecovery.acknowledge(notice) }
+                                    } finally {
+                                        recoveryAcknowledging = false
+                                    }
+                                    if (!acknowledged) {
+                                        operationSnackbarState.showSnackbar(
+                                            "Could not save acknowledgement. The storage warning remains active.",
+                                            withDismissAction = true,
+                                        )
+                                    }
+                                }
+                            },
+                        ) { Text("Acknowledge · keep evidence") }
+                    }
+                }
+            }
         }
     }
 
@@ -766,13 +853,38 @@ public fun YardhalAppRoot(
         }
     }
 
-    whoisInfo?.let { info ->
+    whoisPresentation?.let { presentation ->
+        val info = presentation.info
         ModalBottomSheet(onDismissRequest = coordinator::dismissWhois) {
                 Column(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 8.dp),
+                    modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 8.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     Text("Whois · ${info.nick}", style = MaterialTheme.typography.titleLarge)
+                    Text(
+                        metadataFreshnessLabel(presentation.cached, !presentation.offline, presentation.fetchedAtMs),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    if (presentation.cached) {
+                        Text("Previously observed user information, not current server permissions or presence.", style = MaterialTheme.typography.bodySmall)
+                    }
+                    if (presentation.refreshing) {
+                        Text("Refreshing… showing previously observed information", style = MaterialTheme.typography.bodySmall)
+                    }
+                    if (!presentation.offline) {
+                        TextButton(
+                            enabled = !presentation.refreshing,
+                            onClick = {
+                                coordinator.memberAction(
+                                    presentation.networkId,
+                                    ConversationRef.server(presentation.networkId).storageKey,
+                                    dev.brentdevs.yardhal.ui.screens.MemberAction.WHOIS,
+                                    info.nick,
+                                )
+                            },
+                        ) { Text("Refresh WHOIS") }
+                    }
                     info.realName?.let { Text(it) }
                     if (info.user != null || info.host != null) {
                         Text("${info.user ?: "?"}@${info.host ?: "?"}", style = MaterialTheme.typography.bodySmall)

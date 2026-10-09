@@ -8,16 +8,28 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import dev.brentdevs.yardhal.coordinator.LiveCoordinator
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.launch
 import dev.brentdevs.yardhal.core.data.NetworkPresets
 import dev.brentdevs.yardhal.core.data.ThemeDefinition
 import dev.brentdevs.yardhal.core.data.ThemeFileParser
@@ -28,16 +40,29 @@ import dev.brentdevs.yardhal.ui.theme.YardhalTheme
 
 class MainActivity : ComponentActivity() {
 
-    private lateinit var coordinator: LiveCoordinator
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         val app = application as YardhalApplication
-        coordinator = app.coordinator
-        val networkSaver = NetworkSaver(coordinator, app.vault)
 
         setContent {
+            val startup by app.startup.collectAsState()
+            if (startup != ApplicationStartup.READY) {
+                YardhalTheme {
+                    Surface(modifier = Modifier.fillMaxSize()) {
+                        Column(
+                            verticalArrangement = Arrangement.Center,
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                        ) {
+                            if (startup == ApplicationStartup.LOADING) CircularProgressIndicator()
+                            Text(if (startup == ApplicationStartup.LOADING) "Loading local conversations…" else "Unable to initialize local storage.")
+                        }
+                    }
+                }
+                return@setContent
+            }
+            val coordinator = app.coordinator
+            val networkSaver = remember(coordinator) { NetworkSaver(coordinator, app.vault) }
             var appearance by remember { mutableStateOf(app.chatAppearanceStore.snapshot()) }
             val isDark = isSystemInDarkTheme()
             val dynamicSupported = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
@@ -70,12 +95,14 @@ class MainActivity : ComponentActivity() {
 
         consumeShareIntent(intent)
         requestNotificationPermission()
+        lifecycleScope.launch {
+            lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                if (app.awaitInitialization()) app.coordinator.onForegroundResume()
+                awaitCancellation()
+            }
+        }
     }
 
-    override fun onResume() {
-        super.onResume()
-        coordinator.onForegroundResume()
-    }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)

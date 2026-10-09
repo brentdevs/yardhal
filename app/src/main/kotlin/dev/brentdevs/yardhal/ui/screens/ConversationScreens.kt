@@ -96,6 +96,7 @@ import dev.brentdevs.yardhal.coordinator.NetworkProfiles
 import dev.brentdevs.yardhal.core.data.ChatAppearancePreferences
 import dev.brentdevs.yardhal.core.data.ConversationKind
 import dev.brentdevs.yardhal.ui.components.DayPill
+import dev.brentdevs.yardhal.ui.metadataFreshnessLabel
 import dev.brentdevs.yardhal.ui.components.MessageRow
 import dev.brentdevs.yardhal.ui.components.NetworkBadge
 import dev.brentdevs.yardhal.ui.components.NewMessagesDivider
@@ -356,6 +357,30 @@ private fun HistoryStateRow(
 private val QUICK_REACTIONS = listOf("👍", "❤️", "😂", "🎉", "👀", "🙏")
 private val HTTP_LINK = Regex("https?://\\S+")
 
+internal fun replyPreviewText(message: ChatMessage, buffer: ConversationBuffer): String? {
+    val preview = message.replyPreview
+    if (preview != null) {
+        if (preview.redacted) return "Deleted message"
+        val text = preview.text.take(60).ifBlank { if (preview.attachmentUrl != null) "Attachment" else "Message" }
+        return "${preview.sender}: $text"
+    }
+    return message.replyToMsgid?.let { target ->
+        buffer.messages.firstOrNull { it.msgid == target }?.let { "${it.sender}: ${it.text.take(60)}" }
+    }
+}
+
+internal fun conversationUnreadCount(buffer: ConversationBuffer): Int = buffer.unreadCount
+
+internal fun conversationMentionCount(buffer: ConversationBuffer): Int = buffer.mentionCount
+
+internal fun mentionBadgeLabel(count: Int, known: Boolean): String? = when {
+    !known && count == 0 -> "@?"
+    !known -> "@≥${count.coerceAtMost(99)}"
+    count > 99 -> "@99+"
+    count > 0 -> "@$count"
+    else -> null
+}
+
 @OptIn(ExperimentalMaterial3Api::class, androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
 public fun ConversationScreen(
@@ -402,6 +427,9 @@ public fun ConversationScreen(
     var membersVisible by remember { mutableStateOf(false) }
     var memberTarget by remember { mutableStateOf<String?>(null) }
     var memberQuery by rememberSaveable { mutableStateOf("") }
+    var metadataVisible by remember { mutableStateOf(false) }
+    val staleRoster = buffer.cachedRoster || !connected
+    val liveMemberActions = !staleRoster && buffer.joinState == JoinState.JOINED
     var overflowVisible by remember { mutableStateOf(false) }
     val context = LocalContext.current
     fun openLink(url: String) {
@@ -454,8 +482,8 @@ public fun ConversationScreen(
         }
     }
 
-    androidx.compose.runtime.LaunchedEffect(buffer.key, buffer.joinState) {
-        if (buffer.ref.kind == ConversationKind.CHANNEL && buffer.joinState == JoinState.JOINED) {
+    androidx.compose.runtime.LaunchedEffect(buffer.key, buffer.joinState, connected) {
+        if (buffer.ref.kind == ConversationKind.CHANNEL) {
             onLoadMembers()
         }
     }
@@ -494,7 +522,9 @@ public fun ConversationScreen(
                         Text(buffer.displayName, style = MaterialTheme.typography.titleMedium)
                         val topic = buffer.topic
                         Text(
-                            text = if (topic.isNullOrBlank()) networkName else "$networkName · $topic",
+                            text = if (topic.isNullOrBlank()) networkName else {
+                                "${metadataFreshnessLabel(buffer.cachedTopic, connected, buffer.cachedStateAtMs)} · $networkName · $topic"
+                            },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1,
@@ -509,9 +539,9 @@ public fun ConversationScreen(
                     }
                 },
                 actions = {
-                    if (buffer.members.isNotEmpty()) {
-                        IconButton(onClick = { membersVisible = true }) {
-                            Icon(Icons.Filled.People, contentDescription = "Members · ${buffer.members.size}")
+                    if (buffer.ref.kind == ConversationKind.CHANNEL) {
+                        IconButton(onClick = { membersVisible = true; onLoadMembers() }) {
+                            Icon(Icons.Filled.People, contentDescription = "Members · ${buffer.members.size} · ${metadataFreshnessLabel(buffer.cachedRoster, connected, buffer.cachedStateAtMs)}")
                         }
                     }
                     IconButton(onClick = onOpenSearch) {
@@ -522,6 +552,13 @@ public fun ConversationScreen(
                             Icon(Icons.Filled.MoreVert, contentDescription = "Conversation options")
                         }
                         DropdownMenu(expanded = overflowVisible, onDismissRequest = { overflowVisible = false }) {
+                            if (buffer.ref.kind == ConversationKind.CHANNEL) {
+                                DropdownMenuItem(text = { Text("Channel information") }, onClick = {
+                                    overflowVisible = false
+                                    metadataVisible = true
+                                    onLoadMembers()
+                                })
+                            }
                             DropdownMenuItem(text = { Text("Join channel") }, onClick = {
                                 overflowVisible = false
                                 onOpenJoin()
@@ -600,6 +637,14 @@ public fun ConversationScreen(
                         onEdit = onEditNetwork,
                         onTrustCertificate = onTrustCertificate,
                         onRemoveCertificateTrust = onRemoveCertificateTrust,
+                    )
+                }
+                if (!buffer.mentionCountKnown) {
+                    Text(
+                        "Mention count is incomplete for older stored messages. Shown mentions are a known lower bound.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
                     )
                 }
                 val statusText = when {
@@ -709,9 +754,7 @@ public fun ConversationScreen(
                                     appearance = appearance,
                                     reactions = buffer.reactions[message.msgid].orEmpty()
                                         .filterValues { it.isNotEmpty() },
-                                    quotedText = message.replyToMsgid?.let { target ->
-                                        buffer.messages.firstOrNull { it.msgid == target }?.let { "${it.sender}: ${it.text.take(60)}" }
-                                    },
+                                    quotedText = replyPreviewText(message, buffer),
                                     onLongPress = {
                                         actionTarget = message
                                     },
@@ -741,6 +784,36 @@ public fun ConversationScreen(
             }
     }
 
+    if (metadataVisible) {
+        ModalBottomSheet(onDismissRequest = { metadataVisible = false }) {
+            Column(
+                modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(24.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text(buffer.displayName, style = MaterialTheme.typography.titleLarge)
+                Text("Topic · ${metadataFreshnessLabel(buffer.cachedTopic, connected, buffer.cachedStateAtMs)}", style = MaterialTheme.typography.labelMedium)
+                Text(buffer.topic ?: "No observed topic")
+                Text("Modes · ${metadataFreshnessLabel(buffer.cachedModes, connected, buffer.cachedStateAtMs)}", style = MaterialTheme.typography.labelMedium)
+                Text(
+                    buffer.channelModes.entries.sortedBy { it.key }.joinToString(" ") { (mode, parameters) ->
+                        if (mode == "k") "+k (key set)" else "+$mode ${parameters.joinToString(" ")}".trim()
+                    }.ifBlank { "No observed modes" },
+                )
+                Text("Roster · ${metadataFreshnessLabel(buffer.cachedRoster, connected, buffer.cachedStateAtMs)}", style = MaterialTheme.typography.labelMedium)
+                Text("${buffer.members.size} ${if (staleRoster) "previously observed members" else "members"}")
+                if (buffer.rosterTruncated) {
+                    Text("Only a retained subset of the cached roster is shown. Reconnect and refresh for the full roster.", style = MaterialTheme.typography.bodySmall)
+                }
+                if (buffer.cachedTopic || buffer.cachedModes || staleRoster) {
+                    Text("Cached information is historical. Roles, membership and modes do not establish current server permissions.", style = MaterialTheme.typography.bodySmall)
+                }
+                if (connected) {
+                    TextButton(onClick = onLoadMembers) { Text("Refresh channel information") }
+                }
+            }
+        }
+    }
+
     if (actionTarget != null) {
         val target = actionTarget ?: return
         ModalBottomSheet(onDismissRequest = { actionTarget = null }) {
@@ -768,6 +841,18 @@ public fun ConversationScreen(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 2,
                         )
+                    }
+                }
+                if (target.sender.isNotBlank()) {
+                    OutlinedButton(
+                        onClick = {
+                            onMemberAction(MemberAction.WHOIS, target.sender)
+                            actionTarget = null
+                        },
+                    ) {
+                        Icon(Icons.Filled.Info, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(if (connected) "WHOIS" else "Stored WHOIS")
                     }
                 }
                 if (target.msgid != null) {
@@ -931,6 +1016,20 @@ public fun ConversationScreen(
                         )
                     }
                 }
+                Text(
+                    metadataFreshnessLabel(buffer.cachedRoster, connected, buffer.cachedStateAtMs),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (staleRoster) {
+                    Text("Previously observed members and roles; not current presence or permissions.", style = MaterialTheme.typography.bodySmall)
+                }
+                if (buffer.rosterTruncated) {
+                    Text("Cached roster truncated · showing ${buffer.members.size} retained members, not the full roster.", style = MaterialTheme.typography.bodySmall)
+                }
+                if (connected) {
+                    TextButton(onClick = onLoadMembers) { Text("Refresh members") }
+                }
                 OutlinedTextField(
                     value = memberQuery,
                     onValueChange = { memberQuery = it },
@@ -943,8 +1042,8 @@ public fun ConversationScreen(
             }
             LazyColumn(modifier = Modifier.padding(horizontal = 8.dp)) {
                 val sections = listOf(
-                    Triple("ops", "Operators (${filteredOps.size})", filteredOps),
-                    Triple("voices", "Voices (${filteredVoices.size})", filteredVoices),
+                    Triple("ops", "${if (staleRoster) "Previously observed operators" else "Operators"} (${filteredOps.size})", filteredOps),
+                    Triple("voices", "${if (staleRoster) "Previously observed voices" else "Voices"} (${filteredVoices.size})", filteredVoices),
                     Triple("bots", "Bots & Relays (${filteredBots.size})", filteredBots),
                     Triple("users", "Users (${filteredPlain.size})", filteredPlain),
                 )
@@ -972,8 +1071,8 @@ public fun ConversationScreen(
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Text(
-                                text = if (presence?.away == true) "○" else "●",
-                                color = if (presence?.away == true) {
+                                text = if (staleRoster) "?" else if (presence?.away == true) "○" else "●",
+                                color = if (staleRoster || presence?.away == true) {
                                     MaterialTheme.colorScheme.onSurfaceVariant
                                 } else {
                                     MaterialTheme.colorScheme.primary
@@ -1014,7 +1113,7 @@ public fun ConversationScreen(
                                     modifier = Modifier.padding(start = 8.dp),
                                 ) {
                                     Text(
-                                        text = "✓ $account",
+                                        text = if (staleRoster) "Previously: $account" else "✓ $account",
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                         modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp),
@@ -1061,7 +1160,7 @@ public fun ConversationScreen(
                             avatarUrl = memberProfile?.avatarUrl,
                         )
                         StatusDot(
-                            status = if (away) ConnectionStatus.CONNECTING else ConnectionStatus.REGISTERED,
+                            status = if (staleRoster) ConnectionStatus.DISCONNECTED else if (away) ConnectionStatus.CONNECTING else ConnectionStatus.REGISTERED,
                             modifier = Modifier.align(Alignment.BottomEnd),
                             size = 14.dp,
                         )
@@ -1087,7 +1186,7 @@ public fun ConversationScreen(
                                     color = MaterialTheme.colorScheme.primaryContainer,
                                 ) {
                                     Text(
-                                        text = "✓ $account",
+                                        text = if (staleRoster) "Previously: $account" else "✓ $account",
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.onPrimaryContainer,
                                         modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
@@ -1121,17 +1220,26 @@ public fun ConversationScreen(
                         }
                     }
                 }
+                Text(
+                    metadataFreshnessLabel(buffer.cachedRoster, connected, buffer.cachedStateAtMs),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (staleRoster) {
+                    Text("Cached roles and presence are not current server permissions.", style = MaterialTheme.typography.bodySmall)
+                    if (connected) TextButton(onClick = onLoadMembers) { Text("Refresh members") }
+                }
 
                 if (isOp || isVoice || isBot || away) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         if (isOp) {
                             Surface(shape = RoundedCornerShape(8.dp), color = MaterialTheme.colorScheme.tertiaryContainer) {
-                                Text("Operator", modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp), style = MaterialTheme.typography.labelSmall)
+                                Text(if (staleRoster) "Previously operator" else "Operator", modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp), style = MaterialTheme.typography.labelSmall)
                             }
                         }
                         if (isVoice) {
                             Surface(shape = RoundedCornerShape(8.dp), color = MaterialTheme.colorScheme.secondaryContainer) {
-                                Text("Voice", modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp), style = MaterialTheme.typography.labelSmall)
+                                Text(if (staleRoster) "Previously voice" else "Voice", modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp), style = MaterialTheme.typography.labelSmall)
                             }
                         }
                         if (isBot) {
@@ -1141,7 +1249,7 @@ public fun ConversationScreen(
                         }
                         if (away) {
                             Surface(shape = RoundedCornerShape(8.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
-                                Text(awayMsg?.let { "Away: $it" } ?: "Away", modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp), style = MaterialTheme.typography.labelSmall)
+                                Text(if (staleRoster) "Previously away" else awayMsg?.let { "Away: $it" } ?: "Away", modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp), style = MaterialTheme.typography.labelSmall)
                             }
                         }
                     }
@@ -1172,19 +1280,23 @@ public fun ConversationScreen(
                 }
 
                 if (buffer.ref.kind == dev.brentdevs.yardhal.core.data.ConversationKind.CHANNEL) {
-                    Text("Channel moderation", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(
+                        if (liveMemberActions) "Channel moderation · server authorizes actions" else "Refresh live membership before moderation",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                     FlowRow(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        TextButton(onClick = { onMemberAction(MemberAction.KICK, nick); memberTarget = null }) {
+                        TextButton(enabled = liveMemberActions, onClick = { onMemberAction(MemberAction.KICK, nick); memberTarget = null }) {
                             Text("Kick", color = MaterialTheme.colorScheme.error)
                         }
-                        TextButton(onClick = { onMemberAction(MemberAction.BAN, nick); memberTarget = null }) {
+                        TextButton(enabled = liveMemberActions, onClick = { onMemberAction(MemberAction.BAN, nick); memberTarget = null }) {
                             Text("Ban", color = MaterialTheme.colorScheme.error)
                         }
                         if (accountBanAvailable && account != null) {
-                            TextButton(onClick = { onMemberAction(MemberAction.BAN_ACCOUNT, nick); memberTarget = null }) {
+                            TextButton(enabled = liveMemberActions, onClick = { onMemberAction(MemberAction.BAN_ACCOUNT, nick); memberTarget = null }) {
                                 Text("Ban account", color = MaterialTheme.colorScheme.error)
                             }
                         }
@@ -1299,12 +1411,14 @@ private fun CollapsedEventsRow(
     }
 }
 
-private sealed interface OverviewEntry {
+internal sealed interface OverviewEntry {
     public data class NetworkHeader(
         public val network: dev.brentdevs.yardhal.coordinator.UiNetwork,
         public val isCollapsed: Boolean,
         public val hasUnread: Boolean,
         public val unreadCount: Int,
+        public val mentionCount: Int,
+        public val mentionCountKnown: Boolean,
     ) : OverviewEntry
 
     public data class ServerRow(
@@ -1322,19 +1436,8 @@ private sealed interface OverviewEntry {
     ) : OverviewEntry
 }
 
-private fun countUnreadMessages(buffer: ConversationBuffer): Int {
-    if (!buffer.hasUnread) return 0
-    val cutoff = buffer.unreadFromTimestampMs ?: buffer.readAtMs
-    var count = 0
-    for (i in buffer.messages.indices.reversed()) {
-        val msg = buffer.messages[i]
-        if (msg.timestampMs < cutoff) continue
-        if (msg.countsAsUnread) count++
-    }
-    return count
-}
 
-private fun buildOverviewEntries(
+internal fun buildOverviewEntries(
     networks: List<dev.brentdevs.yardhal.coordinator.UiNetwork>,
     buffers: List<ConversationBuffer>,
     mutedKeys: Set<String>,
@@ -1350,9 +1453,24 @@ private fun buildOverviewEntries(
             it.ref.networkId == network.id && it.ref.kind != dev.brentdevs.yardhal.core.data.ConversationKind.SERVER
         }
         val isCollapsed = network.id in collapsedNetworkIds
-        val netHasUnread = own.any { it.hasUnread }
-        val netUnreadCount = own.sumOf { countUnreadMessages(it) }
-        entries.add(OverviewEntry.NetworkHeader(network, isCollapsed, netHasUnread, netUnreadCount))
+        var netHasUnread = false
+        var netUnreadCount = 0
+        var netMentionCount = 0
+        var netMentionCountKnown = true
+        for (buffer in own) {
+            if (buffer.key in mutedKeys) continue
+            netHasUnread = netHasUnread || buffer.hasUnread
+            netUnreadCount += conversationUnreadCount(buffer)
+            netMentionCount += conversationMentionCount(buffer)
+            netMentionCountKnown = netMentionCountKnown && buffer.mentionCountKnown
+        }
+        entries.add(
+            OverviewEntry.NetworkHeader(
+                network, isCollapsed, netHasUnread, netUnreadCount,
+                netMentionCount,
+                netMentionCountKnown,
+            ),
+        )
 
         entries.add(OverviewEntry.ServerRow(network.id, network.name))
 
@@ -1625,12 +1743,19 @@ public fun NetworkOverviewScreen(
                                 )
                             }
                             if (entry.isCollapsed && entry.hasUnread) {
-                                val netBadgeText = if (entry.unreadCount > 99) "99+" else if (entry.unreadCount > 0) "${entry.unreadCount}" else "•"
+                                val unreadLabel = if (entry.unreadCount > 99) "99+" else if (entry.unreadCount > 0) "${entry.unreadCount}" else "•"
+                                val mentionLabel = mentionBadgeLabel(entry.mentionCount, entry.mentionCountKnown)
+                                val netBadgeText = if (mentionLabel == null) unreadLabel else "$unreadLabel · $mentionLabel"
                                 Badge(
-                                    containerColor = MaterialTheme.colorScheme.primary,
-                                    contentColor = MaterialTheme.colorScheme.onPrimary,
+                                    containerColor = if (entry.mentionCount > 0) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                                    contentColor = if (entry.mentionCount > 0) MaterialTheme.colorScheme.onError else MaterialTheme.colorScheme.onPrimary,
                                 ) {
-                                    Text(netBadgeText)
+                                    Text(
+                                        netBadgeText,
+                                        modifier = if (entry.mentionCountKnown) Modifier else Modifier.semantics {
+                                            stateDescription = "Mention count incomplete; ${entry.mentionCount} known mentions"
+                                        },
+                                    )
                                 }
                                 Spacer(modifier = Modifier.width(4.dp))
                             }
@@ -1734,20 +1859,9 @@ public fun NetworkOverviewScreen(
                         val buffer = entry.buffer
                         val last = buffer.messages.lastOrNull()
                         val isChannel = buffer.ref.kind == dev.brentdevs.yardhal.core.data.ConversationKind.CHANNEL
-                        val unreadCount = countUnreadMessages(buffer)
-                        val hasMention = if (!buffer.hasUnread) false else {
-                            val cutoff = buffer.unreadFromTimestampMs ?: buffer.readAtMs
-                            var found = false
-                            for (i in buffer.messages.indices.reversed()) {
-                                val msg = buffer.messages[i]
-                                if (msg.timestampMs < cutoff) continue
-                                if (msg.highlightsMe) {
-                                    found = true
-                                    break
-                                }
-                            }
-                            found
-                        }
+                        val unreadCount = conversationUnreadCount(buffer)
+                        val mentionCount = conversationMentionCount(buffer)
+                        val hasMention = mentionCount > 0
                         val dismissState = androidx.compose.material3.rememberSwipeToDismissBoxState(
                             confirmValueChange = { value ->
                                 when (value) {
@@ -1845,7 +1959,11 @@ public fun NetworkOverviewScreen(
                                             )
                                         } else if (buffer.joinState == dev.brentdevs.yardhal.coordinator.JoinState.JOINING) {
                                             Text(
-                                                text = "  joining…",
+                                                text = when {
+                                                    networks.any { it.id == buffer.ref.networkId && it.status == ConnectionStatus.REGISTERED } -> "  joining…"
+                                                    buffer.cachedTopic || buffer.cachedModes || buffer.cachedRoster || buffer.cachedStateAtMs != null -> "  cached"
+                                                    else -> "  not joined"
+                                                },
                                                 style = MaterialTheme.typography.labelSmall,
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                             )
@@ -1869,20 +1987,32 @@ public fun NetworkOverviewScreen(
                                 }
                                 if (buffer.hasUnread) {
                                     Spacer(modifier = Modifier.width(8.dp))
-                                    val badgeText = if (unreadCount > 99) "99+" else if (unreadCount > 0) "$unreadCount" else if (hasMention) "!" else "•"
+                                    val unreadLabel = if (unreadCount > 99) "99+" else if (unreadCount > 0) "$unreadCount" else "•"
+                                    val mentionLabel = mentionBadgeLabel(mentionCount, buffer.mentionCountKnown)
+                                    val badgeText = if (mentionLabel == null) unreadLabel else "$unreadLabel · $mentionLabel"
                                     if (hasMention) {
                                         Badge(
                                             containerColor = MaterialTheme.colorScheme.error,
                                             contentColor = MaterialTheme.colorScheme.onError,
                                         ) {
-                                            Text(badgeText)
+                                            Text(
+                                                badgeText,
+                                                modifier = if (buffer.mentionCountKnown) Modifier else Modifier.semantics {
+                                                    stateDescription = "Mention count incomplete; $mentionCount known mentions"
+                                                },
+                                            )
                                         }
                                     } else {
                                         Badge(
                                             containerColor = MaterialTheme.colorScheme.surfaceVariant,
                                             contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
                                         ) {
-                                            Text(badgeText)
+                                            Text(
+                                                badgeText,
+                                                modifier = if (buffer.mentionCountKnown) Modifier else Modifier.semantics {
+                                                    stateDescription = "Mention count incomplete; $mentionCount known mentions"
+                                                },
+                                            )
                                         }
                                     }
                                 }

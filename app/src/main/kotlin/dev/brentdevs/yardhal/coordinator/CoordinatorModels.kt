@@ -53,11 +53,37 @@ public data class ChatMessage(
     public val senderAccount: String? = null,
     public val channelContext: String? = null,
     public val historyContext: Boolean = false,
+    public val localReplyParentRowId: Long? = null,
+    public val replyPreview: ReplyPreview? = null,
+    public val attachmentName: String? = null,
+    public val attachmentMimeType: String? = null,
+    public val attachmentSizeBytes: Long? = null,
+    public val attachmentWidth: Int? = null,
+    public val attachmentHeight: Int? = null,
+    public val redacted: Boolean = false,
+    public val highlightsKnown: Boolean = true,
+    public val reactionsTruncated: Boolean = false,
 ) {
     public val countsAsUnread: Boolean
-        get() = !sentByUs && !playback && !historyContext &&
+        get() = !sentByUs && !playback && !historyContext && !redacted &&
             (kind == MessageKind.PRIVMSG || kind == MessageKind.NOTICE || kind == MessageKind.ACTION)
 }
+
+public data class ReplyPreview(
+    public val sender: String,
+    public val text: String,
+    public val attachmentUrl: String? = null,
+    public val redacted: Boolean = false,
+)
+
+public data class WhoisPresentation(
+    public val networkId: String,
+    public val info: dev.brentdevs.yardhal.core.data.WhoisInfo,
+    public val fetchedAtMs: Long,
+    public val cached: Boolean,
+    public val refreshing: Boolean,
+    public val offline: Boolean,
+)
 
 public data class PresenceState(
     public val away: Boolean? = null,
@@ -91,6 +117,15 @@ public data class ConversationBuffer(
     public val unreadFromTimestampMs: Long? = null,
     public val readAtMs: Long = 0L,
     public val history: ConversationHistory = ConversationHistory(),
+    public val cachedTopic: Boolean = false,
+    public val cachedRoster: Boolean = false,
+    public val rosterTruncated: Boolean = false,
+    public val cachedModes: Boolean = false,
+    public val cachedStateAtMs: Long? = null,
+    public val channelModes: Map<String, List<String>> = emptyMap(),
+    public val unreadCount: Int = 0,
+    public val mentionCount: Int = 0,
+    public val mentionCountKnown: Boolean = true,
 ) {
     public val key: String get() = ref.storageKey
 

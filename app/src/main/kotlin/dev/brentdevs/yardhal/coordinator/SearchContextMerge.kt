@@ -15,43 +15,28 @@ internal fun mergeSearchContext(
             message.storedRowId == row.rowId || (row.msgid != null && message.msgid == row.msgid)
         }
         val anonymous = if (identified >= 0) -1 else merged.uniqueHistoryIndex { message ->
-            message.storedRowId == null && (message.msgid == null || row.msgid == null) &&
+            !message.pendingEcho && message.storedRowId == null && (message.msgid == null || row.msgid == null) &&
                 message.sender == row.senderNick && message.kind == row.kind &&
                 message.text == row.text && message.timestampMs == row.timestampMs
         }
         val index = if (identified >= 0) identified else anonymous
         if (index >= 0) {
             val existing = merged[index]
-            merged[index] = existing.copy(
+            merged[index] = mergeChatMessageMetadata(existing, row.toChatMessage(existing.localId),
+                incomingCanonical = existing.pendingEcho && !row.pendingEcho).copy(
                 storedRowId = row.rowId,
-                msgid = existing.msgid ?: row.msgid,
-                historyContext = existing.historyContext && row.historyContext,
             )
         } else {
             added = true
-            merged.add(
-                ChatMessage(
-                    localId = nextLocalId(),
-                    sender = row.senderNick,
-                    kind = row.kind,
-                    text = row.text,
-                    timestampMs = row.timestampMs,
-                    sentByUs = row.sentByUs,
-                    highlightsMe = false,
-                    msgid = row.msgid,
-                    storedRowId = row.rowId,
-                    channelContext = row.channelContext,
-                    historyContext = row.historyContext,
-                ),
-            )
+            merged.add(row.toChatMessage(nextLocalId()))
         }
     }
-    if (!added) return merged
+    if (!added) return sanitizeRedactedMessages(merged)
     if (prependEqualTimestamp && current.isNotEmpty()) {
         java.util.Collections.rotate(merged, merged.size - current.size)
     }
     merged.sortBy { it.timestampMs }
-    return merged
+    return sanitizeRedactedMessages(merged)
 }
 
 internal inline fun <T> List<T>.uniqueHistoryIndex(matches: (T) -> Boolean): Int {

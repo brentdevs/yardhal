@@ -4,6 +4,8 @@ import dev.brentdevs.yardhal.core.client.TlsClientIdentity
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
+internal class NetworkConfigValidationException(message: String) : IllegalArgumentException(message)
+
 @Serializable
 public data class NetworkConfig(
     public val id: String,
@@ -36,10 +38,10 @@ public data class NetworkConfig(
     @kotlinx.serialization.Transient public val tlsClientIdentity: TlsClientIdentity? = null,
 ) {
     init {
-        require(id.isNotBlank())
-        require(host.isNotBlank())
-        require(nick.isNotBlank())
-        require(port in 1..65535)
+        if (id.isBlank()) throw NetworkConfigValidationException("Network ID must not be blank")
+        if (host.isBlank()) throw NetworkConfigValidationException("Network host must not be blank")
+        if (nick.isBlank()) throw NetworkConfigValidationException("Network nickname must not be blank")
+        if (port !in 1..65535) throw NetworkConfigValidationException("Network port must be between 1 and 65535")
     }
 
     override fun toString(): String =
@@ -57,8 +59,8 @@ public data class SocksProxyConfig(
     public val passwordRef: String? = null,
 ) {
     init {
-        require(host.isNotBlank())
-        require(port in 1..65535)
+        if (host.isBlank()) throw NetworkConfigValidationException("Proxy host must not be blank")
+        if (port !in 1..65535) throw NetworkConfigValidationException("Proxy port must be between 1 and 65535")
     }
 }
 
@@ -69,9 +71,11 @@ public data class CertificatePin(
     public val sha256: String,
 ) {
     init {
-        require(host.isNotBlank())
-        require(port in 1..65535)
-        require(sha256.length == 64 && sha256.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' })
+        if (host.isBlank()) throw NetworkConfigValidationException("Certificate pin host must not be blank")
+        if (port !in 1..65535) throw NetworkConfigValidationException("Certificate pin port must be between 1 and 65535")
+        if (sha256.length != 64 || sha256.any { it !in '0'..'9' && it !in 'a'..'f' && it !in 'A'..'F' }) {
+            throw NetworkConfigValidationException("Certificate pin must be a SHA-256 hexadecimal digest")
+        }
     }
 }
 

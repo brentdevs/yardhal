@@ -312,7 +312,7 @@ class HistoryCoordinatorIntegrationTests {
             }
         }
 
-        override fun mergeStoredHistory(ref: ConversationRef, messages: List<StoredMessage>) {
+        override suspend fun mergeStoredHistory(ref: ConversationRef, messages: List<StoredMessage>) {
             synchronized(selectionLock) {
                 val buffer = buffers[ref.storageKey] ?: return
                 buffers = buffers + (ref.storageKey to buffer.copy(messages =
@@ -730,6 +730,9 @@ class HistoryCoordinatorIntegrationTests {
         discovery.peer.send("PING :finish-discovery")
         await { harness.buffer().history.gaps.size == 1 }
         val carol = ConversationRef.directMessage(harness.config.id, "carol")
+        await {
+            harness.coordinator.buffers.value[carol.storageKey]?.messages?.singleOrNull()?.text == "tester offline DM"
+        }
         assertEquals("tester offline DM", harness.buffer(carol).messages.single().text)
         val gap = harness.buffer().history.gaps.single()
         assertEquals(BASE, gap.from.timestampMs)

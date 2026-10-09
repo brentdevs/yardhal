@@ -237,10 +237,19 @@ class PerNetworkStateTests {
         state.feed(":srv 005 me CHATHISTORY=500 :are supported")
         val effects = state.feed(":me!u@h JOIN #room")
         assertTrue(InboundEffect.EnsureBuffer(channel("#room")) in effects)
+        assertTrue(InboundEffect.SetJoinState(channel("#room"), JoinState.JOINED) in effects)
         assertEquals(listOf("TOPIC #room", "MODE #room"), effects.sent())
         assertEquals(listOf(InboundEffect.RequestHistory(channel("#room"))),
             effects.filterIsInstance<InboundEffect.RequestHistory>())
         assertTrue(effects.appended().isEmpty())
+    }
+
+    @Test
+    fun historicalOwnJoinCannotAcknowledgeCurrentMembership() {
+        val state = state()
+        val context = InboundContext(nowMs = now, historyPlayback = true)
+        val effects = state.feed(":me!u@h JOIN #room", context)
+        assertTrue(effects.filterIsInstance<InboundEffect.SetJoinState>().isEmpty())
     }
 
     @Test
@@ -270,11 +279,21 @@ class PerNetworkStateTests {
     fun kickOfAnotherUserRemovesThemAndKickOfUsFailsTheJoin() {
         val state = state()
         state.joinChannelWith("#room", "me", "alice")
+        state.feed(":srv 324 me #room +nt")
         val other = state.feed(":op!u@h KICK #room alice :rude")
         assertEquals("alice was kicked by op (rude)", other.appended().single().text)
         assertEquals(listOf("me"), other.only<InboundEffect.SetMembers>().members.map { it.nick })
+        assertTrue(other.only<InboundEffect.SetMembers>().complete)
+        assertTrue(checkNotNull(state.channel(channel("#room").storageKey)).modesComplete)
         val own = state.feed(":op!u@h KICK #room me")
         assertTrue(own.only<InboundEffect.SetMembers>().members.isEmpty())
+        assertFalse(own.only<InboundEffect.SetMembers>().complete)
+        assertFalse(own.only<InboundEffect.SetModes>().complete)
+        val kicked = checkNotNull(state.channel(channel("#room").storageKey))
+        assertFalse(kicked.membersComplete)
+        assertFalse(kicked.modesComplete)
+        val lateNames = state.feed(":srv 366 me #room :End of NAMES")
+        assertTrue(lateNames.filterIsInstance<InboundEffect.SetJoinState>().isEmpty())
         assertTrue(InboundEffect.ClearTyping(channel("#room")) in own)
         assertTrue(InboundEffect.SetJoinState(channel("#room"), JoinState.FAILED) in own)
     }
@@ -316,9 +335,10 @@ class PerNetworkStateTests {
     }
 
     @Test
-    fun namesAccumulateUntilEndAndMarkJoined() {
+    fun namesAccumulateUntilEndWithoutChangingMembershipEstablishedByJoin() {
         val state = state()
-        state.feed(":me!u@h JOIN #room")
+        val joined = state.feed(":me!u@h JOIN #room")
+        assertTrue(InboundEffect.SetJoinState(channel("#room"), JoinState.JOINED) in joined)
         assertTrue(state.feed(":srv 353 me = #room :@me +bob").isEmpty())
         assertTrue(state.feed(":srv 353 me = #room :alice!a@host").isEmpty())
         val end = state.feed(":srv 366 me #room :End of NAMES")
@@ -326,7 +346,8 @@ class PerNetworkStateTests {
             listOf(ChannelMember("alice"), ChannelMember("bob", '+'), ChannelMember("me", '@')),
             end.only<InboundEffect.SetMembers>().members,
         )
-        assertTrue(InboundEffect.SetJoinState(channel("#room"), JoinState.JOINED) in end)
+        assertTrue(end.filterIsInstance<InboundEffect.SetJoinState>().isEmpty())
+        assertTrue(end.only<InboundEffect.SetMembers>().complete)
     }
 
     @Test
@@ -334,6 +355,43 @@ class PerNetworkStateTests {
         val state = state()
         state.feed(":srv 353 me = #gone :alice")
         assertTrue(state.feed(":srv 366 me #gone :End", InboundContext(nowMs = now, hasBuffer = { false })).isEmpty())
+    }
+
+    @Test
+    fun namesQueriesForRetainedBuffersNeverEstablishOurMembership() {
+        for (names in listOf(emptyList(), listOf("alice"))) {
+            val state = state()
+            val ref = channel("#room")
+            val context = InboundContext(nowMs = now, hasBuffer = { it == ref.storageKey })
+            if (names.isNotEmpty()) state.feed(":srv 353 me = #room :${names.joinToString(" ")}", context)
+            val end = state.feed(":srv 366 me #room :End of NAMES", context)
+            val members = end.only<InboundEffect.SetMembers>()
+            assertEquals(names, members.members.map { it.nick })
+            assertTrue(members.complete)
+            assertTrue(end.filterIsInstance<InboundEffect.SetJoinState>().isEmpty())
+            assertTrue(end.sent().isEmpty())
+        }
+    }
+
+    @Test
+    fun emptyNamesForAJoiningBufferDoesNotAcknowledgeTheJoin() {
+        val state = state()
+        val ref = channel("#room")
+        val context = InboundContext(nowMs = now, openChannels = { listOf("#room") }, hasBuffer = { it == ref.storageKey })
+        val reconnect = state.apply(IrcEvent.ConnectionOpened, context)
+        assertTrue(InboundEffect.SetJoinState(ref, JoinState.JOINING) in reconnect)
+        val registered = state.apply(IrcEvent.Registered("me", "Welcome"), context)
+        assertEquals(listOf("JOIN #room"), registered.sent())
+        val queried = state.feed(":srv 366 me #room :End of NAMES", context)
+        assertTrue(queried.only<InboundEffect.SetMembers>().complete)
+        assertTrue(queried.only<InboundEffect.SetMembers>().members.isEmpty())
+        assertTrue(queried.filterIsInstance<InboundEffect.SetJoinState>().isEmpty())
+        val joined = state.feed(":me!u@h JOIN #room", context)
+        assertTrue(InboundEffect.SetJoinState(ref, JoinState.JOINED) in joined)
+        val empty = state.feed(":srv 366 me #room :End of NAMES", context)
+        assertTrue(empty.only<InboundEffect.SetMembers>().complete)
+        assertTrue(empty.only<InboundEffect.SetMembers>().members.isEmpty())
+        assertTrue(empty.filterIsInstance<InboundEffect.SetJoinState>().isEmpty())
     }
 
     @Test
@@ -346,6 +404,7 @@ class PerNetworkStateTests {
         val members = end.only<InboundEffect.SetMembers>()
         assertEquals(listOf(ChannelMember("alice", '@'), ChannelMember("me")), members.members)
         assertEquals(PresenceState(away = true, user = "~a", host = "host", realName = "Alice"), members.presence["alice"])
+        assertTrue(members.complete)
     }
 
     @Test
@@ -646,5 +705,311 @@ class PerNetworkStateTests {
         assertNull(state.batchType("h"))
         assertFalse(state.whoisExpected)
         assertFalse(state.feed("@batch=h :alice!u@h PRIVMSG #room :live").appended().single().playback)
+    }
+
+    @Test
+    fun liveRosterDeltasStayPartialUntilACompleteResponseAndThenRetainCompleteness() {
+        val state = state()
+        val partial = state.feed(":alice!u@h JOIN #room").only<InboundEffect.SetMembers>()
+        assertFalse(partial.complete)
+        assertFalse(checkNotNull(state.channel(channel("#room").storageKey)).membersComplete)
+        state.feed(":srv 353 me = #room :alice bob")
+        val completed = state.feed(":srv 366 me #room :End of NAMES").only<InboundEffect.SetMembers>()
+        assertTrue(completed.complete)
+        val joined = state.feed(":carol!u@h JOIN #room").only<InboundEffect.SetMembers>()
+        assertTrue(joined.complete)
+        assertEquals(listOf("alice", "bob", "carol"), joined.members.map { it.nick })
+        val parted = state.feed(":bob!u@h PART #room").only<InboundEffect.SetMembers>()
+        assertTrue(parted.complete)
+        assertEquals(listOf("alice", "carol"), parted.members.map { it.nick })
+        assertTrue(state.feed(":alice!u@h NICK alicia").only<InboundEffect.SetMembers>().complete)
+    }
+
+    @Test
+    fun completeNamesRefreshReplacesOldRosterWhileReconcilingInterleavedLiveDeltas() {
+        val state = state()
+        state.joinChannelWith("#room", "me", "stale", "alice")
+        state.feed(":srv 353 me = #room :me alice bob")
+        state.feed(":carol!u@h JOIN #room")
+        state.feed(":alice!u@h PART #room")
+        state.feed(":bob!u@h NICK bobby")
+        val completed = state.feed(":srv 366 me #room :End of NAMES").only<InboundEffect.SetMembers>()
+        assertTrue(completed.complete)
+        assertEquals(listOf("bobby", "carol", "me"), completed.members.map { it.nick })
+    }
+
+    @Test
+    fun emptyNamesAndWhoResponsesAreCompleteAndRemovePreviouslyObservedMembers() {
+        for (numeric in listOf(366, 315)) {
+            val state = state()
+            state.joinChannelWith("#room", "me", "stale")
+            val effects = state.feed(":srv $numeric me #room :End")
+            val completed = effects.only<InboundEffect.SetMembers>()
+            assertTrue(effects.filterIsInstance<InboundEffect.SetJoinState>().isEmpty(), numeric.toString())
+            assertTrue(completed.complete, numeric.toString())
+            assertTrue(completed.members.isEmpty(), numeric.toString())
+            assertTrue(completed.presence.isEmpty(), numeric.toString())
+            assertTrue(checkNotNull(state.channel(channel("#room").storageKey)).membersComplete)
+        }
+    }
+
+    @Test
+    fun whoxRowsArePartialUntilWhoEndReconcilesTheWholeRoster() {
+        val state = state()
+        state.feed(":me!u@h JOIN #room")
+        state.feed(":stale!u@h JOIN #room")
+        val partial = state.feed(":srv 354 me #room ~a host alice H@ acct :Alice")
+            .only<InboundEffect.SetMembers>()
+        assertFalse(partial.complete)
+        assertEquals(listOf("alice", "stale"), partial.members.map { it.nick })
+        val complete = state.feed(":srv 315 me #room :End of WHO").only<InboundEffect.SetMembers>()
+        assertTrue(complete.complete)
+        assertEquals(listOf(ChannelMember("alice", '@')), complete.members)
+        val refreshed = state.feed(":srv 354 me #room ~b host bob H 0 :Bob")
+            .only<InboundEffect.SetMembers>()
+        assertTrue(refreshed.complete)
+        val replacement = state.feed(":srv 315 me #room :End of WHO").only<InboundEffect.SetMembers>()
+        assertEquals(listOf(ChannelMember("bob")), replacement.members)
+        assertTrue(replacement.complete)
+    }
+
+    @Test
+    fun numericModeSnapshotsReplaceOldModesAndCanBeCompletelyEmpty() {
+        val state = state()
+        val partial = state.feed(":op!u@h MODE #room +s").only<InboundEffect.SetModes>()
+        assertEquals(mapOf("s" to emptyList()), partial.modes)
+        assertFalse(partial.complete)
+        val complete = state.feed(":srv 324 me #room +ntkl secret 12").only<InboundEffect.SetModes>()
+        val expected = mapOf("n" to emptyList(), "t" to emptyList(), "k" to listOf("secret"), "l" to listOf("12"))
+        assertEquals(expected, complete.modes)
+        assertTrue(complete.complete)
+        assertEquals(expected, checkNotNull(state.channel(channel("#room").storageKey)).modeSnapshot())
+        val empty = state.feed(":srv 324 me #room +").only<InboundEffect.SetModes>()
+        assertTrue(empty.complete)
+        assertTrue(empty.modes.isEmpty())
+        assertEquals(expected, complete.modes)
+    }
+
+    @Test
+    fun numericModeSnapshotsPreserveClassAListsObservedByLiveDeltas() {
+        for (customSupport in listOf(false, true)) {
+            val state = state()
+            val listModes = if (customSupport) {
+                state.feed(":srv 005 me CHANMODES=beI,kf,l,imnpst PREFIX=(qov)~@+ :are supported")
+                assertEquals("beI", state.isupport.chanmodes.listA)
+                assertEquals("kf", state.isupport.chanmodes.listB)
+                "beI"
+            } else {
+                "b"
+            }
+            val expectedLists = LinkedHashMap<String, List<String>>()
+            for (mode in listModes) {
+                state.feed(":op!u@h MODE #room +$mode first-$mode")
+                state.feed(":op!u@h MODE #room +$mode second-$mode")
+                expectedLists[mode.toString()] = listOf("first-$mode", "second-$mode")
+            }
+            state.feed(":op!u@h MODE #room +sk old-key")
+            val complete = state.feed(":srv 324 me #room +ntl 12").only<InboundEffect.SetModes>()
+            val expected = expectedLists + mapOf("n" to emptyList(), "t" to emptyList(), "l" to listOf("12"))
+            assertEquals(expected, complete.modes)
+            assertTrue(complete.complete)
+            val empty = state.feed(":srv 324 me #room +").only<InboundEffect.SetModes>()
+            assertEquals(expectedLists, empty.modes)
+            assertTrue(empty.complete)
+            val removed = state.feed(":op!u@h MODE #room -b first-b").only<InboundEffect.SetModes>()
+            assertEquals(listOf("second-b"), removed.modes["b"])
+            assertTrue(removed.complete)
+            assertEquals(expected, complete.modes)
+        }
+    }
+
+    @Test
+    fun unappliedModeNumericsRemainVisibleWithoutChangingTrackedModes() {
+        val ref = channel("#room")
+        val context = InboundContext(nowMs = now, hasBuffer = { it == ref.storageKey })
+        for (line in listOf(
+            ":srv 324 me #unknown +nt",
+            ":srv 324 me alice +i",
+            ":srv 324 me #room +ik",
+            ":srv 324 me #room +nZ",
+            ":srv 324 me #room",
+            ":srv 324 me",
+        )) {
+            val state = state()
+            val initial = state.feed(":srv 324 me #room +nt", context).only<InboundEffect.SetModes>()
+            val effects = state.feed(line, context)
+            assertTrue(effects.filterIsInstance<InboundEffect.SetModes>().isEmpty(), line)
+            assertEquals(state.server, effects.appended().single().ref, line)
+            assertTrue(effects.appended().single().text.isNotEmpty(), line)
+            val tracked = checkNotNull(state.channel(ref.storageKey))
+            assertEquals(initial.modes, tracked.modeSnapshot(), line)
+            assertTrue(tracked.modesComplete, line)
+            assertEquals(listOf(ref), state.channelRefs(), line)
+        }
+    }
+
+
+    @Test
+    fun channelModeDeltasHonorAllParameterClassesAndExcludePrefixModes() {
+        val state = state()
+        state.feed(":srv 005 me CHANMODES=beI,kf,l,imnpst PREFIX=(qov)~@+ :are supported")
+        val partial = state.feed(":op!u@h MODE #room +qobkl Alice Bob mask key 10")
+            .only<InboundEffect.SetModes>()
+        assertEquals(mapOf("b" to listOf("mask"), "k" to listOf("key"), "l" to listOf("10")), partial.modes)
+        assertFalse(partial.complete)
+        val list = state.feed(":op!u@h MODE #room +bb mask other").only<InboundEffect.SetModes>()
+        assertEquals(listOf("mask", "other"), list.modes["b"])
+        val removed = state.feed(":op!u@h MODE #room -qvklb+i Alice Bob key mask")
+            .only<InboundEffect.SetModes>()
+        assertEquals(mapOf("b" to listOf("other"), "i" to emptyList()), removed.modes)
+        assertFalse(removed.complete)
+        state.feed(":srv 324 me #room +nt")
+        val live = state.feed(":op!u@h MODE #room -n+lf 20 throttle").only<InboundEffect.SetModes>()
+        assertEquals(mapOf("b" to listOf("other"), "t" to emptyList(), "l" to listOf("20"), "f" to listOf("throttle")), live.modes)
+        assertTrue(live.complete)
+        assertEquals(mapOf("b" to listOf("mask", "other"), "k" to listOf("key"), "l" to listOf("10")), list.modes)
+    }
+
+    @Test
+    fun invalidModeParametersDoNotPublishOrPartiallyMutateObservedModes() {
+        val state = state()
+        state.feed(":srv 324 me #room +nt")
+        val invalid = state.feed(":srv 324 me #room +ik")
+        assertTrue(invalid.filterIsInstance<InboundEffect.SetModes>().isEmpty())
+        assertEquals(state.server, invalid.appended().single().ref)
+        assertTrue(state.feed(":op!u@h MODE #room -n+k").filterIsInstance<InboundEffect.SetModes>().isEmpty())
+        val channel = checkNotNull(state.channel(channel("#room").storageKey))
+        assertEquals(mapOf("n" to emptyList(), "t" to emptyList()), channel.modeSnapshot())
+        assertTrue(channel.modesComplete)
+    }
+
+    @Test
+    fun reconnectClearsCompletenessAndModesBeforeNewPartialEventsArrive() {
+        val state = state()
+        state.joinChannelWith("#room", "me", "alice")
+        state.feed(":srv 324 me #room +ntk secret")
+        val reset = state.apply(IrcEvent.ConnectionOpened, InboundContext(nowMs = now))
+        val members = reset.only<InboundEffect.SetMembers>()
+        val modes = reset.only<InboundEffect.SetModes>()
+        assertFalse(members.complete)
+        assertTrue(members.members.isEmpty())
+        assertFalse(modes.complete)
+        assertTrue(modes.modes.isEmpty())
+        val channel = checkNotNull(state.channel(channel("#room").storageKey))
+        assertFalse(channel.membersComplete)
+        assertFalse(channel.modesComplete)
+        assertFalse(state.feed(":bob!u@h JOIN #room").only<InboundEffect.SetMembers>().complete)
+        assertFalse(state.feed(":op!u@h MODE #room +s").only<InboundEffect.SetModes>().complete)
+    }
+
+    @Test
+    fun renameAndCasemappingPreserveObservedModeAndRosterCompleteness() {
+        val state = state()
+        state.joinChannelWith("#Old[1]", "me", "Al[ice]")
+        state.feed(":srv 324 me #Old[1] +ntk secret")
+        state.feed(":srv RENAME #Old[1] #New[1] :Moved")
+        assertNull(state.channel(state.channelRef("#Old[1]").storageKey))
+        state.feed(":srv 005 me CASEMAPPING=ascii :are supported")
+        val ref = state.channelRef("#New[1]")
+        assertEquals(listOf(ref), state.channelRefs())
+        val channel = checkNotNull(state.channel(ref.storageKey))
+        assertEquals(ref, channel.ref)
+        assertTrue(channel.membersComplete)
+        assertTrue(channel.modesComplete)
+        assertEquals(listOf("Al[ice]", "me"), channel.memberList().map { it.nick })
+        assertEquals(mapOf("n" to emptyList(), "t" to emptyList(), "k" to listOf("secret")), channel.modeSnapshot())
+        assertTrue(state.feed(":op!u@h MODE #New[1] -k secret").only<InboundEffect.SetModes>().complete)
+    }
+
+    @Test
+    fun casemappingCollisionsReconcileCompleteSnapshotsInsteadOfUnioningStaleModes() {
+        val state = state()
+        state.feed(":srv 005 me CASEMAPPING=ascii :are supported")
+        state.feed(":op!u@h MODE #room[1] +b first-mask")
+        state.feed(":op!u@h MODE #room{1} +b second-mask")
+        state.feed(":srv 324 me #room[1] +ik old-key")
+        state.feed(":srv 324 me #room{1} +nt")
+        state.feed(":srv 005 me CASEMAPPING=rfc1459 :are supported")
+        assertEquals(1, state.channelRefs().size)
+        val channel = checkNotNull(state.channel(state.channelRef("#room[1]").storageKey))
+        assertEquals(mapOf("b" to listOf("first-mask", "second-mask"), "n" to emptyList(), "t" to emptyList()), channel.modeSnapshot())
+        assertTrue(channel.modesComplete)
+    }
+
+    @Test
+    fun pendingNamesSurviveCasemappingChangesBeforeTheCompleteResponse() {
+        val state = state()
+        state.feed(":srv 353 me = #Room[1] :Al[ice]")
+        state.feed(":srv 005 me CASEMAPPING=ascii :are supported")
+        val complete = state.feed(":srv 366 me #Room[1] :End").only<InboundEffect.SetMembers>()
+        assertEquals(state.channelRef("#Room[1]"), complete.ref)
+        assertEquals(listOf(ChannelMember("Al[ice]")), complete.members)
+        assertTrue(complete.complete)
+    }
+
+    @Test
+    fun playbackRefreshResponsesCannotMarkCachedRosterOrModesLive() {
+        val state = state()
+        state.feed(":srv BATCH +history chathistory #room")
+        state.feed("@batch=history :srv BATCH +nested vendor.example/snapshot")
+        for (line in listOf(
+            ":srv 353 me = #room :old",
+            ":srv 352 me #room ~o host srv old H :0 Old",
+            ":srv 354 me #room ~o host old H 0 :Old",
+            ":srv 366 me #room :End of NAMES",
+            ":srv 315 me #room :End of WHO",
+            ":srv 324 me #room +nt",
+            ":op!u@h MODE #room +s",
+        )) {
+            val effects = state.feed("@batch=nested $line")
+            assertTrue(effects.filterIsInstance<InboundEffect.SetMembers>().isEmpty(), line)
+            assertTrue(effects.filterIsInstance<InboundEffect.SetModes>().isEmpty(), line)
+        }
+        assertTrue(state.channelRefs().isEmpty())
+        val historical = InboundContext(nowMs = now, historyPlayback = true)
+        assertTrue(state.feed(":srv 366 me #room :End", historical).filterIsInstance<InboundEffect.SetMembers>().isEmpty())
+        assertTrue(state.feed(":srv 324 me #room +nt", historical).filterIsInstance<InboundEffect.SetModes>().isEmpty())
+    }
+
+    @Test
+    fun renameIntoAnExistingChannelReconcilesCompleteSourceModesAndPreservesListObservations() {
+        val state = state()
+        state.feed(":op!u@h MODE #source +b source-mask")
+        state.feed(":op!u@h MODE #destination +b destination-mask")
+        state.feed(":srv 324 me #source +ntk source-key")
+        state.feed(":srv 324 me #destination +is")
+        state.feed(":srv RENAME #source #destination")
+        val ref = state.channelRef("#destination")
+        assertEquals(listOf(ref), state.channelRefs())
+        val merged = checkNotNull(state.channel(ref.storageKey))
+        assertTrue(merged.modesComplete)
+        assertEquals(
+            mapOf("b" to listOf("destination-mask", "source-mask"), "n" to emptyList(), "t" to emptyList(), "k" to listOf("source-key")),
+            merged.modeSnapshot(),
+        )
+    }
+
+    @Test
+    fun casemappingCollisionsMergePartialListModeParametersWithoutInventingCompleteness() {
+        val state = state()
+        state.feed(":srv 005 me CASEMAPPING=ascii :are supported")
+        state.feed(":op!u@h MODE #room[1] +b first-mask")
+        state.feed(":op!u@h MODE #room{1} +b second-mask")
+        state.feed(":srv 005 me CASEMAPPING=rfc1459 :are supported")
+        val merged = checkNotNull(state.channel(state.channelRef("#room[1]").storageKey))
+        assertEquals(mapOf("b" to listOf("first-mask", "second-mask")), merged.modeSnapshot())
+        assertFalse(merged.modesComplete)
+        val delta = state.feed(":op!u@h MODE #room{1} -b first-mask").only<InboundEffect.SetModes>()
+        assertEquals(mapOf("b" to listOf("second-mask")), delta.modes)
+        assertFalse(delta.complete)
+    }
+
+    @Test
+    fun nonChannelWhoAndModeResponsesDoNotCreateChannelState() {
+        val state = state()
+        assertTrue(state.feed(":srv 315 me alice :End of WHO").filterIsInstance<InboundEffect.SetMembers>().isEmpty())
+        assertTrue(state.feed(":srv 324 me alice +i").filterIsInstance<InboundEffect.SetModes>().isEmpty())
+        assertTrue(state.feed(":me!u@h MODE me +i").filterIsInstance<InboundEffect.SetModes>().isEmpty())
+        assertTrue(state.channelRefs().isEmpty())
     }
 }

@@ -1,6 +1,7 @@
 package dev.brentdevs.yardhal
 
 import android.app.Application
+import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -14,25 +15,44 @@ import dev.brentdevs.yardhal.core.data.AndroidTlsIdentityProvider
 import dev.brentdevs.yardhal.core.data.ChannelOrderStore
 import dev.brentdevs.yardhal.core.data.ChatAppearanceStore
 import dev.brentdevs.yardhal.core.data.CredentialVault
+import dev.brentdevs.yardhal.core.data.DatabaseRecovery
 import dev.brentdevs.yardhal.core.data.FileStsPolicyStore
 import dev.brentdevs.yardhal.core.data.IgnoreStore
 import dev.brentdevs.yardhal.core.data.MessageStore
 import dev.brentdevs.yardhal.core.data.MuteStore
 import dev.brentdevs.yardhal.core.data.NetworkStore
+import dev.brentdevs.yardhal.core.data.OfflineStore
 import dev.brentdevs.yardhal.core.data.ReadMarkerStore
-import dev.brentdevs.yardhal.core.data.YardhalDatabase
+import dev.brentdevs.yardhal.core.data.StorageRecovery
 import dev.brentdevs.yardhal.service.ConnectionService
 import dev.brentdevs.yardhal.service.Notifications
 import dev.brentdevs.yardhal.service.keepsRecoveryService
 import dev.brentdevs.yardhal.ui.image.RemoteImageLoader
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.SupervisorJob
+
+enum class ApplicationStartup {
+    LOADING,
+    READY,
+    FAILED,
+}
 
 class YardhalApplication : Application() {
 
     val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val mutableStartup = MutableStateFlow(ApplicationStartup.LOADING)
+    val startup: StateFlow<ApplicationStartup> = mutableStartup.asStateFlow()
+
+    suspend fun awaitInitialization(): Boolean = startup.first { it != ApplicationStartup.LOADING } == ApplicationStartup.READY
 
     var sharedText: String? by mutableStateOf(null)
 
@@ -57,9 +77,23 @@ class YardhalApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        appScope.launch(Dispatchers.IO) {
+            try {
+                initializeStoresAndCoordinator()
+                mutableStartup.value = ApplicationStartup.READY
+            } catch (failure: CancellationException) {
+                throw failure
+            } catch (failure: Exception) {
+                Log.e("Yardhal", "Local initialization failed", failure)
+                mutableStartup.value = ApplicationStartup.FAILED
+            }
+        }
+    }
+
+    private fun initializeStoresAndCoordinator() {
         val dir = filesDir
         networkStore = NetworkStore(dir)
-        val db = YardhalDatabase.build(this)
+        val db = DatabaseRecovery.open(this)
         messageStore = MessageStore(db.messageDao())
         readMarkerStore = ReadMarkerStore(dir)
         muteStore = MuteStore(dir)
@@ -116,6 +150,7 @@ class YardhalApplication : Application() {
             notifier = LiveCoordinator.HighlightNotifier { networkName, sender, conversation, text ->
                 Notifications.highlight(this, networkName, sender, conversation, text)
             },
+            offlineStore = OfflineStore(db.offlineDao()),
         )
         coordinator.attachIgnores(IgnoreStore(dir))
         connectivityObserver = AndroidConnectivityObserver(this, coordinator::updateConnectivity)
@@ -139,14 +174,22 @@ class YardhalApplication : Application() {
             }
         }
         backfillSearchIndex()
+        appScope.launch(Dispatchers.IO) {
+            while (true) {
+                remoteImages.maintain()
+                delay(5L * 60 * 1_000)
+            }
+        }
     }
 
     override fun onTerminate() {
-        connectivityObserver.close()
+        if (::connectivityObserver.isInitialized) connectivityObserver.close()
+        appScope.cancel()
         super.onTerminate()
     }
 
     private fun backfillSearchIndex() {
+        if (StorageRecovery.databaseTemporary.value) return
         val prefs = getSharedPreferences("yardhal-meta", MODE_PRIVATE)
         if (prefs.getBoolean("fts_backfill_v2", false)) return
         appScope.launch {
