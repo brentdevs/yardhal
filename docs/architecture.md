@@ -301,6 +301,8 @@ retain local quote relationships and heal persisted row identity. Explicit fresh
 optimistic sends remain distinct even with identical text and timestamps.
 Visible echo reconciliation and durable commit are separate publication points;
 an inserted pending row does not prove that its canonical echo has been committed.
+Discovered conversations hydrate independently; another buffer's completed gap
+or an inbound control marker is not a cross-conversation hydration barrier.
 Unconfirmed sends survive restart with a **Delivery unconfirmed** indicator.
 Identified own history heals matching pending sends FIFO when sender, kind, body,
 wire reply and the ±two-minute send/server timestamp window agree. Repeated
