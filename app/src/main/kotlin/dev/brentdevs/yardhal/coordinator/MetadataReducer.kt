@@ -30,12 +30,14 @@ internal fun Reduction.subscribeMetadata() {
 }
 
 internal fun Reduction.handleMetadataMessage(message: IrcMessage) {
+    if (isPlayback(message) || "draft/chathistory-context" in message.tags) return
     val parameters = message.parameters
     if (parameters.size < 3) return
     storeMetadata(target = parameters[0], key = parameters[1], value = parameters.getOrNull(3))
 }
 
 internal fun Reduction.handleMetadataNumeric(numeric: Int, message: IrcMessage) {
+    if (isPlayback(message) || "draft/chathistory-context" in message.tags) return
     val parameters = message.parameters
     when (numeric) {
         IrcMetadata.RPL_KEYVALUE, IrcMetadata.RPL_WHOISKEYVALUE -> {
@@ -103,8 +105,8 @@ private fun Reduction.storeMetadata(target: String, key: String, value: String?)
 private fun Reduction.storeUserMetadata(nick: String, key: String, value: String?) {
     val folded = state.fold(nick)
     val existing = state.users[folded]
-    if (existing == null && value == null) return
     val base = existing ?: UserState(nick)
     val metadata = if (value == null) base.metadata - key else base.metadata + (key to value)
-    state.users[folded] = base.copy(metadata = metadata)
+    state.users[folded] = base.copy(metadata = metadata, metadataObservedAtMs = context.nowMs,
+        metadataKeysObserved = base.metadataKeysObserved + key)
 }

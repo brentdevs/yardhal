@@ -33,13 +33,13 @@ Phase numbers refer to `docs/architecture.md`.
 
 ## Messaging affordances
 
-- [x] message-ids: persisted; reply/react/redact gated on msgid presence (P3/P5)
-- [x] echo-message: own messages reconciled against the server echo, msgid stamped (P5)
-- [x] +draft/reply: send/receive replies with quoted preview and jump-to-source (P5)
-- [x] +draft/react / +draft/unreact: reactions pills with counts, tap to toggle (P5)
+- [x] message-ids: scoped persistence and canonical echo healing; wire reply/react/redact actions require msgid. Durable local quote-parent row IDs are separate inputs for parity phase 5 (P3/P5; parity phase 3)
+- [x] echo-message: own messages reconciled against the server echo, msgid stamped; identical fresh sends retain distinct durable rows and local quotes (P5; parity phase 3)
+- [x] +draft/reply: send/receive replies with quoted preview and jump-to-source; parent relationships and off-page/deleted previews survive process death (P5; parity phase 3)
+- [x] +draft/react / +draft/unreact: durable per-sender membership, reaction pills and tap-to-toggle; bounded retention exposes partial/lower-bound history (P5; parity phase 3)
 - [x] +typing: send rate-limited active TAGMSG; inbound indicators with expiry (P5)
-- [x] draft/message-redaction: REDACT handling + own redacts (P5)
-- [x] draft/read-marker: capability requested; MARKREAD sent on read and applied inbound (cross-device); unread divider + jump (P5)
+- [x] draft/message-redaction: REDACT handling + own redacts; transactional body/FTS/attachment/reaction removal, tombstones and retired-history floors prevent replay resurrection (P5; parity phase 3)
+- [x] draft/read-marker: full-history durable unread/mention cursors; offline advances queue MARKREAD until supported accepted registration, clear on acknowledgement and reconcile monotonically; legacy unknown highlights are not guessed (P5; parity phase 3)
 - [x] draft/multiline: cap + max-bytes/max-lines parsed; inbound batches reassembled (concat, batch msgid, playback-aware, defensive limit flush); composer newlines sent as limit-respecting batches with concat splitting, echo reconciled; separate PRIVMSGs without the cap (P5)
 - [x] +draft/channel-context: `+channel-context`/`+draft/channel-context` on DMs stored per message; tappable "re: #channel" chip (P8)
 
@@ -108,13 +108,13 @@ Ergo and runs all real-server tests without skips.
 | MONITOR | `PerNetworkStateTests.monitorNumericsAreTaggedAsMonitorLines` |
 | extended-monitor | `IdentityReducerTests.extendedMonitorTracksMonitoredNicksOutsideChannels`; `IdentityReducerTests.monitorListNumericEstablishesTargetsForSubsequentIdentityNotifications` |
 | draft/pre-away | `IrcConnectionIntegrationTests.preAwaySendsAwayBeforeCapEnd`; `IrcConnectionIntegrationTests.initialAwayWithoutPreAwayIsSentAfterWelcome` |
-| message-ids | `MessageStoreTests.recordDeduplicatesByMsgid`; `LiveCoordinatorIntegrationTests.echoesKeepMessageIdsOrderedAndMembershipTracksKickAndNickChanges` |
-| echo-message | `LabeledResponseReducerTests.labelledEchoReconcilesPendingMessageEvenWhenTextDiffers`; `LiveCoordinatorIntegrationTests.echoesKeepMessageIdsOrderedAndMembershipTracksKickAndNickChanges` |
-| +draft/reply | `PerNetworkStateTests.channelPrivmsgBecomesAChannelMessageWithServerTimeAndTags`; `IrcMultilineTests.framesBatchWithTargetReferenceAndClientTagsOnOpening` |
-| +draft/react / +draft/unreact | `PerNetworkStateTests.tagmsgReactionsAndTypingBecomeEffects`; `PerNetworkStateTests.reactionFoldAddsAndRemovesPerSender` |
+| message-ids | `MessageStoreTests.recordDeduplicatesByMsgid`; `DurableMessageTests`; `NetworkEditLifecycleTests.advertisedCasemappingMergesChannelAndDirectMessageHistoryAndMetadataAcrossEditAndReload` |
+| echo-message | `LabeledResponseReducerTests.labelledEchoReconcilesPendingMessageEvenWhenTextDiffers`; `DurableMessageTests.identicalFreshLocalSendsKeepDistinctRowsAndQuoteParentsAcrossCanonicalEchoes`; `LiveCoordinatorIntegrationTests` |
+| +draft/reply | `PerNetworkStateTests.channelPrivmsgBecomesAChannelMessageWithServerTimeAndTags`; `DurableMessageTests`; `OfflineCoordinatorTests`; `OfflineConversationPresentationTests` |
+| +draft/react / +draft/unreact | `PerNetworkStateTests.tagmsgReactionsAndTypingBecomeEffects`; `PerNetworkStateTests.reactionFoldAddsAndRemovesPerSender`; `DurableMessageTests`; `ReactionRetentionTests` |
 | +typing | `PerNetworkStateTests.tagmsgReactionsAndTypingBecomeEffects` |
-| draft/message-redaction | `PerNetworkStateTests.redactEmitsRedactionForTheWireConversation`; `PerNetworkStateTests.redactionReplacesOnlyTheMatchingMessage`; `MessagingCoordinatorTests.wireRedactionOnlyChangesTheNamedConversationWhenMessageIdsOverlap` |
-| draft/read-marker | `PerNetworkStateTests.markreadAppliesTimestampToTheTargetAndIgnoresStarTargets` |
+| draft/message-redaction | `PerNetworkStateTests.redactEmitsRedactionForTheWireConversation`; `MessagingCoordinatorTests.wireRedactionOnlyChangesTheNamedConversationWhenMessageIdsOverlap`; `DurableMessageTests`; `NetworkMessageRetentionTests.retiredPendingRedactionsBlockParentReplayWithoutKeepingTargetLedgers` |
+| draft/read-marker | `PerNetworkStateTests.markreadAppliesTimestampToTheTargetAndIgnoresStarTargets`; `DurableReadMarkerTests`; `OfflineCoordinatorTests` |
 | draft/multiline | `IrcMultilineTests.splitsLongLinesBetweenWordsWithConcatTagAndRoundTrips`; `MessagingReducerTests.multilineNestedInChathistoryIsPlayback`; `MessagingCoordinatorTests.multilineComposerTextIsBatchedAndReconciledAgainstTheEchoedBatch`; `ErgoRoundTripTest.multilineEchoAndChannelRenameAgainstRealServer` |
 | +draft/channel-context | `MessagingReducerTests.channelContextTagStoredOnDirectMessages`; `MessagingReducerTests.channelContextOnMultilineBatchOpeningApplies`; `MessagingCoordinatorTests.channelContextSurvivesCoordinatorHistoryReload`; `LiveCoordinatorIntegrationTests.openingPersistedSearchHitRestoresChannelContextIntoAnAbsentConversation`; `MessageStoreTests.channelContextRoundTripsThroughRecentAndHistory`; `YardhalDatabaseMigrationTests.versionOneUpgradePreservesTranscriptHashesRowIdsAndSearch` |
 | batch | `PerNetworkStateTests.playbackBatchesIncludingNestedOnesSuppressHighlights`; `PerNetworkStateTests.disconnectReportsDisconnectedAndReconnectResetsConnectionState` |
@@ -143,11 +143,24 @@ Ergo and runs all real-server tests without skips.
 | draft/channel-rename | `MessagingCoordinatorTests.renameMovesBufferTranscriptMarkersMutesPinsAndAutojoin`; `MessageStoreRenameTests.renamedRowsStaySearchableUnderTheNewConversation`; `MessagingReducerTests.outstandingLabeledReplyFollowsRenamedConversation`; `HistoryCoordinatorIntegrationTests.channelRenameDrainsUnlabelledResponseAndReissuesForNewTargetWithoutNetworkPoisoning` |
 | soju.im/bouncer-networks | `IrcBouncerNetworksTests.commandBuilders`; `BouncerNetworkDraftTests.diffContainsOnlyChangedKeys`; `PerNetworkStateTests.bouncerNetIdBindsAndNetworkUpdatesBumpVersion` |
 | znc.in/playback | `HistoryRequestTrackerTests.bareZncPlaybackRequiresTimestampBoundsAndCorrectDmIdentity`; `HistoryCoordinatorIntegrationTests.clippedNativePlaybackRetainsGapUntilClosedRangeWitnessesCachedLowerBoundary`; `HistoryCoordinatorIntegrationTests.timedOutWildcardPlaybackCannotInjectLateBatchesBareMessagesOrNotifications`; `HistoryCoordinatorIntegrationTests.invalidNativeMetadataCannotInventGapOrPersistFallbackClockMessage`; `HistoryCoordinatorIntegrationTests.repeatedBoundedPlaybackReconnectsMergeDurableGapsWithoutOpeningClosedConversations`; `HistoryCoordinatorIntegrationTests.inclusivePlaybackUpperBoundaryAdvancesFiniteEmptyWindowsWithoutInventingGapsOrArchiveEnd` |
+| Offline snapshot inputs (parity phase 3) | `OfflineStoreTests`; `OfflineSnapshotMappingTests`; `OfflineCoordinatorTests`; `OfflinePresentationTests`; `OfflineConversationPresentationTests` |
+| Migration, retention and recovery (parity phase 3) | `YardhalDatabaseMigrationTests`; `NetworkMessageRetentionTests`; `ReactionRetentionTests`; `DatabaseRecoveryTests`; `StorageRecoveryTests`; `RemoteImageMaintenanceTests` |
 
 Emulator smoke (`make play`) exercises rendered network icons, avatars,
 display names, verified-account/away/bot member rows, account-ban wire syntax,
 multiline send/echo, selected channel rename, channel-context navigation and
 the traffic console. Protocol-only tests above do not claim UI rendering proof.
+
+Parity phase 3 adds native Android 15/Ergo offline kill/cold-launch, saved
+selection, cached roster/WHOIS/topic/modes and live refresh scenes; real reaction
+and wire-reply restoration; prepared local quote/attachment metadata; 350 prepared
+unseen mentions beyond the 200-row page; pending MARKREAD acknowledgement and an
+older injected marker. Native v1/v3 migrations verify IDs/hashes/FTS. Isolated
+message/reaction/cache/image retention and invalid-header/sidecar,
+incomplete/future-upgrade and denied-write recovery fixtures verify runtime
+budgets, exact retained evidence and honest fresh/temporary-store UI.
+See [offline conversation state](architecture.md#offline-conversation-state)
+for schema, freshness, retention and recovery boundaries.
 
 Parity phase 1 was also exercised on actual Android 15 transcripts against
 Ergo 2.14.0 with persistent history capped at five messages, ZNC 1.10.3 with native

@@ -21,6 +21,9 @@ import dev.brentdevs.yardhal.core.data.CredentialVault
 import dev.brentdevs.yardhal.core.data.CertificatePin
 import dev.brentdevs.yardhal.core.data.MessageKind
 import dev.brentdevs.yardhal.core.data.MessageStore
+import dev.brentdevs.yardhal.core.data.MESSAGE_CONVERSATION_LIMIT
+import dev.brentdevs.yardhal.core.data.MESSAGE_NETWORK_LIMIT
+import dev.brentdevs.yardhal.core.data.MESSAGE_PER_CONVERSATION_LIMIT
 import dev.brentdevs.yardhal.core.data.MuteStore
 import dev.brentdevs.yardhal.core.data.MentionMatcher
 import dev.brentdevs.yardhal.core.data.NetworkConfig
@@ -30,6 +33,11 @@ import dev.brentdevs.yardhal.core.data.SaslMode
 import dev.brentdevs.yardhal.core.data.SlashCommand
 import dev.brentdevs.yardhal.core.data.SlashCommandParser
 import dev.brentdevs.yardhal.core.data.StoredMessage
+import dev.brentdevs.yardhal.core.data.CachedUser
+import dev.brentdevs.yardhal.core.data.OfflineConversationShell
+import dev.brentdevs.yardhal.core.data.OfflineRoster
+import dev.brentdevs.yardhal.core.data.OfflineStore
+import dev.brentdevs.yardhal.core.data.ReadCursor
 import dev.brentdevs.yardhal.core.protocol.CaseMapping
 import dev.brentdevs.yardhal.core.protocol.HistoryAnchor
 import dev.brentdevs.yardhal.core.protocol.IrcCtcp
@@ -78,6 +86,7 @@ public class LiveCoordinator(
     private val clientIdentityProvider: (String) -> TlsClientIdentity = {
         throw TlsIdentityUnavailableException("The selected TLS client identity is unavailable. Select it again in network settings.")
     },
+    private val offlineStore: OfflineStore? = null,
 ) {
     public fun interface HighlightNotifier {
         public fun onHighlight(networkName: String, sender: String, conversationName: String, text: String)
@@ -97,6 +106,30 @@ public class LiveCoordinator(
     private val _whois = MutableStateFlow<dev.brentdevs.yardhal.core.data.WhoisInfo?>(null)
     public val whois: StateFlow<dev.brentdevs.yardhal.core.data.WhoisInfo?> = _whois.asStateFlow()
 
+    private val _whoisPresentation = MutableStateFlow<WhoisPresentation?>(null)
+    public val whoisPresentation: StateFlow<WhoisPresentation?> = _whoisPresentation.asStateFlow()
+
+    private val _restoredSelection = MutableStateFlow<String?>(null)
+    public val restoredSelection: StateFlow<String?> = _restoredSelection.asStateFlow()
+    private val _restorationReady = MutableStateFlow(false)
+    public val restorationReady: StateFlow<Boolean> = _restorationReady.asStateFlow()
+    private var startupRequested = false
+    private var maintenanceJob: Job? = null
+    private var lastMaintenanceAtMs: Long? = null
+    private val writesSinceTrim = ConcurrentHashMap<String, Int>()
+    private val loadedRosters = ConcurrentHashMap.newKeySet<String>()
+    private val metadataRequests = ConcurrentHashMap<String, String>()
+    private val restoredCasemapping = ConcurrentHashMap<String, CaseMapping>()
+    private val loadedUsers = ConcurrentHashMap.newKeySet<String>()
+    private val persistedRowsByLocalId = ConcurrentHashMap<String, Long>()
+    private val reactionRevisions = ConcurrentHashMap<String, Long>()
+    private val topicObservedAt = ConcurrentHashMap<String, Long>()
+    private val rosterObservedAt = ConcurrentHashMap<String, Long>()
+    private val modesObservedAt = ConcurrentHashMap<String, Long>()
+    @Volatile private var whoisRequestToken = 0L
+    @Volatile private var requestedWhois: Pair<String, String>? = null
+    @Volatile private var requestedWhoisOrigin: String? = null
+
     private val _operationError = MutableStateFlow<String?>(null)
     public val operationError: StateFlow<String?> = _operationError.asStateFlow()
 
@@ -105,7 +138,13 @@ public class LiveCoordinator(
     }
 
     public fun dismissWhois() {
+        synchronized(selectionLock) {
+            whoisRequestToken += 1
+            requestedWhois = null
+            requestedWhoisOrigin = null
+        }
         _whois.value = null
+        _whoisPresentation.value = null
     }
 
     private var ignoreStore: dev.brentdevs.yardhal.core.data.IgnoreStore? = null
@@ -115,6 +154,8 @@ public class LiveCoordinator(
     }
 
     private val sessions = ConcurrentHashMap<String, Session>()
+    private val pendingStorageMigrations = ConcurrentHashMap<String, Int>()
+    private val deferredMaintenanceNetworks = ConcurrentHashMap.newKeySet<String>()
     private val sessionLifecycleLock = Any()
     @Volatile private var networkAvailable = true
     private var defaultNetworkHandle: Long? = null
@@ -133,6 +174,7 @@ public class LiveCoordinator(
 
     private companion object {
         const val TYPING_SEND_INTERVAL_MS = 4_000L
+        const val MAINTENANCE_INTERVAL_MS = 300_000L
     }
 
     private inner class Session(
@@ -169,6 +211,10 @@ public class LiveCoordinator(
         var identificationGate: NickServIdentificationGate? = null
         var identificationDeadline: Job? = null
         var pendingRegistration: IrcEvent.Registered? = null
+        val replayedReadCursors = ConcurrentHashMap<String, ReadCursor>()
+        var whoisRefreshToken: Long? = null
+        var publishedProfileKeys: Set<String> = emptySet()
+        var whoisRefreshEpoch: Int? = null
 
         init {
             lifecycleJob.invokeOnCompletion {
@@ -195,20 +241,21 @@ public class LiveCoordinator(
             updateBufferKey(key, transform)
         }
 
-        override fun mergeStoredHistory(ref: ConversationRef, messages: List<StoredMessage>) {
-            val key = currentRef(ref).storageKey
-            updateBufferKey(key) { current ->
+        override suspend fun mergeStoredHistory(ref: ConversationRef, messages: List<StoredMessage>) {
+            val target = currentRef(ref)
+            if (networkStore.byId(target.networkId) == null) return
+            val session = sessions[target.networkId]
+            val parents = messageStore.replyParents(target, messages)
+            val reactions = messageStore.reactions(target)
+            if (networkStore.byId(target.networkId) == null || sessions[target.networkId] !== session) return
+            updateBufferKey(target.storageKey) { current ->
                 val merged = mergeSearchContext(current.messages, messages, prependEqualTimestamp = true) { idGenerator.getAndIncrement() }
-                val marker = maxOf(current.readAtMs, readMarkers.marker(key))
-                val boundary = if (mutes.isMuted(key)) null else merged.asSequence()
-                    .filter { it.countsAsUnread && it.timestampMs > marker }.minOfOrNull { it.timestampMs }
-                current.copy(
-                    messages = merged,
-                    hasUnread = current.hasUnread || boundary != null,
-                    unreadFromTimestampMs = current.unreadFromTimestampMs ?: boundary,
-                    readAtMs = marker,
-                )
+                val hydrated = hydrateReplyPreviews(merged, parents)
+                val redacted = hydrated.asSequence().filter { it.redacted }.mapNotNull { it.msgid }.toSet()
+                current.copy(messages = hydrated, reactions = reactions - redacted)
             }
+            refreshUnread(target)
+            loadCachedUsers(target, messages.map { it.senderNick })
         }
 
         override fun replayHistory(
@@ -302,7 +349,530 @@ public class LiveCoordinator(
     })
 
     public fun startAll() {
-        for (config in networkStore.all()) connect(config)
+        synchronized(sessionLifecycleLock) {
+            if (startupRequested) return
+            startupRequested = true
+        }
+        val initialSelectionRevision = synchronized(selectionLock) { selectionRevision }
+        var startupSelection: ConversationRef? = null
+        val startupShellKeys = mutableMapOf<String, Set<String>>()
+        enqueuePersistence {
+            try {
+                val selected = offlineStore?.selection()?.takeIf {
+                    networkStore.byId(it.networkId) != null && !channelOrder.isParted(it.storageKey)
+                }
+                startupSelection = selected
+                val now = clock()
+                for (config in networkStore.all()) {
+                    messageStore.maintainNetwork(config.id, MESSAGE_NETWORK_LIMIT, MESSAGE_CONVERSATION_LIMIT,
+                        nowMs = now, protectedConversations = retentionPriorities(config.id, selected))
+                }
+                offlineStore?.maintain(now)
+                messageStore.maintain(now)
+                val shells = offlineStore?.shells().orEmpty()
+                for (shell in shells) restoredCasemapping[shell.ref.networkId] = shell.caseMapping
+                for (config in networkStore.all()) {
+                    val known = messageStore.knownConversations(config.id)
+                    val cached = shells.filter { it.ref.networkId == config.id }
+                    val retained = retainConversationShells(config.id, known, cached, selected, restoreExisting = true)
+                    startupShellKeys[config.id] = retained
+                    readMarkers.retainNetwork(config.id, retained + known.map { it.storageKey })
+                }
+                for (buffer in _buffers.value.values) refreshUnread(buffer.ref)
+                synchronized(persistenceLock) { lastMaintenanceAtMs = now }
+                val restored = synchronized(selectionLock) {
+                    if (selectionRevision != initialSelectionRevision) selectedStorageKey?.let { _buffers.value[it]?.ref }
+                    else selected?.takeIf { networkStore.byId(it.networkId) != null && !channelOrder.isParted(it.storageKey) }?.let {
+                        buffer(it)
+                        selectedStorageKey = it.storageKey
+                        _restoredSelection.value = it.storageKey
+                        it
+                    }
+                }
+                if (restored != null) {
+                    loadCachedRoster(restored)
+                    persistOpenedShell(restored)
+                    enqueuePersistence {
+                        val current = _buffers.value[restored.storageKey]?.ref
+                        if (current != null && selectedStorageKey == restored.storageKey && networkStore.byId(current.networkId) != null) {
+                            offlineStore?.select(current, clock())
+                        }
+                    }
+                    history.open(restored.storageKey)
+                }
+            } catch (error: Exception) {
+                if (error is kotlinx.coroutines.CancellationException) throw error
+                _operationError.value = "Saved conversation state could not be loaded: ${error.message ?: "storage unavailable"}"
+            }
+            enqueuePersistence {
+                for (config in networkStore.all()) connect(config)
+                for (config in networkStore.all()) {
+                    val retained = startupShellKeys[config.id].orEmpty().mapNotNull { _buffers.value[it]?.ref }
+                    retainConversationShells(config.id, retained, emptyList(), startupSelection)
+                }
+                _restorationReady.value = true
+                for (session in sessions.values) {
+                    if (session.recovery.desiredConnection) launchSession(session)
+                }
+                scheduleMaintenance()
+                if (maintenanceJob == null) maintenanceJob = scope.launch {
+                    while (true) {
+                        delay(MAINTENANCE_INTERVAL_MS)
+                        scheduleMaintenance()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun retentionPriorities(networkId: String, lastSelected: ConversationRef?): Set<String> = linkedSetOf<String>().apply {
+        synchronized(selectionLock) {
+            selectedStorageKey?.takeIf { it.startsWith("$networkId|") }?.let { add(it.substringAfter('|')) }
+        }
+        if (lastSelected?.networkId == networkId) add(lastSelected.normalizedTarget)
+        add(ConversationRef.SERVER_TARGET)
+    }
+
+    private fun retainConversationShells(
+        networkId: String,
+        known: List<ConversationRef>,
+        cached: List<OfflineConversationShell>,
+        lastSelected: ConversationRef?,
+        restoreExisting: Boolean = false,
+    ): Set<String> = synchronized(selectionLock) {
+        if (networkStore.byId(networkId) == null) return@synchronized emptySet()
+        if (pendingStorageMigrations.containsKey(networkId)) return@synchronized _buffers.value.values
+            .filter { it.ref.networkId == networkId }.map { it.key }.toSet()
+        val refs = LinkedHashMap<String, ConversationRef>()
+        val candidates = known + cached.map { it.ref }
+        val selected = selectedStorageKey?.let { key -> _buffers.value[key]?.ref ?: candidates.firstOrNull { it.storageKey == key } }
+        fun retain(ref: ConversationRef?) {
+            if (ref != null && ref.networkId == networkId && !channelOrder.isParted(ref.storageKey) &&
+                refs.size < MESSAGE_CONVERSATION_LIMIT) refs.putIfAbsent(ref.storageKey, ref)
+        }
+        retain(selected)
+        retain(lastSelected)
+        retain(ConversationRef.server(networkId))
+        for (ref in known) retain(ref)
+        for (shell in cached) retain(shell.ref)
+        for (current in _buffers.value.values.filter { it.ref.networkId == networkId }
+            .sortedByDescending { it.messages.lastOrNull()?.timestampMs ?: it.cachedStateAtMs ?: Long.MIN_VALUE }) retain(current.ref)
+        val shells = cached.associateBy { it.ref.storageKey }
+        for (ref in refs.values) {
+            val absent = ref.storageKey !in _buffers.value
+            buffer(ref)
+            if (absent || restoreExisting) shells[ref.storageKey]?.let(::restoreShell)
+        }
+        val dropped = _buffers.value.values.filter { it.ref.networkId == networkId && it.key !in refs }.map { it.key }
+        if (dropped.isNotEmpty()) _buffers.update { buffers -> buffers - dropped.toSet() }
+        for (key in dropped) {
+            history.remove(key)
+            loadedRosters.remove(key)
+            topicObservedAt.remove(key)
+            rosterObservedAt.remove(key)
+            modesObservedAt.remove(key)
+            metadataRequests.remove(key)
+        }
+        refs.keys.toSet()
+    }
+
+    private fun restoreShell(shell: OfflineConversationShell) {
+        restoredCasemapping[shell.ref.networkId] = shell.caseMapping
+        shell.topicObservedAtMs?.let { topicObservedAt[shell.ref.storageKey] = it }
+        shell.modesObservedAtMs?.let { modesObservedAt[shell.ref.storageKey] = it }
+        updateBuffer(shell.ref) { current ->
+            current.copy(
+                ref = shell.ref,
+                displayName = shell.displayName,
+                topic = shell.topic,
+                channelModes = shell.modes,
+                cachedTopic = shell.topicObservedAtMs != null,
+                cachedModes = shell.modesObservedAtMs != null,
+                cachedStateAtMs = shell.observedAtMs,
+                joinState = if (shell.ref.kind == ConversationKind.CHANNEL) JoinState.IDLE else current.joinState,
+            )
+        }
+    }
+
+    private suspend fun loadCachedShell(ref: ConversationRef, shellSnapshot: OfflineConversationShell? = null) {
+        if (pendingStorageMigrations.containsKey(ref.networkId)) return
+        val session = sessions[ref.networkId]
+        val shell = shellSnapshot ?: offlineStore?.shell(ref) ?: return
+        if (networkStore.byId(ref.networkId) == null || sessions[ref.networkId] !== session || pendingStorageMigrations.containsKey(ref.networkId)) return
+        updateBufferKey(ref.storageKey) { current ->
+            if (pendingStorageMigrations.containsKey(ref.networkId) || sessions[ref.networkId] !== session) return@updateBufferKey current
+            val topicAvailable = current.cachedTopic || !topicObservedAt.containsKey(ref.storageKey)
+            val modesAvailable = current.cachedModes || !modesObservedAt.containsKey(ref.storageKey)
+            if (topicAvailable) shell.topicObservedAtMs?.let { topicObservedAt[ref.storageKey] = it }
+            if (modesAvailable) shell.modesObservedAtMs?.let { modesObservedAt[ref.storageKey] = it }
+            current.copy(
+                topic = if (topicAvailable) shell.topic else current.topic,
+                cachedTopic = if (topicAvailable) shell.topicObservedAtMs != null else current.cachedTopic,
+                channelModes = if (modesAvailable) shell.modes else current.channelModes,
+                cachedModes = if (modesAvailable) shell.modesObservedAtMs != null else current.cachedModes,
+                cachedStateAtMs = maxOf(current.cachedStateAtMs ?: Long.MIN_VALUE, shell.observedAtMs),
+            )
+        }
+    }
+
+    private suspend fun loadCachedRoster(ref: ConversationRef) {
+        if (pendingStorageMigrations.containsKey(ref.networkId)) return
+        if (ref.kind != ConversationKind.CHANNEL) return
+        val store = offlineStore ?: return
+        val session = sessions[ref.networkId]
+        if (!loadedRosters.add(ref.storageKey)) return
+        val roster = store.roster(ref) ?: return
+        if (networkStore.byId(ref.networkId) == null || sessions[ref.networkId] !== session || pendingStorageMigrations.containsKey(ref.networkId)) return
+        updateBufferKey(ref.storageKey) { current ->
+            if (pendingStorageMigrations.containsKey(ref.networkId) || sessions[ref.networkId] !== session) return@updateBufferKey current
+            if (current.ref != ref || rosterObservedAt.containsKey(ref.storageKey) && !current.cachedRoster) current else {
+                rosterObservedAt[ref.storageKey] = roster.observedAtMs
+                current.copy(
+                    members = roster.members,
+                    memberPresence = roster.presence.mapValues { (_, value) -> value.toPresenceState() },
+                    cachedRoster = true,
+                    rosterTruncated = roster.truncated,
+                    cachedStateAtMs = maxOf(current.cachedStateAtMs ?: 0L, roster.observedAtMs),
+                )
+            }
+        }
+        loadCachedUsers(ref, roster.members.map { it.nick })
+    }
+
+    private suspend fun loadCachedUsers(ref: ConversationRef, nicks: List<String>) {
+        val store = offlineStore ?: return
+        if (pendingStorageMigrations.containsKey(ref.networkId)) return
+        val session = sessions[ref.networkId]
+        val mapping = session?.state?.casemapping ?: restoredCasemapping[ref.networkId] ?: CaseMapping.RFC1459
+        for (nick in nicks.distinctBy(mapping::fold)) {
+            if (nick.isBlank() || !loadedUsers.add("${ref.networkId}|${mapping.fold(nick)}")) continue
+            val cached = store.user(ref.networkId, nick, mapping) ?: continue
+            if (networkStore.byId(ref.networkId) == null || sessions[ref.networkId] !== session || pendingStorageMigrations.containsKey(ref.networkId)) return
+            val cachedProfile = UserProfile.from(cached.metadata)?.copy(cached = true, observedAtMs = cached.observedAtMs)
+            val live = session?.state?.users?.get(mapping.fold(nick))
+            val profile = if (live?.metadataObservedAtMs != null) mergeObservedProfile(cachedProfile, live) { value ->
+                session?.let { redactPresentation(it, value) } ?: value
+            } else cachedProfile
+            if (profile == null) continue
+            _profiles.update { profiles ->
+                val current = profiles[ref.networkId] ?: NetworkProfiles(mapping, emptyMap())
+                val key = mapping.fold(cached.nick)
+                if (pendingStorageMigrations.containsKey(ref.networkId)) profiles else
+                    profiles + (ref.networkId to current.copy(byFoldedNick = current.byFoldedNick + (key to profile)))
+            }
+        }
+    }
+
+    private suspend fun refreshUnread(ref: ConversationRef) {
+        if (networkStore.byId(ref.networkId) == null) return
+        if (pendingStorageMigrations.containsKey(ref.networkId)) return
+        var cursor = readMarkers.cursor(ref.storageKey)
+        var counts = messageStore.unreadCounts(ref, cursor)
+        if (cursor != readMarkers.cursor(ref.storageKey)) {
+            cursor = readMarkers.cursor(ref.storageKey)
+            counts = messageStore.unreadCounts(ref, cursor)
+        }
+        if (networkStore.byId(ref.networkId) == null) return
+        updateBufferKey(ref.storageKey) { current ->
+            if (pendingStorageMigrations.containsKey(ref.networkId) || readMarkers.cursor(ref.storageKey) != cursor) return@updateBufferKey current
+            val pending = current.messages.filter {
+                it.storedRowId == null && it.countsAsUnread && it.timestampMs > cursor.timestampMs
+            }
+            val unread = counts.unreadCount + pending.size
+            val mentions = counts.mentionCount + pending.count { it.highlightsMe }
+            val muted = mutes.isMuted(ref.storageKey)
+            val boundary = current.messages.asSequence().filter {
+                it.countsAsUnread && (it.timestampMs > cursor.timestampMs ||
+                    it.timestampMs == cursor.timestampMs && (it.storedRowId ?: Long.MAX_VALUE) > cursor.rowId)
+            }.minOfOrNull { it.timestampMs }
+            current.copy(
+                unreadCount = unread,
+                mentionCount = mentions,
+                mentionCountKnown = counts.mentionCountKnown,
+                hasUnread = unread > 0 && !muted,
+                readAtMs = cursor.timestampMs,
+                unreadFromTimestampMs = boundary.takeUnless { muted || unread == 0 },
+            )
+        }
+    }
+
+    private suspend fun refreshVisibleDurableState(ref: ConversationRef, onlyMsgids: Set<String>? = null) {
+        if (pendingStorageMigrations.containsKey(ref.networkId)) return
+        val current = _buffers.value[ref.storageKey] ?: return
+        val session = sessions[ref.networkId]
+        val inspected = current.messages.asSequence().filter { onlyMsgids == null || it.msgid in onlyMsgids }
+            .mapNotNull { it.storedRowId }.toMutableSet()
+        if (onlyMsgids == null) current.replyDraft?.storedRowId?.let(inspected::add)
+        if (inspected.isEmpty()) {
+            if (onlyMsgids == null && current.reactions.isNotEmpty()) {
+                updateBufferKey(ref.storageKey) { buffer ->
+                    buffer.copy(reactions = buffer.reactions.filterKeys { reactionRevisions["${ref.storageKey}|$it"] != null })
+                }
+            }
+            return
+        }
+        val rows = messageStore.byRowIds(ref, inspected)
+        val authoritative = rows.associateBy { it.rowId }
+        val parents = messageStore.replyParents(ref, rows)
+        val msgids = rows.mapNotNull { it.msgid }.toSet() + current.messages.filter { it.storedRowId in inspected }.mapNotNull { it.msgid } +
+            if (onlyMsgids == null) current.reactions.keys else onlyMsgids
+        val restoredReactions = messageStore.reactions(ref, msgids)
+        if (networkStore.byId(ref.networkId) == null || sessions[ref.networkId] !== session || pendingStorageMigrations.containsKey(ref.networkId)) return
+        updateBufferKey(ref.storageKey) { buffer ->
+            if (pendingStorageMigrations.containsKey(ref.networkId) || sessions[ref.networkId] !== session) return@updateBufferKey buffer
+            fun reconcile(message: ChatMessage): ChatMessage? {
+                val rowId = message.storedRowId
+                val stored = authoritative[rowId]
+                if (rowId in inspected && stored == null) return null
+                if (stored == null) return message
+                return mergeChatMessageMetadata(message, stored.toChatMessage(message.localId), incomingCanonical = true).copy(
+                    replyToMsgid = stored.replyToMsgid,
+                    localReplyParentRowId = stored.replyParentRowId,
+                    replyPreview = message.replyPreview.takeIf { rowId in parents },
+                )
+            }
+            val refreshed = buffer.messages.mapNotNull(::reconcile)
+            val ordered = if (refreshed.indices.any { it > 0 && refreshed[it - 1].timestampMs > refreshed[it].timestampMs }) {
+                refreshed.sortedBy { it.timestampMs }
+            } else refreshed
+            val hydrated = hydrateReplyPreviews(ordered, parents)
+            var reactions = buffer.reactions
+            for (msgid in msgids) {
+                if (reactionRevisions["${ref.storageKey}|$msgid"] != null) continue
+                val memberships = restoredReactions[msgid]
+                reactions = if (memberships.isNullOrEmpty()) reactions - msgid else reactions + (msgid to memberships)
+            }
+            val redacted = hydrated.asSequence().filter { it.redacted }.mapNotNull { it.msgid }.toSet()
+            val draft = buffer.replyDraft?.let(::reconcile)?.takeUnless { it.redacted }
+            buffer.copy(messages = hydrated, reactions = reactions - redacted, replyDraft = draft)
+        }
+    }
+
+    private fun persistSnapshot(session: Session, ref: ConversationRef, roster: OfflineRoster? = null) {
+        val current = _buffers.value[ref.storageKey] ?: return
+        val now = clock()
+        val shell = OfflineConversationShell(
+            ref = ref,
+            displayName = current.displayName,
+            observedAtMs = now,
+            caseMapping = session.state.casemapping,
+            topic = current.topic,
+            topicObservedAtMs = topicObservedAt[ref.storageKey],
+            modes = current.channelModes,
+            modesObservedAtMs = modesObservedAt[ref.storageKey],
+        )
+        enqueuePersistence {
+            if (sessions[ref.networkId] !== session || networkStore.byId(ref.networkId) == null) return@enqueuePersistence
+            if (ref.storageKey !in _buffers.value || channelOrder.isParted(ref.storageKey)) return@enqueuePersistence
+            offlineStore?.saveConversation(shell, roster)
+        }
+    }
+
+    private fun persistOpenedShell(ref: ConversationRef) {
+        enqueuePersistence {
+            val current = _buffers.value[ref.storageKey] ?: return@enqueuePersistence
+            if (networkStore.byId(ref.networkId) == null || channelOrder.isParted(ref.storageKey)) return@enqueuePersistence
+            val mapping = sessions[ref.networkId]?.state?.casemapping ?: restoredCasemapping[ref.networkId] ?: CaseMapping.RFC1459
+            offlineStore?.saveConversation(OfflineConversationShell(current.ref, current.displayName, clock(), mapping))
+        }
+    }
+
+    private fun markNetworkCached(networkId: String) {
+        sessions[networkId]?.publishedProfileKeys = emptySet()
+        updateAllBuffersForNetwork(networkId) { current ->
+            current.copy(
+                cachedTopic = current.cachedTopic || topicObservedAt.containsKey(current.key),
+                cachedRoster = current.cachedRoster || rosterObservedAt.containsKey(current.key),
+                cachedModes = current.cachedModes || modesObservedAt.containsKey(current.key),
+                typingUsers = emptyMap(),
+            )
+        }
+        _profiles.update { profiles ->
+            val current = profiles[networkId] ?: return@update profiles
+            profiles + (networkId to current.copy(byFoldedNick = current.byFoldedNick.mapValues { (_, profile) ->
+                profile.copy(cached = true)
+            }))
+        }
+        _whoisPresentation.update { current ->
+            current?.takeIf { it.networkId == networkId }?.copy(cached = true, refreshing = false, offline = true) ?: current
+        }
+        metadataRequests.keys.removeAll { it.substringBefore("|") == networkId }
+    }
+
+    private fun replayPendingReadMarkers(session: Session) {
+        synchronized(session.state) {
+            if (sessions[session.config.id] !== session || !session.state.registered ||
+                session.statusFlow.value != ConnectionStatus.REGISTERED ||
+                "draft/read-marker" !in session.state.supportedCaps || !networkAvailable ||
+                !session.recovery.desiredConnection || session.recovery.phase != RecoveryPhase.REGISTERED ||
+                pendingStorageMigrations.containsKey(session.config.id)
+            ) return
+            for ((key, cursor) in readMarkers.pending(session.config.id)) {
+                if (session.replayedReadCursors[key] == cursor) continue
+                val target = session.bufferTargetFor(key) ?: continue
+                if (target == ConversationRef.SERVER_TARGET) continue
+                sendRaw(session, "MARKREAD $target timestamp=${Instant.ofEpochMilli(cursor.timestampMs)}")
+                session.replayedReadCursors[key] = cursor
+            }
+        }
+    }
+
+    private fun scheduleMaintenance() {
+        synchronized(persistenceLock) {
+            val now = clock()
+            val previous = lastMaintenanceAtMs
+            if (previous != null && now >= previous && now - previous < MAINTENANCE_INTERVAL_MS) return
+            lastMaintenanceAtMs = now
+            enqueuePersistence {
+                val lastSelected = offlineStore?.selection()
+                offlineStore?.maintain(now)
+                for (config in networkStore.all()) {
+                    if (networkStore.byId(config.id) == null) continue
+                    val priorities = synchronized(selectionLock) {
+                        if (pendingStorageMigrations.containsKey(config.id)) null else retentionPriorities(config.id, lastSelected)
+                    }
+                    if (priorities == null) {
+                        deferredMaintenanceNetworks.add(config.id)
+                        continue
+                    }
+                    messageStore.maintainNetwork(config.id, MESSAGE_NETWORK_LIMIT, MESSAGE_CONVERSATION_LIMIT,
+                        nowMs = now, protectedConversations = priorities)
+                    val known = messageStore.knownConversations(config.id)
+                    val cached = offlineStore?.shells(config.id).orEmpty()
+                    if (pendingStorageMigrations.containsKey(config.id)) {
+                        deferredMaintenanceNetworks.add(config.id)
+                        continue
+                    }
+                    val retained = retainConversationShells(config.id, known, cached, lastSelected)
+                    readMarkers.retainNetwork(config.id, retained + known.map { it.storageKey })
+                    for (ref in _buffers.value.values.filter { it.ref.networkId == config.id }.map { it.ref }) {
+                        refreshVisibleDurableState(ref)
+                        refreshUnread(ref)
+                    }
+                }
+                messageStore.maintain(now)
+            }
+        }
+    }
+
+    private fun beginStorageMigration(networkId: String) {
+        pendingStorageMigrations.merge(networkId, 1, Int::plus)
+    }
+
+    private suspend fun finishStorageMigration(networkId: String, completed: Boolean) {
+        if (pendingStorageMigrations.computeIfPresent(networkId) { _, count -> (count - 1).takeIf { it > 0 } } != null) return
+        if (!completed || networkStore.byId(networkId) == null) return
+        val shells = offlineStore?.shells(networkId).orEmpty().associateBy { it.ref.storageKey }
+        for (buffer in _buffers.value.values.filter { it.ref.networkId == networkId }) {
+            shells[buffer.key]?.let { loadCachedShell(buffer.ref, it) }
+            if (buffer.cachedRoster) {
+                loadedRosters.remove(buffer.key)
+                loadCachedRoster(buffer.ref)
+            }
+            refreshVisibleDurableState(buffer.ref)
+            loadCachedUsers(buffer.ref, _buffers.value[buffer.key]?.messages.orEmpty().map { it.sender })
+            refreshUnread(buffer.ref)
+        }
+        sessions[networkId]?.let(::restoreKnownConversations)
+        sessions[networkId]?.let(::replayPendingReadMarkers)
+        if (deferredMaintenanceNetworks.remove(networkId)) {
+            synchronized(persistenceLock) { lastMaintenanceAtMs = null }
+            scheduleMaintenance()
+        }
+    }
+
+    private suspend fun refreshReactionRetention(networkId: String, affectedRows: Set<Long>, requestedRef: ConversationRef, requestedMsgids: Set<String>) {
+        if (pendingStorageMigrations.containsKey(networkId)) return
+        for (buffer in _buffers.value.values.filter { it.ref.networkId == networkId }) {
+            val msgids = buffer.messages.asSequence().filter { it.storedRowId in affectedRows }.mapNotNull { it.msgid }.toMutableSet()
+            if (buffer.key == requestedRef.storageKey) msgids.addAll(requestedMsgids)
+            if (msgids.isNotEmpty()) refreshVisibleDurableState(buffer.ref, msgids)
+        }
+    }
+
+    private fun requestWhois(session: Session, origin: ConversationRef, nick: String) {
+        val explicitRefresh = requestedWhois?.let { it.first == session.config.id && session.state.casemapping.equal(it.second, nick) } == true
+        val token = synchronized(selectionLock) {
+            whoisRequestToken += 1
+            requestedWhois = session.config.id to nick
+            requestedWhoisOrigin = selectedStorageKey
+            whoisRequestToken
+        }
+        _whois.value = null
+        _whoisPresentation.value = null
+        enqueuePersistence {
+            loadCachedUsers(origin, listOf(nick))
+            val cached = offlineStore?.whois(session.config.id, nick, session.state.casemapping)
+            synchronized(session.state) {
+                if (!whoisRequestCurrent(session, nick, token)) return@enqueuePersistence
+                if (_whoisPresentation.value?.cached == false) return@enqueuePersistence
+                val online = session.state.registered && session.statusFlow.value == ConnectionStatus.REGISTERED &&
+                    session.recovery.phase == RecoveryPhase.REGISTERED && networkAvailable
+                val refresh = online && (explicitRefresh || cached?.isFresh(clock()) != true)
+                if (cached != null) {
+                    _whois.value = cached.info
+                    _whoisPresentation.value = WhoisPresentation(session.config.id, cached.info, cached.observedAtMs,
+                        cached = true, refreshing = refresh, offline = !online)
+                } else if (!online) {
+                    _operationError.value = "No saved WHOIS information is available for $nick on this network."
+                }
+                if (refresh) sendWhoisRefresh(session, origin, nick)
+            }
+        }
+    }
+
+    private fun whoisRequestCurrent(session: Session, nick: String, token: Long = whoisRequestToken): Boolean =
+        synchronized(selectionLock) {
+            sessions[session.config.id] === session && networkStore.byId(session.config.id) != null &&
+                whoisRequestToken == token && requestedWhois?.first == session.config.id &&
+                requestedWhois?.second?.let { session.state.casemapping.equal(it, nick) } == true &&
+                requestedWhoisOrigin == selectedStorageKey
+        }
+
+    private fun sendWhoisRefresh(session: Session, origin: ConversationRef, nick: String) {
+        if (!whoisRequestCurrent(session, nick) || !session.state.registered ||
+            session.statusFlow.value != ConnectionStatus.REGISTERED || !networkAvailable ||
+            !session.recovery.desiredConnection || session.recovery.phase != RecoveryPhase.REGISTERED) return
+        val token = whoisRequestToken
+        if (session.whoisRefreshToken == token && session.whoisRefreshEpoch == session.state.connectionEpoch) return
+        session.whoisRefreshToken = token
+        session.whoisRefreshEpoch = session.state.connectionEpoch
+        session.state.whoisExpected = true
+        session.state.whoisTarget = nick
+        session.state.whois.reset()
+        _whoisPresentation.update { it?.copy(refreshing = true, offline = false) }
+        sendLabeled(session, origin, LabeledCommand.WHOIS, "WHOIS $nick $nick")
+    }
+
+    private fun refreshRequestedWhois(session: Session) {
+        val requested = requestedWhois ?: return
+        if (requested.first != session.config.id || !whoisRequestCurrent(session, requested.second)) return
+        val presentation = _whoisPresentation.value
+        if (presentation != null && !presentation.offline && presentation.refreshing) return
+        val origin = requestedWhoisOrigin?.let { _buffers.value[it]?.ref } ?: session.state.server
+        sendWhoisRefresh(session, origin, requested.second)
+    }
+
+    private fun completeWhois(session: Session, info: dev.brentdevs.yardhal.core.data.WhoisInfo) {
+        val now = clock()
+        val mapping = session.state.casemapping
+        val safeInfo = info.copy(
+            user = info.user?.let { redactPresentation(session, it) },
+            host = info.host?.let { redactPresentation(session, it) },
+            realName = info.realName?.let { redactPresentation(session, it) },
+            server = info.server?.let { redactPresentation(session, it) },
+            serverInfo = info.serverInfo?.let { redactPresentation(session, it) },
+            account = info.account?.let { redactPresentation(session, it) },
+            awayMessage = info.awayMessage?.let { redactPresentation(session, it) },
+        )
+        enqueuePersistence {
+            if (sessions[session.config.id] !== session || networkStore.byId(session.config.id) == null) return@enqueuePersistence
+            offlineStore?.saveWhois(session.config.id, safeInfo, now, mapping)
+        }
+        if (!whoisRequestCurrent(session, info.nick)) return
+        _whois.value = safeInfo
+        _whoisPresentation.value = WhoisPresentation(session.config.id, safeInfo, now,
+            cached = false, refreshing = false, offline = false)
     }
 
     public fun connect(config: NetworkConfig) {
@@ -364,6 +934,7 @@ public class LiveCoordinator(
                 synchronized(session.state) { recover(session, RecoverySignal.RESUME) }
             }
             refreshNetworkStates()
+            scheduleMaintenance()
         }
     }
 
@@ -481,19 +1052,24 @@ public class LiveCoordinator(
 
     private fun startSession(
         config: NetworkConfig,
-        casemapping: CaseMapping = CaseMapping.RFC1459,
+        casemapping: CaseMapping = restoredCasemapping[config.id] ?: CaseMapping.RFC1459,
         manuallyWanted: Boolean = false,
         allowStartup: Boolean = true,
     ) {
         val session = Session(config, casemapping, manuallyWanted, allowStartup)
         session.recovery.handle(RecoverySignal.START)
         sessions[config.id] = session
-        _profiles.update { it - config.id }
+        _profiles.update { profiles ->
+            val retained = profiles[config.id] ?: return@update profiles
+            profiles + (config.id to retained.copy(byFoldedNick = retained.byFoldedNick.mapValues { (_, profile) ->
+                profile.copy(cached = true)
+            }))
+        }
         updateAllBuffersForNetwork(config.id) { buffer ->
             buffer.copy(
-                topic = null,
-                members = emptyList(),
-                memberPresence = emptyMap(),
+                cachedTopic = buffer.cachedTopic || topicObservedAt.containsKey(buffer.key) || buffer.topic != null,
+                cachedRoster = buffer.cachedRoster || rosterObservedAt.containsKey(buffer.key) || buffer.members.isNotEmpty(),
+                cachedModes = buffer.cachedModes || modesObservedAt.containsKey(buffer.key) || buffer.channelModes.isNotEmpty(),
                 typingUsers = emptyMap(),
                 joinState = if (buffer.ref.kind == ConversationKind.CHANNEL &&
                     !channelOrder.isParted(buffer.ref.storageKey)
@@ -512,15 +1088,21 @@ public class LiveCoordinator(
         val retainedBuffers = _buffers.value
         val retainedMappingKnown = session.storedMappingKnown
         enqueuePersistence {
-            val known = runCatching {
+            if (pendingStorageMigrations.containsKey(session.config.id)) return@enqueuePersistence
+            val known = try {
                 messageStore.knownConversations(session.config.id)
-            }.getOrDefault(emptyList())
+            } catch (error: Exception) {
+                if (error is kotlinx.coroutines.CancellationException) throw error
+                _operationError.value = "Saved conversations could not be loaded: ${error.message ?: "storage unavailable"}"
+                return@enqueuePersistence
+            }
+            val cachedRefs = offlineStore?.shells(session.config.id).orEmpty().associateBy { it.ref.storageKey }
             synchronized(session.state) {
-                if (sessions[session.config.id] !== session) return@enqueuePersistence
+                if (sessions[session.config.id] !== session || pendingStorageMigrations.containsKey(session.config.id)) return@enqueuePersistence
                 for (storedRef in known) {
                     val ref = currentRef(
                         if (retainedMappingKnown) {
-                            retainedBuffers[storedRef.storageKey]?.ref ?: _buffers.value[storedRef.storageKey]?.ref ?: storedRef
+                            retainedBuffers[storedRef.storageKey]?.ref ?: _buffers.value[storedRef.storageKey]?.ref ?: cachedRefs[storedRef.storageKey]?.ref ?: storedRef
                         } else {
                             storedRef
                         },
@@ -599,6 +1181,7 @@ public class LiveCoordinator(
         session.acceptedEpoch = null
         session.state.registered = false
         session.statusFlow.value = ConnectionStatus.DISCONNECTED
+        markNetworkCached(session.config.id)
         clearIdentification(session)
         session.probeJob?.cancel()
         session.probeJob = null
@@ -617,6 +1200,8 @@ public class LiveCoordinator(
             }
             enqueuePersistence {
                 messageStore.deleteNetwork(networkId)
+                offlineStore?.deleteNetwork(networkId)
+                readMarkers.deleteNetwork(networkId)
                 try {
                     networkStore.deleteUnreferencedPasswords(
                         listOfNotNull(saved.saslPasswordRef, saved.serverPasswordRef, saved.nickServPasswordRef, saved.proxy?.passwordRef),
@@ -635,6 +1220,20 @@ public class LiveCoordinator(
                 _buffers.update { buffers -> buffers.filterValues { it.ref.networkId != networkId } }
             }
             _profiles.update { it - networkId }
+            loadedRosters.removeAll { it.substringBefore("|") == networkId }
+            loadedUsers.removeAll { it.substringBefore("|") == networkId }
+            metadataRequests.keys.removeAll { it.substringBefore("|") == networkId }
+            topicObservedAt.keys.removeAll { it.substringBefore("|") == networkId }
+            rosterObservedAt.keys.removeAll { it.substringBefore("|") == networkId }
+            modesObservedAt.keys.removeAll { it.substringBefore("|") == networkId }
+            restoredCasemapping.remove(networkId)
+            pendingStorageMigrations.remove(networkId)
+            deferredMaintenanceNetworks.remove(networkId)
+            writesSinceTrim.keys.removeAll { it.substringBefore("|") == networkId }
+            persistedRowsByLocalId.keys.removeAll { it.substringBefore("|") == networkId }
+            reactionRevisions.keys.removeAll { it.substringBefore("|") == networkId }
+            if (_restoredSelection.value?.substringBefore("|") == networkId) _restoredSelection.value = null
+            if (_whoisPresentation.value?.networkId == networkId) dismissWhois()
             rawLogs.remove(networkId)
             _rawLogVersion.update { it + 1 }
             refreshNetworkStates()
@@ -673,6 +1272,7 @@ public class LiveCoordinator(
 
     private fun launchSession(session: Session) {
         if (session.reconnector != null) return
+        if (startupRequested && !_restorationReady.value) return
         val reconnector = IrcReconnector(
             scope = session.lifecycleScope,
             policy = ReconnectPolicy(initialDelayMillis = 1_000, maxDelayMillis = 30_000),
@@ -820,13 +1420,17 @@ public class LiveCoordinator(
                 session.state.connectionEpoch += 1
                 session.state.registered = false
                 session.statusFlow.value = ConnectionStatus.DISCONNECTED
+                markNetworkCached(session.config.id)
                 session.reconnector?.setNetworkAvailable(false)
             }
             RecoveryAction.NUDGE -> {
                 if (session.reconnector == null) launchSession(session) else session.reconnector?.nudge()
             }
             RecoveryAction.PROBE -> probeSession(session)
-            RecoveryAction.STOP -> session.reconnector?.stop()
+            RecoveryAction.STOP -> {
+                markNetworkCached(session.config.id)
+                session.reconnector?.stop()
+            }
         }
     }
 
@@ -853,6 +1457,7 @@ public class LiveCoordinator(
                     session.acceptedEpoch = null
                     session.state.connectionEpoch += 1
                     session.statusFlow.value = ConnectionStatus.DISCONNECTED
+                    markNetworkCached(session.config.id)
                     history.reset(session.config.id, "Connection check failed")
                     connection.disconnect()
                     session.reconnector?.nudge()
@@ -922,6 +1527,32 @@ public class LiveCoordinator(
             val previousCapabilities = session.state.supportedCaps
             val previousNick = session.state.ownNick
             val effects = session.state.apply(event, inboundContext(session))
+            if (event is IrcEvent.MessageReceived && event.message.tags["batch"] == null) {
+                val command = event.message.command
+                if (command == "366" || command == "315") {
+                    event.message.parameters.getOrNull(1)?.let { target ->
+                        metadataRequests.remove(session.state.channelRef(target).storageKey, if (command == "366") "NAMES" else "WHO")
+                    }
+                }
+                if (command == "NICK" && "draft/chathistory-context" !in event.message.tags) {
+                    val oldNick = event.message.prefix?.nick
+                    val newNick = event.message.parameters.firstOrNull()
+                    if (oldNick != null && newNick != null) {
+                        val mapping = session.state.casemapping
+                        _profiles.update { profiles ->
+                            val current = profiles[session.config.id] ?: return@update profiles
+                            val profile = current.forNick(oldNick) ?: return@update profiles
+                            profiles + (session.config.id to current.copy(byFoldedNick =
+                                current.byFoldedNick - mapping.fold(oldNick) + (mapping.fold(newNick) to profile)))
+                        }
+                        enqueuePersistence {
+                            if (sessions[session.config.id] === session && networkStore.byId(session.config.id) != null) {
+                                offlineStore?.renameUser(session.config.id, oldNick, newNick, mapping)
+                            }
+                        }
+                    }
+                }
+            }
             if (previousMapping != session.state.casemapping) reconcileCaseMapping(session)
             if (previousSupport !== session.state.isupport) session.storedMappingKnown = true
             if (previousSupport !== session.state.isupport || previousCapabilities != session.state.supportedCaps ||
@@ -933,13 +1564,17 @@ public class LiveCoordinator(
                 )
             }
             for (effect in effects) processEffect(session, effect)
+            if (event is IrcEvent.CapabilitiesNegotiated) replayPendingReadMarkers(session)
             when (event) {
                 is IrcEvent.ConnectionOpened -> {
+                    session.replayedReadCursors.clear()
+                    markNetworkCached(session.config.id)
                     session.connectionError = null
                     session.rejectedCertificate = null
                     session.statusFlow.value = ConnectionStatus.CONNECTING
                 }
                 is IrcEvent.Disconnected -> {
+                    markNetworkCached(session.config.id)
                     session.connection = null
                     session.acceptedEpoch = null
                     connectionFailed(session, event.cause)
@@ -1004,6 +1639,8 @@ public class LiveCoordinator(
             session.config.id, session.historyGeneration, session.state.connectionEpoch.toLong(),
             session.state.casemapping, session.state.ownNick, session.state.isupport, session.state.supportedCaps,
         )
+        replayPendingReadMarkers(session)
+        refreshRequestedWhois(session)
         refreshNetworkStates()
     }
 
@@ -1193,11 +1830,33 @@ public class LiveCoordinator(
                     }
                 }
             }
-            is InboundEffect.ProfilesChanged -> _profiles.update { profiles ->
-                if (sessions[session.config.id] === session) {
-                    profiles + (session.config.id to effect.profiles)
-                } else {
-                    profiles
+            is InboundEffect.ProfilesChanged -> {
+                if (sessions[session.config.id] !== session || !session.state.registered) return
+                val observed = session.state.users.values.filter { it.metadataObservedAtMs != null }
+                val redact: (String) -> String = { redactPresentation(session, it) }
+                val publishedKeys = effect.profiles.byFoldedNick.keys
+                val removedKeys = session.publishedProfileKeys - publishedKeys
+                _profiles.update { profiles ->
+                    val current = profiles[session.config.id] ?: NetworkProfiles(session.state.casemapping, emptyMap())
+                    val merged = current.byFoldedNick.toMutableMap()
+                    for (key in removedKeys) merged.remove(key)
+                    for (user in observed) {
+                        val key = session.state.fold(user.nick)
+                        val profile = mergeObservedProfile(merged[key], user, redact)
+                        if (profile == null) merged.remove(key) else merged[key] = profile
+                    }
+                    profiles + (session.config.id to current.copy(casemapping = session.state.casemapping, byFoldedNick = merged))
+                }
+                session.publishedProfileKeys = publishedKeys
+                val mapping = session.state.casemapping
+                enqueuePersistence {
+                    if (sessions[session.config.id] !== session || networkStore.byId(session.config.id) == null) return@enqueuePersistence
+                    for (user in observed) {
+                        val previous = offlineStore?.user(session.config.id, user.nick, mapping)
+                        if (sessions[session.config.id] !== session || networkStore.byId(session.config.id) == null) return@enqueuePersistence
+                        offlineStore?.saveUser(session.config.id, CachedUser(user.nick, user.presence.toCachedPresence(redact),
+                            mergeObservedMetadata(previous?.metadata.orEmpty(), user, redact), user.metadataObservedAtMs ?: clock()), mapping)
+                    }
                 }
             }
             is InboundEffect.NetworkIconChanged -> refreshNetworkStates()
@@ -1207,7 +1866,10 @@ public class LiveCoordinator(
                 refreshNetworkStates()
             }
             is InboundEffect.OwnNickChanged -> refreshNetworkStates()
-            is InboundEffect.EnsureBuffer -> buffer(effect.ref)
+            is InboundEffect.EnsureBuffer -> {
+                buffer(effect.ref)
+                persistOpenedShell(effect.ref)
+            }
             is InboundEffect.RemoveBuffer -> {
                 removeBuffer(effect.ref.storageKey)
                 channelOrder.markParted(effect.ref.storageKey)
@@ -1233,11 +1895,46 @@ public class LiveCoordinator(
                 channelContext = effect.channelContext,
                 historyContext = effect.historyContext,
             )
-            is InboundEffect.SetTopic -> updateBuffer(effect.ref) { it.copy(topic = effect.topic) }
-            is InboundEffect.SetMembers -> updateBuffer(effect.ref) {
-                it.copy(members = effect.members, memberPresence = effect.presence)
+            is InboundEffect.SetTopic -> {
+                val now = clock()
+                topicObservedAt[effect.ref.storageKey] = now
+                updateBuffer(effect.ref) { it.copy(topic = effect.topic?.let { topic -> redactPresentation(session, topic) }, cachedTopic = false, cachedStateAtMs = now) }
+                persistSnapshot(session, effect.ref)
             }
-            is InboundEffect.SetJoinState -> updateBuffer(effect.ref) { it.copy(joinState = effect.state) }
+            is InboundEffect.SetMembers -> {
+                val now = clock()
+                if (effect.complete) rosterObservedAt[effect.ref.storageKey] = now
+                updateBuffer(effect.ref) { current ->
+                    if (!effect.complete && current.cachedRoster) current else
+                        current.copy(members = effect.members, memberPresence = effect.presence,
+                            cachedRoster = !effect.complete && current.cachedRoster, cachedStateAtMs = now,
+                            rosterTruncated = !effect.complete && current.rosterTruncated)
+                }
+                if (effect.complete) {
+                    loadedRosters.add(effect.ref.storageKey)
+                    val redact: (String) -> String = { redactPresentation(session, it) }
+                    val roster = OfflineRoster(effect.members, effect.presence.mapValues { (_, value) -> value.toCachedPresence(redact) },
+                        now, completeAtObservation = true)
+                    persistSnapshot(session, effect.ref, roster)
+                }
+            }
+            is InboundEffect.SetModes -> {
+                val now = clock()
+                if (effect.complete) modesObservedAt[effect.ref.storageKey] = now
+                updateBuffer(effect.ref) { current ->
+                    if (!effect.complete && current.cachedModes) current else
+                        current.copy(channelModes = effect.modes.mapValues { (_, parameters) -> parameters.map { redactPresentation(session, it) } },
+                            cachedModes = !effect.complete && current.cachedModes,
+                            cachedStateAtMs = now)
+                }
+                if (effect.complete) persistSnapshot(session, effect.ref)
+            }
+            is InboundEffect.SetJoinState -> {
+                updateBuffer(effect.ref) { it.copy(joinState = effect.state) }
+                if (effect.state == JoinState.JOINED && synchronized(selectionLock) { selectedStorageKey == effect.ref.storageKey }) {
+                    ensureMembers(session.config.id, effect.ref.storageKey)
+                }
+            }
             is InboundEffect.ClearTyping -> updateBufferKey(effect.ref.storageKey) { it.copy(typingUsers = emptyMap()) }
             is InboundEffect.SetTyping -> updateBuffer(effect.ref) { buffer ->
                 val now = clock()
@@ -1246,14 +1943,36 @@ public class LiveCoordinator(
                 if (expiresAt == null) fresh.remove(effect.nick) else fresh[effect.nick] = expiresAt
                 buffer.copy(typingUsers = fresh)
             }
-            is InboundEffect.ApplyReaction -> updateBuffer(effect.ref) { buffer ->
-                buffer.copy(reactions = applyReaction(buffer.reactions, effect))
+            is InboundEffect.ApplyReaction -> {
+                val revisions = effect.msgids.associateWith { msgid ->
+                    idGenerator.getAndIncrement().also { reactionRevisions["${effect.ref.storageKey}|$msgid"] = it }
+                }
+                updateBuffer(effect.ref) { current ->
+                    val accepted = effect.msgids.filter { msgid -> current.messages.none { it.msgid == msgid && it.redacted } }
+                    current.copy(reactions = applyReaction(current.reactions, effect.copy(msgids = accepted)))
+                }
+                enqueuePersistence {
+                    if (sessions[session.config.id] !== session || networkStore.byId(session.config.id) == null) return@enqueuePersistence
+                    val affectedRows = mutableSetOf<Long>()
+                    for (msgid in effect.msgids) {
+                        messageStore.applyReaction(effect.ref, msgid, effect.sender, effect.emoji, effect.added, clock(),
+                            onRetentionChanged = { affectedRows.addAll(it) })
+                        revisions[msgid]?.let { reactionRevisions.remove("${effect.ref.storageKey}|$msgid", it) }
+                    }
+                    refreshReactionRetention(session.config.id, affectedRows, effect.ref, effect.msgids.toSet())
+                }
             }
-            is InboundEffect.RedactMessage -> updateBufferKey(effect.ref.storageKey) { buffer ->
-                redactInBuffer(buffer, effect.msgid)
+            is InboundEffect.RedactMessage -> {
+                updateBufferKey(effect.ref.storageKey) { current -> redactInBuffer(current, effect.msgid) }
+                enqueuePersistence {
+                    if (sessions[session.config.id] !== session || networkStore.byId(session.config.id) == null) return@enqueuePersistence
+                    messageStore.redact(effect.ref, effect.msgid, clock())
+                    refreshVisibleDurableState(effect.ref)
+                    refreshUnread(effect.ref)
+                }
             }
             is InboundEffect.ApplyReadMarker -> applyReadMarker(effect.ref, effect.timestampMs)
-            is InboundEffect.WhoisCompleted -> _whois.value = effect.info
+            is InboundEffect.WhoisCompleted -> completeWhois(session, effect.info)
             is InboundEffect.ChannelListed -> _channelList.update { it + effect.entry }
             is InboundEffect.ChannelListFinished -> _channelList.update { list -> list.sortedByDescending { it.users } }
             is InboundEffect.BouncerNetworksChanged -> bumpBouncerVersion()
@@ -1262,35 +1981,35 @@ public class LiveCoordinator(
     }
 
     private fun applyReadMarker(ref: ConversationRef, millis: Long) {
-        readMarkers.advance(ref.storageKey, millis)
-        _buffers.update { current ->
-            val existing = current[ref.storageKey] ?: return@update current
-            if (millis <= existing.readAtMs) {
-                current
-            } else {
-                val boundary = if (mutes.isMuted(ref.storageKey)) null else existing.messages
-                    .asSequence()
-                    .filter { it.timestampMs > millis && it.countsAsUnread }
-                    .minOfOrNull { it.timestampMs }
-                current + (ref.storageKey to existing.copy(
-                    readAtMs = millis,
-                    hasUnread = boundary != null,
-                    unreadFromTimestampMs = boundary,
-                ))
-            }
-        }
+        readMarkers.reconcileRemote(ref.storageKey, millis)
+        enqueuePersistence { refreshUnread(currentRef(ref)) }
     }
 
     private val selectionLock = Any()
     private var selectedStorageKey: String? = null
     private var pendingRenamedKey: String? = null
+    private var selectionRevision = 0L
 
     public fun trackSelection(storageKey: String?) {
-        synchronized(selectionLock) {
-            if (selectedStorageKey != storageKey) {
+        val changed = synchronized(selectionLock) {
+            if (selectedStorageKey == storageKey) false else {
                 selectedStorageKey = storageKey
+                selectionRevision += 1
                 pendingRenamedKey = null
+                true
             }
+        }
+        if (!changed) return
+        if (requestedWhois != null && requestedWhoisOrigin != storageKey) dismissWhois()
+        val token = synchronized(selectionLock) { selectionRevision }
+        enqueuePersistence {
+            if (synchronized(selectionLock) { selectionRevision != token }) return@enqueuePersistence
+            val ref = storageKey?.let { _buffers.value[it]?.ref }
+            if (storageKey != null && ref == null || storageKey == null && !_restorationReady.value) return@enqueuePersistence
+            if (ref != null && networkStore.byId(ref.networkId) == null) return@enqueuePersistence
+            offlineStore?.select(ref, clock())
+            if (ref != null) loadCachedShell(ref)
+            if (ref != null) loadCachedRoster(ref)
         }
     }
 
@@ -1306,11 +2025,18 @@ public class LiveCoordinator(
             }
             selectedStorageKey = renamed
             pendingRenamedKey = null
+            val ref = _buffers.value[renamed]?.ref
+            enqueuePersistence {
+                if (synchronized(selectionLock) { selectedStorageKey != renamed }) return@enqueuePersistence
+                if (ref != null && networkStore.byId(ref.networkId) != null) offlineStore?.select(ref, clock())
+            }
             renamed
         }
 
     private fun removeBuffer(storageKey: String) = withNetworkState(storageKey.substringBefore("|")) {
         history.remove(storageKey)
+        val ref = _buffers.value[storageKey]?.ref
+        if (ref != null) enqueuePersistence { offlineStore?.deleteConversation(ref) }
         synchronized(selectionLock) {
             if (selectedStorageKey == storageKey || pendingRenamedKey == storageKey) pendingRenamedKey = null
             _buffers.update { it - storageKey }
@@ -1326,6 +2052,7 @@ public class LiveCoordinator(
         val fromKey = from.storageKey
         val toKey = to.storageKey
         synchronized(selectionLock) {
+            if (fromKey != toKey) beginStorageMigration(from.networkId)
             if (fromKey != toKey && fromKey in _buffers.value &&
                 (selectedStorageKey == fromKey || pendingRenamedKey == fromKey)
             ) {
@@ -1345,11 +2072,30 @@ public class LiveCoordinator(
                     val marker = maxOf(moved.readAtMs, occupant.readAtMs, readMarkers.marker(toKey))
                     val boundary = if (mutes.isMuted(fromKey) || mutes.isMuted(toKey)) null else messages.asSequence()
                         .filter { it.countsAsUnread && it.timestampMs > marker }.minOfOrNull { it.timestampMs }
+                    val sources = listOf(moved, occupant)
+                    val topicSource = if ((topicObservedAt[fromKey] ?: Long.MIN_VALUE) >=
+                        (topicObservedAt[toKey] ?: Long.MIN_VALUE)) moved else occupant
+                    val modesSource = if ((modesObservedAt[fromKey] ?: Long.MIN_VALUE) >=
+                        (modesObservedAt[toKey] ?: Long.MIN_VALUE)) moved else occupant
                     moved.copy(
                         messages = messages,
                         hasUnread = boundary != null,
                         unreadFromTimestampMs = boundary,
                         readAtMs = marker,
+                        topic = topicSource.topic,
+                        cachedTopic = topicSource.cachedTopic,
+                        channelModes = modesSource.channelModes,
+                        cachedModes = modesSource.cachedModes,
+                        members = sources.flatMap { it.members }.distinctBy { session.state.fold(it.nick) },
+                        memberPresence = occupant.memberPresence + moved.memberPresence,
+                        cachedRoster = moved.cachedRoster || occupant.cachedRoster,
+                        rosterTruncated = moved.rosterTruncated || occupant.rosterTruncated,
+                        cachedStateAtMs = sources.mapNotNull { it.cachedStateAtMs }.maxOrNull(),
+                        reactions = mergeReactions(sources),
+                        unreadCount = maxOf(moved.unreadCount, occupant.unreadCount),
+                        mentionCount = maxOf(moved.mentionCount, occupant.mentionCount),
+                        mentionCountKnown = moved.mentionCountKnown && occupant.mentionCountKnown,
+                        replyDraft = moved.replyDraft ?: occupant.replyDraft,
                     )
                 } ?: moved
                 current - fromKey + (toKey to merged)
@@ -1361,7 +2107,16 @@ public class LiveCoordinator(
             channelOrder.rename(fromKey, toKey)
             _orderState.value = channelOrder.snapshot()
             history.rename(from, to)
-            enqueuePersistence { migrateMessages(from, to) }
+            enqueuePersistence {
+                var completed = false
+                try {
+                    migrateMessages(from, to)
+                    completed = true
+                } finally {
+                    finishStorageMigration(from.networkId, completed)
+                }
+            }
+            migrateCachedKeys(fromKey, toKey)
         }
         val autojoin = session.state.autojoin
         if (autojoin != session.config.autojoin) {
@@ -1369,6 +2124,7 @@ public class LiveCoordinator(
             networkStore.update(session.config)
         }
         history.resume(session.config.id)
+        persistSnapshot(session, to)
     }
 
     private fun currentRef(ref: ConversationRef): ConversationRef {
@@ -1377,8 +2133,9 @@ public class LiveCoordinator(
         return if (ref.normalizedTarget == folded) ref else ref.copy(normalizedTarget = folded)
     }
 
-    private fun migrateConversationMetadata(fromKey: String, toKey: String) {
+    private fun migrateConversationMetadata(fromKey: String, toKey: String, preserveReadReplay: Boolean = false) {
         if (fromKey == toKey) return
+        migrateCachedKeys(fromKey, toKey, preserveReadReplay)
         readMarkers.rename(fromKey, toKey)
         mutes.rename(fromKey, toKey)
         channelOrder.rename(fromKey, toKey)
@@ -1386,47 +2143,101 @@ public class LiveCoordinator(
         _orderState.value = channelOrder.snapshot()
     }
 
+    private fun migrateCachedKeys(fromKey: String, toKey: String, preserveReadReplay: Boolean = false) {
+        for (observations in listOf(topicObservedAt, rosterObservedAt, modesObservedAt)) {
+            observations.remove(fromKey)?.let { from ->
+                observations.merge(toKey, from, ::maxOf)
+            }
+        }
+        if (loadedRosters.remove(fromKey)) loadedRosters.add(toKey)
+        metadataRequests.remove(fromKey)
+        sessions[toKey.substringBefore("|")]?.replayedReadCursors?.let { cursors ->
+            val previous = cursors.remove(fromKey)
+            if (preserveReadReplay && previous != null) cursors.merge(toKey, previous, ::maxOf)
+        }
+        if (_restoredSelection.value == fromKey) _restoredSelection.value = toKey
+    }
+
     private suspend fun migrateMessages(from: ConversationRef, to: ConversationRef) {
+        if (networkStore.byId(from.networkId) == null) return
         messageStore.renameConversation(from, to) { removed, retained ->
             synchronized(selectionLock) {
+                for ((key, rowId) in persistedRowsByLocalId) if (rowId == removed) persistedRowsByLocalId[key] = retained
                 updateAllBuffersForNetwork(from.networkId) { buffer ->
                     buffer.copy(
                         messages = buffer.messages.map { message ->
-                            if (message.storedRowId == removed) message.copy(storedRowId = retained) else message
-                        },
+                            if (message.storedRowId == removed || message.localReplyParentRowId == removed) {
+                                message.copy(
+                                    storedRowId = if (message.storedRowId == removed) retained else message.storedRowId,
+                                    localReplyParentRowId = if (message.localReplyParentRowId == removed) retained else message.localReplyParentRowId,
+                                )
+                            } else message
+                        }.let { mergeConversationMessages(emptyList(), it) },
                         replyDraft = buffer.replyDraft?.let { draft ->
-                            if (draft.storedRowId == removed) draft.copy(storedRowId = retained) else draft
+                            if (draft.storedRowId == removed || draft.localReplyParentRowId == removed) draft.copy(
+                                storedRowId = if (draft.storedRowId == removed) retained else draft.storedRowId,
+                                localReplyParentRowId = if (draft.localReplyParentRowId == removed) retained else draft.localReplyParentRowId,
+                            ) else draft
                         },
                     )
                 }
             }
         }
+        offlineStore?.renameConversation(from, to, sessions[to.networkId]?.state?.casemapping ?: CaseMapping.RFC1459)
+        loadCachedShell(to)
+        if (_buffers.value[to.storageKey]?.cachedRoster == true) {
+            loadedRosters.remove(to.storageKey)
+            loadCachedRoster(to)
+        }
+        refreshVisibleDurableState(to)
+        refreshUnread(to)
     }
 
     private fun reconcileCaseMapping(session: Session) = synchronized(selectionLock) {
         val mapping = session.state.casemapping
+        restoredCasemapping[session.config.id] = mapping
+        _profiles.update { profiles ->
+            val current = profiles[session.config.id] ?: return@update profiles
+            val rekeyed = session.state.users.values.mapNotNull { user ->
+                val previous = current.byFoldedNick[current.casemapping.fold(user.nick)]
+                mergeObservedProfile(previous, user) { redactPresentation(session, it) }?.let { mapping.fold(user.nick) to it }
+            }.toMap()
+            profiles + (session.config.id to current.copy(casemapping = mapping, byFoldedNick = rekeyed))
+        }
+        session.publishedProfileKeys = session.state.users.profiles.keys.toSet()
+        loadedUsers.removeAll { it.substringBefore("|") == session.config.id }
         val existing = _buffers.value.values.filter { it.ref.networkId == session.config.id }
         val refs = existing.associate { it.key to it.ref }
+        val observedTopics = existing.associate { it.key to topicObservedAt[it.key] }
+        val observedModes = existing.associate { it.key to modesObservedAt[it.key] }
         if (session.storedMappingKnown) {
+            beginStorageMigration(session.config.id)
             val order = channelOrder.snapshot()
             val metadataKeys = readMarkers.all().keys + mutes.all() + order.pinnedKeys +
                 order.groups.flatMap { it.memberKeys } + order.partedKeys + refs.keys
             for (key in metadataKeys) {
                 if (key.substringBefore("|") != session.config.id) continue
                 val raw = refs[key]?.rawTarget ?: key.substringAfter("|")
-                migrateConversationMetadata(key, "${session.config.id}|${mapping.fold(raw)}")
+                migrateConversationMetadata(key, "${session.config.id}|${mapping.fold(raw)}", preserveReadReplay = true)
             }
             enqueuePersistence {
-                val persisted = messageStore.knownConversations(session.config.id)
-                for (from in persisted) {
-                    val raw = refs[from.storageKey]?.rawTarget ?: from.rawTarget
-                    val to = from.copy(rawTarget = raw, normalizedTarget = mapping.fold(raw))
-                    migrateMessages(from, to)
-                    synchronized(session.state) {
-                        if (sessions[session.config.id] === session) {
-                            migrateConversationMetadata(from.storageKey, to.storageKey)
+                var completed = false
+                try {
+                    if (networkStore.byId(session.config.id) == null) return@enqueuePersistence
+                    val persisted = messageStore.knownConversations(session.config.id)
+                    val cachedRefs = offlineStore?.shells(session.config.id).orEmpty().associateBy { it.ref.storageKey }
+                    for (from in persisted) {
+                        val raw = refs[from.storageKey]?.rawTarget ?: cachedRefs[from.storageKey]?.ref?.rawTarget ?: from.rawTarget
+                        val to = from.copy(rawTarget = raw, normalizedTarget = mapping.fold(raw))
+                        migrateMessages(from, to)
+                        synchronized(session.state) {
+                            if (sessions[session.config.id] === session) migrateConversationMetadata(from.storageKey, to.storageKey, preserveReadReplay = true)
                         }
                     }
+                    offlineStore?.rekeyNetwork(session.config.id, mapping)
+                    completed = true
+                } finally {
+                    finishStorageMigration(session.config.id, completed)
                 }
             }
         }
@@ -1442,10 +2253,21 @@ public class LiveCoordinator(
             val marker = maxOf(buffers.maxOf { it.readAtMs }, readMarkers.marker(ref.storageKey))
             val boundary = if (mutes.isMuted(ref.storageKey)) null else messages
                 .asSequence().filter { it.countsAsUnread && it.timestampMs > marker }.minOfOrNull { it.timestampMs }
+            val topicSource = buffers.maxBy { observedTopics[it.key] ?: Long.MIN_VALUE }
+            val modesSource = buffers.maxBy { observedModes[it.key] ?: Long.MIN_VALUE }
             first.copy(
                 ref = ref,
                 messages = messages,
-                topic = buffers.firstNotNullOfOrNull { it.topic },
+                topic = topicSource.topic,
+                cachedTopic = topicSource.cachedTopic,
+                channelModes = modesSource.channelModes,
+                cachedModes = modesSource.cachedModes,
+                cachedRoster = buffers.any { it.cachedRoster },
+                rosterTruncated = buffers.any { it.rosterTruncated },
+                cachedStateAtMs = buffers.mapNotNull { it.cachedStateAtMs }.maxOrNull(),
+                unreadCount = buffers.maxOf { it.unreadCount },
+                mentionCount = buffers.maxOf { it.mentionCount },
+                mentionCountKnown = buffers.all { it.mentionCountKnown },
                 readAtMs = marker,
                 hasUnread = boundary != null,
                 unreadFromTimestampMs = boundary,
@@ -1474,9 +2296,12 @@ public class LiveCoordinator(
     }
 
     private fun mergeReactions(buffers: List<ConversationBuffer>): Map<String, Map<String, Set<String>>> {
+        val redacted = buffers.asSequence().flatMap { it.messages.asSequence() }
+            .filter { it.redacted }.mapNotNull { it.msgid }.toSet()
         val merged = LinkedHashMap<String, MutableMap<String, Set<String>>>()
         for (buffer in buffers) {
             for ((msgid, reactions) in buffer.reactions) {
+                if (msgid in redacted) continue
                 val target = merged.getOrPut(msgid) { LinkedHashMap() }
                 for ((emoji, senders) in reactions) target[emoji] = target[emoji].orEmpty() + senders
             }
@@ -1604,9 +2429,10 @@ public class LiveCoordinator(
 
     public fun deleteMessage(networkId: String, storageKey: String, msgid: String) {
         val session = sessions[networkId] ?: return
+        if (!session.state.registered || session.statusFlow.value != ConnectionStatus.REGISTERED) return
         val buffer = _buffers.value[storageKey] ?: return
         sendRaw(session, "REDACT ${buffer.ref.rawTarget} $msgid")
-        updateBufferKey(storageKey) { current -> redactInBuffer(current, msgid) }
+        processEffect(session, InboundEffect.RedactMessage(buffer.ref, msgid))
     }
 
     private fun updateAllBuffersForNetwork(networkId: String, transform: (ConversationBuffer) -> ConversationBuffer) {
@@ -1618,27 +2444,41 @@ public class LiveCoordinator(
     }
 
     public fun ensureMembers(networkId: String, storageKey: String) {
+        val current = _buffers.value[storageKey] ?: return
+        if (current.ref.networkId != networkId || current.ref.kind != ConversationKind.CHANNEL) return
+        enqueuePersistence { loadCachedRoster(current.ref) }
         val session = sessions[networkId] ?: return
-        val buffer = _buffers.value[storageKey] ?: return
-        if (buffer.ref.kind != ConversationKind.CHANNEL || buffer.joinState != JoinState.JOINED) return
-        val needsMembers = buffer.members.isEmpty()
-        val needsPresence = buffer.members.any { buffer.memberPresence[it.nick]?.away == null }
-        if (!needsMembers && !needsPresence) return
-        val query = synchronized(session.state) {
-            if (!session.state.registered) return
-            if (session.state.hasWhox) WHOX_QUERY else ""
+        synchronized(session.state) {
+            if (!session.state.registered || session.statusFlow.value != ConnectionStatus.REGISTERED ||
+                current.joinState != JoinState.JOINED
+            ) return
+            val channel = session.state.channel(storageKey)
+            val needsMembers = current.cachedRoster || channel?.membersComplete != true
+            val needsPresence = current.members.any { current.memberPresence[it.nick]?.away == null }
+            if (needsMembers || needsPresence) {
+                val request = if (current.cachedRoster) "NAMES" else "WHO"
+                if (metadataRequests.putIfAbsent(storageKey, request) == null) {
+                    if (request == "NAMES") sendRaw(session, "NAMES ${current.ref.rawTarget}") else {
+                        val query = if (session.state.hasWhox) WHOX_QUERY else ""
+                        sendRaw(session, "WHO ${current.ref.rawTarget} $query".trimEnd())
+                    }
+                }
+            }
+            if (current.cachedTopic) sendRaw(session, "TOPIC ${current.ref.rawTarget}")
+            if (current.cachedModes || channel?.modesComplete != true) sendRaw(session, "MODE ${current.ref.rawTarget}")
         }
-        sendRaw(session, "WHO ${buffer.ref.rawTarget} $query".trimEnd())
     }
 
     public fun react(networkId: String, storageKey: String, msgid: String, emoji: String) {
         val session = sessions[networkId] ?: return
+        if (!session.state.registered || session.statusFlow.value != ConnectionStatus.REGISTERED) return
         val buffer = _buffers.value[storageKey] ?: return
         val own = session.state.ownNick
         var reactionVerb: String? = null
+        var reactionRevision: Long? = null
         updateBufferKey(storageKey) { current ->
             var reactions = current.reactions
-            if (!current.messages.any { it.msgid == msgid }) return@updateBufferKey current
+            if (!current.messages.any { it.msgid == msgid && !it.redacted }) return@updateBufferKey current
             val perMessage = (reactions[msgid] ?: emptyMap()).toMutableMap()
             when {
                 perMessage[emoji].orEmpty().contains(own) -> {
@@ -1651,11 +2491,21 @@ public class LiveCoordinator(
                     perMessage[emoji] = perMessage[emoji].orEmpty() + own
                 }
             }
+            reactionRevision = idGenerator.getAndIncrement()
+            reactionRevision?.let { reactionRevisions["${buffer.ref.storageKey}|$msgid"] = it }
             reactions = if (perMessage.isEmpty()) reactions - msgid else reactions + (msgid to perMessage.toMap())
             current.copy(reactions = reactions)
         }
         reactionVerb?.let { verb ->
             sendRaw(session, "@+draft/$verb=$emoji;+draft/refs=$msgid TAGMSG ${buffer.ref.rawTarget}")
+            enqueuePersistence {
+                if (sessions[networkId] !== session || networkStore.byId(networkId) == null) return@enqueuePersistence
+                var affectedRows: Set<Long> = emptySet()
+                messageStore.applyReaction(buffer.ref, msgid, own, emoji, verb == "react", clock(),
+                    onRetentionChanged = { affectedRows = it })
+                reactionRevision?.let { reactionRevisions.remove("${buffer.ref.storageKey}|$msgid", it) }
+                refreshReactionRetention(networkId, affectedRows, buffer.ref, setOf(msgid))
+            }
         }
     }
 
@@ -1665,22 +2515,24 @@ public class LiveCoordinator(
 
     public fun directMessageKey(networkId: String, fromKey: String, nick: String): String {
         val session = sessions[networkId]
-        val casemapping = session?.state?.casemapping ?: dev.brentdevs.yardhal.core.protocol.CaseMapping.RFC1459
+        val casemapping = session?.state?.casemapping ?: restoredCasemapping[networkId] ?: CaseMapping.RFC1459
         val ref = ConversationRef.directMessage(networkId, nick, casemapping)
-        buffer(ref)
+        if (networkStore.byId(networkId) != null) buffer(ref)
+        persistOpenedShell(ref)
         return ref.storageKey
     }
 
     public fun ensureConversation(networkId: String, conversation: String): String {
         val session = sessions[networkId]
-        val casemapping = session?.state?.casemapping ?: dev.brentdevs.yardhal.core.protocol.CaseMapping.RFC1459
+        val casemapping = session?.state?.casemapping ?: restoredCasemapping[networkId] ?: CaseMapping.RFC1459
         val ref = when {
             conversation == ConversationRef.SERVER_TARGET -> ConversationRef.server(networkId)
             conversation.firstOrNull()?.let { it in "#&" } == true ->
                 ConversationRef.channel(networkId, conversation, casemapping)
             else -> ConversationRef.directMessage(networkId, conversation, casemapping)
         }
-        buffer(ref)
+        if (networkStore.byId(networkId) != null) buffer(ref)
+        persistOpenedShell(ref)
         return ref.storageKey
     }
 
@@ -1735,10 +2587,22 @@ public class LiveCoordinator(
         val storageKey = ensureConversation(hit.networkId, hit.conversation)
         val ref = _buffers.value[storageKey]?.ref ?: return storageKey
         enqueuePersistence {
+            if (networkStore.byId(ref.networkId) == null) return@enqueuePersistence
+            val session = sessions[ref.networkId]
             val context = messageStore.around(ref, hit.rowId, hit.timestampMs)
-            updateBufferKey(currentRef(ref).storageKey) { current ->
-                current.copy(messages = mergeSearchContext(current.messages, context, nextLocalId = idGenerator::getAndIncrement))
+            if (networkStore.byId(ref.networkId) == null || sessions[ref.networkId] !== session) return@enqueuePersistence
+            val target = currentRef(ref)
+            val parents = messageStore.replyParents(target, context)
+            val reactions = messageStore.reactions(target)
+            if (networkStore.byId(ref.networkId) == null || sessions[ref.networkId] !== session) return@enqueuePersistence
+            updateBufferKey(target.storageKey) { current ->
+                val messages = hydrateReplyPreviews(
+                    mergeSearchContext(current.messages, context, nextLocalId = idGenerator::getAndIncrement), parents)
+                val redacted = messages.asSequence().filter { it.redacted }.mapNotNull { it.msgid }.toSet()
+                current.copy(messages = messages, reactions = reactions - redacted)
             }
+            refreshUnread(target)
+            loadCachedUsers(target, context.map { it.senderNick })
         }
         return storageKey
     }
@@ -1836,12 +2700,18 @@ public class LiveCoordinator(
                 appendSystem(session, _buffers.value[storageKey]?.ref ?: ConversationRef.server(networkId), "Upload failed: ${error.message}")
                 return@launch
             }
+            if (sessions[networkId] !== session || networkStore.byId(networkId) == null ||
+                !session.state.registered || session.statusFlow.value != ConnectionStatus.REGISTERED
+            ) return@launch
             sendMessage(
                 session = session,
                 ref = _buffers.value[storageKey]?.ref ?: return@launch,
                 wireText = uploaded.url,
                 optimisticText = uploaded.url,
                 attachmentUrl = uploaded.url,
+                attachmentName = fileName,
+                attachmentMimeType = mimeType,
+                attachmentSizeBytes = bytes.size.toLong(),
             )
         }
     }
@@ -1874,24 +2744,62 @@ public class LiveCoordinator(
         playback: Boolean = false,
         attachmentUrl: String? = null,
         pendingEcho: Boolean = false,
-        persist: Boolean = true,
         reconcilePendingEcho: Boolean = false,
         echoLabel: String? = null,
         senderAccount: String? = null,
         channelContext: String? = null,
         historyContext: Boolean = false,
         optimistic: Boolean = false,
+        quoteParent: ChatMessage? = null,
+        attachmentName: String? = null,
+        attachmentMimeType: String? = null,
+        attachmentSizeBytes: Long? = null,
+        attachmentWidth: Int? = null,
+        attachmentHeight: Int? = null,
     ) {
+        if (sessions[ref.networkId] !== session || networkStore.byId(ref.networkId) == null) return
         val presentedText = redactPresentation(session, text)
         val newLocalId = idGenerator.getAndIncrement()
         val muted = mutes.isMuted(ref.storageKey)
         var appended = false
         var persistedLocalId = newLocalId
         var persistedTimestampMs = timestampMs
+        val entry = ChatMessage(
+            localId = newLocalId,
+            sender = sender,
+            kind = kind,
+            text = presentedText,
+            timestampMs = timestampMs,
+            sentByUs = sentByUs,
+            highlightsMe = highlightsMe,
+            highlightsKnown = !playback && !historyContext,
+            msgid = msgid,
+            replyToMsgid = replyToMsgid,
+            attachmentUrl = attachmentUrl?.let { redactPresentation(session, it) },
+            playback = playback,
+            pendingEcho = pendingEcho,
+            echoLabel = echoLabel.takeIf { pendingEcho },
+            senderAccount = senderAccount?.let { redactPresentation(session, it) },
+            channelContext = channelContext,
+            historyContext = historyContext,
+            localReplyParentRowId = quoteParent?.storedRowId,
+            replyPreview = quoteParent?.let { ReplyPreview(it.sender, it.text, it.attachmentUrl, it.redacted) },
+            attachmentName = attachmentName?.let { redactPresentation(session, it) },
+            attachmentMimeType = attachmentMimeType,
+            attachmentSizeBytes = attachmentSizeBytes,
+            attachmentWidth = attachmentWidth,
+            attachmentHeight = attachmentHeight,
+        )
         updateBuffer(ref) { buffer ->
             appended = false
             if (reconcilePendingEcho && !playback) {
-                reconcileEcho(buffer, kind, presentedText, echoLabel, msgid, timestampMs, attachmentUrl, senderAccount)?.let { return@updateBuffer it }
+                val optimisticMessage = buffer.messages.firstOrNull {
+                    it.pendingEcho && if (echoLabel != null) it.echoLabel == echoLabel else it.kind == kind && it.text == presentedText
+                }
+                reconcileEcho(buffer, kind, presentedText, echoLabel, msgid, timestampMs, attachmentUrl, senderAccount)?.let {
+                    persistedLocalId = optimisticMessage?.localId ?: persistedLocalId
+                    return@updateBuffer it
+                }
             }
             val byMsgid = if (msgid == null) -1 else buffer.messages.indexOfFirst { it.msgid == msgid }
             val byContent = if (byMsgid >= 0 || !playback) -1 else {
@@ -1904,39 +2812,16 @@ public class LiveCoordinator(
             if (duplicateIndex >= 0) {
                 val existing = buffer.messages[duplicateIndex]
                 persistedLocalId = existing.localId
-                val updated = existing.copy(
-                    msgid = existing.msgid ?: msgid,
-                    replyToMsgid = existing.replyToMsgid ?: replyToMsgid,
-                    attachmentUrl = existing.attachmentUrl ?: attachmentUrl,
-                    channelContext = existing.channelContext ?: channelContext,
-                    senderAccount = existing.senderAccount ?: senderAccount,
-                    historyContext = existing.historyContext && historyContext,
-                )
+                val updated = mergeChatMessageMetadata(existing, entry)
                 if (updated == existing) return@updateBuffer buffer
                 val messages = buffer.messages.toMutableList()
                 messages[duplicateIndex] = updated
                 return@updateBuffer buffer.copy(messages = messages)
             }
-            val entry = ChatMessage(
-                localId = newLocalId,
-                sender = sender,
-                kind = kind,
-                text = presentedText,
-                timestampMs = timestampMs,
-                sentByUs = sentByUs,
-                highlightsMe = highlightsMe,
-                msgid = msgid,
-                replyToMsgid = replyToMsgid,
-                attachmentUrl = attachmentUrl,
-                playback = playback,
-                pendingEcho = pendingEcho,
-                echoLabel = echoLabel.takeIf { pendingEcho },
-                senderAccount = senderAccount,
-                channelContext = channelContext,
-                historyContext = historyContext,
-            )
             appended = true
-            val countsAsUnread = entry.countsAsUnread && !muted && timestampMs > buffer.readAtMs
+            val cursor = readMarkers.cursor(ref.storageKey)
+            val countsAsUnread = entry.countsAsUnread && !muted &&
+                (timestampMs > cursor.timestampMs || timestampMs == cursor.timestampMs && cursor.rowId < Long.MAX_VALUE)
             val boundary = if (countsAsUnread) {
                 val existing = buffer.unreadFromTimestampMs
                 if (existing == null || existing <= buffer.readAtMs) timestampMs else minOf(existing, timestampMs)
@@ -1948,18 +2833,20 @@ public class LiveCoordinator(
             buffer.copy(
                 messages = messages,
                 hasUnread = buffer.hasUnread || countsAsUnread,
+                unreadCount = buffer.unreadCount + if (countsAsUnread) 1 else 0,
+                mentionCount = buffer.mentionCount + if (countsAsUnread && entry.highlightsMe) 1 else 0,
                 unreadFromTimestampMs = boundary,
             )
         }
-        if (persist) {
-            val localId = if (msgid == null) {
-                persistedLocalId
-            } else {
-                _buffers.value[ref.storageKey]?.messages?.firstOrNull { it.msgid == msgid }?.localId ?: persistedLocalId
-            }
-            persistAsync(session, ref, sender, kind, presentedText, msgid, persistedTimestampMs, sentByUs, localId, channelContext, historyContext)
+        val localId = if (msgid == null) {
+            persistedLocalId
+        } else {
+            _buffers.value[ref.storageKey]?.messages?.firstOrNull { it.msgid == msgid }?.localId ?: persistedLocalId
         }
-        if (appended && highlightsMe && !sentByUs && !playback && !muted) {
+        val snapshot = _buffers.value[ref.storageKey]?.messages?.firstOrNull { it.localId == localId }
+        if (snapshot != null) persistAsync(session, ref, snapshot.copy(timestampMs = persistedTimestampMs),
+            reconcilePendingEcho || sentByUs && msgid != null, quoteParent?.localId, optimistic)
+        if (appended && highlightsMe && !sentByUs && !playback && !historyContext && !muted) {
             notifier.onHighlight(session.config.name, sender, ConversationNames.forRef(ref), presentedText)
         }
     }
@@ -1967,48 +2854,110 @@ public class LiveCoordinator(
     private fun persistAsync(
         session: Session,
         ref: ConversationRef,
-        sender: String,
-        kind: MessageKind,
-        text: String,
-        msgid: String?,
-        timestampMs: Long,
-        sentByUs: Boolean,
-        localId: Long,
-        channelContext: String?,
-        historyContext: Boolean,
+        message: ChatMessage,
+        healPendingEcho: Boolean,
+        quoteParentLocalId: Long?,
+        freshLocal: Boolean,
     ) {
+        val interactionRevision = message.msgid?.let { reactionRevisions["${ref.storageKey}|$it"] }
         enqueuePersistence {
+            if (networkStore.byId(ref.networkId) == null) return@enqueuePersistence
+            val active = _buffers.value.values.firstOrNull { current ->
+                current.ref.networkId == ref.networkId && current.messages.any { it.localId == message.localId }
+            }
+            if (sessions[ref.networkId] !== session && active == null) return@enqueuePersistence
+            val target = active?.ref ?: currentRef(ref)
+            val quoteRowId = message.localReplyParentRowId ?: quoteParentLocalId?.let { parentId ->
+                active?.messages?.firstOrNull { it.localId == parentId }?.storedRowId
+            }
             val stored = StoredMessage(
-                networkId = session.config.id,
-                conversation = ref,
-                msgid = msgid,
-                senderNick = sender,
+                networkId = target.networkId,
+                conversation = target,
+                msgid = message.msgid,
+                senderNick = message.sender,
                 senderUser = null,
                 senderHost = null,
-                kind = kind,
-                text = text,
-                sentByUs = sentByUs,
-                timestampMs = timestampMs,
-                channelContext = channelContext,
-                historyContext = historyContext,
+                kind = message.kind,
+                text = message.text,
+                sentByUs = message.sentByUs,
+                timestampMs = message.timestampMs,
+                channelContext = message.channelContext,
+                historyContext = message.historyContext,
+                highlightsMe = message.highlightsMe,
+                highlightsKnown = message.highlightsKnown,
+                playback = message.playback,
+                replyToMsgid = message.replyToMsgid,
+                replyParentRowId = quoteRowId,
+                attachmentUrl = message.attachmentUrl,
+                attachmentName = message.attachmentName,
+                attachmentMimeType = message.attachmentMimeType,
+                attachmentSizeBytes = message.attachmentSizeBytes,
+                attachmentWidth = message.attachmentWidth,
+                attachmentHeight = message.attachmentHeight,
+                senderAccount = message.senderAccount,
+                redacted = message.redacted,
+                reactionsTruncated = message.reactionsTruncated,
             )
-            val inserted = messageStore.recordWithRowId(stored)
-            val persisted = if (inserted != null) stored else messageStore.findStoredMessage(stored) ?: return@enqueuePersistence
-            val rowId = inserted ?: persisted.rowId
-            val key = _buffers.value.values.firstOrNull { buffer ->
-                buffer.ref.networkId == ref.networkId && buffer.messages.any { it.localId == localId }
-            }?.key ?: return@enqueuePersistence
-            updateBufferKey(key) { current ->
-                val index = current.messages.indexOfFirst { it.localId == localId }
+            val existingRowId = persistedRowsByLocalId["${ref.networkId}|${message.localId}"] ?: message.storedRowId
+                ?: active?.messages?.firstOrNull { it.localId == message.localId }?.storedRowId
+            val recordedRowId = when {
+                healPendingEcho && existingRowId != null -> messageStore.healEcho(target, existingRowId, stored)
+                freshLocal -> messageStore.recordLocalEcho(stored)
+                else -> messageStore.recordWithRowId(stored)
+            }
+            val persisted = if (recordedRowId != null) messageStore.byRowId(target, recordedRowId)
+                else if (freshLocal) null else messageStore.findStoredMessage(stored)
+            if (persisted == null) {
+                if ((stored.historyContext || stored.playback) && sessions[ref.networkId] === session &&
+                    networkStore.byId(ref.networkId) != null) {
+                    updateBufferKey(target.storageKey) { current ->
+                        current.copy(
+                            messages = current.messages.filterNot { it.localId == message.localId },
+                            reactions = if (message.msgid == null) current.reactions else current.reactions - message.msgid,
+                        )
+                    }
+                }
+                return@enqueuePersistence
+            }
+            if (message.pendingEcho) persistedRowsByLocalId["${ref.networkId}|${message.localId}"] = persisted.rowId
+            else persistedRowsByLocalId.remove("${ref.networkId}|${message.localId}")
+            val parents = messageStore.replyParents(target, listOf(persisted))
+            val persistedMsgid = persisted.msgid
+            val restoredReactions = persistedMsgid?.let { messageStore.reactions(target, it) }
+            if (networkStore.byId(ref.networkId) == null) return@enqueuePersistence
+            val visible = _buffers.value.values.firstOrNull { current ->
+                current.ref.networkId == ref.networkId && current.messages.any { it.localId == message.localId }
+            }
+            updateBufferKey(visible?.key ?: target.storageKey) { current ->
+                val index = current.messages.indexOfFirst { it.localId == message.localId }
                 if (index < 0) current else {
                     val updated = current.messages.toMutableList()
-                    val message = updated[index]
-                    updated[index] = message.copy(storedRowId = rowId, msgid = message.msgid ?: persisted.msgid,
-                        sentByUs = message.sentByUs || persisted.sentByUs,
-                        historyContext = message.historyContext && persisted.historyContext)
-                    current.copy(messages = updated)
+                    updated[index] = mergeChatMessageMetadata(updated[index], persisted.toChatMessage(message.localId))
+                        .copy(storedRowId = persisted.rowId)
+                    val hydrated = hydrateReplyPreviews(updated, parents)
+                    val redacted = hydrated.asSequence().filter { it.redacted }.mapNotNull { it.msgid }.toSet()
+                    val reactions = if (persistedMsgid != null && restoredReactions != null &&
+                        reactionRevisions["${current.key}|$persistedMsgid"] == interactionRevision
+                    ) {
+                        if (restoredReactions.isEmpty()) current.reactions - persistedMsgid
+                        else current.reactions + (persistedMsgid to restoredReactions)
+                    } else current.reactions
+                    current.copy(messages = hydrated, reactions = reactions - redacted)
                 }
             }
+            refreshUnread(target)
+            if (target.storageKey in _buffers.value && !channelOrder.isParted(target.storageKey)) {
+                offlineStore?.saveConversation(OfflineConversationShell(target,
+                    _buffers.value[target.storageKey]?.displayName ?: ConversationNames.forRef(target), clock(),
+                    sessions[target.networkId]?.state?.casemapping ?: restoredCasemapping[target.networkId] ?: CaseMapping.RFC1459))
+            }
+            val writes = (writesSinceTrim[target.storageKey] ?: 0) + 1
+            if (writes >= 100) {
+                messageStore.trimTo(target, MESSAGE_PER_CONVERSATION_LIMIT, clock())
+                writesSinceTrim[target.storageKey] = 0
+                refreshUnread(target)
+            } else writesSinceTrim[target.storageKey] = writes
+            scheduleMaintenance()
         }
     }
 
@@ -2046,15 +2995,21 @@ public class LiveCoordinator(
     }
 
     public fun markRead(storageKey: String) {
-        val latest = _buffers.value[storageKey]?.messages?.maxOfOrNull { it.timestampMs } ?: return
-        readMarkers.advance(storageKey, latest)
-        updateBufferKey(storageKey) { it.copy(hasUnread = false, readAtMs = latest) }
-        val networkId = storageKey.substringBefore("|")
-        val session = sessions[networkId] ?: return
-        if ("draft/read-marker" !in session.state.supportedCaps) return
-        val target = session.bufferTargetFor(storageKey) ?: return
-        val iso = java.time.Instant.ofEpochMilli(latest).toString()
-        sendRaw(session, "MARKREAD $target timestamp=$iso")
+        val selected = _buffers.value[storageKey] ?: return
+        val latest = selected.messages.maxWithOrNull(compareBy<ChatMessage> { it.timestampMs }
+            .thenBy { it.storedRowId ?: Long.MAX_VALUE })
+        if (latest != null) {
+            readMarkers.advance(storageKey, latest.timestampMs, latest.storedRowId ?: 0L)
+            updateBufferKey(storageKey) { it.copy(hasUnread = false, unreadCount = 0, mentionCount = 0,
+                unreadFromTimestampMs = null, readAtMs = readMarkers.marker(storageKey)) }
+        }
+        enqueuePersistence {
+            if (networkStore.byId(selected.ref.networkId) == null || storageKey !in _buffers.value) return@enqueuePersistence
+            val newest = messageStore.newestCursor(selected.ref)
+            if (newest != null) readMarkers.advance(storageKey, newest.timestampMs, newest.rowId)
+            refreshUnread(selected.ref)
+            sessions[selected.ref.networkId]?.let(::replayPendingReadMarkers)
+        }
     }
 
     private fun Session.bufferTargetFor(storageKey: String): String? {
@@ -2137,7 +3092,7 @@ public class LiveCoordinator(
     }
 
     private fun SlashCommand.isLocal(): Boolean =
-        this is SlashCommand.Query || this is SlashCommand.IgnoreAdd ||
+        this is SlashCommand.Query || this is SlashCommand.IgnoreAdd || this is SlashCommand.Whois ||
             this is SlashCommand.IgnoreRemove || this is SlashCommand.Help
 
     public fun sendText(networkId: String, storageKey: String, input: String): Boolean {
@@ -2149,7 +3104,7 @@ public class LiveCoordinator(
         if (replyTo != null) {
             updateBufferKey(storageKey) { it.copy(replyDraft = null) }
         }
-        dispatchCommand(session, activeBuffer.ref, command, replyToMsgid = replyTo?.msgid)
+        dispatchCommand(session, activeBuffer.ref, command, replyToMsgid = replyTo?.msgid, quoteParent = replyTo)
         return true
     }
 
@@ -2164,10 +3119,11 @@ public class LiveCoordinator(
         active: ConversationRef,
         command: SlashCommand,
         replyToMsgid: String? = null,
+        quoteParent: ChatMessage? = null,
     ) {
         when (command) {
-            is SlashCommand.PlainMessage -> sendComposed(session, active, command.text, replyToMsgid)
-            is SlashCommand.EscapedMessage -> sendComposed(session, active, "/" + command.text, replyToMsgid)
+            is SlashCommand.PlainMessage -> sendComposed(session, active, command.text, replyToMsgid, quoteParent)
+            is SlashCommand.EscapedMessage -> sendComposed(session, active, "/" + command.text, replyToMsgid, quoteParent)
             is SlashCommand.Action -> sendMessage(
                 session,
                 active,
@@ -2181,7 +3137,11 @@ public class LiveCoordinator(
                 sanitizeOutboundText(command.text),
                 origin = active,
             )
-            is SlashCommand.Query -> buffer(resolveTargetRef(session, command.nick))
+            is SlashCommand.Query -> {
+                val ref = resolveTargetRef(session, command.nick)
+                buffer(ref)
+                persistOpenedShell(ref)
+            }
             is SlashCommand.Join -> {
                 if (command.channels.isEmpty()) return
                 val channels = command.channels.joinToString(",")
@@ -2220,10 +3180,7 @@ public class LiveCoordinator(
             is SlashCommand.Away ->
                 sendRaw(session, if (command.message == null) "AWAY" else "AWAY :${command.message}")
             is SlashCommand.Quit -> disconnect(session.config.id, sanitizeOutboundText(command.reason ?: ""))
-            is SlashCommand.Whois -> {
-                synchronized(session.state) { session.state.whoisExpected = true }
-                sendLabeled(session, active, LabeledCommand.WHOIS, "WHOIS ${command.target} ${command.target}")
-            }
+            is SlashCommand.Whois -> requestWhois(session, active, command.target)
             is SlashCommand.Kick -> {
                 val channel = command.channel ?: active.rawTarget
                 val reason = command.reason
@@ -2333,16 +3290,17 @@ public class LiveCoordinator(
         }
     }
 
-    private fun sendComposed(session: Session, ref: ConversationRef, text: String, replyToMsgid: String?) {
+    private fun sendComposed(session: Session, ref: ConversationRef, text: String, replyToMsgid: String?, quoteParent: ChatMessage? = null) {
         val normalized = IrcMultiline.normalize(text)
         if ('\n' !in normalized) {
-            sendMessage(session, ref, normalized, replyToMsgid = replyToMsgid)
+            sendMessage(session, ref, normalized, replyToMsgid = replyToMsgid, quoteParent = quoteParent)
             return
         }
         val limits = session.state.outboundMultilineLimits()
         if (limits == null) {
             normalized.split('\n').filter { it.isNotBlank() }.forEachIndexed { index, line ->
-                sendMessage(session, ref, line, replyToMsgid = replyToMsgid.takeIf { index == 0 })
+                sendMessage(session, ref, line, replyToMsgid = replyToMsgid.takeIf { index == 0 },
+                    quoteParent = quoteParent.takeIf { index == 0 })
             }
             return
         }
@@ -2363,7 +3321,7 @@ public class LiveCoordinator(
                 highlightsMe = false,
                 replyToMsgid = reply,
                 pendingEcho = echoed,
-                persist = !echoed,
+                quoteParent = quoteParent.takeIf { index == 0 },
                 echoLabel = label,
                 optimistic = true,
             )
@@ -2388,6 +3346,10 @@ public class LiveCoordinator(
         replyToMsgid: String? = null,
         attachmentUrl: String? = null,
         origin: ConversationRef = ref,
+        quoteParent: ChatMessage? = null,
+        attachmentName: String? = null,
+        attachmentMimeType: String? = null,
+        attachmentSizeBytes: Long? = null,
     ) {
         val safeWireText = sanitizeOutboundText(wireText)
         val echoExpected = "echo-message" in session.state.supportedCaps
@@ -2406,7 +3368,10 @@ public class LiveCoordinator(
                 replyToMsgid = replyToMsgid,
                 attachmentUrl = attachmentUrl,
                 pendingEcho = echoExpected,
-                persist = !echoExpected,
+                quoteParent = quoteParent,
+                attachmentName = attachmentName,
+                attachmentMimeType = attachmentMimeType,
+                attachmentSizeBytes = attachmentSizeBytes,
                 echoLabel = label,
                 optimistic = true,
             )

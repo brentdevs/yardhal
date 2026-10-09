@@ -65,6 +65,8 @@ public data class UserState(
     public val nick: String,
     public val presence: PresenceState = PresenceState(),
     public val metadata: Map<String, String> = emptyMap(),
+    public val metadataObservedAtMs: Long? = null,
+    public val metadataKeysObserved: Set<String> = emptySet(),
 ) {
     public val profile: UserProfile?
         get() = UserProfile.from(metadata)
@@ -73,8 +75,32 @@ public data class UserState(
 public class ChannelState(public val ref: ConversationRef) {
     internal val members: LinkedHashMap<String, ChannelMember> = LinkedHashMap()
     internal val metadata: LinkedHashMap<String, String> = LinkedHashMap()
+    internal val modes: LinkedHashMap<String, List<String>> = LinkedHashMap()
+    public var membersComplete: Boolean = false
+        internal set
+    public var modesComplete: Boolean = false
+        internal set
 
     public fun memberList(): List<ChannelMember> = members.values.sortedBy { it.nick.lowercase() }
+
+    public fun modeSnapshot(): Map<String, List<String>> = LinkedHashMap(modes)
+
+    internal fun mergeFrom(other: ChannelState, casemapping: CaseMapping, listModes: String) {
+        if (other.membersComplete) members.clear()
+        for (member in other.members.values) members[casemapping.fold(member.nick)] = member
+        membersComplete = membersComplete || other.membersComplete
+        metadata.putAll(other.metadata)
+        if (other.modesComplete) modes.clear()
+        for ((mode, parameters) in other.modes) {
+            val prior = modes[mode]
+            modes[mode] = if (prior != null && mode.single() in listModes) {
+                (prior + parameters).distinct()
+            } else {
+                parameters
+            }
+        }
+        modesComplete = modesComplete || other.modesComplete
+    }
 
     public fun metadataValue(key: String): String? = metadata[key]
 }
@@ -105,6 +131,7 @@ public class PerNetworkState(
     public var isupport: ISupport = ISupport.EMPTY
         internal set
     public var whoisExpected: Boolean = false
+    public var whoisTarget: String? = null
     public var listingChannels: Boolean = false
     public var registered: Boolean = false
         internal set
@@ -152,6 +179,8 @@ public class PerNetworkState(
         if (isChannelName(target)) channelRef(target) else directRef(target)
 
     public fun channel(storageKey: String): ChannelState? = channels[storageKey]
+
+    public fun channelRefs(): List<ConversationRef> = channels.values.map { it.ref }
 
     public fun user(nick: String): UserState? = users[fold(nick)]
 
@@ -212,12 +241,12 @@ public class PerNetworkState(
 
     internal fun renameChannel(from: ConversationRef, to: ConversationRef) {
         channels.remove(from.storageKey)?.let { existing ->
-            val moved = ChannelState(to)
-            moved.members.putAll(existing.members)
-            moved.metadata.putAll(existing.metadata)
-            channels[to.storageKey] = moved
+            val moved = channels.getOrPut(to.storageKey) { ChannelState(to) }
+            moved.mergeFrom(existing, casemapping, isupport.chanmodes.listA)
         }
-        pendingNames.remove(from.storageKey)?.let { pendingNames[to.storageKey] = it }
+        pendingNames.remove(from.storageKey)?.let { pending ->
+            pendingNames.getOrPut(to.storageKey) { LinkedHashMap() }.putAll(pending)
+        }
         for ((label, pending) in pendingLabels) {
             if (pending.origin.storageKey == from.storageKey) {
                 pendingLabels[label] = pending.copy(origin = to)
@@ -283,8 +312,12 @@ public class PerNetworkState(
         for (channelName in reduction.context.openChannels()) reduction.channelOrCreate(channelRef(channelName))
         for (channel in channels.values) {
             channel.members.clear()
+            channel.membersComplete = false
             channel.metadata.clear()
+            channel.modes.clear()
+            channel.modesComplete = false
             reduction.publishMembers(channel)
+            reduction.publishModes(channel)
             reduction.emit(InboundEffect.SetJoinState(channel.ref, JoinState.JOINING))
         }
     }
@@ -295,7 +328,7 @@ public class PerNetworkState(
         for (member in members) {
             users[fold(member.nick)]?.let { presence[member.nick] = it.presence }
         }
-        return InboundEffect.SetMembers(channel.ref, members, presence)
+        return InboundEffect.SetMembers(channel.ref, members, presence, channel.membersComplete)
     }
 
     internal fun rekey(previous: CaseMapping) {
@@ -305,8 +338,7 @@ public class PerNetworkState(
         for (old in oldChannels) {
             val ref = channelRef(old.ref.rawTarget)
             val fresh = channels.getOrPut(ref.storageKey) { ChannelState(ref) }
-            for (member in old.members.values) fresh.members[fold(member.nick)] = member
-            fresh.metadata.putAll(old.metadata)
+            fresh.mergeFrom(old, casemapping, isupport.chanmodes.listA)
         }
         val oldUsers = users.values.toList()
         users.clear()
@@ -367,6 +399,10 @@ internal class Reduction(val state: PerNetworkState, val context: InboundContext
         emit(state.memberSnapshot(channel))
     }
 
+    fun publishModes(channel: ChannelState) {
+        emit(InboundEffect.SetModes(channel.ref, channel.modeSnapshot(), channel.modesComplete))
+    }
+
     fun channelOrCreate(ref: ConversationRef): ChannelState =
         state.channels.getOrPut(ref.storageKey) { ChannelState(ref) }
 
@@ -399,6 +435,7 @@ internal fun Reduction.handleMessage(message: IrcMessage) {
         command == "PART" -> handlePart(message)
         command == "KICK" -> handleKick(message)
         command == "TOPIC" -> handleTopicVerb(message)
+        command == "MODE" -> handleMode(message)
         command == "NICK" -> handleNickChange(message)
         command == "AWAY" -> handleAway(message)
         command == "ACCOUNT" -> handleAccount(message)

@@ -10,6 +10,8 @@ internal val PROFILE_DEFERRING_BATCHES: Set<String> = setOf(IrcMetadata.BATCH_TY
 public data class UserProfile(
     public val avatarUrl: String? = null,
     public val displayName: String? = null,
+    public val cached: Boolean = false,
+    public val observedAtMs: Long? = null,
 ) {
     public companion object {
         public fun from(metadata: Map<String, String>): UserProfile? {
@@ -45,6 +47,9 @@ internal class UserTable : LinkedHashMap<String, UserState>() {
     override fun put(key: String, value: UserState): UserState? {
         val previous = super.put(key, value)
         syncProfile(key, value.profile)
+        if (value.metadataObservedAtMs != null &&
+            (previous?.metadataObservedAtMs != value.metadataObservedAtMs || previous?.metadataKeysObserved != value.metadataKeysObserved)
+        ) profileVersion += 1
         return previous
     }
 

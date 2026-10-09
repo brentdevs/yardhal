@@ -21,6 +21,7 @@ internal fun Reduction.handleNumeric(numeric: Int, message: IrcMessage) {
         numeric == 5 -> applyIsupportTokens(message)
         numeric == 332 -> handleTopicNumeric(message)
         numeric == 331 -> handleNoTopic(message)
+        numeric == 324 -> handleModeNumeric(message)
         numeric == 353 -> accumulateNames(message)
         numeric == 366 || numeric == 315 -> finalizeNames(message)
         numeric == 367 -> handleBanListEntry(message)
@@ -63,6 +64,8 @@ internal fun Reduction.handleJoinFailure(message: IrcMessage) {
 
 internal fun Reduction.handleWhoisNumeric(numeric: Int, message: IrcMessage) {
     if (!state.whoisExpected && correlation?.command != LabeledCommand.WHOIS) return
+    val target = message.parameters.getOrNull(1) ?: return
+    if (state.whoisTarget?.let { !state.casemapping.equal(it, target) } == true) return
     val complete = state.whois.handle(numeric, message.parameters) ?: return
     state.whoisExpected = false
     emit(InboundEffect.WhoisCompleted(complete))

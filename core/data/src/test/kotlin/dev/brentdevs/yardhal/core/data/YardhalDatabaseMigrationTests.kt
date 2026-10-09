@@ -22,7 +22,7 @@ class YardhalDatabaseMigrationTests {
         val legacy = listOf(
             message(ref, 41, "legacy-1", "first legacy notice", 1000),
             message(ref, 57, null, "second legacy notice", 2000),
-        )
+        ).map { it.copy(highlightsKnown = false) }
         context.deleteDatabase(name)
         try {
             createVersionOneDatabase(context, name, legacy)
@@ -31,10 +31,11 @@ class YardhalDatabaseMigrationTests {
             try {
                 val store = MessageStore(db.messageDao())
                 assertEquals(legacy, store.recent(ref, 10))
+                assertEquals(UnreadCounts(2, 0, false), store.unreadCounts(ref, ReadCursor()))
                 assertEquals(legacy, store.after(ref, 0))
                 assertEquals(legacy, store.before(ref, MessageCursor(3000, 0), 10))
                 assertEquals(legacy, store.around(ref, 57, 2000))
-                assertEquals(3, db.openHelper.writableDatabase.version)
+                assertEquals(4, db.openHelper.writableDatabase.version)
                 assertEquals(
                     legacy.map { it.rowId to MessageStore.contentHash(it) },
                     db.messageDao().allRows().sortedBy { it.rowId }.map { it.rowId to it.contentHash },
@@ -79,7 +80,7 @@ class YardhalDatabaseMigrationTests {
         val legacy = listOf(
             message(ref, 41, "shared-id", "first legacy notice", 1000).copy(channelContext = "#Context"),
             message(ref, 57, null, "second legacy notice", 2000),
-        )
+        ).map { it.copy(highlightsKnown = false) }
         val added = mutableListOf<StoredMessage>()
         context.deleteDatabase(name)
         try {
@@ -88,6 +89,7 @@ class YardhalDatabaseMigrationTests {
             try {
                 val store = MessageStore(db.messageDao())
                 assertEquals(legacy, store.recent(ref, 10))
+                assertEquals(UnreadCounts(2, 0, false), store.unreadCounts(ref, ReadCursor()))
                 assertEquals(legacy, store.after(ref, 0))
                 assertEquals(legacy, store.before(ref, MessageCursor(3000, 0), 10))
                 assertEquals(legacy, store.around(ref, 57, 2000))
@@ -105,7 +107,7 @@ class YardhalDatabaseMigrationTests {
                     }
                     assertTrue(found)
                 }
-                assertEquals(3, db.openHelper.writableDatabase.version)
+                assertEquals(4, db.openHelper.writableDatabase.version)
                 assertEquals(
                     legacy.map { it.rowId to MessageStore.contentHash(it) },
                     db.messageDao().allRows().sortedBy { it.rowId }.map { it.rowId to it.contentHash },
@@ -141,6 +143,61 @@ class YardhalDatabaseMigrationTests {
                 assertEquals(added.map { it.rowId }.toSet(), store.search("new replay").map { it.rowId }.toSet())
             } finally {
                 reopened.close()
+            }
+        } finally {
+            context.deleteDatabase(name)
+        }
+    }
+
+    @Test
+    fun versionThreeUpgradePreservesHistoryMetadataAndRepairsOnlyMissingFtsRows() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val name = "message-migration-v3-test.db"
+        val ref = ConversationRef.channel("n1", "#room")
+        val legacy = listOf(
+            message(ref, 41, "live", "live body", 1000).copy(channelContext = "#Context"),
+            message(ref, 57, "history", "historic body", 2000).copy(historyContext = true),
+        ).map { it.copy(highlightsKnown = false) }
+        context.deleteDatabase(name)
+        try {
+            createVersionTwoDatabase(context, name, legacy)
+            context.openOrCreateDatabase(name, Context.MODE_PRIVATE, null).use { fixture ->
+                fixture.execSQL("ALTER TABLE messages ADD COLUMN historyContext INTEGER NOT NULL DEFAULT 0")
+                fixture.execSQL("UPDATE messages SET historyContext = 1 WHERE rowId = 57")
+                fixture.execSQL("DROP INDEX index_messages_msgid")
+                fixture.execSQL(
+                    "CREATE UNIQUE INDEX index_messages_networkId_conversation_msgid ON messages(networkId, conversation, msgid)",
+                )
+                fixture.execSQL("DELETE FROM message_fts WHERE rowid = 57")
+                fixture.execSQL("INSERT INTO message_fts(rowid, sender, body) VALUES(999, 'orphan', 'orphanindex')")
+                fixture.execSQL("UPDATE room_master_table SET identity_hash = '7372bbb340fb21877bbf4725649347e3' WHERE id = 42")
+                fixture.version = 3
+            }
+            YardhalDatabase.build(context, name).use { db ->
+                val store = MessageStore(db.messageDao())
+                assertEquals(legacy, store.recent(ref, 10))
+                assertEquals(legacy.map { it.rowId to MessageStore.contentHash(it) }, db.messageDao().allRows().map { it.rowId to it.contentHash })
+                assertEquals(listOf(41L), store.search("archiveindex").map { it.rowId })
+                assertEquals(listOf(57L), store.search("historic").map { it.rowId })
+                assertTrue(store.search("orphanindex").isEmpty())
+                assertTrue(store.reactions(ref).isEmpty())
+                assertEquals(UnreadCounts(1, 0, false), store.unreadCounts(ref, ReadCursor()))
+                assertEquals(UnreadCounts(), store.unreadCounts(ref, ReadCursor(1000, 41)))
+                val enriched = legacy.first().copy(
+                    highlightsMe = true, senderAccount = "account", attachmentUrl = "https://example.test/a.png",
+                    highlightsKnown = true,
+                    attachmentName = "a.png", attachmentMimeType = "image/png", attachmentWidth = 10, attachmentHeight = 20,
+                )
+                assertFalse(store.record(enriched))
+                assertEquals(enriched, store.byRowId(ref, 41))
+                assertEquals(UnreadCounts(1, 1, true), store.unreadCounts(ref, ReadCursor()))
+                assertEquals(201L, assertNotNull(store.recordWithRowId(message(ref, 0, "new", "new body", 3000))))
+            }
+            YardhalDatabase.build(context, name).use { db ->
+                val restored = MessageStore(db.messageDao()).recent(ref, 10).first()
+                assertEquals("account", restored.senderAccount)
+                assertEquals(10, restored.attachmentWidth)
+                assertTrue(restored.highlightsMe)
             }
         } finally {
             context.deleteDatabase(name)
@@ -233,3 +290,10 @@ class YardhalDatabaseMigrationTests {
         timestampMs = timestampMs,
     )
 }
+
+private inline fun <T> YardhalDatabase.use(block: (YardhalDatabase) -> T): T =
+    try {
+        block(this)
+    } finally {
+        close()
+    }

@@ -4,6 +4,7 @@ import dev.brentdevs.yardhal.core.data.ChannelMember
 import dev.brentdevs.yardhal.core.data.ConversationRef
 import dev.brentdevs.yardhal.core.data.MessageKind
 import dev.brentdevs.yardhal.core.data.NamesParser
+import dev.brentdevs.yardhal.core.protocol.ChannelModeLists
 import dev.brentdevs.yardhal.core.protocol.IrcMessage
 
 internal fun Reduction.handleJoin(message: IrcMessage) {
@@ -126,10 +127,99 @@ internal fun Reduction.handleNoTopic(message: IrcMessage) {
     emit(InboundEffect.SetTopic(state.channelRef(channelName), null))
 }
 
+internal fun Reduction.handleMode(message: IrcMessage) {
+    val channelName = message.parameters.firstOrNull() ?: return
+    if (state.isChannelName(channelName) && !isPlayback(message)) {
+        val encoded = message.parameters.getOrNull(1) ?: return
+        val ref = state.channelRef(channelName)
+        if (context.hasBuffer(ref.storageKey)) {
+            val channel = channelOrCreate(ref)
+            if (applyChannelModes(channel.modes, encoded, message.parameters, 2)) publishModes(channel)
+        }
+    }
+    serverLine(message)
+}
+
+internal fun Reduction.handleModeNumeric(message: IrcMessage) {
+    if (isPlayback(message)) return
+    val channelName = message.parameters.getOrNull(1) ?: return
+    if (!state.isChannelName(channelName)) return
+    val encoded = message.parameters.getOrNull(2) ?: return
+    val ref = state.channelRef(channelName)
+    if (!context.hasBuffer(ref.storageKey)) return
+    val modes = LinkedHashMap<String, List<String>>()
+    if (!applyChannelModes(modes, encoded, message.parameters, 3)) return
+    val channel = channelOrCreate(ref)
+    channel.modes.clear()
+    channel.modes.putAll(modes)
+    channel.modesComplete = true
+    publishModes(channel)
+}
+
+private fun Reduction.applyChannelModes(
+    modes: LinkedHashMap<String, List<String>>,
+    encoded: String,
+    parameters: List<String>,
+    parameterStart: Int,
+): Boolean {
+    val classes = state.isupport.chanmodes
+    var adding = true
+    var requiredParameters = 0
+    for (mode in encoded) {
+        when (mode) {
+            '+' -> adding = true
+            '-' -> adding = false
+            else -> if (mode in state.prefixModes.modes || requiresModeParameter(mode, adding, classes)) requiredParameters += 1
+        }
+    }
+    if (requiredParameters > parameters.size - parameterStart) return false
+    adding = true
+    var parameterIndex = parameterStart
+    for (mode in encoded) {
+        when (mode) {
+            '+' -> adding = true
+            '-' -> adding = false
+            else -> {
+                val prefix = mode in state.prefixModes.modes
+                val parameter = if (prefix || requiresModeParameter(mode, adding, classes)) parameters[parameterIndex++] else null
+                if (prefix) continue
+                val key = mode.toString()
+                when {
+                    mode in classes.listA -> {
+                        if (parameter == null) continue
+                        val prior = modes[key].orEmpty()
+                        if (adding) {
+                            if (parameter !in prior) modes[key] = prior + parameter
+                        } else {
+                            val remaining = prior.filterNot { it == parameter }
+                            if (remaining.isEmpty()) modes.remove(key) else modes[key] = remaining
+                        }
+                    }
+                    mode in classes.listB || mode in classes.alwaysWithParamC -> {
+                        if (adding && parameter != null) modes[key] = listOf(parameter) else modes.remove(key)
+                    }
+                    mode in classes.neverWithParamD -> {
+                        if (adding) modes[key] = emptyList() else modes.remove(key)
+                    }
+                }
+            }
+        }
+    }
+    return true
+}
+
+private fun requiresModeParameter(mode: Char, adding: Boolean, classes: ChannelModeLists): Boolean =
+    mode in classes.listA || mode in classes.listB || (adding && mode in classes.alwaysWithParamC)
+
 internal fun Reduction.accumulateNames(message: IrcMessage) {
+    if (isPlayback(message)) return
     if (message.parameters.size < 2) return
     val (channelName, entries) = NamesParser.parseNamesLine(message.parameters.drop(1), state.prefixModes)
-    val ref = state.channelRef(channelName ?: return)
+    val name = channelName ?: return
+    if (!state.isChannelName(name)) return
+    val ref = state.channelRef(name)
+    if (!context.hasBuffer(ref.storageKey)) return
+    channelOrCreate(ref)
     val pending = state.pendingNames.getOrPut(ref.storageKey) { LinkedHashMap() }
     for (entry in entries) {
         pending[state.fold(entry.member.nick)] = entry.member
@@ -138,8 +228,13 @@ internal fun Reduction.accumulateNames(message: IrcMessage) {
 }
 
 internal fun Reduction.accumulateWhoLine(message: IrcMessage) {
+    if (isPlayback(message)) return
     if (message.parameters.size < 7) return
-    val ref = state.channelRef(message.parameters[1])
+    val channelName = message.parameters[1]
+    if (!state.isChannelName(channelName)) return
+    val ref = state.channelRef(channelName)
+    if (!context.hasBuffer(ref.storageKey)) return
+    channelOrCreate(ref)
     val nick = message.parameters[5].substringBefore('!').substringBefore('@')
     val flags = message.parameters[6]
     val symbol = state.prefixModes.symbols.firstOrNull { it in flags }
@@ -155,19 +250,23 @@ internal fun Reduction.accumulateWhoLine(message: IrcMessage) {
 }
 
 internal fun Reduction.finalizeNames(message: IrcMessage) {
-    if (message.parameters.size < 2) return
-    val ref = state.channelRef(message.parameters[1])
-    val pending = state.pendingNames.remove(ref.storageKey) ?: return
+    if (isPlayback(message) || message.parameters.size < 2) return
+    val channelName = message.parameters[1]
+    if (!state.isChannelName(channelName)) return
+    val ref = state.channelRef(channelName)
+    val pending = state.pendingNames.remove(ref.storageKey).orEmpty()
     if (!context.hasBuffer(ref.storageKey)) return
     val channel = channelOrCreate(ref)
     channel.members.clear()
     channel.members.putAll(pending)
+    channel.membersComplete = true
     for ((folded, member) in pending) state.users.getOrPut(folded) { UserState(member.nick) }
     publishMembers(channel)
     emit(InboundEffect.SetJoinState(ref, JoinState.JOINED))
 }
 
 internal fun Reduction.handleWhoXLine(message: IrcMessage) {
+    if (isPlayback(message)) return
     if (message.parameters.size < 8) return
     val fields = message.parameters.drop(1)
     val channelName = fields[0]
@@ -181,9 +280,12 @@ internal fun Reduction.handleWhoXLine(message: IrcMessage) {
             realName = fields[6],
         )
     }
-    if (state.isChannelName(channelName)) {
-        val ref = state.channelRef(channelName)
+    val channelRef = channelName.takeIf(state::isChannelName)?.let(state::channelRef)
+    if (channelRef != null && context.hasBuffer(channelRef.storageKey)) {
+        val ref = channelRef
         val channel = channelOrCreate(ref)
+        state.pendingNames.getOrPut(ref.storageKey) { LinkedHashMap() }[state.fold(nick)] =
+            ChannelMember(nick, state.prefixModes.symbols.firstOrNull { it in flags })
         val folded = state.fold(nick)
         if (folded !in channel.members) {
             channel.members[folded] = ChannelMember(nick, state.prefixModes.symbols.firstOrNull { it in flags })

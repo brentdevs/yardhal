@@ -312,7 +312,7 @@ class HistoryCoordinatorIntegrationTests {
             }
         }
 
-        override fun mergeStoredHistory(ref: ConversationRef, messages: List<StoredMessage>) {
+        override suspend fun mergeStoredHistory(ref: ConversationRef, messages: List<StoredMessage>) {
             synchronized(selectionLock) {
                 val buffer = buffers[ref.storageKey] ?: return
                 buffers = buffers + (ref.storageKey to buffer.copy(messages =

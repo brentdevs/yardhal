@@ -34,8 +34,9 @@ Each layer depends only on the ones below it.
   IRCv3 batches are tracked by the app-layer reducer, not here.
 - **`core/data`** — Android library holding persistent stores:
   `NetworkStore` (kotlinx.serialization + file/DataStore),
-  `MessageStore` (Room, dedup by `msgid` or content hash,
-  scrollback trimming), `ReadMarkerStore`, `MuteStore`,
+  `MessageStore` (Room, scoped message identity and interaction retention),
+  `OfflineStore` (Room cached conversation/user observations and selection),
+  `ReadMarkerStore` (durable cursors and pending remote reads), `MuteStore`,
   `SlashCommandParser`, mention matching, network presets.
   Credentials live in Android Keystore-backed storage.
 - **`app`** — Compose UI plus the application-owned `LiveCoordinator`, the
@@ -88,11 +89,13 @@ or pending NAMES replies remain tracked; unshared users and profiles are pruned.
 Profile removals publish immediately unless an open metadata/join batch defers
 publication until its close.
 
-Room schema 3 stores nullable channel context and history-context eligibility
-through transcript reloads and search-hit restoration. The explicit 1→2 migration
-adds channel context; 2→3 adds the context flag and scopes the unique message-ID
-index to `(networkId, conversation, msgid)`. Existing row IDs, content hashes and
-FTS rows survive both migrations. There is no destructive fallback.
+Room schema 4 preserves channel context and history-context eligibility through
+transcript reloads and search-hit restoration. The explicit 1→2 migration adds
+channel context; 2→3 adds the context flag and scopes the unique message-ID index
+to `(networkId, conversation, msgid)`; 3→4 adds durable interaction metadata,
+reaction/tombstone/retention ledgers, offline observations, last selection and
+cache-row quarantine. Existing row IDs, content hashes, message metadata and FTS
+rows survive migration. There is no destructive fallback.
 Rename-following retains only the active selected key and one pending destination,
 retargeted across rapid renames before buffer publication. Consuming a redirect,
 changing selection, reusing its source or removing its destination/network clears
@@ -277,6 +280,108 @@ authenticated microsocks relay, including changed certificates and real KeyChain
 EXTERNAL. Real TLS/mTLS JVM regressions use PKCS#12 fixtures. Robolectric's
 Conscrypt 2.5.2 needs the app test JVM's `java.base/java.net` opening on JDK 21;
 native Android and production TLS providers are not replaced or bypassed.
+
+## Offline conversation state
+
+[Halyard parity phase 3 / issue 14](https://github.com/brentdevs/yardhal/issues/14)
+extends the existing Room and JSON stores without renumbering the roadmap.
+
+### Durable messages and reads
+
+Schema 4 stores highlight/playback classification, wire reply IDs, resolved local
+quote-parent row IDs, attachment URL/name/MIME/size/dimensions, sender account,
+redaction and partial-reaction state. Quoted previews can resolve parents outside
+the loaded page. Redaction removes body, attachments, searchable text and
+reactions; restored previews never expose the deleted parent body.
+
+Message, FTS and interaction mutations share transactions. Canonical echoes
+retain local quote relationships and heal persisted row identity. Explicit fresh
+optimistic sends remain distinct even with identical text and timestamps;
+ordinary replay still deduplicates. Rename/CASEMAPPING collisions retarget parent
+IDs and visible identities, reconcile interaction membership and move retention
+floors. Network removal also removes its offline snapshots and interaction state.
+
+Unread/mention counts query retained history, not just the 200-row transcript
+page. Read cursors compare `(timestampMs, rowId)`; legacy numeric markers retain
+their timestamp-inclusive meaning. Migrated messages have unknown highlight
+classification, rather than being reclassified against today's nickname. The UI
+shows unknown or lower-bound mention counts. Offline advances save both the local
+cursor and pending remote cursor. Replay requires the accepted registered,
+authenticated session and negotiated read-marker support; sending does not clear
+pending state. An incoming acknowledgement clears covered pending reads, while
+older markers cannot regress the local cursor.
+
+### Cached observations and launch
+
+Configured networks restore bounded shells and the saved selection before
+starting connections; selected history is loaded locally. Existing Compose
+rotation/navigation restoration takes precedence. Roster and user detail
+hydration is lazy. Cached topics, modes, rosters, roles and WHOIS carry observation
+times and explicit cached/stale/offline presentation, not current presence or
+permissions. Cached roles do not authorize moderation or satisfy authentication.
+Complete live NAMES/MODE/WHOIS responses replace historical snapshots; incomplete
+updates do not claim a complete live roster or mode set. Colliding cached rosters
+retain bounded historical membership unions with per-member observation times
+and are explicitly partial until a complete live response replaces them.
+
+WHOIS is fresh for less than five minutes, only when its observation is not in
+the future. Expired freshness still permits cached display while live refresh is
+requested. WHOIS and user metadata expire independently after 30 days; equality
+at the retention boundary is retained. Malformed cached payloads preserve the
+complete original row in deduplicated `offline_quarantine` evidence before
+clearing unusable fields. Live observations can repair the active cache; evidence
+is not automatically pruned or presented as restored conversation history.
+
+### Retention budgets
+
+- Messages: at most 10,000 per target, 250,000 per network and 1,000 conversation
+  slots per network. Selected/last-selected targets and the server buffer have
+  priority within, never in addition to, these budgets.
+- Attached reactions: at most 1,024 sender memberships per parent and 100,000 per
+  network, preferring recent observations with deterministic identity ties.
+  Trimming persists partial-history flags, including when no memberships remain;
+  the transcript displays lower bounds rather than silently advertising completeness.
+- Orphan reactions: 1,000 globally and 30 days. Redaction tombstones: 10,000 per
+  target and 30 days since observation. Retirement folds historical floors into
+  a bounded network ledger before dropping target bookkeeping. Older replay cannot
+  resurrect retired history or deleted parents; a new live event at the timestamp
+  floor remains eligible.
+- Offline shells/users: 1,000 each per network, with selected-shell priority;
+  rosters: 10,000 entries. Cached observations expire after 30 days.
+- Remote images: 32 MiB on disk, oldest-first eviction, seven-day expiry including
+  unrequested files; 8 MiB memory budget. Exact TTL/budget boundaries are retained.
+
+Maintenance runs at startup and every five minutes; coordinator write activity
+also triggers message/interaction maintenance every 100 writes. Cache maintenance
+uses SQL without decoding every hidden roster or profile. Runtime buffers remain
+bounded and reconcile committed removals/partial interactions.
+
+### Recovery and exercised verification
+
+`DatabaseRecovery` opens and validates Room eagerly. Healthy current-schema files
+receive read-only physical-table checks plus writable FTS logical validation,
+without whole-database backup copies. Android FTS4's whole-database read-only
+`quick_check` is unsuitable because it attempts an index-validation write.
+Upgrades, invalid headers and pending rollback journals preserve fsynced original
+DB/WAL/SHM/journal evidence before SQLite can migrate, roll back or delete files.
+Interrupted preservation/retirement resumes without rerunning failed migrations.
+Transient locks, read-only access, disk-full and permission failures do not
+misclassify or quarantine valid data. Recovery creates a fresh persistent store
+only after safe retirement; otherwise it uses explicitly temporary memory storage.
+Malformed JSON preserves exact bytes before a writable replacement is permitted.
+The root warning distinguishes evidence from restored messages, empty replacement
+storage and temporary session data.
+
+Verification: `nix develop --command make check` and `make test-ircd`; native
+Android 15/Ergo process-kill/cold-launch scenes with saved selection, real wire
+reaction/reply restoration, prepared local quote/attachment metadata, cached
+roster/WHOIS/topic/mode presentation and subsequent live refresh. Prepared
+350-mention history exercises offline reads beyond the 200-row window, durable
+pending MARKREAD replay, acknowledgement and an injected older server marker.
+Native v1/v3 upgrades retain IDs/hashes/FTS; native small message/reaction budgets,
+1,000-shell/user caps, 30-day equality and image TTL/disk limits exercise maintenance.
+Isolated invalid-header/sidecar, incomplete/future-schema and denied-write fixtures
+exercise byte-exact quarantine and fresh/temporary-storage UX without user data.
 
 ## Network configuration
 

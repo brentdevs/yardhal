@@ -57,6 +57,13 @@ public sealed interface InboundEffect {
         public val ref: ConversationRef,
         public val members: List<ChannelMember>,
         public val presence: Map<String, PresenceState>,
+        public val complete: Boolean = false,
+    ) : InboundEffect
+
+    public data class SetModes(
+        public val ref: ConversationRef,
+        public val modes: Map<String, List<String>>,
+        public val complete: Boolean,
     ) : InboundEffect
 
     public data class SetJoinState(public val ref: ConversationRef, public val state: JoinState) : InboundEffect

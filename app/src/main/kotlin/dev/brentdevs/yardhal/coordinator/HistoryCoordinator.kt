@@ -26,7 +26,7 @@ internal interface HistoryHost {
     fun historyRef(networkId: String, target: String): ConversationRef
     fun ensureHistoryBuffer(ref: ConversationRef)
     fun updateHistoryBuffer(key: String, transform: (ConversationBuffer) -> ConversationBuffer)
-    fun mergeStoredHistory(ref: ConversationRef, messages: List<StoredMessage>)
+    suspend fun mergeStoredHistory(ref: ConversationRef, messages: List<StoredMessage>)
     fun replayHistory(
         networkId: String,
         generation: Long,

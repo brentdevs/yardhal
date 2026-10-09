@@ -1,5 +1,8 @@
 package dev.brentdevs.yardhal.core.data
 
+import kotlinx.serialization.Serializable
+
+@Serializable
 public data class WhoisInfo(
     public val nick: String,
     public val user: String? = null,

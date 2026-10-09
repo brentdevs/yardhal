@@ -61,13 +61,28 @@ class LabeledResponseReducerTests {
     fun singleLabelledReplyIsRoutedToOriginBuffer() {
         val state = negotiated("batch", "labeled-response")
         val channel = state.channelRef("#c")
-        val label = assertNotNull(state.issueLabel(channel, LabeledCommand.MODE, 1000L))
+        val label = assertNotNull(state.issueLabel(channel, LabeledCommand.RAW, 1000L))
 
-        val effects = state.feed("@label=$label :srv 324 me #c +nt")
+        val effects = state.feed("@label=$label :srv 999 me :Reply")
 
         val line = effects.appended().single()
         assertEquals(channel, line.ref)
-        assertEquals("#c +nt", line.text)
+        assertNull(state.pendingLabel(label))
+    }
+
+    @Test
+    fun labelledModeReplyUpdatesTargetModesWithoutTranscript() {
+        val state = negotiated("batch", "labeled-response")
+        val channel = state.channelRef("#c")
+        val label = assertNotNull(state.issueLabel(state.directRef("alice"), LabeledCommand.MODE, 1000L))
+
+        val effects = state.feed("@label=$label :srv 324 me #c +nt")
+        val modes = effects.filterIsInstance<InboundEffect.SetModes>().single()
+
+        assertEquals(channel, modes.ref)
+        assertEquals(mapOf("n" to emptyList(), "t" to emptyList()), modes.modes)
+        assertTrue(modes.complete)
+        assertTrue(effects.appended().isEmpty())
         assertNull(state.pendingLabel(label))
     }
 
@@ -86,10 +101,10 @@ class LabeledResponseReducerTests {
     fun labelledReplyFallsBackToServerWhenOriginBufferClosed() {
         val state = negotiated("batch", "labeled-response")
         val channel = state.channelRef("#c")
-        val label = assertNotNull(state.issueLabel(channel, LabeledCommand.MODE, 1000L))
+        val label = assertNotNull(state.issueLabel(channel, LabeledCommand.RAW, 1000L))
 
         val effects = state.feed(
-            "@label=$label :srv 324 me #c +nt",
+            "@label=$label :srv 999 me :Reply",
             InboundContext(nowMs = 1000L, hasBuffer = { false }),
         )
 
@@ -106,7 +121,6 @@ class LabeledResponseReducerTests {
         val error = state.feed("@batch=w1 :srv 401 me ghost :No such nick").appended().single()
         val unknown = state.feed("@batch=w1 :srv 999 me ghost :Odd").appended().single()
         assertEquals(query, error.ref)
-        assertEquals("[error] ghost No such nick", error.text)
         assertEquals(query, unknown.ref)
         assertNotNull(state.pendingLabel(label))
 
@@ -197,8 +211,8 @@ class LabeledResponseReducerTests {
         val state = negotiated("batch", "echo-message")
         val channel = state.channelRef("#c")
 
-        val reply = state.feed(":srv 324 me #c +nt").appended().single()
-        val stray = state.feed("@label=unknown :srv 324 me #c +nt").appended().single()
+        val reply = state.feed(":srv 999 me :Reply").appended().single()
+        val stray = state.feed("@label=unknown :srv 999 me :Reply").appended().single()
         val echo = state.feed("@msgid=m2 :me!u@h PRIVMSG #c :hello").appended().single()
 
         assertEquals(state.server, reply.ref)

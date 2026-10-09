@@ -14,18 +14,21 @@ import dev.brentdevs.yardhal.core.data.AndroidTlsIdentityProvider
 import dev.brentdevs.yardhal.core.data.ChannelOrderStore
 import dev.brentdevs.yardhal.core.data.ChatAppearanceStore
 import dev.brentdevs.yardhal.core.data.CredentialVault
+import dev.brentdevs.yardhal.core.data.DatabaseRecovery
 import dev.brentdevs.yardhal.core.data.FileStsPolicyStore
 import dev.brentdevs.yardhal.core.data.IgnoreStore
 import dev.brentdevs.yardhal.core.data.MessageStore
 import dev.brentdevs.yardhal.core.data.MuteStore
 import dev.brentdevs.yardhal.core.data.NetworkStore
+import dev.brentdevs.yardhal.core.data.OfflineStore
 import dev.brentdevs.yardhal.core.data.ReadMarkerStore
-import dev.brentdevs.yardhal.core.data.YardhalDatabase
+import dev.brentdevs.yardhal.core.data.StorageRecovery
 import dev.brentdevs.yardhal.service.ConnectionService
 import dev.brentdevs.yardhal.service.Notifications
 import dev.brentdevs.yardhal.service.keepsRecoveryService
 import dev.brentdevs.yardhal.ui.image.RemoteImageLoader
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.SupervisorJob
@@ -59,7 +62,7 @@ class YardhalApplication : Application() {
         super.onCreate()
         val dir = filesDir
         networkStore = NetworkStore(dir)
-        val db = YardhalDatabase.build(this)
+        val db = DatabaseRecovery.open(this)
         messageStore = MessageStore(db.messageDao())
         readMarkerStore = ReadMarkerStore(dir)
         muteStore = MuteStore(dir)
@@ -116,6 +119,7 @@ class YardhalApplication : Application() {
             notifier = LiveCoordinator.HighlightNotifier { networkName, sender, conversation, text ->
                 Notifications.highlight(this, networkName, sender, conversation, text)
             },
+            offlineStore = OfflineStore(db.offlineDao()),
         )
         coordinator.attachIgnores(IgnoreStore(dir))
         connectivityObserver = AndroidConnectivityObserver(this, coordinator::updateConnectivity)
@@ -139,6 +143,12 @@ class YardhalApplication : Application() {
             }
         }
         backfillSearchIndex()
+        appScope.launch(Dispatchers.IO) {
+            while (true) {
+                remoteImages.maintain()
+                delay(5L * 60 * 1_000)
+            }
+        }
     }
 
     override fun onTerminate() {
@@ -147,6 +157,7 @@ class YardhalApplication : Application() {
     }
 
     private fun backfillSearchIndex() {
+        if (StorageRecovery.databaseTemporary.value) return
         val prefs = getSharedPreferences("yardhal-meta", MODE_PRIVATE)
         if (prefs.getBoolean("fts_backfill_v2", false)) return
         appScope.launch {

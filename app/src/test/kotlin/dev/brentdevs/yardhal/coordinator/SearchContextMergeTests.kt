@@ -120,4 +120,114 @@ class SearchContextMergeTests {
         assertEquals(listOf(4L, 1L, 2L, 3L), merged.map { it.localId })
         assertEquals(listOf(41L, 43L, 44L, 42L), merged.map { it.storedRowId })
     }
+
+    @Test
+    fun searchAndLocalHistoryRestoreEveryDurableRenderField() {
+        val row = stored(42, "reply").copy(
+            highlightsMe = true,
+            playback = true,
+            historyContext = true,
+            channelContext = "#context",
+            replyToMsgid = "parent",
+            replyParentRowId = 41,
+            attachmentUrl = "https://example.test/image.png",
+            attachmentName = "image.png",
+            attachmentMimeType = "image/png",
+            attachmentSizeBytes = 123,
+            attachmentWidth = 320,
+            attachmentHeight = 240,
+            senderAccount = "alice-account",
+        )
+        val expected = row.toChatMessage(3)
+        val searched = mergeSearchContext(emptyList(), listOf(row)) { 3 }
+        val history = mergeSearchContext(emptyList(), listOf(row), prependEqualTimestamp = true) { 3 }
+
+        assertEquals(expected, searched.single())
+        assertEquals(expected, history.single())
+        assertEquals(true, expected.highlightsMe)
+        assertEquals(true, expected.playback)
+        assertEquals(true, expected.historyContext)
+        assertEquals("#context", expected.channelContext)
+        assertEquals("parent", expected.replyToMsgid)
+        assertEquals(41L, expected.localReplyParentRowId)
+        assertEquals(row.attachmentUrl, expected.attachmentUrl)
+        assertEquals(row.attachmentName, expected.attachmentName)
+        assertEquals(row.attachmentMimeType, expected.attachmentMimeType)
+        assertEquals(row.attachmentSizeBytes, expected.attachmentSizeBytes)
+        assertEquals(row.attachmentWidth, expected.attachmentWidth)
+        assertEquals(row.attachmentHeight, expected.attachmentHeight)
+        assertEquals(row.senderAccount, expected.senderAccount)
+    }
+
+    @Test
+    fun overlappingStoredHistoryHealsMetadataWithoutLosingLiveIdentityOrReplyPreview() {
+        val preview = ReplyPreview("bob", "parent", "https://example.test/parent.png")
+        val current = live(1, "reply").copy(replyPreview = preview)
+        val row = stored(42, "reply").copy(
+            highlightsMe = true,
+            playback = true,
+            historyContext = true,
+            channelContext = "#context",
+            replyToMsgid = "parent",
+            replyParentRowId = 41,
+            attachmentUrl = "https://example.test/image.png",
+            attachmentName = "image.png",
+            attachmentMimeType = "image/png",
+            attachmentSizeBytes = 123,
+            attachmentWidth = 320,
+            attachmentHeight = 240,
+            senderAccount = "alice-account",
+        )
+        val merged = mergeSearchContext(listOf(current), listOf(row)) { error("Already visible") }.single()
+
+        assertEquals(row.toChatMessage(1).copy(playback = false, historyContext = false, replyPreview = preview), merged)
+    }
+
+    @Test
+    fun durableTombstoneWinsInEitherSearchMergeDirectionAndClearsSensitiveFields() {
+        val healthy = stored(42, "parent").copy(
+            replyToMsgid = "older-parent",
+            replyParentRowId = 40,
+            attachmentUrl = "https://example.test/private.png",
+            attachmentName = "private.png",
+            attachmentMimeType = "image/png",
+            attachmentSizeBytes = 123,
+            attachmentWidth = 320,
+            attachmentHeight = 240,
+        )
+        val deleted = healthy.copy(redacted = true)
+        val expected = deleted.toChatMessage(1)
+        val first = mergeSearchContext(listOf(healthy.toChatMessage(1)), listOf(deleted)) { error("Already visible") }
+        val second = mergeSearchContext(first, listOf(healthy)) { error("Already visible") }
+        val restored = mergeSearchContext(emptyList(), listOf(deleted)) { 1 }
+
+        assertEquals(expected, first.single())
+        assertEquals(first, second)
+        assertEquals(first, restored)
+        assertEquals("message deleted", expected.text)
+        assertEquals(MessageKind.SYSTEM, expected.kind)
+        assertEquals(null, expected.replyToMsgid)
+        assertEquals(null, expected.localReplyParentRowId)
+        assertEquals(null, expected.replyPreview)
+        assertEquals(null, expected.attachmentUrl)
+        assertEquals(null, expected.attachmentName)
+        assertEquals(null, expected.attachmentMimeType)
+        assertEquals(null, expected.attachmentSizeBytes)
+        assertEquals(null, expected.attachmentWidth)
+        assertEquals(null, expected.attachmentHeight)
+    }
+
+    @Test
+    fun historyOverlapTombstonesAlreadyVisibleParentAndItsReplyPreview() {
+        val parent = stored(41, "parent")
+        val reply = stored(42, "reply").copy(replyToMsgid = "parent", replyParentRowId = 41)
+            .toChatMessage(2).copy(replyPreview = ReplyPreview("alice", "private", "https://example.test/private.png"))
+        val merged = mergeSearchContext(
+            listOf(parent.toChatMessage(1), reply),
+            listOf(parent.copy(redacted = true)),
+        ) { error("Parent already visible") }
+
+        assertEquals(parent.copy(redacted = true).toChatMessage(1), merged[0])
+        assertEquals(reply.copy(replyPreview = ReplyPreview("alice", "message deleted", redacted = true)), merged[1])
+    }
 }
