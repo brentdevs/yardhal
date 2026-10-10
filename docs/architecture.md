@@ -922,6 +922,11 @@ retention protecting visible entries. HTTPS media fetching deliberately retains
 browser-like private/local-address access; it is not an SSRF/DNS-rebinding guard.
 Image probes use MIME/length headers only; bounded decoding validates image bytes.
 
+CI exposed an existing retention assertion race: pruned rows publish before the
+separate unread recount finishes. The regression now waits for both public-state
+transitions and retains all row, quote-parent, reaction and unread assertions;
+production retention behavior is unchanged.
+
 ## Roadmap
 
 Phases land in order; each phase ships with tests and updated docs.

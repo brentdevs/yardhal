@@ -852,7 +852,10 @@ class OfflineCoordinatorTests {
                 harness.messages.trimTo(harness.room, 1, harness.now.get())
                 harness.now.addAndGet(300_001)
                 harness.coordinator.onForegroundResume()
-                await { harness.coordinator.buffers.value.getValue(harness.room.storageKey).messages.size == 1 }
+                await {
+                    val current = harness.coordinator.buffers.value.getValue(harness.room.storageKey)
+                    current.messages.size == 1 && current.unreadCount == 1
+                }
                 val after = harness.coordinator.buffers.value.getValue(harness.room.storageKey)
                 assertEquals("reply", after.messages.single().msgid)
                 assertNull(after.messages.single().replyPreview)
