@@ -118,6 +118,7 @@ public sealed interface IrcEvent {
     public data class SaslResult(public val outcome: SaslOutcome) : IrcEvent
     public data class Registered(public val nickname: String, public val welcomeText: String) : IrcEvent
     public data class MessageReceived(public val message: IrcMessage) : IrcEvent
+    public data class FrameRejected(public val reason: LineRejection) : IrcEvent
     public data class Disconnected(public val cause: Throwable?) : IrcEvent
 }
 
@@ -529,7 +530,10 @@ public class IrcConnection(
                 withContext(Dispatchers.IO) {
                     val stream: InputStream = current.getInputStream()
                     val chunk = ByteArray(8192)
-                    val framer = LineFramer(sink = ::handleLine)
+                    val framer = LineFramer(
+                        onRejected = { emit(IrcEvent.FrameRejected(it)) },
+                        sink = ::handleLine,
+                    )
                     while (isActive) {
                         val read = stream.read(chunk)
                         if (read < 0) break
@@ -597,6 +601,8 @@ public class IrcConnection(
     }
 
     public fun redactPresentation(text: String): String = trafficRedactor.redactPresentation(text)
+
+    public fun presentationRedactor(): (String) -> String = trafficRedactor::redactPresentation
 
     public suspend fun probe(timeoutMillis: Long = 5_000): Boolean {
         require(timeoutMillis > 0) { "probe timeout must be positive" }

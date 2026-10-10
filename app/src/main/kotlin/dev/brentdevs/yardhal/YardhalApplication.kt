@@ -14,6 +14,9 @@ import dev.brentdevs.yardhal.core.client.Socks5Config
 import dev.brentdevs.yardhal.core.data.AndroidTlsIdentityProvider
 import dev.brentdevs.yardhal.core.data.ChannelOrderStore
 import dev.brentdevs.yardhal.core.data.ChatAppearanceStore
+import dev.brentdevs.yardhal.core.data.CatchUpStore
+import dev.brentdevs.yardhal.core.data.NotificationPreferencesStore
+import dev.brentdevs.yardhal.core.data.ThemeLibraryStore
 import dev.brentdevs.yardhal.core.data.CredentialVault
 import dev.brentdevs.yardhal.core.data.DatabaseRecovery
 import dev.brentdevs.yardhal.core.data.FileStsPolicyStore
@@ -33,6 +36,9 @@ import dev.brentdevs.yardhal.core.data.StorageRecovery
 import dev.brentdevs.yardhal.service.ConnectionService
 import dev.brentdevs.yardhal.service.Notifications
 import dev.brentdevs.yardhal.service.keepsRecoveryService
+import dev.brentdevs.yardhal.service.ConversationNotifier
+import dev.brentdevs.yardhal.service.NotificationRouteInbox
+import dev.brentdevs.yardhal.ui.theme.createThemeLibrary
 import dev.brentdevs.yardhal.ui.image.RemoteImageLoader
 import dev.brentdevs.yardhal.ui.image.MediaEnvironment
 import kotlinx.coroutines.CancellationException
@@ -63,6 +69,8 @@ class YardhalApplication : Application() {
 
     var sharedText: String? by mutableStateOf(null)
     var sharedAttachmentError: String? by mutableStateOf(null)
+    var incomingThemeLink: String? by mutableStateOf(null)
+    val notificationRoutes = NotificationRouteInbox()
 
     lateinit var networkStore: NetworkStore
         private set
@@ -77,6 +85,12 @@ class YardhalApplication : Application() {
     lateinit var coordinator: LiveCoordinator
         private set
     lateinit var chatAppearanceStore: ChatAppearanceStore
+        private set
+    lateinit var themeLibrary: ThemeLibraryStore
+        private set
+    lateinit var notificationPreferencesStore: NotificationPreferencesStore
+        private set
+    lateinit var catchUpStore: CatchUpStore
         private set
     lateinit var mediaPreferences: MediaPreferencesStore
         private set
@@ -119,6 +133,9 @@ class YardhalApplication : Application() {
         muteStore = MuteStore(dir)
         vault = AndroidCredentialVault(this)
         chatAppearanceStore = ChatAppearanceStore(dir)
+        themeLibrary = createThemeLibrary(this, dir)
+        notificationPreferencesStore = NotificationPreferencesStore(dir)
+        catchUpStore = CatchUpStore(dir)
         mediaPreferences = MediaPreferencesStore(dir)
         mediaEnvironment = MediaEnvironment(remoteImages, mediaPreferences, appScope)
         recentEmoji = RecentEmojiStore(dir)
@@ -136,6 +153,8 @@ class YardhalApplication : Application() {
             mutes = muteStore,
             vault = vault,
             channelOrder = ChannelOrderStore(dir),
+            catchUpStore = catchUpStore,
+            themeLibrary = themeLibrary,
             connectionFactory = ConnectionFactory { config, onStsUpgrade ->
                 IrcConnection(
                     config = IrcConnectionConfig(
@@ -168,9 +187,15 @@ class YardhalApplication : Application() {
             },
             clientIdentityProvider = tlsIdentityProvider::resolve,
             stsPolicies = stsPolicies,
-            notifier = LiveCoordinator.HighlightNotifier { networkName, sender, conversation, text ->
-                Notifications.highlight(this, networkName, sender, conversation, text)
+            notifier = ConversationNotifier { event, eligibility ->
+                val preferences = notificationPreferencesStore.snapshot()
+                val avatar = if (preferences.showAvatars && mediaPreferences.snapshot().loadAvatars) {
+                    remoteImages.cachedAvatar(event.avatarUrl)
+                } else null
+                Notifications.post(this, event, eligibility, preferences, avatar)
             },
+            appIsForeground = { mediaEnvironment.appActive.value },
+            onNotificationConversationRead = { Notifications.cancelConversation(this, it) },
             offlineStore = OfflineStore(db.offlineDao()),
             relayStore = relayConfigurations,
         )

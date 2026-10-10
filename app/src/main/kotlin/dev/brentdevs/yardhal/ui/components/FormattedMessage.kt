@@ -14,7 +14,7 @@ import androidx.compose.ui.text.style.TextDecoration
 import dev.brentdevs.yardhal.core.protocol.IrcFormatting
 import dev.brentdevs.yardhal.ui.theme.IrcPalette
 
-private val URL_REGEX = Regex("""https?://[^\s<>"{}|\\^`\[\]]+""", RegexOption.IGNORE_CASE)
+private val URL_REGEX = Regex("""(?:https?://|yardhal://theme/)[^\s<>"{}|\\^`\[\]]+""", RegexOption.IGNORE_CASE)
 private val CHANNEL_REGEX = Regex("""(?<![^\s\u0007,:(\[<])([#&][^ \r\n\u0007,:]+)""")
 private val MENTION_REGEX = Regex("""(?<![^\s(\[<])@([a-zA-Z_\\\[\]\{\}\^`|][a-zA-Z0-9_\\\[\]\{\}\^`|-]*)""")
 private val HEX_COLOR_REGEX = Regex("""^#[0-9a-fA-F]{3,8}$""")

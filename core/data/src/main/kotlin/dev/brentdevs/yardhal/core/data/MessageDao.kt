@@ -149,6 +149,57 @@ public interface MessageDao {
     )
     public suspend fun byRowIds(networkId: String, conversation: String, rowIds: List<Long>): List<MessageRow>
 
+    @RawQuery
+    public suspend fun catchUpRows(query: SupportSQLiteQuery): List<CatchUpQueryRow>
+
+    @Query(
+        "SELECT networkId, conversation, COUNT(*) AS retainedCount, MIN(timestampMs) AS oldestTimestampMs, " +
+            "MAX(timestampMs) AS newestTimestampMs FROM messages WHERE networkId IN (:networkIds) " +
+            "AND redacted = 0 AND historyContext = 0 AND kind IN ('PRIVMSG', 'NOTICE', 'ACTION') " +
+            "AND conversation NOT LIKE '*%' GROUP BY networkId, conversation",
+    )
+    public suspend fun catchUpCoverage(networkIds: List<String>): List<CatchUpRetainedScope>
+
+    @Query("SELECT * FROM message_retention WHERE networkId IN (:networkIds)")
+    public suspend fun catchUpRetention(networkIds: List<String>): List<MessageRetentionRow>
+
+    @Transaction
+    public suspend fun catchUpPage(
+        networkIds: List<String>,
+        before: CatchUpCursor?,
+        limit: Int,
+    ): CatchUpQueryPage {
+        require(limit in 1..CATCH_UP_PAGE_LIMIT)
+        if (networkIds.isEmpty()) return CatchUpQueryPage(emptyList(), emptyList(), emptyList(), false)
+        val placeholders = networkIds.joinToString(",") { "?" }
+        val boundary = if (before == null) "" else
+            "WHERE activityTimestampMs < ? OR (activityTimestampMs = ? AND rowId < ?)"
+        val args = ArrayList<Any>(networkIds.size + 4)
+        args.addAll(networkIds)
+        if (before != null) {
+            args.add(before.timestampMs)
+            args.add(before.timestampMs)
+            args.add(before.rowId)
+        }
+        args.add(limit + 1)
+        val rows = catchUpRows(
+            SimpleSQLiteQuery(
+                "SELECT * FROM (SELECT m.*, MAX(m.timestampMs, COALESCE(r.reactionTimestampMs, m.timestampMs)) " +
+                    "AS activityTimestampMs FROM messages m LEFT JOIN " +
+                    "(SELECT networkId, conversation, msgid, MAX(observedAtMs) AS reactionTimestampMs " +
+                    "FROM message_reactions WHERE orphan = 0 GROUP BY networkId, conversation, msgid) r " +
+                    "ON r.networkId = m.networkId AND r.conversation = m.conversation AND r.msgid = m.msgid " +
+                    "WHERE m.networkId IN ($placeholders) AND m.redacted = 0 AND m.historyContext = 0 " +
+                    "AND m.kind IN ('PRIVMSG', 'NOTICE', 'ACTION') AND m.conversation NOT LIKE '*%') " +
+                    "$boundary ORDER BY activityTimestampMs DESC, rowId DESC LIMIT ?",
+                args.toTypedArray(),
+            ),
+        )
+        return CatchUpQueryPage(
+            rows.take(limit), catchUpCoverage(networkIds), catchUpRetention(networkIds), rows.size > limit,
+        )
+    }
+
     @Query(
         "SELECT * FROM messages WHERE networkId = :networkId AND conversation = :conversation AND sentByUs = 0 " +
             "AND historyContext = 0 AND playback = 0 AND redacted = 0 AND kind IN ('PRIVMSG', 'NOTICE', 'ACTION') " +

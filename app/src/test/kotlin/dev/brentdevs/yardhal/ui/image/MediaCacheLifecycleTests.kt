@@ -1,10 +1,12 @@
 package dev.brentdevs.yardhal.ui.image
 
 import android.graphics.Bitmap
+import android.graphics.Color
 import androidx.compose.runtime.AbstractApplier
 import androidx.compose.runtime.Composition
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.Recomposer
+import androidx.compose.ui.graphics.asAndroidBitmap
 import dev.brentdevs.yardhal.core.data.MediaPreferencesStore
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -18,6 +20,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertNull
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
@@ -144,6 +147,51 @@ class MediaCacheLifecycleTests {
             assertNotNull(loader.load(url, 64))
         } finally {
             clearing.join(5_000)
+            loader.cancelRequests()
+        }
+    }
+
+    @Test
+    fun avatarRenditionsRetainTemplateIdentityInUiAndDisappearOnLruEvictionAndClear() = runBlocking {
+        fun png(size: Int, color: Int): ByteArray = ByteArrayOutputStream().also { output ->
+            val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+            bitmap.eraseColor(color)
+            assertTrue(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output))
+            bitmap.recycle()
+        }.toByteArray()
+        val small = png(64, Color.RED)
+        val large = png(1024, Color.BLUE)
+        var requests = 0
+        val loader = RemoteImageLoader(temporaryFolder.root, connectionFactory = { url ->
+            requests++
+            ImageConnection(url, if (url.path == "/pressure.png") large else small)
+        })
+        val url = "https://profiles.test/avatar/{size}.png"
+        assertNotNull(loader.load(url, 16, ImageCacheCategory.AVATAR))
+        assertNotNull(loader.load(url, 32, ImageCacheCategory.AVATAR))
+        assertEquals(Color.RED, assertNotNull(loader.cachedAvatar(url)).getPixel(0, 0))
+        assertEquals(Color.RED, assertNotNull(loader.cached(url, 32, ImageCacheCategory.AVATAR)).getPixel(0, 0))
+        val recomposer = Recomposer(coroutineContext)
+        val composition = Composition(EmptyApplier(), recomposer)
+        try {
+            var image: RemoteImageState? = null
+            composition.setContent {
+                image = rememberRemoteImage(loader, url, 16, ImageCacheCategory.AVATAR).value
+            }
+            assertEquals(Color.RED, assertIs<RemoteImageState.Success>(image).bitmap.asAndroidBitmap().getPixel(0, 0))
+            assertEquals(2, requests)
+            val pressureUrl = "https://profiles.test/pressure.png"
+            assertNotNull(loader.load(pressureUrl, 1024, ImageCacheCategory.AVATAR))
+            assertNull(loader.cachedAvatar(url))
+            assertNull(loader.cached(url, 16, ImageCacheCategory.AVATAR))
+            assertNull(loader.cached(url, 32, ImageCacheCategory.AVATAR))
+            assertEquals(Color.BLUE, assertNotNull(loader.cachedAvatar(pressureUrl)).getPixel(0, 0))
+            loader.clear(ImageCacheCategory.AVATAR)
+            assertNull(loader.cachedAvatar(pressureUrl))
+            assertEquals(3, requests)
+        } finally {
+            composition.dispose()
+            recomposer.cancel()
             loader.cancelRequests()
         }
     }

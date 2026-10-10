@@ -1,13 +1,9 @@
 package dev.brentdevs.yardhal.ui
 
-import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.ui.semantics.Role
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.Box
@@ -33,7 +29,6 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -61,7 +56,6 @@ import dev.brentdevs.yardhal.coordinator.ConnectionStatus
 import dev.brentdevs.yardhal.coordinator.ConversationBuffer
 import dev.brentdevs.yardhal.coordinator.LiveCoordinator
 import dev.brentdevs.yardhal.coordinator.NetworkProfiles
-import dev.brentdevs.yardhal.core.data.ChatAppearancePreferences
 import dev.brentdevs.yardhal.core.data.ChatAppearanceStore
 import dev.brentdevs.yardhal.core.data.ConversationRef
 import dev.brentdevs.yardhal.core.data.StorageRecovery
@@ -86,6 +80,19 @@ import dev.brentdevs.yardhal.media.AttachmentStagingPanel
 import dev.brentdevs.yardhal.media.UploadSettingsSheet
 import dev.brentdevs.yardhal.ui.components.LocalRecentEmojiStore
 import dev.brentdevs.yardhal.ui.screens.RelaySettingsSheet
+import dev.brentdevs.yardhal.core.data.CatchUpController
+import dev.brentdevs.yardhal.core.data.CatchUpStore
+import dev.brentdevs.yardhal.core.data.FtsHit
+import dev.brentdevs.yardhal.core.data.NotificationPreferencesStore
+import dev.brentdevs.yardhal.core.data.ThemeLibraryStore
+import dev.brentdevs.yardhal.service.NotificationRouteInbox
+import dev.brentdevs.yardhal.service.NotificationSettingsSheet
+import dev.brentdevs.yardhal.ui.theme.AppearanceSettingsSheet
+import dev.brentdevs.yardhal.ui.screens.BugReportSheet
+import dev.brentdevs.yardhal.ui.screens.CatchUpSheet
+import dev.brentdevs.yardhal.ui.screens.ChannelSettingsSheet
+import dev.brentdevs.yardhal.ui.theme.ThemeSettingsSheet
+import dev.brentdevs.yardhal.ui.theme.ConversationAccent
 
 private val NETWORK_ID_SET_SAVER = listSaver<Set<String>, String>(
     save = { it.toList() },
@@ -102,13 +109,18 @@ public fun YardhalAppRoot(
     uploadSettings: UploadSettingsStore,
     recentEmojiStore: RecentEmojiStore,
     relayConfigurations: RelayConfigurationStore,
+    themeLibrary: ThemeLibraryStore,
+    notificationPreferencesStore: NotificationPreferencesStore,
+    notificationRoutes: NotificationRouteInbox,
+    catchUpStore: CatchUpStore,
+    incomingThemeLink: String?,
+    onThemeLinkConsumed: (String) -> Unit,
     presets: List<NetworkPresetUi>,
     onNetworkSaved: (NetworkDraft) -> Boolean,
     sharedTextProvider: () -> String? = { null },
     onSharedConsumed: () -> Unit = {},
     incomingShareError: String? = null,
     onSharedErrorConsumed: (String) -> Unit = {},
-    onAppearanceChanged: (ChatAppearancePreferences) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val networks by coordinator.networks.collectAsStateWithLifecycle()
@@ -177,10 +189,11 @@ public fun YardhalAppRoot(
         }
     }
     val conversationStateHolder = rememberSaveableStateHolder()
-    var joinDialogVisible by remember { mutableStateOf(false) }
-    var joinDraft by remember { mutableStateOf("") }
-    var joinNetworkId by remember { mutableStateOf<String?>(null) }
-    var joinSendFailed by remember { mutableStateOf(false) }
+    var joinDialogVisible by rememberSaveable { mutableStateOf(false) }
+    var joinDraft by rememberSaveable { mutableStateOf("") }
+    var joinNetworkId by rememberSaveable { mutableStateOf<String?>(null) }
+    var joinSendFailed by rememberSaveable { mutableStateOf(false) }
+    var invitationSender by rememberSaveable { mutableStateOf<String?>(null) }
     var searchVisible by remember { mutableStateOf(false) }
     var searchQuery by rememberSaveable { mutableStateOf("") }
     var searchNetworkScope by rememberSaveable { mutableStateOf<String?>(null) }
@@ -200,12 +213,81 @@ public fun YardhalAppRoot(
     var uploadSettingsVisible by rememberSaveable { mutableStateOf(false) }
     var relaySettingsVisible by rememberSaveable { mutableStateOf(false) }
     var relaySettingsRevision by remember { mutableStateOf(0) }
+    var themeSettingsVisible by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(incomingThemeLink) {
+        if (incomingThemeLink != null) themeSettingsVisible = true
+    }
+    var notificationSettingsVisible by rememberSaveable { mutableStateOf(false) }
+    var catchUpVisible by rememberSaveable { mutableStateOf(false) }
+    var bugReportVisible by rememberSaveable { mutableStateOf(false) }
+    var channelSettingsKey by rememberSaveable { mutableStateOf<String?>(null) }
+    val channelSettings by coordinator.channelSettings.collectAsStateWithLifecycle()
+    val pendingNotificationRoutes by notificationRoutes.pending.collectAsStateWithLifecycle()
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val drawerScope = rememberCoroutineScope()
+    LaunchedEffect(pendingNotificationRoutes, restorationReady, joinDialogVisible) {
+        if (!restorationReady || joinDialogVisible) return@LaunchedEffect
+        val route = pendingNotificationRoutes.firstOrNull() ?: return@LaunchedEffect
+        dismissNetworkEditor()
+        bouncerVisible = false
+        bouncerInitialId = null
+        removingAccountId = null
+        coordinator.dismissWhois()
+        recoveryDetailsVisible = false
+        notificationSettingsVisible = false
+        catchUpVisible = false
+        channelSettingsKey = null
+        appearanceVisible = false
+        mediaSettingsVisible = false
+        uploadSettingsVisible = false
+        relaySettingsVisible = false
+        themeSettingsVisible = false
+        bugReportVisible = false
+        searchVisible = false
+        drawerScope.launch { drawerState.close() }
+        if (coordinator.networkStore.byId(route.ref.networkId) == null) {
+            notificationRoutes.consume(route)
+            operationSnackbarState.showSnackbar("This notification's network was removed.")
+        } else if (route.invite) {
+            joinNetworkId = route.ref.networkId
+            joinDraft = route.ref.rawTarget
+            invitationSender = route.sender
+            joinSendFailed = false
+            joinDialogVisible = true
+            notificationRoutes.consume(route)
+        } else {
+            val key = coordinator.ensureConversation(route.ref.networkId, route.ref.rawTarget)
+            selectConversation(key)
+            coordinator.markRead(key)
+            searchTargetRowId = null
+            returnToSearch = false
+            notificationRoutes.consume(route)
+        }
+    }
+    val catchUpController = remember(coordinator, catchUpStore) {
+        CatchUpController(
+            messages = coordinator.messageStore,
+            dismissals = catchUpStore,
+            readCursor = { ref -> coordinator.readMarkers.cursor(ref.storageKey) },
+            historyGaps = coordinator::historyGaps,
+            onJump = { message ->
+                val hit = FtsHit(message.rowId, message.networkId, message.conversation.rawTarget,
+                    message.senderNick, message.timestampMs, message.text)
+                selectConversation(coordinator.openSearchHit(hit))
+                drawerScope.launch { drawerState.close() }
+                searchTargetRowId = message.rowId
+                returnToSearch = false
+            },
+            onRead = coordinator::markReadThrough,
+        )
+    }
+    LaunchedEffect(catchUpVisible) {
+        if (catchUpVisible) catchUpController.refresh(coordinator.networkStore.all().map { it.id })
+    }
     var shareChooserBatchId by rememberSaveable { mutableStateOf<String?>(null) }
     var dismissedShareBatches by rememberSaveable(stateSaver = NETWORK_ID_SET_SAVER) { mutableStateOf(emptySet<String>()) }
     var attachmentPickerKey by rememberSaveable { mutableStateOf<String?>(null) }
     var attachmentError by remember { mutableStateOf<String?>(null) }
-    val drawerState = rememberDrawerState(DrawerValue.Closed)
-    val drawerScope = rememberCoroutineScope()
     LaunchedEffect(attachmentError) {
         attachmentError?.let { operationSnackbarState.showSnackbar(it, withDismissAction = true) }
         attachmentError = null
@@ -228,7 +310,8 @@ public fun YardhalAppRoot(
     }
 
     val configuration = LocalConfiguration.current
-    var appearance by remember { mutableStateOf(appearanceStore.snapshot()) }
+    val appearance by appearanceStore.preferences.collectAsStateWithLifecycle()
+    val themeState by themeLibrary.state.collectAsStateWithLifecycle()
     val wide = configuration.screenWidthDp >= 600
     val paneWidth = (configuration.screenWidthDp * 0.38f).coerceIn(280f, 360f).dp
     val sharedDraft = sharedTextProvider()
@@ -338,10 +421,16 @@ public fun YardhalAppRoot(
             },
             rawLogVersion = rawLogVersion,
             rawLogProvider = coordinator::rawLog,
+            onReorder = coordinator::reorder,
+            onSetUnreadSorting = coordinator::setUnreadSorting,
+            appearance = appearance,
             showBouncerButton = coordinator.networkStore.all().any { it.mode != dev.brentdevs.yardhal.core.data.NetworkMode.DIRECT } ||
                 bouncerAccounts.values.any { it.mode != dev.brentdevs.yardhal.core.data.NetworkMode.DIRECT },
             onOpenBouncer = { selectionSettled = true; bouncerInitialId = null; bouncerVisible = true },
             onOpenAppearance = { selectionSettled = true; appearanceVisible = true },
+            onOpenCatchUp = { catchUpVisible = true },
+            onOpenBugReport = { bugReportVisible = true },
+            onOpenNotifications = { notificationSettingsVisible = true },
             onMarkRead = coordinator::markRead,
             onToggleMute = coordinator::toggleMute,
             onLeave = { key -> coordinator.leaveConversation(key.substringBefore("|"), key) },
@@ -366,6 +455,7 @@ public fun YardhalAppRoot(
                 { message: dev.brentdevs.yardhal.coordinator.ChatMessage -> coordinator.relayPresentation(networkId, message) }
             }
             conversationStateHolder.SaveableStateProvider(key) {
+                ConversationAccent(themeState, buffer.ref) {
                 ConversationScreen(
                     buffer = buffer,
                     networkName = networkName,
@@ -413,6 +503,13 @@ public fun YardhalAppRoot(
                     onSearchTargetShown = { searchTargetRowId = null },
                     appearance = appearance,
                     onOpenAppearance = { appearanceVisible = true },
+                    onOpenChannelSettings = {
+                        channelSettingsKey = key
+                        coordinator.openChannelSettings(key)
+                    },
+                    onOpenCatchUp = { catchUpVisible = true },
+                    onOpenBugReport = { bugReportVisible = true },
+                    onOpenNotifications = { notificationSettingsVisible = true },
                     onOpenSearch = {
                         selectionSettled = true
                         searchVisible = true
@@ -459,6 +556,7 @@ public fun YardhalAppRoot(
                     },
                     modifier = Modifier.fillMaxSize(),
                 )
+                }
             }
         }
 
@@ -707,134 +805,48 @@ public fun YardhalAppRoot(
     }
 
     if (appearanceVisible) {
-        val updateAppearance: (ChatAppearancePreferences) -> Unit = { updated ->
-            appearance = updated
-            appearanceStore.update(updated)
-            onAppearanceChanged(updated)
-        }
-        ModalBottomSheet(onDismissRequest = { appearanceVisible = false }) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 24.dp, vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp),
-            ) {
-                Text("Chat appearance", style = MaterialTheme.typography.titleLarge)
-                TextButton(onClick = { appearanceVisible = false; mediaSettingsVisible = true }) {
-                    Text("Media and privacy")
-                }
-                TextButton(onClick = { appearanceVisible = false; uploadSettingsVisible = true }) {
-                    Text("Uploads and photo privacy")
-                }
-                if (selectedKey != null) {
-                    TextButton(onClick = { appearanceVisible = false; relaySettingsVisible = true }) {
-                        Text("Configured relay senders")
-                    }
-                }
-
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .defaultMinSize(minHeight = 48.dp)
-                        .toggleable(
-                            value = appearance.compact,
-                            role = Role.Switch,
-                            onValueChange = { updateAppearance(appearance.copy(compact = it)) },
-                        ),
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("Compact spacing", style = MaterialTheme.typography.bodyLarge)
-                        Text("Reduce padding between messages", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                    Switch(
-                        checked = appearance.compact,
-                        onCheckedChange = null,
-                    )
-                }
-
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .defaultMinSize(minHeight = 48.dp)
-                        .toggleable(
-                            value = appearance.monospaceFont,
-                            role = Role.Switch,
-                            onValueChange = { updateAppearance(appearance.copy(monospaceFont = it)) },
-                        ),
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("Monospace font", style = MaterialTheme.typography.bodyLarge)
-                        Text("Render messages in fixed-width font", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                    Switch(
-                        checked = appearance.monospaceFont,
-                        onCheckedChange = null,
-                    )
-                }
-
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .defaultMinSize(minHeight = 48.dp)
-                            .toggleable(
-                                value = appearance.dynamicColor,
-                                role = Role.Switch,
-                                onValueChange = { updateAppearance(appearance.copy(dynamicColor = it)) },
-                            ),
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Material You Dynamic Colors", style = MaterialTheme.typography.bodyLarge)
-                            Text("Match wallpaper palette on Android 12+", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                        Switch(
-                            checked = appearance.dynamicColor,
-                            onCheckedChange = null,
-                        )
-                    }
-                }
-
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .defaultMinSize(minHeight = 48.dp)
-                        .toggleable(
-                            value = appearance.amoledDark,
-                            role = Role.Switch,
-                            onValueChange = { updateAppearance(appearance.copy(amoledDark = it)) },
-                        ),
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("AMOLED pure black", style = MaterialTheme.typography.bodyLarge)
-                        Text("Pitch-black background in dark mode", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                    Switch(
-                        checked = appearance.amoledDark,
-                        onCheckedChange = null,
-                    )
-                }
-
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Message text size", style = MaterialTheme.typography.titleSmall)
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        modifier = Modifier.horizontalScroll(rememberScrollState()),
-                    ) {
-                        listOf("Small" to 0.9f, "Default" to 1f, "Large" to 1.15f, "Extra Large" to 1.25f).forEach { (label, scale) ->
-                            FilterChip(
-                                selected = kotlin.math.abs(appearance.textScale - scale) < 0.01f,
-                                onClick = { updateAppearance(appearance.copy(textScale = scale)) },
-                                label = { Text(label) },
-                            )
-                        }
-                    }
-                }
-            }
+        AppearanceSettingsSheet(
+            store = appearanceStore,
+            onDismiss = { appearanceVisible = false },
+            onOpenThemes = { appearanceVisible = false; themeSettingsVisible = true },
+            onOpenMedia = { appearanceVisible = false; mediaSettingsVisible = true },
+            onOpenUploads = { appearanceVisible = false; uploadSettingsVisible = true },
+            onOpenRelays = { appearanceVisible = false; relaySettingsVisible = true },
+            relaysAvailable = selectedKey?.let { buffers[it] } != null,
+        )
+    }
+    if (themeSettingsVisible) {
+        ThemeSettingsSheet(
+            store = themeLibrary,
+            conversation = selectedKey?.let { buffers[it]?.ref },
+            incomingLink = incomingThemeLink,
+            onIncomingLinkConsumed = onThemeLinkConsumed,
+            onDismiss = { themeSettingsVisible = false },
+        )
+    }
+    if (notificationSettingsVisible) {
+        NotificationSettingsSheet(notificationPreferencesStore, onDismiss = { notificationSettingsVisible = false })
+    }
+    if (catchUpVisible) {
+        CatchUpSheet(
+            catchUpController,
+            onDismiss = { catchUpVisible = false },
+            networkName = { id -> networks.firstOrNull { it.id == id }?.name ?: id },
+        )
+    }
+    if (bugReportVisible) {
+        BugReportSheet(coordinator, onDismiss = { bugReportVisible = false })
+    }
+    channelSettingsKey?.let { key ->
+        channelSettings[key]?.let { state ->
+            ChannelSettingsSheet(
+                state = state,
+                onDismiss = { channelSettingsKey = null },
+                onModeChange = { mode, enabled, parameter -> coordinator.setChannelMode(key, mode, enabled, parameter) },
+                onTopicChange = { topic -> coordinator.setChannelTopic(key, topic) },
+                onRefreshList = { mode -> coordinator.refreshChannelAccessList(key, mode) },
+                onListChange = { mode, mask, adding -> coordinator.editChannelAccessList(key, mode, mask, adding) },
+            )
         }
     }
     if (mediaSettingsVisible) {
@@ -960,10 +972,11 @@ public fun YardhalAppRoot(
         val activeNetworkId = joinNetworkId ?: networks.singleOrNull()?.id
         val networkReady = networks.any { it.id == activeNetworkId && it.status == ConnectionStatus.REGISTERED }
         AlertDialog(
-            onDismissRequest = { joinDialogVisible = false },
-            title = { Text("Join channel") },
+            onDismissRequest = { joinDialogVisible = false; invitationSender = null },
+            title = { Text(if (invitationSender != null) "Channel invitation" else "Join channel") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    invitationSender?.let { Text("$it invited you to $joinDraft. Joining sends an IRC JOIN only after confirmation.") }
                     if (networks.size > 1) {
                         Text("Network", style = MaterialTheme.typography.labelMedium)
                         Row(
@@ -1006,7 +1019,8 @@ public fun YardhalAppRoot(
             },
             confirmButton = {
                 Button(
-                    enabled = joinDraft.startsWith("#") && joinDraft.length > 1 && networkReady,
+                    enabled = (joinDraft.startsWith("#") || joinDraft.startsWith("&")) &&
+                        joinDraft.length > 1 && networkReady,
                     onClick = {
                         val sent = activeNetworkId?.let { networkId ->
                             coordinator.sendText(
@@ -1016,8 +1030,15 @@ public fun YardhalAppRoot(
                             )
                         } == true
                         if (sent) {
+                            if (invitationSender != null) {
+                                selectConversation(coordinator.ensureConversation(activeNetworkId,
+                                    joinDraft.substringBefore(',').substringBefore(' ')))
+                                searchTargetRowId = null
+                                returnToSearch = false
+                            }
                             joinDraft = ""
                             joinDialogVisible = false
+                            invitationSender = null
                         } else {
                             joinSendFailed = true
                         }
@@ -1025,7 +1046,7 @@ public fun YardhalAppRoot(
                 ) { Text("Join") }
             },
             dismissButton = {
-                TextButton(onClick = { joinDialogVisible = false }) { Text("Cancel") }
+                TextButton(onClick = { joinDialogVisible = false; invitationSender = null }) { Text("Cancel") }
             },
         )
     }

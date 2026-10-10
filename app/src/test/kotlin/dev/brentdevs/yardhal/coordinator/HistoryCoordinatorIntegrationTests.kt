@@ -257,7 +257,10 @@ class HistoryCoordinatorIntegrationTests {
                     onStsUpgrade = onStsUpgrade)
             },
             stsPolicies = InMemoryStsPolicyStore(),
-            notifier = LiveCoordinator.HighlightNotifier { _, _, _, text -> highlights += text },
+            notifier = dev.brentdevs.yardhal.service.ConversationNotifier { event, eligibility ->
+                if (eligibility.appended && !eligibility.sentByUs && !eligibility.playback && !eligibility.historyContext &&
+                    !eligibility.muted && !eligibility.read && !eligibility.ignored && !eligibility.viewed) highlights += event.text
+            },
             clock = time::get,
             historyElapsedClock = elapsed::get,
         )

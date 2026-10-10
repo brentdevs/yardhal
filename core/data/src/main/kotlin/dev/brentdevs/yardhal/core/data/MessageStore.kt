@@ -200,6 +200,40 @@ public class MessageStore(private val dao: MessageDao) {
         return (older + newer).map { it.toStored(conversation) }
     }
 
+    public suspend fun catchUpPage(
+        networkIds: List<String>,
+        before: CatchUpCursor? = null,
+        limit: Int = CATCH_UP_PAGE_LIMIT,
+    ): CatchUpMessagePage {
+        val page = dao.catchUpPage(networkIds.distinct(), before, limit)
+        val candidates = page.rows.map { candidate ->
+            val row = candidate.message
+            val ref = conversationRef(row.networkId, row.conversation)
+            val parent = row.replyParentRowId?.let { dao.byRowId(it) }
+                ?: row.replyToMsgid?.let { dao.byMsgid(row.networkId, row.conversation, it) }
+            val reactions = row.msgid?.let {
+                dao.visibleReactionsForMessage(row.networkId, row.conversation, it)
+            }.orEmpty()
+            CatchUpCandidate(
+                row.toStored(ref), candidate.activityTimestampMs,
+                parent?.takeIf {
+                    it.networkId == row.networkId && it.conversation == row.conversation && !it.redacted
+                }?.sentByUs == true,
+                reactions,
+            )
+        }
+        return CatchUpMessagePage(
+            candidates, page.scopes, page.retention, page.hasMore,
+            page.rows.lastOrNull()?.let { CatchUpCursor(it.activityTimestampMs, it.message.rowId) },
+        )
+    }
+
+    public suspend fun resolveCatchUpAnchor(anchor: CatchUpAnchor): StoredMessage? =
+        dao.byRowId(anchor.rowId)?.takeIf {
+            it.networkId == anchor.networkId && !it.redacted &&
+                (anchor.msgid == null || it.msgid == anchor.msgid)
+        }?.let { it.toStored(conversationRef(it.networkId, it.conversation)) }
+
     public suspend fun latestTimestamp(conversation: ConversationRef): Long? =
         dao.latestTimestamp(conversation.networkId, conversation.normalizedTarget)
 

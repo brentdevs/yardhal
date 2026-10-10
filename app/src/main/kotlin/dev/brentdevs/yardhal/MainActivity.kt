@@ -3,7 +3,6 @@ package dev.brentdevs.yardhal
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -14,12 +13,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.Alignment
 import androidx.core.app.ActivityCompat
@@ -30,12 +26,14 @@ import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.launch
 import dev.brentdevs.yardhal.core.data.NetworkPresets
-import dev.brentdevs.yardhal.core.data.ThemeDefinition
-import dev.brentdevs.yardhal.core.data.ThemeFileParser
+import dev.brentdevs.yardhal.core.data.ThemeShareLink
 import dev.brentdevs.yardhal.ui.YardhalAppRoot
 import dev.brentdevs.yardhal.ui.image.MediaEnvironmentProvider
 import dev.brentdevs.yardhal.ui.screens.NetworkPresetUi
 import dev.brentdevs.yardhal.ui.theme.YardhalTheme
+import dev.brentdevs.yardhal.ui.theme.LibraryYardhalTheme
+import dev.brentdevs.yardhal.service.NotificationRoutes
+import android.net.Uri
 import dev.brentdevs.yardhal.media.IncomingShareIntake
 import java.util.UUID
 import kotlinx.coroutines.Dispatchers
@@ -44,6 +42,8 @@ import kotlinx.coroutines.CancellationException
 class MainActivity : ComponentActivity() {
     private var shareRequestId: String = UUID.randomUUID().toString()
     private var shareHandled = false
+    private var handledNotificationUri: String? = null
+    private var handledThemeLink: String? = null
 
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -52,6 +52,13 @@ class MainActivity : ComponentActivity() {
         shareHandled = savedInstanceState?.getBoolean("share-handled") ?: false
         enableEdgeToEdge()
         val app = application as YardhalApplication
+        handledNotificationUri = savedInstanceState?.getString("notification-handled-uri")
+        handledThemeLink = savedInstanceState?.getString("theme-handled-link")
+        savedInstanceState?.getString("theme-pending-link")?.let { app.incomingThemeLink = it }
+        savedInstanceState?.getStringArrayList("notification-pending")?.forEach { encoded ->
+            NotificationRoutes.decode(Uri.parse(encoded))?.let(app.notificationRoutes::enqueue)
+        }
+        consumeNotificationIntent(intent)
 
         setContent {
             val startup by app.startup.collectAsState()
@@ -71,25 +78,26 @@ class MainActivity : ComponentActivity() {
             }
             val coordinator = app.coordinator
             val networkSaver = remember(coordinator) { NetworkSaver(coordinator, app.vault) }
-            var appearance by remember { mutableStateOf(app.chatAppearanceStore.snapshot()) }
-            val isDark = isSystemInDarkTheme()
-            val dynamicSupported = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
-            val useDynamic = appearance.dynamicColor && dynamicSupported
-            val bundledTheme = remember { loadBundledTheme() }
+            val appearance by app.chatAppearanceStore.preferences.collectAsState()
+            val libraryState by app.themeLibrary.state.collectAsState()
             val presets = remember {
                 NetworkPresets.ALL.map {
                     NetworkPresetUi(it.id, it.name, it.host, it.port, it.tls)
                 }
             }
-            YardhalTheme(
-                themeDefinition = if (isDark && !useDynamic) bundledTheme else null,
-                dynamicColor = useDynamic,
-                amoledDark = appearance.amoledDark,
-            ) {
+            LibraryYardhalTheme(libraryState = libraryState, appearance = appearance) {
                 MediaEnvironmentProvider(app.mediaEnvironment) {
                     YardhalAppRoot(
                         coordinator = coordinator,
                         appearanceStore = app.chatAppearanceStore,
+                        themeLibrary = app.themeLibrary,
+                        notificationPreferencesStore = app.notificationPreferencesStore,
+                        notificationRoutes = app.notificationRoutes,
+                        catchUpStore = app.catchUpStore,
+                        incomingThemeLink = app.incomingThemeLink,
+                        onThemeLinkConsumed = { link ->
+                            if (app.incomingThemeLink == link) app.incomingThemeLink = null
+                        },
                         mediaEnvironment = app.mediaEnvironment,
                         attachmentStages = app.attachmentStages,
                         uploadSettings = app.uploadSettings,
@@ -103,14 +111,13 @@ class MainActivity : ComponentActivity() {
                         onSharedErrorConsumed = { error ->
                             if (app.sharedAttachmentError == error) app.sharedAttachmentError = null
                         },
-                        onAppearanceChanged = { appearance = it },
                         modifier = Modifier,
                     )
                 }
             }
         }
 
-        consumeShareIntent(intent)
+        if (!consumeThemeIntent(intent)) consumeShareIntent(intent)
         requestNotificationPermission()
         lifecycleScope.launch {
             lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
@@ -126,13 +133,45 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         shareRequestId = UUID.randomUUID().toString()
         shareHandled = false
-        consumeShareIntent(intent)
+        handledNotificationUri = null
+        handledThemeLink = null
+        if (!consumeThemeIntent(intent)) consumeShareIntent(intent)
+        consumeNotificationIntent(intent)
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putString("share-request-id", shareRequestId)
         outState.putBoolean("share-handled", shareHandled)
+        outState.putString("notification-handled-uri", handledNotificationUri)
+        outState.putString("theme-handled-link", handledThemeLink)
+        outState.putString("theme-pending-link", (application as YardhalApplication).incomingThemeLink)
+        val pending = (application as YardhalApplication).notificationRoutes.pending.value
+        outState.putStringArrayList("notification-pending", ArrayList(pending.map { NotificationRoutes.encode(it).toString() }))
         super.onSaveInstanceState(outState)
+    }
+
+    private fun consumeNotificationIntent(incoming: Intent?) {
+        val route = NotificationRoutes.decode(incoming) ?: return
+        val encoded = incoming?.data?.toString() ?: return
+        if (handledNotificationUri == encoded) return
+        (application as YardhalApplication).notificationRoutes.enqueue(route)
+        handledNotificationUri = encoded
+    }
+
+    private fun consumeThemeIntent(incoming: Intent?): Boolean {
+        val link = when (incoming?.action) {
+            Intent.ACTION_VIEW -> incoming.data?.takeIf { it.scheme == "yardhal" && it.host == "theme" }?.toString()
+            Intent.ACTION_SEND -> if (incoming.type == "text/plain" && !incoming.hasExtra(Intent.EXTRA_STREAM) &&
+                incoming.clipData?.let { clip -> (0 until clip.itemCount).any { clip.getItemAt(it).uri != null } } != true
+            ) {
+                incoming.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()?.trim()?.takeIf { it.startsWith("yardhal://theme/") }
+            } else null
+            else -> null
+        }?.take(ThemeShareLink.MAX_LENGTH + 1) ?: return false
+        if (handledThemeLink == link) return true
+        (application as YardhalApplication).incomingThemeLink = link
+        handledThemeLink = link
+        return true
     }
 
     private fun consumeShareIntent(incoming: Intent?) {
@@ -177,10 +216,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun loadBundledTheme(): ThemeDefinition? = runCatching {
-        val text = assets.open("themes/night.toml").bufferedReader().use { it.readText() }
-        ThemeFileParser.parse(text)
-    }.getOrNull()
 
     private fun requestNotificationPermission() {
         ContextCompat.checkSelfPermission(

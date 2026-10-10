@@ -30,6 +30,13 @@ import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
+import java.util.Locale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -51,13 +58,16 @@ public fun NickAvatar(
     size: Dp = 38.dp,
     avatarUrl: String? = null,
     mediaVisible: Boolean = true,
+    description: String? = "Avatar for $nick",
 ) {
     val environment = LocalMediaEnvironment.current
     val preferences by (environment?.preferences?.preferences ?: DefaultMediaSignals.preferences).collectAsState()
     val view = LocalView.current
     val viewport = remember(view) { AvatarViewport(view) }
     var inViewport by remember { mutableStateOf(false) }
-    val visibleModifier = modifier.onGloballyPositioned { coordinates ->
+    val visibleModifier = modifier.clearAndSetSemantics {
+        description?.let { contentDescription = it; role = Role.Image }
+    }.onGloballyPositioned { coordinates ->
         inViewport = coordinates.isAttached && viewport.intersects(coordinates.boundsInWindow())
     }
     val image by rememberRemoteImage(
@@ -77,7 +87,7 @@ public fun NickAvatar(
         return
     }
     val color = nickColor(nick)
-    val initial = nick.firstOrNull { it.isLetterOrDigit() }?.uppercase() ?: "?"
+    val initial = remember(nick) { avatarInitial(nick) }
     Box(
         modifier = visibleModifier
             .size(size)
@@ -94,6 +104,16 @@ public fun NickAvatar(
     }
 }
 
+internal fun avatarInitial(nick: String): String {
+    var offset = 0
+    while (offset < nick.length) {
+        val point = nick.codePointAt(offset)
+        if (Character.isLetterOrDigit(point)) return String(Character.toChars(point)).uppercase(Locale.ROOT)
+        offset += Character.charCount(point)
+    }
+    return "?"
+}
+
 @Composable
 public fun NetworkBadge(
     phase: RecoveryPhase,
@@ -107,7 +127,10 @@ public fun NetworkBadge(
     val view = LocalView.current
     val viewport = remember(view) { AvatarViewport(view) }
     var inViewport by remember { mutableStateOf(false) }
-    val visibleModifier = modifier.onGloballyPositioned { coordinates ->
+    val visibleModifier = modifier.semantics {
+        contentDescription = "Network status"
+        stateDescription = phase.name.replace('_', ' ').lowercase(Locale.ROOT)
+    }.onGloballyPositioned { coordinates ->
         inViewport = coordinates.isAttached && viewport.intersects(coordinates.boundsInWindow())
     }
     val image by rememberRemoteImage(
@@ -116,7 +139,7 @@ public fun NetworkBadge(
     )
     val loaded = (image as? RemoteImageState.Success)?.bitmap
     if (loaded == null) {
-        RecoveryStatusDot(phase, visibleModifier)
+        Box(modifier = visibleModifier.size(size)) { RecoveryStatusDot(phase, Modifier, size) }
         return
     }
     Box(modifier = visibleModifier.size(size)) {
@@ -167,7 +190,7 @@ private fun RecoveryStatusDot(phase: RecoveryPhase, modifier: Modifier, size: Dp
         RecoveryPhase.DISCONNECTED, RecoveryPhase.USER_DISCONNECTED, RecoveryPhase.OFFLINE -> Color(0xFF6E7681)
     }
     Box(
-        modifier = modifier.size(size).clip(CircleShape).background(color),
+        modifier = modifier.size(size).clip(CircleShape).background(color).clearAndSetSemantics {},
     )
 }
 
@@ -187,6 +210,10 @@ public fun StatusDot(
     }
     Box(
         modifier = modifier
+            .semantics {
+                contentDescription = "Connection status"
+                stateDescription = status.name.lowercase(Locale.ROOT)
+            }
             .size(size)
             .clip(CircleShape)
             .background(color),

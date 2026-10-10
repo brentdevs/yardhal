@@ -1,16 +1,28 @@
 package dev.brentdevs.yardhal.ui.screens
 
+import dev.brentdevs.yardhal.coordinator.ChatMessage
 import dev.brentdevs.yardhal.coordinator.ConnectionStatus
 import dev.brentdevs.yardhal.coordinator.ConversationBuffer
 import dev.brentdevs.yardhal.coordinator.UiNetwork
 import dev.brentdevs.yardhal.core.data.ChannelOrderState
+import dev.brentdevs.yardhal.core.data.ChannelOrderStore
+import dev.brentdevs.yardhal.core.data.ChannelMember
+import dev.brentdevs.yardhal.core.data.MessageKind
+import dev.brentdevs.yardhal.core.data.NicknameSuggestionOrder
+import dev.brentdevs.yardhal.core.data.OrderKind
+import dev.brentdevs.yardhal.core.data.OrderMove
 import dev.brentdevs.yardhal.core.data.ConversationRef
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import org.junit.Rule
+import org.junit.rules.TemporaryFolder
 
 class NetworkOverviewPresentationTests {
+    @get:Rule
+    val tmp = TemporaryFolder()
+
     private val network = UiNetwork("network", "Saved network", "irc.example.test", ConnectionStatus.DISCONNECTED, "alice")
 
     @Test
@@ -66,6 +78,84 @@ class NetworkOverviewPresentationTests {
         assertEquals(12, header.mentionCount)
         assertFalse(header.mentionCountKnown)
         assertTrue(saved.messages.isEmpty())
+    }
+
+    @Test
+    fun restartedManualOrderingRendersAcrossNetworkNamesUnreadPinsAndGroups() {
+        val store = ChannelOrderStore(tmp.root)
+        val other = network.copy(id = "other", name = "Alphabetically first")
+        val a = buffer("#a", 80, 2)
+        val z = buffer("#z", 0, 0)
+        val pin = buffer("#pin", 0, 0)
+        val groupA = buffer("#group-a", 0, 0)
+        val groupB = buffer("#group-b", 0, 0)
+        store.createGroup("work", "Work")
+        store.createGroup("social", "Social")
+        store.addToGroup("work", groupA.key)
+        store.addToGroup("social", groupB.key)
+        store.togglePin(pin.key)
+        store.addToGroup("work", pin.key)
+        store.move(OrderMove(OrderKind.NETWORK, network.id, listOf(other.id, network.id), 0))
+        store.move(OrderMove(OrderKind.GROUP, "social", listOf("work", "social"), 0))
+        store.move(OrderMove(OrderKind.CHANNEL, z.key, listOf(a.key, z.key), 0))
+        val order = ChannelOrderStore(tmp.root).snapshot()
+        val entries = buildOverviewEntries(listOf(other, network), listOf(a, z, pin, groupA, groupB), emptySet(), order, emptySet())
+        assertEquals(listOf(network.id, other.id), entries.filterIsInstance<OverviewEntry.NetworkHeader>().map { it.network.id })
+        assertEquals(listOf(pin.key, groupB.key, groupA.key, z.key, a.key), entries.filterIsInstance<OverviewEntry.BufferRow>().map { it.buffer.key })
+        assertEquals(listOf("Pinned", "Social", "Work", "Channels"), entries.filterIsInstance<OverviewEntry.SectionHeader>().map { it.label })
+        assertTrue(entries.filterIsInstance<OverviewEntry.BufferRow>().first().inGroup)
+        store.setSortUnreadFirst(true)
+        val alternate = buildOverviewEntries(listOf(network), listOf(a, z), emptySet(), store.snapshot(), emptySet())
+        assertEquals(listOf(a.key, z.key), alternate.filterIsInstance<OverviewEntry.BufferRow>().map { it.buffer.key })
+        store.setSortUnreadFirst(false)
+        val manual = buildOverviewEntries(listOf(network), listOf(a, z), emptySet(), ChannelOrderStore(tmp.root).snapshot(), emptySet())
+        assertEquals(listOf(z.key, a.key), manual.filterIsInstance<OverviewEntry.BufferRow>().map { it.buffer.key })
+    }
+
+    @Test
+    fun orderingSectionsKeepPinnedAndSameNamedGroupsSeparateAndRetainEmptyGroups() {
+        val store = ChannelOrderStore(tmp.root)
+        store.createGroup("first", "Same")
+        store.createGroup("second", "Same")
+        store.createGroup("empty", "Empty")
+        val pinned = buffer("#pin", 0, 0)
+        val first = buffer("#first", 0, 0)
+        val second = buffer("#second", 0, 0)
+        store.togglePin(pinned.key)
+        store.addToGroup("first", pinned.key)
+        store.addToGroup("first", first.key)
+        store.addToGroup("second", second.key)
+        val entries = buildOverviewEntries(listOf(network), listOf(pinned, first, second), emptySet(), store.snapshot(), emptySet())
+        val sections = orderingSections(entries, store.snapshot())
+        assertEquals(listOf("first", "second", "empty"), sections.single { it.kind == OrderKind.GROUP }.items.map { it.key })
+        assertEquals(listOf(listOf(pinned.key), listOf(first.key), listOf(second.key)), sections.filter { it.kind == OrderKind.CHANNEL }.map { it.items.map { item -> item.key } })
+        assertEquals(3, sections.filter { it.kind == OrderKind.CHANNEL }.map { it.id }.distinct().size)
+    }
+
+    @Test
+    fun nicknameSuggestionModesSortRolesAlphabeticallyAndLatestObservedActivityWithoutChangingMembers() {
+        val members = listOf(ChannelMember("zed", '@'), ChannelMember("amy"), ChannelMember("voice", '+'), ChannelMember("Owner", '~'), ChannelMember("Half", '%'))
+        val buffer = buffer("#room", 0, 0).copy(
+            members = members,
+            messages = listOf(
+                ChatMessage(1, "AMY", MessageKind.PRIVMSG, "new", 300, false, false, "one"),
+                ChatMessage(2, "zed", MessageKind.PRIVMSG, "middle", 200, false, false, "two"),
+                ChatMessage(3, "amy", MessageKind.PRIVMSG, "old playback", 100, false, false, "three", playback = true),
+            ),
+        )
+        assertEquals(listOf("Owner", "zed", "Half", "voice", "amy"), nicknameSuggestions(buffer, NicknameSuggestionOrder.ROLE))
+        assertEquals(listOf("amy", "Half", "Owner", "voice", "zed"), nicknameSuggestions(buffer, NicknameSuggestionOrder.ALPHABETICAL))
+        assertEquals(listOf("amy", "zed", "Half", "Owner", "voice"), nicknameSuggestions(buffer, NicknameSuggestionOrder.RECENT))
+        assertEquals(members, buffer.members)
+    }
+
+    @Test
+    fun hiddenUnreadCountsPreserveMentionAndUnknownCoverageIndicatorsWithoutNumbers() {
+        assertEquals("•", overviewBadgeLabel(740, 0, true, false))
+        assertEquals("@", overviewBadgeLabel(740, 12, true, false))
+        assertEquals("@", overviewBadgeLabel(740, 0, false, false))
+        assertEquals("99+ · @12", overviewBadgeLabel(740, 12, true, true))
+        assertEquals("35 · @?", overviewBadgeLabel(35, 0, false, true))
     }
 
     private fun buffer(target: String, unread: Int, mentions: Int): ConversationBuffer = ConversationBuffer(

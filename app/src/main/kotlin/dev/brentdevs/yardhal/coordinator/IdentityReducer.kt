@@ -96,6 +96,8 @@ internal fun Reduction.handleInvite(message: IrcMessage) {
     if (state.isOwnNick(invitee)) {
         if (context.isIgnored(inviter)) return
         system(state.server, "✉ $inviter invited you to $channelName")
+        if (state.isChannelName(channelName)) emit(InboundEffect.NotifyInvite(state.channelRef(channelName),
+            inviter, context.nowMs, message.tag("msgid"), isPlayback(message) || "draft/chathistory-context" in message.tags))
         return
     }
     val ref = state.channelRef(channelName)

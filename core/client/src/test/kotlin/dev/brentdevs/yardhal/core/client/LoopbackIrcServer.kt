@@ -60,11 +60,20 @@ public class LoopbackIrcServer : AutoCloseable {
     }
 
     public fun sendLine(line: String) {
+        sendBytes((line + "\r\n").toByteArray(Charsets.UTF_8))
+    }
+
+    public fun sendBytes(data: ByteArray) {
         val stream = clientOutput ?: error("no client connected")
         synchronized(stream) {
-            stream.write((line + "\r\n").toByteArray(Charsets.UTF_8))
+            stream.write(data)
             stream.flush()
         }
+    }
+
+    public fun finishSending() {
+        val socket = clientSocket ?: error("no client connected")
+        socket.shutdownOutput()
     }
 
     public fun dropClient() {
