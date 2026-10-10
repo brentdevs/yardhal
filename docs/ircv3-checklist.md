@@ -175,9 +175,11 @@ Ergo and runs all real-server tests without skips.
 | Offline snapshot inputs (parity phase 3) | `OfflineStoreTests`; `OfflineSnapshotMappingTests`; `OfflineCoordinatorTests`; `OfflinePresentationTests`; `OfflineConversationPresentationTests` |
 | Migration, retention and recovery (parity phase 3) | `YardhalDatabaseMigrationTests`; `NetworkMessageRetentionTests`; `ReactionRetentionTests`; `DatabaseRecoveryTests`; `StorageRecoveryTests`; `RemoteImageMaintenanceTests` |
 | Client-only tags / CLIENTTAGDENY (parity phase 5) | `ClientTagPolicyTests.catchAllAllowsOnlyExactNegatedExceptions`; `ClientTagPolicyTests.messageTagsMustBeNegotiatedEvenWithAllowExceptions`; `ClientTagPolicyTests.workInProgressReactionsNeverInventForbiddenStableNames` |
-| Bounded image-only probes (parity phase 5) | `MediaHttpTests.unsupportedHeadFallsBackToBoundedRangeEvenWhenServerIgnoresRange`; `MediaHttpTests.contentRangeUsesWholeResourceLengthInsteadOfSmallRangeLength`; `MediaHttpTests.extensionlessVideoAndHtmlAreNotPromotedToInlineMedia`; `MediaHttpTests.redirectsHaveAnExactHopLimitAndNeverContactDowngradedTargets` |
+| Bounded image-only probes (parity phase 5) | `MediaHttpTests.unsupportedHeadFallsBackToRangeHeadersWithoutReadingAnUnusedBody`; `MediaHttpTests.contentRangeUsesWholeResourceLengthInsteadOfSmallRangeLength`; `MediaHttpTests.extensionlessVideoAndHtmlAreNotPromotedToInlineMedia`; `MediaHttpTests.redirectsHaveAnExactHopLimitAndNeverContactDowngradedTargets` |
 | Staging/recovery/draft boundaries (parity phase 5) | `AttachmentStageManagerTests.unboundShareCopiesPrivatelyBeforeSelectionAndDestinationCannotChangeLater`; `AttachmentStageManagerTests.staleInFlightStagesRestoreAsInterruptedAndCompletedUploadsRemainInsertable`; `AttachmentStageManagerTests.separatelyCompletedUploadsInOneBatchReserveCaptionOnlyOnceBeforeCapture`; `AttachmentDraftRoutingTests.completingUploadCannotInsertIntoNewlySelectedConversationOrNetwork` |
 | Relay/emoji presentation (parity phase 5) | `RelayParserTests.ordinarySenderCannotMasqueradeAsConfiguredRelay`; `RelayParserTests.formatsRequireExactBoundariesAndRetainWireSource`; `EmojiCatalogTests.pickerFiltersUnsupportedDeviceGlyphsInsteadOfShowingBrokenChoices`; `EmojiCatalogTests.categoryTransitionsKeepMultiCodepointEmojiAndSearchableNamesIntact` |
+| Phase 5 review upload/staging boundaries | `FilehostUploaderTests`; `UploadHttpsAuthenticationTests`; `UploadSettingsStoreTests`; `AttachmentStageManagerTests`; `AttachmentSanitizerTests` |
+| Phase 5 review state and lifecycle boundaries | `PortableInteractionsTests`; `PerNetworkStateTests`; `InteractionPreferencesTests`; `MediaPreferencesStoreTests`; `MediaCacheLifecycleTests`; `RemoteVideoOwnershipTests`; `MediaEnvironmentTests`; `AvatarViewportTests` |
 
 Emulator smoke (`make play`) exercises rendered network icons, avatars,
 display names, verified-account/away/bot member rows, account-ban wire syntax,
@@ -284,3 +286,19 @@ original source without bridge account/avatar inheritance, while unconfigured
 relay-looking text stayed literal. See `docs/architecture.md` for byte-count and
 sanitization evidence. These are not native phase 5 Ergo/soju/ZNC interoperability
 or Halyard source-mirroring claims (pinned source links returned 404).
+
+Phase 5 review hardening passed the full gate and a further native Android 15
+smoke against an ASCII-casemapping IRC fixture, a platform-trusted protected
+HTTPS upload/media endpoint and a real external SAF DocumentsProvider. Observed
+cases include retained-auth HTTP rejection without provider mutation, successful
+credential replacement-input reset, tagged action attachments surviving cold
+launch, grant release after private copying, published-caption durability,
+rotation-stable deferred shares, emoji selection despite recent-storage failure,
+profile-bearing PNG rejection with byte-identical explicit Keep, independent
+media preference updates, uninterrupted video across GIF setting changes,
+extensionless negative-probe recheck, and case-equivalent relay format replacement
+without conflating ASCII-distinct brackets. See
+[review hardening evidence](architecture.md#review-hardening-evidence) for exact
+byte counts and the deliberate browser-like HTTPS/private-address and
+headers-only probe posture. Controlled review fixtures do not add interoperability
+claims for Ergo, soju or ZNC.

@@ -74,7 +74,9 @@ public fun AttachmentStagingPanel(
                 if (completed.size > 1) TextButton(onClick = {
                     scope.launch {
                         try {
-                            manager.prepareInsertion(completed.map { it.id })?.let(onInsert)
+                            val insertion = manager.prepareInsertion(completed.map { it.id })
+                            if (insertion != null) { insertionError = null; onInsert(insertion) }
+                            else insertionError = "This uploaded attachment has no valid destination. Remove it and select/share it again."
                         } catch (cancelled: CancellationException) { throw cancelled }
                         catch (_: Exception) { insertionError = "Unable to capture this destination's upload draft. Check local storage and destination availability." }
                     }

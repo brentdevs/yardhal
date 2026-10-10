@@ -10,6 +10,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.zip.CRC32
 import java.util.Base64
+import java.util.zip.DeflaterOutputStream
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -39,7 +40,8 @@ class AttachmentSanitizerTests {
 
     @Test
     fun jpegStripsLocationAndCommentsWhileRetainingOnlyOrientationAndPixels() {
-        val base = encodedBitmap(2, 3, Bitmap.CompressFormat.JPEG)
+        val base = Base64.getDecoder().decode("/9j/4AAQSkZJRgABAgAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAADAAIDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDi6KKK+ZP3E//Z")
+        assertFalse(String(base, Charsets.ISO_8859_1).contains("ICC_PROFILE"))
         val exif = ByteBuffer.allocate(48).order(ByteOrder.LITTLE_ENDIAN).apply {
             put("Exif\u0000\u0000II".toByteArray()); putShort(42); putInt(8); putShort(1)
             putShort(0x0112); putShort(3); putInt(1); putShort(6); putShort(0); putInt(0)
@@ -52,9 +54,18 @@ class AttachmentSanitizerTests {
         val offset = String(result, Charsets.ISO_8859_1).indexOf("Exif")
         assertTrue(offset >= 0)
         assertEquals(6, result[offset + 24].toInt())
+        val original = assertNotNull(BitmapFactory.decodeByteArray(source, 0, source.size))
         val decoded = assertNotNull(BitmapFactory.decodeByteArray(result, 0, result.size))
-        assertEquals(2, decoded.width)
-        assertEquals(3, decoded.height)
+        try {
+            assertEquals(2, decoded.width)
+            assertEquals(3, decoded.height)
+            for (y in 0 until decoded.height) for (x in 0 until decoded.width) {
+                assertEquals(original.getPixel(x, y), decoded.getPixel(x, y))
+            }
+        } finally {
+            original.recycle()
+            decoded.recycle()
+        }
     }
 
     @Test
@@ -130,6 +141,37 @@ class AttachmentSanitizerTests {
         val limited = BoundedAttachmentOutput(ByteArrayOutputStream(), 4)
         limited.write(ByteArray(4))
         assertFailsWith<AttachmentSizeException> { limited.write(0) }
+    }
+
+    @Test
+    fun knownLinearRgbProfilesRequireExplicitKeepAndKeepEveryOriginalByte() {
+        val profile = Base64.getDecoder().decode("AAAB6GxjbXMCMAAAbW50clJHQiBYWVogB9gAAwAcAA4AGAAlYWNzcEFQUEwAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAEAAPbWAAEAAAAA0y1sY21zAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJZGVzYwAAAPAAAABmY3BydAAAAVgAAAANd3RwdAAAAWgAAAAUclhZWgAAAXwAAAAUZ1hZWgAAAZAAAAAUYlhZWgAAAaQAAAAUclRSQwAAAbgAAAAQZ1RSQwAAAcgAAAAQYlRSQwAAAdgAAAAQZGVzYwAAAAAAAAAMbGluZWFyIHNSR0IAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB0ZXh0AAAAAG5vbmUAAAAAWFlaIAAAAAAAAPM6AAEAAAABFptYWVogAAAAAAAAb5cAADjvAAADj1hZWiAAAAAAAABiowAAt40AABjcWFlaIAAAAAAAACScAAAPgwAAtrxjdXJ2AAAAAAAAAAEBAAAAY3VydgAAAAAAAAABAQAAAGN1cnYAAAAAAAAAAQEAAAA=")
+        assertEquals("acsp", String(profile, 36, 4, Charsets.US_ASCII))
+        val jpeg = encodedBitmap(2, 2, Bitmap.CompressFormat.JPEG)
+        val app2 = "ICC_PROFILE\u0000".toByteArray(Charsets.US_ASCII) + byteArrayOf(1, 1) + profile
+        val profiledJpeg = jpeg.copyOfRange(0, 2) + byteArrayOf(0xff.toByte(), 0xe2.toByte()) +
+            ByteBuffer.allocate(2).putShort((app2.size + 2).toShort()).array() + app2 + jpeg.copyOfRange(2, jpeg.size)
+        val png = encodedBitmap(2, 2, Bitmap.CompressFormat.PNG)
+        val compressed = ByteArrayOutputStream().also { output -> DeflaterOutputStream(output).use { it.write(profile) } }.toByteArray()
+        val prefixEnd = 33
+        val profiledPng = png.copyOfRange(0, prefixEnd) + chunk("iCCP", "Linear RGB\u0000".toByteArray() + byteArrayOf(0) + compressed) + png.copyOfRange(prefixEnd, png.size)
+        val webp = encodedBitmap(2, 2, Bitmap.CompressFormat.WEBP_LOSSLESS)
+        val firstChunk = String(webp, 12, 4, Charsets.US_ASCII)
+        val imageChunks = if (firstChunk == "VP8X") webp.copyOfRange(30, webp.size) else webp.copyOfRange(12, webp.size)
+        val content = webpChunk("VP8X", byteArrayOf(0x20, 0, 0, 0, 1, 0, 0, 1, 0, 0)) +
+            webpChunk("ICCP", profile) + imageChunks
+        val profiledWebp = "RIFF".toByteArray() + ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(content.size + 4).array() + "WEBP".toByteArray() + content
+        listOf("image/jpeg" to profiledJpeg, "image/png" to profiledPng, "image/webp" to profiledWebp).forEach { (mime, bytes) ->
+            val original = assertNotNull(BitmapFactory.decodeByteArray(bytes, 0, bytes.size))
+            try {
+                assertEquals(2, original.width)
+                assertEquals(2, original.height)
+            } finally { original.recycle() }
+            val failure = assertFailsWith<AttachmentSanitizationException> { sanitize(bytes, mime) }
+            assertTrue(failure.message.orEmpty().contains("Keep metadata explicitly"))
+            assertFalse(File(temporary.root, "sanitized").exists())
+            assertContentEquals(bytes, sanitize(bytes, mime, PhotoMetadataPolicy.KEEP))
+        }
     }
 
     private fun encodedBitmap(width: Int, height: Int, format: Bitmap.CompressFormat): ByteArray {

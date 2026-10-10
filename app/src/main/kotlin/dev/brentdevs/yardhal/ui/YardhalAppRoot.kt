@@ -50,7 +50,6 @@ import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalConfiguration
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.CancellationException
@@ -202,7 +201,7 @@ public fun YardhalAppRoot(
     var relaySettingsVisible by rememberSaveable { mutableStateOf(false) }
     var relaySettingsRevision by remember { mutableStateOf(0) }
     var shareChooserBatchId by rememberSaveable { mutableStateOf<String?>(null) }
-    var dismissedShareBatches by remember { mutableStateOf(emptySet<String>()) }
+    var dismissedShareBatches by rememberSaveable(stateSaver = NETWORK_ID_SET_SAVER) { mutableStateOf(emptySet<String>()) }
     var attachmentPickerKey by rememberSaveable { mutableStateOf<String?>(null) }
     var attachmentError by remember { mutableStateOf<String?>(null) }
     val drawerState = rememberDrawerState(DrawerValue.Closed)
@@ -229,7 +228,6 @@ public fun YardhalAppRoot(
     }
 
     val configuration = LocalConfiguration.current
-    val context = LocalContext.current
     var appearance by remember { mutableStateOf(appearanceStore.snapshot()) }
     val wide = configuration.screenWidthDp >= 600
     val paneWidth = (configuration.screenWidthDp * 0.38f).coerceIn(280f, 360f).dp
@@ -255,16 +253,13 @@ public fun YardhalAppRoot(
             val destination = original?.let {
                 AttachmentDestination(it.ref.networkId, it.key, "${networks.firstOrNull { network -> network.id == it.ref.networkId }?.name.orEmpty()} · ${it.displayName}")
             }
-            uris.forEach { uri ->
-                runCatching {
-                    context.contentResolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                }
-            }
             drawerScope.launch {
                 try {
-                    attachmentStages.stageIncoming(uris, destination = destination)
+                    attachmentStages.stageIncoming(uris, destination = destination, persistPermissions = true)
                 } catch (cancelled: CancellationException) {
                     throw cancelled
+                } catch (failure: dev.brentdevs.yardhal.media.AttachmentUriAccessException) {
+                    attachmentError = failure.message ?: "Unable to preserve file access. Select the files again."
                 } catch (_: Exception) {
                     attachmentError = "Unable to preserve selected files. Free local storage or select the files again."
                 }
@@ -860,6 +855,7 @@ public fun YardhalAppRoot(
             RelaySettingsSheet(
                 networkId = relayNetwork.id,
                 networkName = relayNetwork.name,
+                mapping = coordinator.caseMapping(relayNetwork.id),
                 store = relayConfigurations,
                 onDismiss = { relaySettingsVisible = false },
                 onChanged = { relaySettingsRevision += 1 },

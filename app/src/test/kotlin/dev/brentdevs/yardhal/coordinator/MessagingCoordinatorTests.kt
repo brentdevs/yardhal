@@ -225,7 +225,11 @@ class MessagingCoordinatorTests {
     @Test
     fun closedTransportRejectsActionsBeforeDisconnectPresentationArrives() {
         Executors.newSingleThreadExecutor().asCoroutineDispatcher().use { dispatcher ->
-            withHarness("server-time", dispatcher = dispatcher) { _, harness ->
+            withHarness("server-time", dispatcher = dispatcher) { server, harness ->
+                val ref = ConversationRef.channel(harness.config.id, "#room")
+                server.send("@msgid=parent :alice!u@h PRIVMSG #room :quoted parent")
+                await { harness.coordinator.buffers.value[ref.storageKey]?.messages?.any { it.msgid == "parent" } == true }
+                val parent = harness.coordinator.buffers.value.getValue(ref.storageKey).messages.single { it.msgid == "parent" }
                 val blocked = CountDownLatch(1)
                 val release = CountDownLatch(1)
                 val blocker = harness.scope.launch {
@@ -236,9 +240,19 @@ class MessagingCoordinatorTests {
                     assertTrue(blocked.await(5, TimeUnit.SECONDS))
                     harness.connections.single().disconnect()
                     assertEquals(ConnectionStatus.REGISTERED, harness.coordinator.networks.value.single().status)
-                    val ref = ConversationRef.channel(harness.config.id, "#room")
-                    assertFalse(harness.coordinator.sendText(harness.config.id, ref.storageKey, "/me shares https://files.example/completed.jpg"))
+                    harness.coordinator.setReplyDraft(harness.config.id, ref.storageKey, parent)
+                    val uploaded = dev.brentdevs.yardhal.core.data.UploadedAttachment(
+                        "https://files.example/object", "clip.mp4", "video/mp4", 1234,
+                    )
+                    assertFalse(harness.coordinator.sendText(
+                        harness.config.id, ref.storageKey, "/me shares ${uploaded.url}", listOf(uploaded),
+                    ))
                     assertTrue(harness.coordinator.buffers.value.getValue(ref.storageKey).messages.none { it.kind == MessageKind.ACTION && it.sentByUs })
+                    val retainedQuote = assertNotNull(harness.coordinator.buffers.value.getValue(ref.storageKey).replyDraft)
+                    assertEquals("parent", retainedQuote.msgid)
+                    assertEquals("alice", retainedQuote.sender)
+                    assertEquals("quoted parent", retainedQuote.text)
+                    assertTrue(harness.messages.recent(ref, 20).none { it.kind == MessageKind.ACTION && it.sentByUs })
                 } finally {
                     release.countDown()
                     blocker.join()

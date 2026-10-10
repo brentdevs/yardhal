@@ -1,11 +1,13 @@
 package dev.brentdevs.yardhal.core.client
 
+import com.sun.net.httpserver.HttpServer
 import com.sun.net.httpserver.HttpsConfigurator
 import com.sun.net.httpserver.HttpsServer
 import java.io.ByteArrayInputStream
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.security.KeyStore
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.KeyManagerFactory
@@ -14,6 +16,7 @@ import javax.net.ssl.TrustManagerFactory
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNull
 import org.junit.jupiter.api.parallel.ResourceLock
 import org.junit.jupiter.api.parallel.Resources
 
@@ -70,6 +73,66 @@ class UploadHttpsAuthenticationTests {
             assertFailsWith<FilehostException.UnsafeUrl> { FilehostUploader.upload(endpoint, file, true) }
         } finally {
             server.stop(0)
+            HttpsURLConnection.setDefaultSSLSocketFactory(original)
+        }
+    }
+
+    @Test
+    fun authenticatedRedirectsNeverContactHttpsOrDowngradeTargetsOrForwardCredentials() {
+        val context = context()
+        val source = HttpsServer.create(InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0)
+        val secureTarget = HttpsServer.create(InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0)
+        val insecureTarget = HttpServer.create(InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0)
+        source.httpsConfigurator = HttpsConfigurator(context)
+        secureTarget.httpsConfigurator = HttpsConfigurator(context)
+        val targetRequests = AtomicInteger()
+        val targetAuthorization = AtomicReference<String?>()
+        for (target in listOf(secureTarget, insecureTarget)) {
+            target.createContext("/target") { exchange ->
+                targetRequests.incrementAndGet()
+                targetAuthorization.set(exchange.requestHeaders.getFirst("Authorization"))
+                exchange.requestBody.use { it.readBytes() }
+                exchange.sendResponseHeaders(500, -1)
+                exchange.close()
+            }
+        }
+        val location = AtomicReference("")
+        val status = AtomicInteger(307)
+        val sourceAuthorization = AtomicReference<String?>()
+        val sourceRequests = AtomicInteger()
+        source.createContext("/upload") { exchange ->
+            sourceRequests.incrementAndGet()
+            sourceAuthorization.set(exchange.requestHeaders.getFirst("Authorization"))
+            exchange.requestBody.use { it.readBytes() }
+            exchange.responseHeaders.add("Location", location.get())
+            exchange.sendResponseHeaders(status.get(), -1)
+            exchange.close()
+        }
+        val original = HttpsURLConnection.getDefaultSSLSocketFactory()
+        HttpsURLConnection.setDefaultSSLSocketFactory(context.socketFactory)
+        source.start()
+        secureTarget.start()
+        insecureTarget.start()
+        try {
+            val file = OutgoingFile("owned.bin", "application/octet-stream", 1) { ByteArrayInputStream(byteArrayOf(1)) }
+            for (target in listOf("https://localhost:${secureTarget.address.port}/target", "http://localhost:${insecureTarget.address.port}/target")) {
+                location.set(target)
+                for (code in listOf(301, 302, 303, 307, 308)) {
+                    status.set(code)
+                    val failure = assertFailsWith<FilehostException.HttpStatus> {
+                        FilehostUploader.upload("https://localhost:${source.address.port}/upload", file, true, "provider-user", "provider-password")
+                    }
+                    assertEquals(code, failure.code)
+                    assertEquals("Basic cHJvdmlkZXItdXNlcjpwcm92aWRlci1wYXNzd29yZA==", sourceAuthorization.get())
+                    assertEquals(0, targetRequests.get())
+                    assertNull(targetAuthorization.get())
+                }
+            }
+            assertEquals(10, sourceRequests.get())
+        } finally {
+            source.stop(0)
+            secureTarget.stop(0)
+            insecureTarget.stop(0)
             HttpsURLConnection.setDefaultSSLSocketFactory(original)
         }
     }

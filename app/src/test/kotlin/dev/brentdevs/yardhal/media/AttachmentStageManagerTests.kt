@@ -12,11 +12,21 @@ import dev.brentdevs.yardhal.core.data.StagedAttachment
 import dev.brentdevs.yardhal.core.data.UploadEnvironment
 import dev.brentdevs.yardhal.core.data.UploadSettingsStore
 import dev.brentdevs.yardhal.core.data.UploadedAttachment
+import dev.brentdevs.yardhal.core.data.UploadProvider
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.DataInputStream
 import java.io.File
 import java.io.InputStream
 import java.io.IOException
 import java.util.UUID
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.util.Base64
+import java.util.Locale
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.test.Test
@@ -55,6 +65,65 @@ class AttachmentStageManagerTests {
         override fun describe(uri: Uri): AttachmentUriDescription = AttachmentUriDescription("shared.bin", "application/octet-stream", null)
         override fun open(uri: Uri): InputStream = ByteArrayInputStream(bytes)
     }
+    private data class UploadHttpRequest(val method: String, val headers: Map<String, String>, val body: ByteArray)
+
+    private class UploadHttpPeer(
+        private val server: ServerSocket,
+        private val tolerateDisconnectedResponse: Boolean = false,
+        private val respond: (UploadHttpRequest) -> String,
+    ) : AutoCloseable {
+        private val executor = Executors.newSingleThreadExecutor()
+        private val worker = executor.submit {
+            while (!server.isClosed) {
+                val socket = try { server.accept() } catch (failure: IOException) {
+                    if (server.isClosed) break else throw failure
+                }
+                socket.use {
+                    socket.soTimeout = 5000
+                    val input = DataInputStream(socket.getInputStream().buffered())
+                    val requestLine = readLine(input).split(' ')
+                    check(requestLine.size == 3 && requestLine[1] == "/upload")
+                    val headers = LinkedHashMap<String, String>()
+                    while (true) {
+                        val line = readLine(input)
+                        if (line.isEmpty()) break
+                        val separator = line.indexOf(':')
+                        check(separator > 0)
+                        headers[line.substring(0, separator).lowercase(Locale.ROOT)] = line.substring(separator + 1).trim()
+                    }
+                    val length = checkNotNull(headers["content-length"]).toInt()
+                    check(length in 0..1024 * 1024)
+                    val body = ByteArray(length).also(input::readFully)
+                    val location = respond(UploadHttpRequest(requestLine.first(), headers, body))
+                    try {
+                        socket.getOutputStream().apply {
+                            write("HTTP/1.1 201 Created\r\nLocation: $location\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                            flush()
+                        }
+                    } catch (failure: IOException) {
+                        if (!tolerateDisconnectedResponse) throw failure
+                    }
+                }
+            }
+        }
+
+        private fun readLine(input: InputStream): String {
+            val bytes = ByteArrayOutputStream()
+            while (true) {
+                val next = input.read()
+                check(next >= 0)
+                if (next == 10) return bytes.toString(Charsets.US_ASCII.name()).removeSuffix("\r")
+                check(bytes.size() < 8192)
+                bytes.write(next)
+            }
+        }
+
+        override fun close() {
+            server.close()
+            try { worker.get(5, TimeUnit.SECONDS) } finally { executor.shutdownNow() }
+        }
+    }
+
     private suspend fun recreateManager(access: AttachmentUriAccess, directory: File = File(temporary.root, "stages")): AttachmentStageManager {
         scope.coroutineContext.job.children.toList().joinAll()
         scope.coroutineContext.job.cancelAndJoin()
@@ -289,6 +358,305 @@ class AttachmentStageManagerTests {
         val acknowledged = recreateManager(access(byteArrayOf()), directory)
         assertTrue(acknowledged.pendingInsertions().isEmpty())
         assertEquals("", assertNotNull(acknowledged.prepareInsertion(listOf(complete.id))).caption)
+    }
+
+    @Test
+    fun captionSaveFailureNeverPublishesUndurableTextAndRapidEditsKeepTheLatestRevision() = runBlocking {
+        val directory = File(temporary.root, "stages")
+        val stages = manager(access(byteArrayOf(1)), directory)
+        val batch = stages.stageIncoming(listOf(Uri.parse("content://owned/caption")), caption = "durable", destination = destination)
+        withTimeout(5000) { stages.attachments.first { it.single().status == AttachmentStageStatus.READY } }
+        scope.coroutineContext.job.children.toList().joinAll()
+        val blocker = File(directory, "manifest.json.tmp")
+        assertTrue(blocker.mkdir())
+        stages.updateCaption(batch, "not durable")
+        withTimeout(5000) { stages.attachments.first { it.single().error.orEmpty().contains("Unable to save") } }
+        assertEquals("durable", stages.attachments.value.single().caption)
+        assertEquals("durable", AttachmentStageStore(directory).load().single().caption)
+        scope.coroutineContext.job.children.toList().joinAll()
+        assertTrue(blocker.delete())
+        repeat(100) { stages.updateCaption(batch, "revision $it") }
+        scope.coroutineContext.job.children.toList().joinAll()
+        assertEquals("revision 99", stages.attachments.value.single().caption)
+        assertEquals("revision 99", AttachmentStageStore(directory).load().single().caption)
+        assertEquals("revision 99", recreateManager(access(byteArrayOf()), directory).attachments.value.single().caption)
+    }
+
+    @Test
+    fun keepRequestedDuringCopySurvivesReleaseAndRetryWithoutFlatteningAnimation() = runBlocking {
+        val bytes = Base64.getDecoder().decode("R0lGODlhAgACAIEAAP8AAAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQACgAAACwAAAAAAgACAAAIBgABCAQQEAAh+QQBCgABACwAAAAAAgACAIEAAP8AAAAAAAAAAAAIBgABCAQQEAA7")
+        val reading = CountDownLatch(1)
+        val proceed = CountDownLatch(1)
+        val opens = AtomicInteger()
+        val preferences = settings()
+        val stages = manager(object : AttachmentUriAccess {
+            override fun describe(uri: Uri): AttachmentUriDescription = AttachmentUriDescription("animated.gif", "image/gif", null)
+            override fun open(uri: Uri): InputStream {
+                opens.incrementAndGet()
+                return object : ByteArrayInputStream(bytes) {
+                    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                        reading.countDown()
+                        check(proceed.await(5, TimeUnit.SECONDS))
+                        return super.read(buffer, offset, length)
+                    }
+                }
+            }
+        }, settings = preferences)
+        stages.stageIncoming(listOf(Uri.parse("content://owned/animation")), destination = destination)
+        assertTrue(reading.await(5, TimeUnit.SECONDS))
+        val id = stages.attachments.value.single().id
+        val copying = scope.coroutineContext.job.children.toSet()
+        stages.keepMetadataAndRetry(id)
+        stages.retry(id)
+        scope.coroutineContext.job.children.filter { it !in copying }.toList().joinAll()
+        proceed.countDown()
+        val ready = withTimeout(5000) { stages.attachments.first { it.single().status == AttachmentStageStatus.READY }.single() }
+        scope.coroutineContext.job.children.toList().joinAll()
+        assertEquals(PhotoMetadataPolicy.KEEP, ready.metadataPolicy)
+        assertEquals(PhotoMetadataPolicy.STRIP, preferences.snapshot().photoMetadataPolicy)
+        assertEquals(destination, ready.destination)
+        assertEquals(1, opens.get())
+        assertNull(ready.uploaded)
+        assertContentEquals(bytes, File(temporary.root, "stages/$id.source").readBytes())
+        assertContentEquals(bytes, File(temporary.root, "stages/$id.ready").readBytes())
+        val restored = recreateManager(access(byteArrayOf()))
+        assertEquals(PhotoMetadataPolicy.KEEP, restored.attachments.value.single().metadataPolicy)
+        assertContentEquals(bytes, File(temporary.root, "stages/$id.ready").readBytes())
+    }
+
+    @Test
+    fun removeDuringCopyCancelsQueuedKeepAndRetryAndDeletesEveryPrivateArtifact() = runBlocking {
+        val reading = CountDownLatch(1)
+        val closed = CountDownLatch(1)
+        val directory = File(temporary.root, "stages")
+        val stages = manager(object : AttachmentUriAccess {
+            override fun describe(uri: Uri): AttachmentUriDescription = AttachmentUriDescription("blocked", "application/octet-stream", null)
+            override fun open(uri: Uri): InputStream = object : InputStream() {
+                override fun read(): Int = throw IOException("Use bulk reads")
+                override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                    reading.countDown()
+                    check(closed.await(5, TimeUnit.SECONDS))
+                    throw IOException("closed")
+                }
+                override fun close() { closed.countDown() }
+            }
+        }, directory)
+        stages.stageIncoming(listOf(Uri.parse("content://owned/remove")), destination = destination)
+        assertTrue(reading.await(5, TimeUnit.SECONDS))
+        val id = stages.attachments.value.single().id
+        val copying = scope.coroutineContext.job.children.toSet()
+        stages.keepMetadataAndRetry(id)
+        stages.retry(id)
+        scope.coroutineContext.job.children.filter { it !in copying }.toList().joinAll()
+        stages.remove(id)
+        assertTrue(closed.await(5, TimeUnit.SECONDS))
+        scope.coroutineContext.job.children.toList().joinAll()
+        assertTrue(stages.attachments.value.isEmpty())
+        assertTrue(AttachmentStageStore(directory).load().isEmpty())
+        listOf("source", "ready", "source.part", "ready.part").forEach { assertTrue(!File(directory, "$id.$it").exists()) }
+        assertTrue(recreateManager(access(byteArrayOf()), directory).attachments.value.isEmpty())
+    }
+
+    @Test
+    fun startupSweepsPartialAndOrphanFilesButPreservesDurablePrivateSources() {
+        val directory = File(temporary.root, "stages").apply { mkdirs() }
+        val stage = StagedAttachment(UUID.randomUUID().toString(), UUID.randomUUID().toString(), destination, "content://owned/restore", status = AttachmentStageStatus.COPYING)
+        AttachmentStageStore(directory).save(listOf(stage))
+        val source = File(directory, "${stage.id}.source").apply { writeBytes(byteArrayOf(1, 2)) }
+        val ready = File(directory, "${stage.id}.ready").apply { writeBytes(byteArrayOf(3)) }
+        val garbage = listOf("${stage.id}.source.part", "${stage.id}.ready.part", "${UUID.randomUUID()}.source", "${UUID.randomUUID()}.ready", "${UUID.randomUUID()}.ready.part")
+            .map { File(directory, it).apply { writeBytes(byteArrayOf(9)) } }
+        val stages = manager(access(byteArrayOf()), directory)
+        assertEquals(AttachmentStageStatus.INTERRUPTED, stages.attachments.value.single().status)
+        assertTrue(garbage.none { it.exists() })
+        assertContentEquals(byteArrayOf(1, 2), source.readBytes())
+        assertContentEquals(byteArrayOf(3), ready.readBytes())
+    }
+
+    @Test
+    fun realHttpConsentUploadInsertionAcknowledgementAndRemovalRetainBytesUntilExplicitRemoval() = runBlocking {
+        val server = ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"))
+        val requests = AtomicInteger()
+        val body = AtomicReference<ByteArray>()
+        val method = AtomicReference<String>()
+        val contentType = AtomicReference<String>()
+        val peer = UploadHttpPeer(server) { request ->
+            requests.incrementAndGet()
+            method.set(request.method)
+            contentType.set(request.headers["content-type"])
+            body.set(request.body)
+            "/files/private.bin"
+        }
+        try {
+            val endpoint = "http://127.0.0.1:${server.localPort}/upload"
+            val preferences = settings()
+            val provider = UploadProvider(label = "Local filehost", endpointUrl = endpoint)
+            preferences.saveProvider(provider)
+            preferences.selectProvider(null, provider.id)
+            val directory = File(temporary.root, "stages")
+            val bytes = ByteArray(65537) { (it % 251).toByte() }
+            val stages = AttachmentStageManager(directory, preferences, scope, { UploadEnvironment(null, false) }, access(bytes))
+            stages.stageIncoming(listOf(Uri.parse("content://owned/http")), caption = "caption", destination = destination)
+            val ready = withTimeout(5000) { stages.attachments.first { it.single().status == AttachmentStageStatus.READY }.single() }
+            assertEquals(0, requests.get())
+            stages.upload(ready.id)
+            val consent = withTimeout(5000) { stages.attachments.first { it.single().status == AttachmentStageStatus.AWAITING_CONSENT }.single() }
+            assertEquals(0, requests.get())
+            stages.upload(ready.id, consent.consentKey)
+            val uploaded = withTimeout(5000) { stages.attachments.first { it.single().status == AttachmentStageStatus.UPLOADED }.single() }
+            assertEquals(1, requests.get())
+            assertEquals("POST", method.get())
+            assertEquals("application/octet-stream", contentType.get())
+            assertContentEquals(bytes, body.get())
+            assertEquals("http://127.0.0.1:${server.localPort}/files/private.bin", uploaded.uploaded?.url)
+            val insertion = assertNotNull(stages.prepareInsertion(listOf(ready.id)))
+            assertEquals(destination, insertion.destination)
+            assertEquals("caption", insertion.caption)
+            stages.ackInserted(insertion.token)
+            withTimeout(5000) { stages.attachments.first { it.single().status == AttachmentStageStatus.INSERTED } }
+            stages.retry(ready.id)
+            scope.coroutineContext.job.children.toList().joinAll()
+            assertEquals(1, requests.get())
+            assertContentEquals(bytes, File(directory, "${ready.id}.ready").readBytes())
+            assertEquals(uploaded.uploaded, AttachmentStageStore(directory).load().single().uploaded)
+            stages.remove(ready.id)
+            scope.coroutineContext.job.children.toList().joinAll()
+            assertTrue(stages.attachments.value.isEmpty())
+            assertTrue(AttachmentStageStore(directory).load().isEmpty())
+            assertTrue(!File(directory, "${ready.id}.source").exists())
+            assertTrue(!File(directory, "${ready.id}.ready").exists())
+        } finally { peer.close() }
+    }
+
+    @Test
+    fun removingAnInFlightHttpUploadNeverResurrectsACompletedRowOrPrivateFiles() = runBlocking {
+        val received = CountDownLatch(1)
+        val respond = CountDownLatch(1)
+        val server = ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"))
+        val peer = UploadHttpPeer(server, tolerateDisconnectedResponse = true) {
+            received.countDown()
+            check(respond.await(5, TimeUnit.SECONDS))
+            "/files/removed"
+        }
+        try {
+            val preferences = settings()
+            val provider = UploadProvider(label = "Local", endpointUrl = "http://127.0.0.1:${server.localPort}/upload")
+            preferences.saveProvider(provider)
+            preferences.selectProvider(null, provider.id)
+            preferences.grantConsent(preferences.resolve(destination.networkId, null, false))
+            val directory = File(temporary.root, "stages")
+            val stages = AttachmentStageManager(directory, preferences, scope, { UploadEnvironment(null, false) }, access(byteArrayOf(1, 2, 3)))
+            stages.stageIncoming(listOf(Uri.parse("content://owned/upload-remove")), destination = destination)
+            val ready = withTimeout(5000) { stages.attachments.first { it.single().status == AttachmentStageStatus.READY }.single() }
+            scope.coroutineContext.job.children.toList().joinAll()
+            stages.upload(ready.id)
+            assertTrue(received.await(5, TimeUnit.SECONDS))
+            stages.remove(ready.id)
+            stages.retry(ready.id)
+            stages.keepMetadataAndRetry(ready.id)
+            respond.countDown()
+            withTimeout(5000) { scope.coroutineContext.job.children.toList().joinAll() }
+            assertTrue(stages.attachments.value.isEmpty())
+            assertTrue(AttachmentStageStore(directory).load().isEmpty())
+            listOf("source", "ready", "source.part", "ready.part").forEach { assertTrue(!File(directory, "${ready.id}.$it").exists()) }
+        } finally {
+            respond.countDown()
+            peer.close()
+        }
+    }
+
+    @Test
+    fun startupRetainsOnlyNeededUriGrantsAndDurableSourceCopyReleasesThem() = runBlocking {
+        val directory = File(temporary.root, "stages").apply { mkdirs() }
+        val missing = StagedAttachment(UUID.randomUUID().toString(), UUID.randomUUID().toString(), destination, "content://owned/needed", status = AttachmentStageStatus.COPYING)
+        val copied = missing.copy(id = UUID.randomUUID().toString(), sourceUri = "content://owned/copied", status = AttachmentStageStatus.READY, sizeBytes = 1)
+        AttachmentStageStore(directory).save(listOf(missing, copied))
+        File(directory, "${copied.id}.source").writeBytes(byteArrayOf(1))
+        File(directory, "${copied.id}.ready").writeBytes(byteArrayOf(1))
+        val retained = AtomicReference<Set<String>>()
+        val uriAccess = object : AttachmentUriAccess {
+            override fun describe(uri: Uri): AttachmentUriDescription = AttachmentUriDescription("file", "application/octet-stream", null)
+            override fun open(uri: Uri): InputStream = ByteArrayInputStream(byteArrayOf(2, 3))
+            override fun releaseUnused(retainedUriStrings: Set<String>) {
+                if (missing.sourceUri !in retainedUriStrings) assertTrue(File(directory, "${missing.id}.source").isFile)
+                retained.set(retainedUriStrings)
+            }
+        }
+        val stages = manager(uriAccess, directory)
+        assertEquals(setOf(missing.sourceUri), retained.get())
+        stages.retry(missing.id)
+        withTimeout(5000) { stages.attachments.first { it.first().status == AttachmentStageStatus.READY } }
+        scope.coroutineContext.job.children.toList().joinAll()
+        assertEquals(emptySet(), retained.get())
+        assertContentEquals(byteArrayOf(2, 3), File(directory, "${missing.id}.source").readBytes())
+    }
+
+    @Test
+    fun uriGrantCleanupFailureIsActionableDurableAndNeverDeletesThePrivateSource() {
+        val directory = File(temporary.root, "stages").apply { mkdirs() }
+        val stage = StagedAttachment(UUID.randomUUID().toString(), UUID.randomUUID().toString(), destination, "content://owned/copied",
+            status = AttachmentStageStatus.READY, sizeBytes = 2)
+        AttachmentStageStore(directory).save(listOf(stage))
+        val source = File(directory, "${stage.id}.source").apply { writeBytes(byteArrayOf(1, 2)) }
+        val ready = File(directory, "${stage.id}.ready").apply { writeBytes(byteArrayOf(1, 2)) }
+        val stages = manager(object : AttachmentUriAccess {
+            override fun describe(uri: Uri): AttachmentUriDescription = error("Private source must be retained")
+            override fun open(uri: Uri): InputStream = error("Private source must be retained")
+            override fun releaseUnused(retainedUriStrings: Set<String>) { throw SecurityException("Provider refused release") }
+        }, directory)
+        val failed = stages.attachments.value.single()
+        assertEquals(AttachmentStageStatus.ERROR, failed.status)
+        assertTrue(failed.error.orEmpty().contains("release unused file permissions"))
+        assertEquals(failed, AttachmentStageStore(directory).load().single())
+        assertContentEquals(byteArrayOf(1, 2), source.readBytes())
+        assertContentEquals(byteArrayOf(1, 2), ready.readBytes())
+    }
+
+    @Test
+    fun permissionAndManifestFailuresReleaseNewGrantsWithoutPublishingRowsAndSameRequestCanRetry() = runBlocking {
+        val directory = File(temporary.root, "stages")
+        val uri = Uri.parse("content://owned/persist")
+        val request = UUID.randomUUID().toString()
+        val grants = AtomicReference<Set<String>>(emptySet())
+        val opens = AtomicInteger()
+        var denyPermission = true
+        val stages = manager(object : AttachmentUriAccess {
+            override fun describe(uri: Uri): AttachmentUriDescription = AttachmentUriDescription("file", "application/octet-stream", null)
+            override fun open(uri: Uri): InputStream {
+                opens.incrementAndGet()
+                return ByteArrayInputStream(byteArrayOf(1, 2))
+            }
+            override fun persist(uris: List<Uri>) {
+                grants.set(uris.map { it.toString() }.toSet())
+                if (denyPermission) throw AttachmentUriAccessException("Unable to retain file permission. Remove unused stages to release permissions, then select the file again.")
+            }
+            override fun releaseUnused(retainedUriStrings: Set<String>) {
+                grants.set(grants.get().intersect(retainedUriStrings))
+            }
+        }, directory)
+        val denied = assertFailsWith<AttachmentUriAccessException> {
+            stages.stageIncoming(listOf(uri), requestId = request, persistPermissions = true)
+        }
+        assertEquals("Unable to retain file permission. Remove unused stages to release permissions, then select the file again.", denied.message)
+        assertTrue(stages.attachments.value.isEmpty())
+        assertTrue(AttachmentStageStore(directory).load().isEmpty())
+        assertEquals(emptySet(), grants.get())
+        assertEquals(0, opens.get())
+        denyPermission = false
+        val blocker = File(directory, "manifest.json.tmp")
+        assertTrue(blocker.mkdir())
+        assertFailsWith<IOException> { stages.stageIncoming(listOf(uri), requestId = request, persistPermissions = true) }
+        assertTrue(stages.attachments.value.isEmpty())
+        assertTrue(AttachmentStageStore(directory).load().isEmpty())
+        assertEquals(emptySet(), grants.get())
+        assertEquals(0, opens.get())
+        assertTrue(blocker.delete())
+        assertEquals(request, stages.stageIncoming(listOf(uri), requestId = request, persistPermissions = true))
+        withTimeout(5000) { stages.attachments.first { it.single().status == AttachmentStageStatus.READY } }
+        scope.coroutineContext.job.children.toList().joinAll()
+        assertEquals(1, opens.get())
+        assertEquals(emptySet(), grants.get())
+        assertContentEquals(byteArrayOf(1, 2), File(directory, "${stages.attachments.value.single().id}.source").readBytes())
     }
 
     @Test

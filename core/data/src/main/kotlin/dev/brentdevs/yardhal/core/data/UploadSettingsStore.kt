@@ -82,16 +82,15 @@ public class UploadSettingsStore(directory: File, private val vault: CredentialV
     }
 
     @Synchronized
-    public fun saveProvider(provider: UploadProvider, authentication: UploadAuthentication? = null, replaceAuthentication: Boolean = false) {
+    public fun saveProvider(provider: UploadProvider, authentication: UploadAuthentication? = null, replaceAuthentication: Boolean = false): UploadProvider {
         require(provider.id.isNotBlank() && provider.label.isNotBlank()) { "Provider name is required" }
-        UploadUrlPolicy.validate(provider.endpointUrl, requireSecure = false)
-        if (authentication != null) {
-            UploadUrlPolicy.validate(provider.endpointUrl, requireSecure = true)
-            require(':' !in authentication.username && authentication.username.none { it.isISOControl() }) { "Invalid authentication username" }
-        }
         val previous = state.providers.firstOrNull { it.id == provider.id }
         val reference = if (replaceAuthentication) authentication?.let { "upload:${UUID.randomUUID()}" }
             else previous?.credentialRef
+        UploadUrlPolicy.validate(provider.endpointUrl, requireSecure = reference != null)
+        if (replaceAuthentication && authentication != null) {
+            require(':' !in authentication.username && authentication.username.none { it.isISOControl() }) { "Invalid authentication username" }
+        }
         if (reference != null && replaceAuthentication && authentication != null) {
             vault.storePassword("$reference:user", authentication.username)
             try {
@@ -109,6 +108,7 @@ public class UploadSettingsStore(directory: File, private val vault: CredentialV
             throw failure
         }
         if (previous?.credentialRef != reference) previous?.credentialRef?.let(::deleteCredentials)
+        return saved
     }
 
     @Synchronized

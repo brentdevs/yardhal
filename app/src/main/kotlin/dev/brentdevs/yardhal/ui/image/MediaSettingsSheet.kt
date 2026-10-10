@@ -29,9 +29,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import dev.brentdevs.yardhal.core.data.MediaPreferences
+import dev.brentdevs.yardhal.core.data.MediaPreferencesStore
 import java.io.IOException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -39,7 +42,9 @@ import kotlinx.coroutines.withContext
 public fun MediaSettingsSheet(environment: MediaEnvironment, onDismiss: () -> Unit) {
     val preferences by environment.preferences.preferences.collectAsState()
     val revision by environment.cacheRevision.collectAsState()
+    val retentionError by environment.retentionError.collectAsState()
     val scope = rememberCoroutineScope()
+    val updates = remember(environment) { Mutex() }
     var error by remember { mutableStateOf<String?>(null) }
     var usage by remember { mutableStateOf(ImageCacheUsage(0, 0)) }
     LaunchedEffect(environment, preferences.mediaCacheBytes, preferences.avatarCacheBytes, revision) {
@@ -48,15 +53,17 @@ public fun MediaSettingsSheet(environment: MediaEnvironment, onDismiss: () -> Un
             environment.loader.usage()
         }
     }
-    fun update(value: MediaPreferences) {
+    fun update(transform: (MediaPreferences) -> MediaPreferences) {
         scope.launch {
-            try {
-                withContext(Dispatchers.IO) { environment.preferences.update(value) }
-                error = null
-            } catch (_: IOException) {
-                error = "Media preferences could not be saved. Try again when storage is available."
-            } catch (_: SecurityException) {
-                error = "Media preferences storage is unavailable."
+            updates.withLock {
+                try {
+                    withContext(Dispatchers.IO) { environment.preferences.update(transform) }
+                    error = null
+                } catch (_: IOException) {
+                    error = "Media preferences could not be saved. Try again when storage is available."
+                } catch (_: SecurityException) {
+                    error = "Media preferences storage is unavailable."
+                }
             }
         }
     }
@@ -80,18 +87,20 @@ public fun MediaSettingsSheet(environment: MediaEnvironment, onDismiss: () -> Un
         ) {
             Text("Media and privacy", style = MaterialTheme.typography.titleLarge)
             Text("Previews contact the linked host and reveal your IP address. Hidden images are not fetched or probed. Videos never autoplay.", style = MaterialTheme.typography.bodySmall)
-            MediaSwitch("Automatically load images and discover image links", preferences.autoLoadImages) { update(preferences.copy(autoLoadImages = it)) }
-            MediaSwitch("Load avatars and network icons", preferences.loadAvatars) { update(preferences.copy(loadAvatars = it)) }
-            MediaSwitch("Allow video playback after pressing Play", preferences.enableVideos) { update(preferences.copy(enableVideos = it)) }
-            MediaSwitch("Animate GIFs and animated images", preferences.animateImages) { update(preferences.copy(animateImages = it)) }
-            MediaSwitch("Reduce motion (show still images)", preferences.reducedMotion) { update(preferences.copy(reducedMotion = it)) }
+            MediaSwitch("Automatically load images and discover image links", preferences.autoLoadImages) { value -> update { it.copy(autoLoadImages = value) } }
+            MediaSwitch("Load avatars and network icons", preferences.loadAvatars) { value -> update { it.copy(loadAvatars = value) } }
+            MediaSwitch("Allow video playback after pressing Play", preferences.enableVideos) { value -> update { it.copy(enableVideos = value) } }
+            MediaSwitch("Animate GIFs and animated images", preferences.animateImages) { value -> update { it.copy(animateImages = value) } }
+            MediaSwitch("Reduce motion (show still images)", preferences.reducedMotion) { value -> update { it.copy(reducedMotion = value) } }
             Text("System reduced-motion settings also disable animation. Returning to a video requires pressing Play again.", style = MaterialTheme.typography.bodySmall)
-            CacheBudget("Images and GIFs", preferences.mediaCacheBytes, usage.mediaBytes) { update(preferences.copy(mediaCacheBytes = it)) }
+            CacheBudget("Images and GIFs", preferences.mediaCacheBytes, usage.mediaBytes) { value -> update { it.copy(mediaCacheBytes = value) } }
             TextButton(onClick = { clear(ImageCacheCategory.MEDIA) }) { Text("Clear image and GIF cache") }
-            CacheBudget("Avatars", preferences.avatarCacheBytes, usage.avatarBytes) { update(preferences.copy(avatarCacheBytes = it)) }
+            CacheBudget("Avatars", preferences.avatarCacheBytes, usage.avatarBytes) { value -> update { it.copy(avatarCacheBytes = value) } }
             TextButton(onClick = { clear(ImageCacheCategory.AVATAR) }) { Text("Clear avatar cache") }
-            Text("Videos use bounded temporary files removed when playback closes. Media bytes and temporary playback files are not synced. Reveal and hide choices are saved per message.", style = MaterialTheme.typography.bodySmall)
+            Text("Videos use bounded temporary files removed when playback closes. Media bytes and temporary playback files are not synced.", style = MaterialTheme.typography.bodySmall)
+            Text("Reveal and hide retention normally keeps at most ${MediaPreferencesStore.MAX_REVEAL_ENTRIES} choices, protecting visible media and the ${MediaPreferencesStore.RECENT_REVEAL_ENTRIES} latest changes. Older revealed choices expire before older hidden choices. Expired choices use the global setting and may load automatically.", style = MaterialTheme.typography.bodySmall)
             error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+            retentionError?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
             TextButton(onClick = onDismiss) { Text("Done") }
         }
     }

@@ -744,8 +744,10 @@ depends on Android support, not just a recognized extension.
 Unknown/extensionless links are image-only candidates, not page scraping or video
 discovery. HEAD accepts a supported image MIME and bounded advertised size;
 unsupported HEAD (405/501) or absent/generic MIME can fall back to a range GET.
-The fallback reads at most 1,024 bytes even if Range is ignored and checks the
-whole-resource Content-Range size. HTML and extensionless video are not promoted.
+The fallback requests bytes 0–1,023 but inspects only MIME and whole-resource
+Content-Range headers; it does not read an unused body or claim magic validation.
+Actual bounded image decoding establishes whether the content is an image.
+HTML MIME and extensionless video are not promoted.
 Requests allow at most four redirects without HTTPS downgrade. Images/GIFs have
 a 16-MiB byte limit, 8,192-pixel dimension limit and 32-Mi-pixel decoded-area
 limit; preview decoding targets 1,024 pixels. Explicit video downloads are
@@ -760,6 +762,15 @@ animation. Separate bounded avatar/icon and image/GIF caches expose usage,
 budget selection and category-specific clearing. Media bytes/playback files are
 not synced. Fetching still discloses the device's IP to the linked host: HTTPS
 does not provide anonymity.
+The HTTPS policy intentionally permits loopback, private, link-local and internal
+DNS destinations, including each redirect. It is not an SSRF boundary or
+DNS-rebinding filter. Untrusted links/avatars can make local-network requests;
+automatic image discovery and avatar loading have separate controls.
+Reveal retention normally caps at 4,096 entries; visible/foreground pins and the
+latest 128 changes are protected. Old unprotected REVEALED choices expire before
+HIDDEN ones; excess active pins permit a temporary bound of active count + 128.
+Expired choices revert to global policy, potentially auto-loading old hidden
+media. Releasing pins trims on application-owned IO, never Compose disposal.
 
 ### Uploads and share staging
 
@@ -780,6 +791,12 @@ retains EXTRA_TEXT as the batch caption. Revoked grants, inaccessible files and
 oversize batches produce actionable errors rather than fake uploads.
 Intake persists its manifest before publishing stages or marking the incoming
 intent consumed; consumed shares do not replay after rotation or restart.
+Persistable SAF grants are acquired in the same serialized intake transaction
+as manifest persistence. Startup, durable source-copy completion and removal
+release unused grants; pending uncopied stages retain theirs. Partial acquisition
+and storage failures clean up without phantom stages or lost retry identity.
+Dismissed destination choosers survive rotation; superseded intents are checked
+before intake as well as before marking consumption.
 External shares copy before destination selection; assignment is immutable.
 Picker results bind to the original destination, not the newly visible session.
 Consent, byte progress, cancellation and retry remain scoped to that stage.
@@ -793,10 +810,11 @@ sync/backup; provider secrets are absent from manifests/provider JSON.
 
 Default Strip removes metadata from supported JPEG/PNG/static WebP while retaining
 necessary JPEG orientation and validated Adobe color-transform markers.
-GIF, animated PNG/WebP, unknown images and unsafe orientation reject Strip
-honestly; Keep requires explicit choice and warns of location/device/personal
-disclosure. No silent flattening or general video/file metadata sanitation is
-claimed.
+ICC-profile-bearing JPEG/PNG/WebP reject Strip rather than dropping rendering
+information and changing colors. GIF, animated PNG/WebP, unknown images and unsafe
+orientation also reject honestly; Keep requires explicit choice and warns of
+location/device/personal disclosure. No silent flattening or general video/file
+metadata sanitation is claimed.
 
 ### Composition and trust
 
@@ -834,8 +852,9 @@ provider, real TLS IRC sockets and real HTTP upload endpoints:
   Offscreen HTTP cancellation stopped at 1,671,168 of 8,388,608 bytes.
 - Separate avatar/media clearing and budget eviction were visible. Returning
   online retried a visible failed image; hidden state survived cold launch without
-  fetching. A HEAD-405 image probe read exactly 1,024 range bytes, then loaded the
-  image; extensionless video was not promoted.
+  fetching. The initial HEAD-405 smoke read exactly 1,024 range bytes before
+  loading the image; current probes inspect only headers and decode separately.
+  Extensionless video was not promoted.
 - A valid 1,451-byte JPEG retained orientation 6 while removing GPS/artist
   metadata. FILEHOST and provider-specific Basic-auth uploads required consent
   and explicit Send. Multiple files retained the caption once. Unsupported GIF
@@ -859,6 +878,49 @@ rows, CMYK JPEG color preservation while stripping metadata, and rejected action
 sends retaining the draft. These observations do not establish native phase 5
 Ergo/soju/ZNC interoperability or Halyard source-mirroring proof; pinned Halyard
 links returned 404.
+
+### Review hardening evidence
+
+The phase 5 review gate passed with `nix develop --command make check`, including
+native-graphics decoding and sanitization regressions. Native Android 15 review
+smoke used an owned plaintext IRC fixture advertising ASCII casemapping,
+message-tags and echo-message, a platform-trusted HTTPS endpoint, and an external
+DocumentsProvider with real persistable SAF grants:
+
+- Repeated Basic-auth provider edits retained usable credentials and reset
+  replacement inputs after success. An HTTP edit retaining those credentials
+  was rejected without changing the persisted HTTPS provider; failed saves
+  retained replacement inputs.
+- A 2,354,571-byte MP4 uploaded with consent and authentication. Clearing its
+  inserted URL kept the stage retryable. Explicit `/me` sent the permitted
+  `+draft/attachment` tag and retained filename/MIME/size locally after cold
+  launch; only accepted explicit Send consumed the stage. Persisted SAF read grants
+  were released after the private copy completed.
+- A published caption survived force-stop/cold-launch. Choosing Later for a
+  shared document did not reopen destination selection after real rotation.
+  An obstructed recent-emoji write did not prevent synchronous selection of
+  the multi-codepoint astronaut or sheet dismissal.
+- Strip visibly rejected a valid 556-byte ICC-profile-bearing PNG; explicit
+  Keep uploaded byte-identical contents. Rapid independent image/video setting
+  changes both persisted. Changing GIF animation during a 60-second MP4 left
+  playback running and its HTTPS GET count at one. Natural completion removed
+  the temporary playback file.
+- An extensionless endpoint initially returned text and offered Recheck for
+  image. After it changed to PNG, recheck issued a fresh HEAD and a 305-byte GET
+  and rendered the actual image. The final gated APK also rendered the current
+  ICC privacy wording and both relay formats: `Alice[` and `alice{` remained
+  distinct under ASCII, while adding `ALICE[` replaced the former format.
+  Actual inbound messages displayed separate claimed author and wire source.
+
+Deterministic regressions additionally cover Unicode and quoted filename
+boundaries, local stream failures versus transport failures, real redirect and
+upload cancellation peers, queued Keep/retry ordering and removal, partial URI
+grant rollback, failed caption persistence, orphan partial-file cleanup,
+surrogate-safe portable quotes, CLIENTTAGDENY invalidation, post-clear cache
+contents, late/timeout video ownership, clipped avatar geometry, and reveal
+retention protecting visible entries. HTTPS media fetching deliberately retains
+browser-like private/local-address access; it is not an SSRF/DNS-rebinding guard.
+Image probes use MIME/length headers only; bounded decoding validates image bytes.
 
 ## Roadmap
 

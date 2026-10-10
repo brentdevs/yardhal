@@ -40,10 +40,18 @@ architecture of the Halyard iOS client.
 
 Open **App options → Chat appearance → Media and privacy** for image discovery,
 avatars/network icons, explicit video playback, animation/reduced motion and
-separate cache usage, budgets and clear actions. Reveal/hide choices are saved
-per message. Hidden media is not fetched or probed; leaving the visible transcript
-or backgrounding cancels media work. Previews contact linked hosts and disclose
-your IP address; they are not anonymized or proxied through IRC.
+separate cache usage, budgets and clear actions. Saved reveal/hide choices normally
+retain up to 4,096 entries, protecting visible and recent choices and expiring old
+reveals before old hides. Expired choices revert to global policy and can auto-load
+if enabled. While retained, hidden media is not fetched or probed; leaving the
+visible transcript or backgrounding cancels media work.
+
+Previews and avatars contact linked hosts directly and disclose your IP; they
+are not anonymized or proxied through IRC. HTTPS validation is not an SSRF
+boundary: loopback, private, link-local and DNS-resolved local HTTPS endpoints
+remain supported, including on redirects. Untrusted links can therefore cause
+local-network requests. Disable automatic image discovery and avatars separately
+if that network access is unwanted; explicit Reveal/Play still contacts the host.
 
 **Chat appearance → Uploads and photo privacy** configures global or per-network
 HTTP upload providers, protected provider-specific Basic credentials, size limits
@@ -61,12 +69,16 @@ stay with that destination. Uploading never sends IRC chat: the resulting URL
 enters only the matching destination draft (return there if viewing another
 conversation), then press **Send**. After process recreation, **Insert URL again**
 recovers a completed URL without uploading again; the ordinary draft is transient.
+SAF read grants are retained only until a durable private copy exists or the
+attachment is removed. Grant failures are actionable rather than silently
+discarding process-recovery access.
 
 Metadata stripping is the default for supported JPEG, PNG and static WebP.
 JPEG preserves necessary orientation and supported Adobe color interpretation
-while removing personal metadata. GIF, animated PNG/WebP, unknown image formats
-and unsafe orientation fail honestly under Strip; explicitly choosing Keep may
-disclose location/device/personal metadata. No animation is silently flattened.
+while removing personal metadata. ICC-profile-bearing JPEG/PNG/WebP, GIF,
+animated PNG/WebP, unknown image formats and unsafe orientation fail honestly
+under Strip; choose Keep explicitly to preserve their original appearance and
+bytes, accepting location/device/personal disclosure. No animation is flattened.
 Video/file uploads are not a promise of metadata removal. Media format recognition
 is broader than device decoder support; unsupported content retains an
 external-open fallback.

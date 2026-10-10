@@ -16,6 +16,22 @@ class ImageUrlPolicyTests {
     }
 
     @Test
+    fun browserLikeHttpsPolicyKeepsInternalEndpointsAndRedirectsWithoutPretendingToFilterDns() {
+        for (url in listOf(
+            "https://127.0.0.1/avatar.png",
+            "https://[::1]/avatar.png",
+            "https://10.0.2.2:8443/avatar.png",
+            "https://192.168.1.2/avatar.png",
+            "https://169.254.1.2/avatar.png",
+            "https://files.internal/avatar.png",
+            "https://files/avatar.png",
+        )) {
+            assertEquals(url, ImageUrlPolicy.resolve(url, 64))
+            assertEquals(url, MediaPolicy.redirect("https://public.example/image", url))
+        }
+    }
+
+    @Test
     fun nonHttpsSchemesAreRejected() {
         assertNull(ImageUrlPolicy.resolve("http://example.com/a.png", 64))
         assertNull(ImageUrlPolicy.resolve("file:///sdcard/a.png", 64))

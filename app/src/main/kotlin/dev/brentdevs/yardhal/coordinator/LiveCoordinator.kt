@@ -2972,6 +2972,13 @@ public class LiveCoordinator(
         }
     }
 
+    public fun caseMapping(networkId: String): CaseMapping = synchronized(sessionLifecycleLock) {
+        val session = sessions[networkId]
+        synchronized(session?.state ?: selectionLock) {
+            session?.state?.casemapping ?: restoredCasemapping[networkId] ?: CaseMapping.RFC1459
+        }
+    }
+
     public fun relayPresentation(networkId: String, message: ChatMessage): ChatMessage {
         if (message.redacted || message.sentByUs || message.kind != MessageKind.PRIVMSG) return message
         val mapping = sessions[networkId]?.state?.casemapping ?: restoredCasemapping[networkId] ?: CaseMapping.RFC1459
@@ -3525,8 +3532,6 @@ public class LiveCoordinator(
                     iconUrl = live?.state?.networkIconUrl,
                     taggedRepliesAvailable = live?.state?.clientTagPolicy?.reply != null,
                     reactionsAvailable = live?.state?.clientTagPolicy?.reactionsAvailable == true,
-                    typingAvailable = live?.state?.clientTagPolicy?.typing != null,
-                    attachmentTagsAvailable = live?.state?.clientTagPolicy?.attachment != null,
                     connectionPhase = when {
                         binding?.rejectionReason != null -> RecoveryPhase.AUTHENTICATION_REJECTED
                         binding?.enabled == false -> RecoveryPhase.DISCONNECTED
@@ -3589,12 +3594,17 @@ public class LiveCoordinator(
                 return@compose sent
             }
             if (command is SlashCommand.Action) {
+                val attachment = attachmentFor(command.description, attachments)
                 val sent = sendMessage(
                     session,
                     activeBuffer.ref,
                     "\u0001ACTION ${command.description}\u0001",
                     optimisticKind = MessageKind.ACTION,
                     optimisticText = command.description,
+                    attachmentUrl = attachment?.url,
+                    attachmentName = attachment?.name,
+                    attachmentMimeType = attachment?.mimeType,
+                    attachmentSizeBytes = attachment?.sizeBytes,
                 )
                 if (!sent) _operationError.value = "Message was not fully queued. Your draft was retained; reconnect before retrying."
                 return@compose sent
@@ -3790,6 +3800,12 @@ public class LiveCoordinator(
         }
     }
 
+    private fun attachmentFor(
+        body: String,
+        attachments: List<dev.brentdevs.yardhal.core.data.UploadedAttachment>,
+    ): dev.brentdevs.yardhal.core.data.UploadedAttachment? =
+        attachments.firstOrNull { it.url in body.split(Regex("\\s+")) }
+
     private fun sendComposed(
         session: Session,
         ref: ConversationRef,
@@ -3799,10 +3815,8 @@ public class LiveCoordinator(
         attachments: List<dev.brentdevs.yardhal.core.data.UploadedAttachment> = emptyList(),
     ): Boolean {
         val normalized = IrcMultiline.normalize(text)
-        fun attachmentFor(body: String): dev.brentdevs.yardhal.core.data.UploadedAttachment? =
-            attachments.firstOrNull { it.url in body.split(Regex("\\s+")) }
         if ('\n' !in normalized) {
-            val attachment = attachmentFor(normalized)
+            val attachment = attachmentFor(normalized, attachments)
             return sendMessage(session, ref, normalized, replyToMsgid = replyToMsgid, quoteParent = quoteParent,
                 attachmentUrl = attachment?.url, attachmentName = attachment?.name,
                 attachmentMimeType = attachment?.mimeType, attachmentSizeBytes = attachment?.sizeBytes)
@@ -3810,7 +3824,7 @@ public class LiveCoordinator(
         val limits = session.state.outboundMultilineLimits()
         if (limits == null) {
             for ((index, line) in normalized.split('\n').filter { it.isNotBlank() }.withIndex()) {
-                val attachment = attachmentFor(line)
+                val attachment = attachmentFor(line, attachments)
                 if (!sendMessage(session, ref, line, replyToMsgid = replyToMsgid.takeIf { index == 0 },
                         quoteParent = quoteParent.takeIf { index == 0 }, attachmentUrl = attachment?.url,
                         attachmentName = attachment?.name, attachmentMimeType = attachment?.mimeType,
@@ -3824,7 +3838,7 @@ public class LiveCoordinator(
             val reply = replyToMsgid.takeIf { index == 0 }
             val label = session.state.issueLabel(ref, LabeledCommand.PRIVMSG, clock())
             val body = IrcMultiline.combine(lines)
-            val attachment = attachmentFor(body)
+            val attachment = attachmentFor(body, attachments)
             val policy = session.state.clientTagPolicy
             val batchTags = buildMap {
                 if (label != null) put("label", label)

@@ -2,6 +2,7 @@ package dev.brentdevs.yardhal.core.data
 
 import dev.brentdevs.yardhal.core.client.FilehostException
 import java.io.File
+import java.io.IOException
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -98,6 +99,67 @@ class UploadSettingsStoreTests {
         store.selectProvider(null, provider.id)
         assertFailsWith<FilehostException.InsecureTransport> { store.resolve("a", null, requireSecureTransport = true) }
         assertFailsWith<FilehostException.InsecureTransport> { store.saveProvider(provider, UploadAuthentication("a", "b"), true) }
+    }
+
+    @Test
+    fun retainedAuthenticationRejectsHttpEditWithoutChangingPersistenceOrVault() {
+        val store = store()
+        val provider = store.saveProvider(UploadProvider(label = "Private", endpointUrl = "https://private.example/upload"),
+            UploadAuthentication("protected-account", "protected-secret"), true)
+        store.selectProvider(null, provider.id)
+        val before = File(temporary.root, "upload-settings.json").readText()
+        assertFailsWith<FilehostException.InsecureTransport> {
+            store.saveProvider(provider.copy(label = "Changed", endpointUrl = "http://private.example/upload"))
+        }
+        assertEquals(before, File(temporary.root, "upload-settings.json").readText())
+        assertEquals(provider, store.snapshot().providers.single())
+        assertEquals("protected-account", assertNotNull(store().resolve("a", null).authentication).username)
+        assertEquals("protected-secret", assertNotNull(store().resolve("a", null).authentication).password)
+    }
+
+    @Test
+    fun repeatLabelEditsUsingPersistedProviderPreserveVaultAuthentication() {
+        val store = store()
+        var editing = store.saveProvider(UploadProvider(label = "Private", endpointUrl = "https://private.example/upload"),
+            UploadAuthentication("protected-account", "protected-secret"), true)
+        val reference = assertNotNull(editing.credentialRef)
+        store.selectProvider(null, editing.id)
+        editing = store.saveProvider(editing.copy(label = "First edit"))
+        editing = store.saveProvider(editing.copy(label = "Second edit"))
+        assertEquals(reference, editing.credentialRef)
+        assertEquals("Second edit", store().resolve("a", null).label)
+        assertEquals("protected-account", vault.readPassword("$reference:user"))
+        assertEquals("protected-secret", assertNotNull(store().resolve("a", null).authentication).password)
+    }
+
+    @Test
+    fun clearingAuthenticationExplicitlyAllowsAnHttpEndpointEdit() {
+        val store = store()
+        val provider = store.saveProvider(UploadProvider(label = "Private", endpointUrl = "https://private.example/upload"),
+            UploadAuthentication("account", "secret"), true)
+        val reference = assertNotNull(provider.credentialRef)
+        val saved = store.saveProvider(provider.copy(endpointUrl = "http://private.example/upload"), replaceAuthentication = true)
+        assertNull(saved.credentialRef)
+        assertNull(vault.readPassword("$reference:user"))
+        assertNull(vault.readPassword("$reference:password"))
+        assertEquals(saved, store().snapshot().providers.single())
+    }
+
+    @Test
+    fun failedCredentialReplacementKeepsPreviouslyPersistedProviderAndVaultAuthentication() {
+        val store = store()
+        val provider = store.saveProvider(UploadProvider(label = "Private", endpointUrl = "https://private.example/upload"),
+            UploadAuthentication("old-account", "old-secret"), true)
+        store.selectProvider(null, provider.id)
+        val before = File(temporary.root, "upload-settings.json").readText()
+        assertTrue(File(temporary.root, "upload-settings.json.tmp").mkdir())
+        assertFailsWith<IOException> {
+            store.saveProvider(provider.copy(label = "Rejected"), UploadAuthentication("new-account", "new-secret"), true)
+        }
+        assertEquals(before, File(temporary.root, "upload-settings.json").readText())
+        assertEquals(provider, store.snapshot().providers.single())
+        assertEquals("old-account", assertNotNull(store().resolve("a", null).authentication).username)
+        assertEquals("old-secret", assertNotNull(store().resolve("a", null).authentication).password)
     }
 
     @Test

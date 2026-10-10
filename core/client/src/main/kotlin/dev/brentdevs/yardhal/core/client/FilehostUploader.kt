@@ -24,6 +24,7 @@ public sealed class FilehostException(message: String) : IOException(message) {
     public class Cancelled : FilehostException("Upload cancelled. The staged file is available to retry.")
     public class SizeMismatch : FilehostException("The staged file changed size. Remove it and select the file again.")
     public class Transport : FilehostException("Upload connection failed. Check connectivity and retry.")
+    public class LocalRead : FilehostException("Unable to read the staged file. Remove it and select the file again.")
 }
 
 public class UploadCancellation {
@@ -83,8 +84,11 @@ public object FilehostUploader {
     private val EMPTY_BYTES = ByteArray(0)
     private val MIME_TYPE_PATTERN = Regex("[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+")
 
-    private fun escapeQuoted(value: String): String =
-        value.filterNot { it.isISOControl() }.replace("\\", "\\\\").replace("\"", "\\\"").take(255)
+    private fun escapeQuoted(value: String): String {
+        val sanitized = value.filterNot { it.isISOControl() }
+        val end = sanitized.offsetByCodePoints(0, minOf(255, sanitized.codePointCount(0, sanitized.length)))
+        return sanitized.substring(0, end).replace("\\", "\\\\").replace("\"", "\\\"")
+    }
 
     private fun post(
         uri: URI,
@@ -117,7 +121,14 @@ public object FilehostUploader {
             connection.setRequestProperty("Content-Type", if (multipart == null) file.mimeType else "multipart/form-data; boundary=$boundary")
             if (multipart == null) connection.setRequestProperty("Content-Disposition", "attachment; filename=\"${escapeQuoted(file.name)}\"")
             connection.setFixedLengthStreamingMode(Math.addExact(file.sizeBytes, (header.size + footer.size).toLong()))
-            file.openStream().use { input ->
+            val source = try { file.openStream() } catch (_: IOException) {
+                cancellation.check()
+                throw FilehostException.LocalRead()
+            } catch (_: SecurityException) {
+                cancellation.check()
+                throw FilehostException.LocalRead()
+            }
+            source.use { input ->
                 cancellation.attach(input)
                 connection.outputStream.use { output ->
                     output.write(header)
@@ -144,7 +155,13 @@ public object FilehostUploader {
         onProgress(0, size)
         while (true) {
             cancellation.check()
-            val count = input.read(buffer)
+            val count = try { input.read(buffer) } catch (_: IOException) {
+                cancellation.check()
+                throw FilehostException.LocalRead()
+            } catch (_: SecurityException) {
+                cancellation.check()
+                throw FilehostException.LocalRead()
+            }
             if (count < 0) break
             if (count == 0) continue
             if (count.toLong() > size - sent) throw FilehostException.SizeMismatch()

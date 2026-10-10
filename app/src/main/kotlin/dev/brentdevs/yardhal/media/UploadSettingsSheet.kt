@@ -55,13 +55,14 @@ public fun UploadSettingsSheet(settings: UploadSettingsStore, networks: List<Net
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
-    fun applyChange(change: () -> Unit) {
+    fun <T> applyChange(onSuccess: (T) -> Unit = {}, change: () -> T) {
         if (busy) return
         busy = true
         scope.launch {
             try {
-                withContext(Dispatchers.IO) { change() }
+                val result = withContext(Dispatchers.IO) { change() }
                 preferences = settings.snapshot()
+                onSuccess(result)
                 error = null
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (_: Exception) { error = "Unable to save upload settings. Check the endpoint URL, HTTPS authentication, provider scope and local storage." }
@@ -91,31 +92,35 @@ public fun UploadSettingsSheet(settings: UploadSettingsStore, networks: List<Net
             }
             HorizontalDivider()
             Text(if (editing == null) "Add provider for ${networkId?.let { id -> networks.firstOrNull { it.id == id }?.name } ?: "all networks"}" else "Edit provider", style = MaterialTheme.typography.titleMedium)
-            OutlinedTextField(value = label, onValueChange = { label = it }, label = { Text("Provider name") }, modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(value = endpoint, onValueChange = { endpoint = it }, label = { Text("HTTP(S) upload endpoint; no embedded credentials") }, modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(value = label, onValueChange = { label = it }, enabled = !busy, label = { Text("Provider name") }, modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(value = endpoint, onValueChange = { endpoint = it }, enabled = !busy, label = { Text("HTTP(S) upload endpoint; no embedded credentials") }, modifier = Modifier.fillMaxWidth())
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Checkbox(checked = replaceAuthentication, onCheckedChange = { replaceAuthentication = it; username = ""; password = "" })
+                Checkbox(checked = replaceAuthentication, enabled = !busy, onCheckedChange = { replaceAuthentication = it; username = ""; password = "" })
                 Text("Set/replace protected Basic credentials (empty clears)")
             }
             if (replaceAuthentication) {
-                OutlinedTextField(value = username, onValueChange = { username = it }, label = { Text("Provider username") }, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(value = password, onValueChange = { password = it }, label = { Text("Provider password") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(value = username, onValueChange = { username = it }, enabled = !busy, label = { Text("Provider username") }, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(value = password, onValueChange = { password = it }, enabled = !busy, label = { Text("Provider password") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
                 Text("Authentication requires HTTPS. Secrets are not stored in draft manifests or provider JSON.")
             }
             Button(enabled = !busy && label.isNotBlank(), onClick = {
                 val provider = editing?.copy(label = label.trim(), endpointUrl = endpoint.trim()) ?: UploadProvider(label = label.trim(), endpointUrl = endpoint.trim(), networkId = networkId)
                 val replace = replaceAuthentication
                 val auth = if (username.isEmpty() && password.isEmpty()) null else UploadAuthentication(username, password)
-                applyChange { settings.saveProvider(provider, auth, replace) }
-                password = ""; username = ""
+                applyChange(onSuccess = { saved ->
+                    editing = saved
+                    replaceAuthentication = false
+                    username = ""
+                    password = ""
+                }) { settings.saveProvider(provider, auth, replace) }
             }) { Text("Save provider") }
-            if (editing != null) TextButton(onClick = { editing = null; label = ""; endpoint = "https://"; replaceAuthentication = false; username = ""; password = "" }) { Text("Add another provider") }
+            if (editing != null) TextButton(enabled = !busy, onClick = { editing = null; label = ""; endpoint = "https://"; replaceAuthentication = false; username = ""; password = "" }) { Text("Add another provider") }
             HorizontalDivider()
             Text("Attachment size and metadata", style = MaterialTheme.typography.titleMedium)
             OutlinedTextField(value = maximumMiB, onValueChange = { maximumMiB = it }, label = { Text("Maximum file size in MiB (1–2048)") }, modifier = Modifier.fillMaxWidth())
             FilterChip(selected = policy == PhotoMetadataPolicy.STRIP, onClick = { policy = PhotoMetadataPolicy.STRIP }, label = { Text("Strip photo metadata/location (default)") })
             FilterChip(selected = policy == PhotoMetadataPolicy.KEEP, onClick = { policy = PhotoMetadataPolicy.KEEP }, label = { Text("Keep metadata explicitly") })
-            Text("JPEG preserves orientation and supported color interpretation while stripping photo metadata. PNG and static WebP strip metadata where appearance can be retained. GIF, animated PNG/WebP, unknown images and unsafe orientation fail honestly under Strip; choose Keep explicitly instead. No format is silently flattened.")
+            Text("JPEG preserves orientation and supported Adobe color interpretation. Strip rejects ICC-profile-bearing JPEG/PNG/WebP instead of changing colors. Unprofiled PNG and static WebP strip metadata where appearance can be retained. GIF, animated PNG/WebP, unknown images and unsafe orientation also fail honestly; choose Keep explicitly instead. No format is silently flattened.")
             if (policy == PhotoMetadataPolicy.KEEP) Text("Warning: uploads may disclose location, device and personal information.", color = MaterialTheme.colorScheme.error)
             val maximum = maximumMiB.toLongOrNull()?.takeIf { it in 1..2048 }?.times(1024 * 1024)
             Button(enabled = !busy && maximum != null, onClick = { if (maximum != null) { val chosenPolicy = policy; applyChange { settings.updateLimits(maximum, chosenPolicy) } } }) { Text("Save size and privacy policy") }

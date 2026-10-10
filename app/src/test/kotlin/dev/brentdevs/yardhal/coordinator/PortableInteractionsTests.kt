@@ -34,6 +34,22 @@ class PortableInteractionsTests {
     }
 
     @Test
+    fun quoteBoundsNeverSplitSupplementarySenderOrBodyCodePoints() {
+        val senderPrefix = "s".repeat(63)
+        val bodyPrefix = "b".repeat(159)
+        assertEquals(
+            "> $senderPrefix: $bodyPrefix — answer",
+            portableQuote(parent().copy(sender = senderPrefix + "😀tail", text = bodyPrefix + "😀tail"), "answer"),
+        )
+        val completeSender = "s".repeat(62) + "😀"
+        val completeBody = "b".repeat(158) + "😀"
+        assertEquals(
+            "> $completeSender: $completeBody — answer",
+            portableQuote(parent().copy(sender = completeSender + "tail", text = completeBody + "tail"), "answer"),
+        )
+    }
+
+    @Test
     fun mediaIdentityUsesScopedDurableRows() {
         val one = ConversationBuffer(ConversationRef.channel("one", "#room"), "#room")
         val two = ConversationBuffer(ConversationRef.channel("two", "#room"), "#room")

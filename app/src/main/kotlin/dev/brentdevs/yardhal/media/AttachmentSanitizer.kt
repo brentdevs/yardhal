@@ -118,6 +118,7 @@ object AttachmentSanitizer {
             if (length < 2) throw AttachmentSanitizationException()
             val payload = ByteArray(length - 2)
             input.readFully(payload)
+            if (marker == 0xe2 && payload.size >= 12 && String(payload, 0, 12, Charsets.US_ASCII) == "ICC_PROFILE\u0000") throw AttachmentSanitizationException()
             if (marker in 0xc0..0xcf && marker != 0xc4 && marker != 0xc8 && marker != 0xcc) {
                 if (payload.size < 6) throw AttachmentSanitizationException()
                 frameSeen = true
@@ -194,7 +195,7 @@ object AttachmentSanitizer {
             if ((first && (name != "IHDR" || length != 13)) || (!first && name == "IHDR")) throw AttachmentSanitizationException()
             first = false
             if (name == "IDAT" && length > 0) dataSeen = true
-            if (name in PNG_ANIMATION_CHUNKS) throw AttachmentSanitizationException()
+            if (name in PNG_ANIMATION_CHUNKS || name == "iCCP") throw AttachmentSanitizationException()
             val keep = name in PNG_RENDERING_CHUNKS
             if (!keep && type[0].toInt() and 32 == 0) throw AttachmentSanitizationException()
             val crc = CRC32().apply { update(type) }
@@ -231,12 +232,12 @@ object AttachmentSanitizer {
             val length = ByteBuffer.wrap(chunkHeader, 4, 4).order(ByteOrder.LITTLE_ENDIAN).int.toLong() and 0xffffffffL
             val padded = length + (length and 1)
             if (padded > size - position - 8) throw AttachmentSanitizationException()
-            if (type in WEBP_ANIMATION_CHUNKS) throw AttachmentSanitizationException()
+            if (type in WEBP_ANIMATION_CHUNKS || type == "ICCP") throw AttachmentSanitizationException()
             when (type) {
                 "VP8X" -> {
                     if (length != 10L) throw AttachmentSanitizationException()
                     val payload = ByteArray(10).also(input::readFully)
-                    if (payload[0].toInt() and 2 != 0) throw AttachmentSanitizationException()
+                    if (payload[0].toInt() and (2 or 0x20) != 0) throw AttachmentSanitizationException()
                     kept += 8 + padded
                 }
                 "EXIF" -> {

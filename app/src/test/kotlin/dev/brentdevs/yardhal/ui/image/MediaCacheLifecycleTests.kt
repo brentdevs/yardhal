@@ -1,10 +1,13 @@
 package dev.brentdevs.yardhal.ui.image
 
+import android.graphics.Bitmap
 import androidx.compose.runtime.AbstractApplier
 import androidx.compose.runtime.Composition
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.Recomposer
 import dev.brentdevs.yardhal.core.data.MediaPreferencesStore
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
@@ -16,6 +19,7 @@ import java.util.concurrent.TimeUnit
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -23,13 +27,19 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeout
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+import org.robolectric.annotation.GraphicsMode
 
 @RunWith(RobolectricTestRunner::class)
+@Config(sdk = [35], manifest = Config.NONE)
+@GraphicsMode(GraphicsMode.Mode.NATIVE)
 class MediaCacheLifecycleTests {
     @get:Rule
     val temporaryFolder = TemporaryFolder()
@@ -85,6 +95,83 @@ class MediaCacheLifecycleTests {
     }
 
     @Test
+    fun advertisedImageMimeCannotPublishHtmlAsAnImageWithoutSuccessfulDecoding() = runBlocking {
+        val url = "https://files.test/not-an-image.png"
+        val bytes = "<html><body>Not an image</body></html>".toByteArray()
+        val loader = RemoteImageLoader(temporaryFolder.root, connectionFactory = { ImageConnection(it, bytes) })
+        assertNull(loader.load(url, 64))
+        assertNull(loader.cached(url, 64))
+    }
+
+    @Test
+    fun cacheClearRemovesDecodedAndDiskImagesAfterPendingPublicationCompletes() = runBlocking<Unit> {
+        val bytes = ByteArrayOutputStream().also { output ->
+            val bitmap = Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)
+            assertTrue(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output))
+            bitmap.recycle()
+        }.toByteArray()
+        val url = "https://files.test/photo.png"
+        val loader = RemoteImageLoader(temporaryFolder.root, connectionFactory = { ImageConnection(it, bytes) })
+        assertNotNull(loader.load(url, 64))
+        val diskLock = assertNotNull(loader.javaClass.getDeclaredField("diskLock").apply { isAccessible = true }.get(loader))
+        val started = CountDownLatch(1)
+        val finished = CountDownLatch(1)
+        val failure = java.util.concurrent.atomic.AtomicReference<Throwable?>()
+        val clearing = Thread {
+            started.countDown()
+            try {
+                loader.clear(ImageCacheCategory.MEDIA)
+            } catch (error: Throwable) {
+                failure.set(error)
+            } finally {
+                finished.countDown()
+            }
+        }
+        try {
+            synchronized(diskLock) {
+                clearing.start()
+                assertTrue(started.await(5, TimeUnit.SECONDS))
+                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+                while (clearing.state != Thread.State.BLOCKED && clearing.isAlive && System.nanoTime() < deadline) Thread.yield()
+                assertEquals(Thread.State.BLOCKED, clearing.state)
+                assertNotNull(loader.cached(url, 64))
+                assertEquals(bytes.size.toLong(), loader.usage().mediaBytes)
+            }
+            assertTrue(finished.await(5, TimeUnit.SECONDS))
+            failure.get()?.let { throw it }
+            assertNull(loader.cached(url, 64))
+            assertEquals(0L, loader.usage().mediaBytes)
+            assertNotNull(loader.load(url, 64))
+        } finally {
+            clearing.join(5_000)
+            loader.cancelRequests()
+        }
+    }
+
+    @Test
+    fun cancelledVideoDownloadRemovesItsActiveTemporaryFileRatherThanLeavingAnOrphan() = runBlocking {
+        val connection = BlockingConnection("video/mp4")
+        val loader = RemoteImageLoader(temporaryFolder.root, connectionFactory = { connection })
+        val loading = async(start = CoroutineStart.UNDISPATCHED) { loader.loadVideo("https://files.test/video.mp4") }
+        try {
+            assertTrue(withContext(Dispatchers.IO) { connection.readStarted.await(5, TimeUnit.SECONDS) })
+            val playbackDirectory = File(temporaryFolder.root, "remote-video-playback")
+            val file = assertNotNull(playbackDirectory.listFiles()?.singleOrNull())
+            loader.maintain()
+            assertTrue(file.exists())
+            loading.cancelAndJoin()
+            withTimeout(5_000) {
+                while (file.exists()) delay(1)
+            }
+            assertTrue(connection.disconnected)
+            assertEquals(emptyList(), playbackDirectory.listFiles()?.toList())
+        } finally {
+            loading.cancelAndJoin()
+            loader.cancelRequests()
+        }
+    }
+
+    @Test
     fun onlineReturnClearsFailureBackoffAndExactRetryBoundaryIsEligible() = runBlocking {
         var count = 0
         var now = 1000L
@@ -98,7 +185,7 @@ class MediaCacheLifecycleTests {
         now++
         assertNull(loader.load(url, 64))
         assertEquals(2, count)
-        val environment = MediaEnvironment(loader, MediaPreferencesStore(temporaryFolder.newFolder("preferences")))
+        val environment = MediaEnvironment(loader, MediaPreferencesStore(temporaryFolder.newFolder("preferences")), this)
         environment.setOnline(false)
         assertFalse(environment.online.value)
         environment.setOnline(true)
@@ -112,10 +199,10 @@ class MediaCacheLifecycleTests {
         cachedFile("remote-images", "media", 16)
         cachedFile("remote-avatars", "avatar", 8)
         val preferences = MediaPreferencesStore(temporaryFolder.newFolder("preferences"))
-        preferences.update(dev.brentdevs.yardhal.core.data.MediaPreferences(mediaCacheBytes = 0, avatarCacheBytes = 0))
+        preferences.update { it.copy(mediaCacheBytes = 0, avatarCacheBytes = 0) }
         var requests = 0
         val loader = RemoteImageLoader(temporaryFolder.root, connectionFactory = { url -> requests++; FailedConnection(url) })
-        val environment = MediaEnvironment(loader, preferences)
+        val environment = MediaEnvironment(loader, preferences, this)
         assertEquals(ImageCacheUsage(0, 0), loader.usage())
         assertNull(loader.load("https://files.test/photo.png", 64))
         assertEquals(0, requests)
@@ -128,7 +215,7 @@ class MediaCacheLifecycleTests {
     fun offlineAndOffscreenImagesAreUnavailableWithoutStartingNetworkOrSpinner() = runBlocking {
         var requests = 0
         val loader = RemoteImageLoader(temporaryFolder.root, connectionFactory = { url -> requests++; FailedConnection(url) })
-        val environment = MediaEnvironment(loader, MediaPreferencesStore(temporaryFolder.newFolder("preferences")))
+        val environment = MediaEnvironment(loader, MediaPreferencesStore(temporaryFolder.newFolder("preferences")), this)
         environment.setAppActive(true)
         environment.setOnline(false)
         val recomposer = Recomposer(coroutineContext)
@@ -166,12 +253,22 @@ class MediaCacheLifecycleTests {
         override fun usingProxy(): Boolean = false
     }
 
-    private class BlockingConnection : HttpURLConnection(URL("https://files.test/photo.png")) {
+    private class ImageConnection(url: URL, private val bytes: ByteArray) : HttpURLConnection(url) {
+        override fun getResponseCode(): Int = 200
+        override fun getContentType(): String = "image/png"
+        override fun getContentLengthLong(): Long = bytes.size.toLong()
+        override fun getInputStream(): InputStream = ByteArrayInputStream(bytes)
+        override fun connect() = Unit
+        override fun disconnect() = Unit
+        override fun usingProxy(): Boolean = false
+    }
+
+    private class BlockingConnection(private val type: String = "image/png") : HttpURLConnection(URL("https://files.test/photo.png")) {
         val readStarted = CountDownLatch(1)
         private val stopped = CountDownLatch(1)
         @Volatile var disconnected = false
         override fun getResponseCode(): Int = 200
-        override fun getContentType(): String = "image/png"
+        override fun getContentType(): String = type
         override fun getContentLengthLong(): Long = -1
         override fun getInputStream(): InputStream = object : InputStream() {
             override fun read(): Int {

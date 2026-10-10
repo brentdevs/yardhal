@@ -120,7 +120,7 @@ class YardhalApplication : Application() {
         vault = AndroidCredentialVault(this)
         chatAppearanceStore = ChatAppearanceStore(dir)
         mediaPreferences = MediaPreferencesStore(dir)
-        mediaEnvironment = MediaEnvironment(remoteImages, mediaPreferences)
+        mediaEnvironment = MediaEnvironment(remoteImages, mediaPreferences, appScope)
         recentEmoji = RecentEmojiStore(dir)
         relayConfigurations = RelayConfigurationStore(dir)
         uploadSettings = UploadSettingsStore(dir, vault)

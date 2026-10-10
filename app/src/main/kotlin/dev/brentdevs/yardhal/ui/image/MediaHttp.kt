@@ -69,16 +69,6 @@ internal class MediaHttp(private val connectionFactory: (URL) -> HttpURLConnecti
             } else connection.contentLengthLong.takeIf { it >= 0 }
             if (total != null && total > MediaPolicy.MAX_IMAGE_BYTES) return@request MediaProbeResult.NotImage
             if (!MediaPolicy.isImageMime(connection.contentType)) return@request MediaProbeResult.NotImage
-            connection.inputStream.use { input ->
-                val buffer = ByteArray(MediaPolicy.PROBE_BYTES)
-                var count = 0
-                while (count < buffer.size) {
-                    cancellation.check()
-                    val read = input.read(buffer, count, buffer.size - count)
-                    if (read < 0) break
-                    count += read
-                }
-            }
             MediaProbeResult.Image(MediaPolicy.mime(connection.contentType).orEmpty(), total)
         } ?: MediaProbeResult.Unavailable
     }

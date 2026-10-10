@@ -120,7 +120,11 @@ public class PerNetworkState(
     public var ownNick: String = configuredNick
         internal set
     public var supportedCaps: Set<String> = emptySet()
-        internal set
+        internal set(value) {
+            if (field == value) return
+            field = value
+            cachedClientTagPolicy = null
+        }
     public var prefixModes: ChannelPrefixModes = ChannelPrefixModes.DEFAULT
         internal set
     public var hasWhox: Boolean = false
@@ -130,7 +134,10 @@ public class PerNetworkState(
     public var isBouncerDiscovery: Boolean = false
         internal set
     public var isupport: ISupport = ISupport.EMPTY
-        internal set
+        internal set(value) {
+            if (field["CLIENTTAGDENY"] != value["CLIENTTAGDENY"]) cachedClientTagPolicy = null
+            field = value
+        }
     public var whoisExpected: Boolean = false
     public var whoisTarget: String? = null
     public var listingChannels: Boolean = false
@@ -164,8 +171,12 @@ public class PerNetworkState(
 
     public val accountExtban: AccountExtban? get() = isupport.accountExtban
 
+    private var cachedClientTagPolicy: dev.brentdevs.yardhal.core.protocol.ClientTagPolicy? = null
+
     public val clientTagPolicy: dev.brentdevs.yardhal.core.protocol.ClientTagPolicy
-        get() = dev.brentdevs.yardhal.core.protocol.ClientTagPolicy(supportedCaps, isupport["CLIENTTAGDENY"])
+        get() = cachedClientTagPolicy ?: dev.brentdevs.yardhal.core.protocol.ClientTagPolicy(
+            supportedCaps, isupport["CLIENTTAGDENY"],
+        ).also { cachedClientTagPolicy = it }
 
     public val server: ConversationRef get() = ConversationRef.server(networkId)
 
@@ -295,6 +306,7 @@ public class PerNetworkState(
     }
 
     private fun resetConnectionScopedState(reduction: Reduction) {
+        cachedClientTagPolicy = null
         openBatches.clear()
         pendingNames.clear()
         whois.reset()

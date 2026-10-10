@@ -23,6 +23,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import dev.brentdevs.yardhal.core.data.RelayConfiguration
 import dev.brentdevs.yardhal.core.data.RelayConfigurationStore
+import dev.brentdevs.yardhal.core.protocol.CaseMapping
 import dev.brentdevs.yardhal.core.protocol.RelayFormat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -34,6 +35,7 @@ public fun RelaySettingsSheet(
     networkId: String,
     networkName: String,
     store: RelayConfigurationStore,
+    mapping: CaseMapping,
     onDismiss: () -> Unit,
     onChanged: () -> Unit = {},
 ) {
@@ -43,13 +45,13 @@ public fun RelaySettingsSheet(
     var error by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
     var saving by remember { mutableStateOf(false) }
-    fun save(next: List<RelayConfiguration>, clearSender: Boolean) {
+    fun save(clearSender: Boolean, change: () -> Unit) {
         if (saving) return
         saving = true
         scope.launch {
             try {
-                withContext(Dispatchers.IO) { store.update(networkId, next) }
-                configurations = next
+                withContext(Dispatchers.IO) { change() }
+                configurations = store.forNetwork(networkId)
                 if (clearSender) sender = ""
                 error = null
                 onChanged()
@@ -71,7 +73,7 @@ public fun RelaySettingsSheet(
             configurations.forEach { item ->
                 Text("${item.wireSender} · ${item.format}")
                 TextButton(enabled = !saving, onClick = {
-                    save(configurations - item, false)
+                    save(false) { store.update(networkId, configurations - item) }
                 }) { Text("Remove ${item.wireSender}") }
             }
             OutlinedTextField(sender, { sender = it }, label = { Text("Exact relay bot nickname") }, singleLine = true, modifier = Modifier.fillMaxWidth())
@@ -85,8 +87,8 @@ public fun RelaySettingsSheet(
             }
             error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             TextButton(enabled = !saving, onClick = {
-                val next = configurations.filterNot { it.wireSender == sender.trim() } + RelayConfiguration(sender.trim(), format.name)
-                save(next, true)
+                val configuration = RelayConfiguration(sender.trim(), format.name)
+                save(true) { store.upsert(networkId, configuration, mapping) }
             }) { Text(if (saving) "Saving…" else "Add relay sender") }
         }
     }

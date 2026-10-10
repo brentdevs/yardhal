@@ -25,7 +25,6 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Modifier
@@ -33,6 +32,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import dev.brentdevs.yardhal.YardhalApplication
 import dev.brentdevs.yardhal.core.data.RecentEmojiStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -60,7 +60,7 @@ public fun EmojiPicker(onDismiss: () -> Unit, onSelect: (String) -> Unit) {
     val context = LocalContext.current
     val store = LocalRecentEmojiStore.current
     val recent = store?.recent?.collectAsState()?.value.orEmpty()
-    val scope = rememberCoroutineScope()
+    val scope = (context.applicationContext as YardhalApplication).appScope
     var saveError by remember { mutableStateOf<String?>(null) }
     var saving by remember { mutableStateOf(false) }
     var catalog by remember { mutableStateOf<List<EmojiEntry>?>(null) }
@@ -107,10 +107,10 @@ public fun EmojiPicker(onDismiss: () -> Unit, onSelect: (String) -> Unit) {
                     Text(entry.emoji, style = MaterialTheme.typography.headlineMedium,
                         modifier = Modifier.semantics { contentDescription = entry.name }.clickable(enabled = !saving) {
                             saving = true
-                            scope.launch {
+                            onSelect(entry.emoji)
+                            scope.launch(Dispatchers.Main.immediate) {
                                 try {
                                     withContext(Dispatchers.IO) { store?.record(entry.emoji) }
-                                    onSelect(entry.emoji)
                                 } catch (failure: java.io.IOException) {
                                     saveError = "Could not save recent emoji: ${failure.message}"
                                 } catch (failure: SecurityException) {

@@ -5,6 +5,7 @@ import android.database.ContentObserver
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.util.Log
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
@@ -17,11 +18,16 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import dev.brentdevs.yardhal.core.data.MediaPreferencesStore
+import java.io.IOException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.update
 
 internal object DefaultMediaSignals {
     val online = MutableStateFlow(true)
@@ -32,15 +38,21 @@ internal object DefaultMediaSignals {
     val revision = MutableStateFlow(0L)
 }
 
-public class MediaEnvironment(public val loader: RemoteImageLoader, public val preferences: MediaPreferencesStore) {
+public class MediaEnvironment(
+    public val loader: RemoteImageLoader,
+    public val preferences: MediaPreferencesStore,
+    private val appScope: CoroutineScope,
+) {
     private val mutableOnline = MutableStateFlow(true)
     private val mutableActive = MutableStateFlow(false)
     private val mutableSystemReducedMotion = MutableStateFlow(false)
     private val mutableCacheRevision = MutableStateFlow(0L)
+    private val mutableRetentionError = MutableStateFlow<String?>(null)
     public val online: StateFlow<Boolean> = mutableOnline.asStateFlow()
     public val appActive: StateFlow<Boolean> = mutableActive.asStateFlow()
     public val systemReducedMotion: StateFlow<Boolean> = mutableSystemReducedMotion.asStateFlow()
     public val cacheRevision: StateFlow<Long> = mutableCacheRevision.asStateFlow()
+    public val retentionError: StateFlow<String?> = mutableRetentionError.asStateFlow()
     init {
         loader.setNetworkAllowed(false)
         val initial = preferences.snapshot()
@@ -62,9 +74,22 @@ public class MediaEnvironment(public val loader: RemoteImageLoader, public val p
 
     public fun setSystemReducedMotion(reduced: Boolean) { mutableSystemReducedMotion.value = reduced }
 
+    public fun releaseReveal(retained: AutoCloseable): Job = appScope.launch(Dispatchers.IO) {
+        try {
+            retained.close()
+            mutableRetentionError.value = null
+        } catch (failure: IOException) {
+            Log.e("Yardhal", "Media reveal retention cleanup failed", failure)
+            mutableRetentionError.value = "Some old reveal and hide choices could not be expired. Cleanup will retry when another media choice is saved."
+        } catch (failure: SecurityException) {
+            Log.e("Yardhal", "Media reveal retention storage is unavailable", failure)
+            mutableRetentionError.value = "Media choice retention storage is unavailable. Cleanup will retry when another media choice is saved."
+        }
+    }
+
     public suspend fun clearCache(category: ImageCacheCategory) {
         withContext(Dispatchers.IO) { loader.clear(category) }
-        mutableCacheRevision.value += 1
+        mutableCacheRevision.update { it + 1 }
     }
 }
 

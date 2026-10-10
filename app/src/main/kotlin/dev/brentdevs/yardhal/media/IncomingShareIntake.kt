@@ -28,6 +28,8 @@ public data class AttachmentUriDescription(public val name: String, public val m
 public interface AttachmentUriAccess {
     public fun describe(uri: Uri): AttachmentUriDescription
     public fun open(uri: Uri): InputStream
+    public fun persist(uris: List<Uri>) {}
+    public fun releaseUnused(retainedUriStrings: Set<String>) {}
 }
 
 public class AttachmentUriAccessException(message: String) : IOException(message)
@@ -54,4 +56,18 @@ public class AndroidAttachmentUriAccess(private val resolver: ContentResolver) :
 
     override fun open(uri: Uri): InputStream = resolver.openInputStream(uri)
         ?: throw AttachmentUriAccessException("The shared file is unavailable. Select or share the file again.")
+
+    override fun persist(uris: List<Uri>) {
+        try {
+            uris.forEach { resolver.takePersistableUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+        } catch (_: SecurityException) {
+            throw AttachmentUriAccessException("Android could not preserve access to the selected files. Remove unused staged attachments, then select the files again.")
+        }
+    }
+
+    override fun releaseUnused(retainedUriStrings: Set<String>) {
+        resolver.persistedUriPermissions.filter { it.isReadPermission && it.uri.toString() !in retainedUriStrings }.forEach {
+            resolver.releasePersistableUriPermission(it.uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+    }
 }

@@ -72,11 +72,16 @@ public fun MediaPreview(descriptor: MediaDescriptor, mediaIdentity: String?, vis
     val eligible = MediaPolicy.mayLoad(preferences.autoLoadImages, reveal, visible, active)
     val animate = MediaPolicy.mayAnimate(preferences.animateImages, preferences.reducedMotion || systemReducedMotion, visible, active)
     var playRequested by remember(descriptor.url, visible, active, online, preferences.enableVideos) { mutableStateOf(false) }
+    val requestAnimation = discovered.kind != MediaKind.VIDEO && animate
     val wantsVideo = discovered.kind == MediaKind.VIDEO && preferences.enableVideos && reveal != MediaRevealState.HIDDEN && playRequested && visible && active
-    var state by remember(descriptor.url, eligible, wantsVideo, online, animate, revision) {
+    var state by remember(descriptor.url, eligible, wantsVideo, online, requestAnimation, revision) {
         mutableStateOf<PreviewState>(if ((eligible && discovered.kind != MediaKind.VIDEO || wantsVideo) && online) PreviewState.Loading else PreviewState.Idle)
     }
     var retry by remember(descriptor.url) { mutableStateOf(0) }
+    DisposableEffect(environment, mediaIdentity, descriptor.url, visible, active) {
+        val retained = if (mediaIdentity != null && visible && active) environment?.preferences?.retainReveal(mediaIdentity, descriptor.url) else null
+        onDispose { if (retained != null) environment?.releaseReveal(retained) }
+    }
     fun setReveal(next: MediaRevealState) {
         if (environment == null || mediaIdentity == null) {
             localReveal = next
@@ -93,7 +98,7 @@ public fun MediaPreview(descriptor: MediaDescriptor, mediaIdentity: String?, vis
             }
         }
     }
-    LaunchedEffect(loader, descriptor.url, eligible, wantsVideo, online, animate, revision, retry) {
+    LaunchedEffect(loader, descriptor.url, eligible, wantsVideo, online, requestAnimation, revision, retry) {
         if (!online || loader == null) {
             state = if (eligible || wantsVideo) PreviewState.Unavailable else PreviewState.Idle
             return@LaunchedEffect
@@ -162,6 +167,14 @@ public fun MediaPreview(descriptor: MediaDescriptor, mediaIdentity: String?, vis
                 if (discovered.kind == MediaKind.IMAGE || discovered.kind == MediaKind.UNKNOWN) {
                     if (!eligible) TextButton(onClick = { setReveal(MediaRevealState.REVEALED) }) { Text(if (discovered.kind == MediaKind.UNKNOWN) "Check for image" else "Reveal image") }
                     else TextButton(onClick = { setReveal(MediaRevealState.HIDDEN) }) { Text("Hide media") }
+                }
+                if (descriptor.kind == MediaKind.UNKNOWN && discovered.kind == MediaKind.FILE) {
+                    TextButton(enabled = online && visible && active, onClick = {
+                        discovered = descriptor
+                        setReveal(MediaRevealState.REVEALED)
+                        loader?.retryFailures()
+                        retry++
+                    }) { Text("Recheck for image") }
                 }
                 if (discovered.kind == MediaKind.VIDEO && preferences.enableVideos && state !is PreviewState.Video) {
                     TextButton(enabled = online && visible && active && state != PreviewState.Loading, onClick = {

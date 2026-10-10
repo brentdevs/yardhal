@@ -42,7 +42,10 @@ public class AttachmentStageManager(
     private val lock = Any()
     private val operations = LinkedHashMap<String, StageCancellation>()
     private val cancelledIds = HashSet<String>()
+    private val removingIds = HashSet<String>()
     private val retryAfterRelease = HashSet<String>()
+    private val keepAfterRelease = HashSet<String>()
+    private val captionRevisions = HashMap<String, Long>()
     private val mutableAttachments = MutableStateFlow(restore(store.load()))
     public val attachments: StateFlow<List<StagedAttachment>> = mutableAttachments.asStateFlow()
 
@@ -52,9 +55,10 @@ public class AttachmentStageManager(
         val retained = mutableAttachments.value.flatMap { listOf("${it.id}.source", "${it.id}.ready") }.toSet()
         directory.listFiles()?.filter { it.name != "manifest.json" && (it.name.endsWith(".source") || it.name.endsWith(".ready") || it.name.endsWith(".part")) && it.name !in retained }
             ?.forEach { it.delete() }
+        persistUserChange { releaseUnusedUriGrants() }
     }
 
-    public suspend fun stageIncoming(uris: List<Uri>, caption: String = "", destination: AttachmentDestination? = null, requestId: String? = null): String = withContext(Dispatchers.IO) {
+    public suspend fun stageIncoming(uris: List<Uri>, caption: String = "", destination: AttachmentDestination? = null, requestId: String? = null, persistPermissions: Boolean = false): String = withContext(Dispatchers.IO) {
         val batch = requestId ?: UUID.randomUUID().toString()
         require(validId(batch)) { "Share request identity must be a UUID" }
         synchronized(lock) { if (mutableAttachments.value.any { it.batchId == batch }) return@withContext batch }
@@ -65,7 +69,22 @@ public class AttachmentStageManager(
         synchronized(lock) {
             if (mutableAttachments.value.any { it.batchId == batch }) return@withContext batch
             val next = mutableAttachments.value + added
-            store.save(next)
+            if (persistPermissions && added.any { it.status == AttachmentStageStatus.COPYING }) {
+                try {
+                    access.persist(uris.distinct())
+                } catch (failure: Exception) {
+                    if (failure !is IOException && failure !is SecurityException) throw failure
+                    releaseUnusedUriGrants()
+                    if (failure is AttachmentUriAccessException) throw failure
+                    throw AttachmentUriAccessException("Unable to retain file permission. Select the file again with access enabled before staging it.")
+                }
+            }
+            try {
+                store.save(next)
+            } catch (failure: Exception) {
+                if (failure is IOException || failure is SecurityException) releaseUnusedUriGrants()
+                throw failure
+            }
             mutableAttachments.value = next
         }
         scope.launch(Dispatchers.IO) {
@@ -83,8 +102,16 @@ public class AttachmentStageManager(
     }
 
     public fun updateCaption(batchId: String, caption: String) {
-        synchronized(lock) { mutableAttachments.value = mutableAttachments.value.map { if (it.batchId == batchId) it.copy(caption = caption) else it } }
-        scope.launch(Dispatchers.IO) { persistUserChange { synchronized(lock) { store.save(mutableAttachments.value) } } }
+        val revision = synchronized(lock) { (captionRevisions.getOrDefault(batchId, 0) + 1).also { captionRevisions[batchId] = it } }
+        scope.launch(Dispatchers.IO) {
+            persistUserChange {
+                synchronized(lock) {
+                    if (captionRevisions[batchId] == revision) {
+                        mutate { entries -> entries.map { if (it.batchId == batchId) it.copy(caption = caption) else it } }
+                    }
+                }
+            }
+        }
     }
 
     public fun retry(id: String) {
@@ -92,6 +119,7 @@ public class AttachmentStageManager(
             val entry = entry(id) ?: return@launch
             if (entry.uploaded != null) return@launch
             synchronized(lock) {
+                if (id in removingIds) return@launch
                 if (id in operations) { retryAfterRelease.add(id); return@launch }
                 cancelledIds.remove(id)
             }
@@ -102,8 +130,13 @@ public class AttachmentStageManager(
 
     public fun keepMetadataAndRetry(id: String) {
         scope.launch(Dispatchers.IO) {
-            if (synchronized(lock) { id in operations }) return@launch
-            synchronized(lock) { cancelledIds.remove(id) }
+            synchronized(lock) {
+                if (id in removingIds) return@launch
+                val current = mutableAttachments.value.firstOrNull { it.id == id } ?: return@launch
+                if (current.uploaded != null) return@launch
+                if (id in operations) { keepAfterRelease.add(id); return@launch }
+                cancelledIds.remove(id)
+            }
             if (persistUserChange { update(id) { it.copy(metadataPolicy = PhotoMetadataPolicy.KEEP) } }) beginCopy(id)
         }
     }
@@ -113,7 +146,12 @@ public class AttachmentStageManager(
     }
 
     public fun cancel(id: String) {
-        val operation = synchronized(lock) { cancelledIds.add(id); operations[id]?.also { it.markCancelled() } }
+        val operation = synchronized(lock) {
+            cancelledIds.add(id)
+            retryAfterRelease.remove(id)
+            keepAfterRelease.remove(id)
+            operations[id]?.also { it.markCancelled() }
+        }
         scope.launch(Dispatchers.IO) {
             operation?.cancel()
             persistUserChange { update(id) { if (it.uploaded == null) it.copy(status = AttachmentStageStatus.CANCELLED, error = "Cancelled. Retry keeps this attachment in its original conversation.") else it } }
@@ -121,13 +159,24 @@ public class AttachmentStageManager(
     }
 
     public fun remove(id: String) {
-        val operation = synchronized(lock) { cancelledIds.add(id); operations[id]?.also { it.markCancelled() } }
+        val operation = synchronized(lock) {
+            removingIds.add(id)
+            cancelledIds.add(id)
+            retryAfterRelease.remove(id)
+            keepAfterRelease.remove(id)
+            operations[id]?.also { it.markCancelled() }
+        }
         scope.launch(Dispatchers.IO) {
             operation?.cancel()
-            if (persistUserChange { mutate { entries -> entries.filterNot { it.id == id } } } && synchronized(lock) {
-                    retryAfterRelease.remove(id)
-                    if (id in operations) false else { cancelledIds.remove(id); true }
-                }) deleteFiles(id)
+            val saved = persistUserChange { mutate { entries -> entries.filterNot { it.id == id } } }
+            val deleteNow = synchronized(lock) {
+                if (!saved || id !in operations) removingIds.remove(id)
+                if (saved && id !in operations) { cancelledIds.remove(id); true } else false
+            }
+            if (deleteNow) {
+                deleteFiles(id)
+                persistUserChange { releaseUnusedUriGrants() }
+            }
         }
     }
 
@@ -289,12 +338,16 @@ public class AttachmentStageManager(
         if (id in operations || id in cancelledIds || mutableAttachments.value.none { it.id == id }) null else StageCancellation().also { operations[id] = it }
     }
     private fun release(id: String) {
-        val shouldRetry = synchronized(lock) {
+        val (shouldKeep, shouldRetry) = synchronized(lock) {
             operations.remove(id)
-            if (mutableAttachments.value.none { it.id == id }) { cancelledIds.remove(id); deleteFiles(id) }
-            retryAfterRelease.remove(id)
+            val removed = mutableAttachments.value.none { it.id == id }
+            if (removed) { removingIds.remove(id); cancelledIds.remove(id); deleteFiles(id) }
+            val keep = keepAfterRelease.remove(id)
+            val retry = retryAfterRelease.remove(id)
+            (!removed && keep) to (!removed && retry)
         }
-        if (shouldRetry) retry(id)
+        persistUserChange { releaseUnusedUriGrants() }
+        if (shouldKeep) keepMetadataAndRetry(id) else if (shouldRetry) retry(id)
     }
     private fun entry(id: String): StagedAttachment? = synchronized(lock) { mutableAttachments.value.firstOrNull { it.id == id } }
     private fun update(id: String, transform: (StagedAttachment) -> StagedAttachment) { mutate { entries -> entries.map { if (it.id == id) transform(it) else it } } }
@@ -302,6 +355,19 @@ public class AttachmentStageManager(
     private fun sourceFile(id: String): File = File(directory, "$id.source")
     private fun readyFile(id: String): File = File(directory, "$id.ready")
     private fun deleteFiles(id: String) { if (validId(id)) listOf("source", "ready", "source.part", "ready.part").forEach { File(directory, "$id.$it").delete() } }
+    private fun releaseUnusedUriGrants() {
+        synchronized(lock) {
+            try {
+                access.releaseUnused(mutableAttachments.value.filter { it.uploaded == null && !sourceFile(it.id).isFile }.map { it.sourceUri }.filter { it.isNotBlank() }.toSet())
+            } catch (failure: Exception) {
+                if (failure !is IOException && failure !is SecurityException) throw failure
+                mutate { entries -> entries.map { it.copy(
+                    status = if (it.uploaded == null) AttachmentStageStatus.ERROR else it.status,
+                    error = "Unable to release unused file permissions. Reopen the app to retry permission cleanup; private staged files were retained.",
+                ) } }
+            }
+        }
+    }
     private fun validId(id: String): Boolean = try { UUID.fromString(id).toString() == id } catch (_: IllegalArgumentException) { false }
 
     private fun persistUserChange(change: () -> Unit): Boolean = try { change(); true } catch (failure: Exception) {

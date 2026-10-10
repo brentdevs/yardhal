@@ -43,6 +43,37 @@ public class RemoteVideo internal constructor(public val file: File, private val
     }
 }
 
+internal class RemoteVideoOwnership : AutoCloseable {
+    private var video: RemoteVideo? = null
+    private var closed = false
+
+    @Synchronized
+    fun retain(value: RemoteVideo) {
+        if (closed) {
+            value.close()
+            throw kotlinx.coroutines.CancellationException("Video request abandoned")
+        }
+        check(video == null)
+        video = value
+    }
+
+    @Synchronized
+    fun transfer(value: RemoteVideo): RemoteVideo {
+        check(!closed)
+        check(value === video)
+        video = null
+        closed = true
+        return value
+    }
+
+    @Synchronized
+    override fun close() {
+        closed = true
+        video?.close()
+        video = null
+    }
+}
+
 public class RemoteImageLoader(
     cacheRoot: File,
     connectionFactory: (URL) -> HttpURLConnection = { it.openConnection() as HttpURLConnection },
@@ -73,7 +104,7 @@ public class RemoteImageLoader(
     }
 
     public fun cached(url: String, sizePx: Int, category: ImageCacheCategory = ImageCacheCategory.MEDIA): Bitmap? =
-        memory(category).get(memoryKey(url, sizePx))
+        synchronized(diskLock) { memory(category).get(memoryKey(url, sizePx)) }
 
     public fun configureBudgets(mediaBytes: Long, avatarBytes: Long) {
         synchronized(diskLock) {
@@ -90,22 +121,22 @@ public class RemoteImageLoader(
     }
 
     public fun clear(category: ImageCacheCategory) {
-        generation(category).incrementAndGet()
         synchronized(flightLock) {
-            inFlight.filterKeys { it.startsWith("$category|") }.values.forEach {
-                it.cancellation.cancel()
-                it.pending.cancel()
+            synchronized(diskLock) {
+                generation(category).incrementAndGet()
+                inFlight.filterKeys { it.startsWith("$category|") }.values.forEach {
+                    it.cancellation.cancel()
+                    it.pending.cancel()
+                }
+                inFlight.keys.removeAll { it.startsWith("$category|") }
+                memory(category).evictAll()
+                if (category == ImageCacheCategory.MEDIA) staticImages.evictAll()
+                failedAt.keys.removeIf { it.startsWith("$category|") }
+                var failed = false
+                directory(category).listFiles()?.forEach { if (!it.delete() && it.exists()) failed = true }
+                if (failed) throw IOException("Some cached media could not be removed")
             }
-            inFlight.keys.removeAll { it.startsWith("$category|") }
         }
-        memory(category).evictAll()
-        if (category == ImageCacheCategory.MEDIA) staticImages.evictAll()
-        synchronized(diskLock) {
-            var failed = false
-            directory(category).listFiles()?.forEach { if (!it.delete() && it.exists()) failed = true }
-            if (failed) throw IOException("Some cached media could not be removed")
-        }
-        failedAt.keys.removeIf { it.startsWith("$category|") }
     }
 
     public fun retryFailures() { failedAt.clear() }
@@ -140,18 +171,18 @@ public class RemoteImageLoader(
         val bytes = bytes(resolved, category) ?: return null
         return withContext(Dispatchers.IO) {
             val bitmap = decode(bytes, sizePx)
-            if (bitmap != null) {
-                synchronized(diskLock) {
-                    if (generation(category).get() == generationAtStart) memory(category).put(memoryKey(resolved, sizePx), bitmap)
-                }
-            } else failedAt["$category|$resolved"] = clock()
-            bitmap
+            synchronized(diskLock) {
+                if (generation(category).get() != generationAtStart) return@synchronized null
+                if (bitmap != null) memory(category).put(memoryKey(resolved, sizePx), bitmap)
+                else failedAt["$category|$resolved"] = clock()
+                bitmap
+            }
         }
     }
 
     public suspend fun loadDrawable(url: String, sizePx: Int, animate: Boolean): Drawable? {
         val resolved = ImageUrlPolicy.resolve(url, sizePx) ?: return null
-        if (!animate || staticImages.get(resolved) == true) {
+        if (!animate || synchronized(diskLock) { staticImages.get(resolved) } == true) {
             cached(resolved, sizePx)?.let { return android.graphics.drawable.BitmapDrawable(null, it) }
         }
         val generationAtStart = mediaGeneration.get()
@@ -164,18 +195,23 @@ public class RemoteImageLoader(
                     configureDecoder(decoder, info, sizePx)
                 })
                 val bitmap = (drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap
-                if (bitmap != null) synchronized(diskLock) {
-                    if (mediaGeneration.get() == generationAtStart) {
+                synchronized(diskLock) {
+                    if (mediaGeneration.get() != generationAtStart) return@synchronized null
+                    if (bitmap != null) {
                         memory.put(memoryKey(resolved, sizePx), bitmap)
                         if (animate) staticImages.put(resolved, true)
                     }
+                    drawable
                 }
-                drawable
             } catch (_: IOException) {
-                failedAt["${ImageCacheCategory.MEDIA}|$resolved"] = clock()
+                synchronized(diskLock) {
+                    if (mediaGeneration.get() == generationAtStart) failedAt["${ImageCacheCategory.MEDIA}|$resolved"] = clock()
+                }
                 null
             } catch (_: IllegalArgumentException) {
-                failedAt["${ImageCacheCategory.MEDIA}|$resolved"] = clock()
+                synchronized(diskLock) {
+                    if (mediaGeneration.get() == generationAtStart) failedAt["${ImageCacheCategory.MEDIA}|$resolved"] = clock()
+                }
                 null
             }
         }
@@ -187,8 +223,9 @@ public class RemoteImageLoader(
 
     public suspend fun loadVideo(url: String): RemoteVideo? {
         if (ImageUrlPolicy.resolve(url, 1) == null) return null
+        val ownership = RemoteVideoOwnership()
         return try {
-            kotlinx.coroutines.withTimeoutOrNull(60_000) {
+            val result = kotlinx.coroutines.withTimeoutOrNull(60_000) {
                 request { cancellation ->
                     val file = synchronized(diskLock) {
                         videoDirectory.mkdirs()
@@ -209,17 +246,23 @@ public class RemoteImageLoader(
                         } finally {
                             retriever.release()
                         }
+                        val video = RemoteVideo(file) { activeVideos.remove(file); file.delete() }
+                        ownership.retain(video)
                         retained = true
-                        RemoteVideo(file) { activeVideos.remove(file); file.delete() }
+                        video
                     } finally {
                         if (!retained) { activeVideos.remove(file); file.delete() }
                     }
                 }
             }
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
+            if (result == null) null else ownership.transfer(result)
         } catch (_: IOException) {
             null
         } catch (_: SecurityException) {
             null
+        } finally {
+            ownership.close()
         }
     }
 
@@ -265,10 +308,11 @@ public class RemoteImageLoader(
         val flight = synchronized(flightLock) {
             inFlight[key]?.also { it.readers++ } ?: run {
                 val cancellation = MediaRequestCancellation()
+                val generationAtStart = generation(category).get()
                 val pending = scope.async(start = CoroutineStart.LAZY) {
                     val result = cachedBytes(url, category) ?: if (networkAllowed) http.download(url, maxBytes(category), false, cancellation)?.also {
                         cancellation.check()
-                        store(url, it, category, cancellation)
+                        store(url, it, category, cancellation, generationAtStart)
                     }
                     else null
                     if (result == null) {
@@ -320,8 +364,9 @@ public class RemoteImageLoader(
         try { file.readBytes() } catch (_: IOException) { null }
     }
 
-    private fun store(url: String, bytes: ByteArray, category: ImageCacheCategory, cancellation: MediaRequestCancellation) = synchronized(diskLock) {
+    private fun store(url: String, bytes: ByteArray, category: ImageCacheCategory, cancellation: MediaRequestCancellation, generationAtStart: Long) = synchronized(diskLock) {
         cancellation.check()
+        if (generation(category).get() != generationAtStart) return@synchronized
         val budget = if (category == ImageCacheCategory.MEDIA) mediaBudget else avatarBudget
         if (bytes.size > budget) return@synchronized
         try {

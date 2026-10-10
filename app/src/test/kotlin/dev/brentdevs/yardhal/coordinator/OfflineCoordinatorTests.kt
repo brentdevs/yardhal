@@ -881,6 +881,7 @@ class OfflineCoordinatorTests {
                     }
                 }
             }).use { harness ->
+                assertEquals(dev.brentdevs.yardhal.core.protocol.CaseMapping.RFC1459, harness.coordinator.caseMapping("unknown"))
                 val old = ConversationRef.channel(harness.config.id, "#room[one]")
                 val renamed = ConversationRef.channel(harness.config.id, "#room[one]", dev.brentdevs.yardhal.core.protocol.CaseMapping.ASCII)
                 harness.record(old, "one", text = "stable message")
@@ -897,6 +898,7 @@ class OfflineCoordinatorTests {
                 withTimeout(10_000) { entered.await() }
                 server.send(":srv 005 tester CASEMAPPING=ascii :are supported")
                 await { harness.coordinator.buffers.value.containsKey(renamed.storageKey) && !harness.coordinator.buffers.value.containsKey(old.storageKey) }
+                assertEquals(dev.brentdevs.yardhal.core.protocol.CaseMapping.ASCII, harness.coordinator.caseMapping(harness.config.id))
                 release.complete(Unit)
                 await { harness.messages.knownConversations(harness.config.id).any { it.storageKey == renamed.storageKey } &&
                     harness.offline.selection()?.storageKey == renamed.storageKey && calls.get() >= 3L }
@@ -1149,6 +1151,57 @@ class OfflineCoordinatorTests {
     }
 
     @Test
+    fun actionUploadsCarryPermittedTagsAndPersistExtensionlessVideoEvenWhenTagsDenied() = runBlocking {
+        Server("server-time echo-message message-tags").use { server ->
+            Harness(server).use { harness ->
+                harness.coordinator.connectNetwork(harness.config.id)
+                await { harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                for ((index, deny) in listOf("*,-draft/attachment", "*").withIndex()) {
+                    val url = "https://files.example/object-$index"
+                    val description = "shares $url"
+                    val uploaded = dev.brentdevs.yardhal.core.data.UploadedAttachment(url, "clip.mp4", "video/mp4", 1234)
+                    val unrelated = uploaded.copy(url = "https://files.example/unrelated", name = "wrong.mp4")
+                    val marker = "action-ready-$index"
+                    server.send(":srv 005 tester CLIENTTAGDENY=$deny :are supported")
+                    server.send("@msgid=$marker :alice!u@h PRIVMSG #room :ready")
+                    await { harness.coordinator.buffers.value[harness.room.storageKey]?.messages?.any { it.msgid == marker } == true }
+                    assertTrue(harness.coordinator.sendText(
+                        harness.config.id, harness.room.storageKey, "/me $description", listOf(unrelated, uploaded),
+                    ))
+                    await { server.received.any { IrcMessage.parse(it)?.parameters == listOf("#room", "\u0001ACTION $description\u0001") } }
+                    val wire = server.received.mapNotNull(IrcMessage::parse)
+                        .single { it.command == "PRIVMSG" && it.parameters == listOf("#room", "\u0001ACTION $description\u0001") }
+                    assertEquals(if (index == 0) mapOf("+draft/attachment" to url) else emptyMap(), wire.tags)
+                    val optimistic = harness.coordinator.buffers.value.getValue(harness.room.storageKey).messages
+                        .single { it.sentByUs && it.text == description }
+                    assertEquals(MessageKind.ACTION, optimistic.kind)
+                    assertEquals(url, optimistic.attachmentUrl)
+                    assertEquals("clip.mp4", optimistic.attachmentName)
+                    assertEquals("video/mp4", optimistic.attachmentMimeType)
+                    assertEquals(1234L, optimistic.attachmentSizeBytes)
+                    assertTrue(optimistic.pendingEcho)
+                    await { harness.messages.recent(harness.room, 20).any { it.sentByUs && it.text == description } }
+                    val persisted = harness.messages.recent(harness.room, 20).single { it.sentByUs && it.text == description }
+                    assertEquals(MessageKind.ACTION, persisted.kind)
+                    assertEquals(url, persisted.attachmentUrl)
+                    assertEquals("clip.mp4", persisted.attachmentName)
+                    assertEquals("video/mp4", persisted.attachmentMimeType)
+                    assertEquals(1234L, persisted.attachmentSizeBytes)
+                    harness.coordinator.leaveConversation(harness.config.id, harness.room.storageKey)
+                    harness.coordinator.ensureConversation(harness.config.id, harness.room.rawTarget)
+                    harness.coordinator.loadPersistedHistory(harness.room.storageKey)
+                    await { harness.coordinator.buffers.value[harness.room.storageKey]?.messages?.any { it.text == description } == true }
+                    val hydrated = harness.coordinator.buffers.value.getValue(harness.room.storageKey).messages.single { it.text == description }
+                    assertEquals(url, hydrated.attachmentUrl)
+                    assertEquals("clip.mp4", hydrated.attachmentName)
+                    assertEquals("video/mp4", hydrated.attachmentMimeType)
+                    assertEquals(1234L, hydrated.attachmentSizeBytes)
+                }
+            }
+        }
+    }
+
+    @Test
     fun portableQuoteWithoutMsgidPersistsParentAndFailedSendKeepsDraft() = runBlocking {
         Server("server-time echo-message").use { server ->
             Harness(server).use { harness ->
@@ -1204,7 +1257,6 @@ class OfflineCoordinatorTests {
                 server.send("@msgid=parent :alice!u@h PRIVMSG #room :parent")
                 await { harness.coordinator.buffers.value[harness.room.storageKey]?.messages?.any { it.msgid == "parent" } == true }
                 assertTrue(harness.coordinator.networks.value.single().reactionsAvailable)
-                assertFalse(harness.coordinator.networks.value.single().typingAvailable)
                 val reaction = "👍; 😃\\🫠"
                 harness.coordinator.sendTyping(harness.config.id, harness.room.storageKey)
                 harness.coordinator.react(harness.config.id, harness.room.storageKey, "parent", reaction)

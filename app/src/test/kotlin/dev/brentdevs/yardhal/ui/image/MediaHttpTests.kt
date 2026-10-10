@@ -20,6 +20,7 @@ class MediaHttpTests {
         assertEquals(MediaProbeResult.Image("image/gif", MediaPolicy.MAX_IMAGE_BYTES.toLong()), accepted)
         assertEquals("HEAD", boundary.requestMethod)
         assertEquals(0, boundary.bodyReads)
+        assertFalse(boundary.bodyOpened)
         assertTrue(boundary.disconnected)
         val oversized = FakeConnection(type = "image/png", length = MediaPolicy.MAX_IMAGE_BYTES + 1L)
         assertEquals(MediaProbeResult.NotImage, MediaHttp { oversized }.probe(oversized.url.toString(), MediaRequestCancellation()))
@@ -27,14 +28,15 @@ class MediaHttpTests {
     }
 
     @Test
-    fun unsupportedHeadFallsBackToBoundedRangeEvenWhenServerIgnoresRange() {
+    fun unsupportedHeadFallsBackToRangeHeadersWithoutReadingAnUnusedBody() {
         val head = FakeConnection(status = 405)
         val range = FakeConnection(type = "image/png", body = ByteArray(MediaPolicy.PROBE_BYTES * 2))
         val connections = ArrayDeque(listOf(head, range))
         assertEquals(MediaProbeResult.Image("image/png", null), MediaHttp { connections.removeFirst() }.probe(head.url.toString(), MediaRequestCancellation()))
         assertEquals("GET", range.requestMethod)
         assertEquals("bytes=0-1023", range.getRequestProperty("Range"))
-        assertEquals(MediaPolicy.PROBE_BYTES, range.bodyReads)
+        assertEquals(0, range.bodyReads)
+        assertFalse(range.bodyOpened)
         assertTrue(range.disconnected)
     }
 
@@ -135,13 +137,17 @@ class MediaHttpTests {
         private val body: ByteArray = byteArrayOf(),
     ) : HttpURLConnection(url) {
         var bodyReads = 0
+        var bodyOpened = false
         var disconnected = false
         override fun getResponseCode(): Int = status
         override fun getContentType(): String? = type
         override fun getContentLengthLong(): Long = length
         override fun getHeaderField(name: String): String? = headers[name]
-        override fun getInputStream(): InputStream = object : ByteArrayInputStream(body) {
-            override fun read(buffer: ByteArray, offset: Int, length: Int): Int = super.read(buffer, offset, length).also { if (it > 0) bodyReads += it }
+        override fun getInputStream(): InputStream {
+            bodyOpened = true
+            return object : ByteArrayInputStream(body) {
+                override fun read(buffer: ByteArray, offset: Int, length: Int): Int = super.read(buffer, offset, length).also { if (it > 0) bodyReads += it }
+            }
         }
         override fun connect() = Unit
         override fun disconnect() { disconnected = true }

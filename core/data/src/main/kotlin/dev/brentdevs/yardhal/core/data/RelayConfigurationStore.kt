@@ -33,6 +33,13 @@ public class RelayConfigurationStore(directory: File) {
         state = next
     }
 
+    @Synchronized
+    public fun upsert(networkId: String, configuration: RelayConfiguration, mapping: CaseMapping) {
+        update(networkId, forNetwork(networkId).filterNot {
+            mapping.equal(it.wireSender, configuration.wireSender)
+        } + configuration)
+    }
+
     public fun parse(networkId: String, sender: String, text: String, mapping: CaseMapping): RelayedMessage? =
         forNetwork(networkId).firstNotNullOfOrNull { configuration ->
             RelayFormat.entries.firstOrNull { it.name == configuration.format }?.let { format ->

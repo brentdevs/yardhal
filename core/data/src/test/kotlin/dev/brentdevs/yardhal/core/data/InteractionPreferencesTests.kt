@@ -25,6 +25,29 @@ class InteractionPreferencesTests {
     }
 
     @Test
+    fun updatingRelayReplacesFoldEqualSenderUsingTheSelectedNetworksMapping() {
+        val directory = Files.createTempDirectory("relay-casemapping").toFile()
+        try {
+            val store = RelayConfigurationStore(directory)
+            store.update("rfc", listOf(RelayConfiguration("Alice[", "ANGLE")))
+            store.upsert("rfc", RelayConfiguration("alice{", "BRACKET"), CaseMapping.RFC1459)
+            assertEquals(listOf(RelayConfiguration("alice{", "BRACKET")), RelayConfigurationStore(directory).forNetwork("rfc"))
+            assertEquals("bob", store.parse("rfc", "ALICE[", "[bob] new format", CaseMapping.RFC1459)?.sender)
+            assertNull(store.parse("rfc", "ALICE[", "<bob> old format", CaseMapping.RFC1459))
+
+            store.update("ascii", listOf(RelayConfiguration("Alice[", "ANGLE")))
+            store.upsert("ascii", RelayConfiguration("alice{", "BRACKET"), CaseMapping.ASCII)
+            assertEquals("bob", store.parse("ascii", "ALICE[", "<bob> original", CaseMapping.ASCII)?.sender)
+            assertEquals("carol", store.parse("ascii", "ALICE{", "[carol] distinct", CaseMapping.ASCII)?.sender)
+            store.upsert("ascii", RelayConfiguration("ALICE[", "COLON"), CaseMapping.ASCII)
+            assertEquals("bob", store.parse("ascii", "alice[", "bob: replacement", CaseMapping.ASCII)?.sender)
+            assertNull(store.parse("ascii", "alice[", "<bob> original", CaseMapping.ASCII))
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun masksAndUnknownFormatsCannotCreateTrustedRelayIdentity() {
         val directory = Files.createTempDirectory("relay-validation").toFile()
         try {

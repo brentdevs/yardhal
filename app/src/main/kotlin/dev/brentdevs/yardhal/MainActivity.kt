@@ -156,10 +156,12 @@ class MainActivity : ComponentActivity() {
         }
         val requestId = shareRequestId
         app.appScope.launch(Dispatchers.Main.immediate) {
+            if (shareRequestId != requestId || shareHandled) return@launch
             if (!app.awaitInitialization()) {
                 app.sharedAttachmentError = "Local storage is unavailable. Reopen Yardhal and share the files again."
                 return@launch
             }
+            if (shareRequestId != requestId || shareHandled) return@launch
             try {
                 app.attachmentStages.stageIncoming(share.uris, share.caption, requestId = requestId)
                 if (shareRequestId == requestId) {

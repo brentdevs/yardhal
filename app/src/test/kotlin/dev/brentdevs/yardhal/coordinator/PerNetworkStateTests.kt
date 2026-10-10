@@ -215,6 +215,42 @@ class PerNetworkStateTests {
     }
 
     @Test
+    fun attachmentTypingAndReactionPermissionsRefreshAfterNegotiationDenyRemovalAndReset() {
+        val state = state()
+        val context = InboundContext(nowMs = now)
+        state.apply(IrcEvent.CapabilitiesNegotiated(setOf("message-tags")), context)
+        assertEquals("+draft/attachment", state.clientTagPolicy.attachment)
+        assertEquals("+typing", state.clientTagPolicy.typing)
+        assertTrue(state.clientTagPolicy.reactionsAvailable)
+        state.feed(":srv 005 me CLIENTTAGDENY=* :are supported")
+        assertNull(state.clientTagPolicy.attachment)
+        assertNull(state.clientTagPolicy.typing)
+        assertFalse(state.clientTagPolicy.reactionsAvailable)
+        state.feed(":srv 005 me CLIENTTAGDENY=*,-draft/attachment :are supported")
+        assertEquals("+draft/attachment", state.clientTagPolicy.attachment)
+        assertNull(state.clientTagPolicy.typing)
+        assertFalse(state.clientTagPolicy.reactionsAvailable)
+        state.feed(":srv 005 me -CLIENTTAGDENY :are supported")
+        assertEquals("+draft/attachment", state.clientTagPolicy.attachment)
+        assertEquals("+typing", state.clientTagPolicy.typing)
+        assertTrue(state.clientTagPolicy.reactionsAvailable)
+        state.apply(IrcEvent.CapabilitiesNegotiated(emptySet()), context)
+        assertNull(state.clientTagPolicy.attachment)
+        assertNull(state.clientTagPolicy.typing)
+        assertFalse(state.clientTagPolicy.reactionsAvailable)
+        state.apply(IrcEvent.CapabilitiesNegotiated(setOf("message-tags")), context)
+        assertEquals("+draft/attachment", state.clientTagPolicy.attachment)
+        state.apply(IrcEvent.ConnectionOpened, context)
+        assertNull(state.clientTagPolicy.attachment)
+        assertNull(state.clientTagPolicy.typing)
+        assertFalse(state.clientTagPolicy.reactionsAvailable)
+        state.apply(IrcEvent.CapabilitiesNegotiated(setOf("message-tags")), context)
+        assertEquals("+draft/attachment", state.clientTagPolicy.attachment)
+        assertEquals("+typing", state.clientTagPolicy.typing)
+        assertTrue(state.clientTagPolicy.reactionsAvailable)
+    }
+
+    @Test
     fun reactionFoldAddsAndRemovesPerSender() {
         val ref = channel("#room")
         val once = applyReaction(emptyMap(), InboundEffect.ApplyReaction(ref, "alice", "👍", listOf("m1"), true))

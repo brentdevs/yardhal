@@ -1,5 +1,6 @@
 package dev.brentdevs.yardhal.ui.components
 
+import android.view.View
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -22,11 +23,13 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -51,10 +54,11 @@ public fun NickAvatar(
 ) {
     val environment = LocalMediaEnvironment.current
     val preferences by (environment?.preferences?.preferences ?: DefaultMediaSignals.preferences).collectAsState()
+    val view = LocalView.current
+    val viewport = remember(view) { AvatarViewport(view) }
     var inViewport by remember { mutableStateOf(false) }
     val visibleModifier = modifier.onGloballyPositioned { coordinates ->
-        val bounds = coordinates.boundsInWindow()
-        inViewport = bounds.width > 0 && bounds.height > 0
+        inViewport = coordinates.isAttached && viewport.intersects(coordinates.boundsInWindow())
     }
     val image by rememberRemoteImage(
         LocalRemoteImageLoader.current, avatarUrl, size.roundToPxInt(),
@@ -100,10 +104,11 @@ public fun NetworkBadge(
 ) {
     val environment = LocalMediaEnvironment.current
     val preferences by (environment?.preferences?.preferences ?: DefaultMediaSignals.preferences).collectAsState()
+    val view = LocalView.current
+    val viewport = remember(view) { AvatarViewport(view) }
     var inViewport by remember { mutableStateOf(false) }
     val visibleModifier = modifier.onGloballyPositioned { coordinates ->
-        val bounds = coordinates.boundsInWindow()
-        inViewport = bounds.width > 0 && bounds.height > 0
+        inViewport = coordinates.isAttached && viewport.intersects(coordinates.boundsInWindow())
     }
     val image by rememberRemoteImage(
         LocalRemoteImageLoader.current, iconUrl, size.roundToPxInt(),
@@ -126,6 +131,31 @@ public fun NetworkBadge(
         RecoveryStatusDot(phase, Modifier.align(Alignment.BottomEnd), size = size * 0.4f)
     }
 }
+
+private class AvatarViewport(private val view: View) {
+    private val visibleFrame = android.graphics.Rect()
+    private val screenLocation = IntArray(2)
+    private val windowLocation = IntArray(2)
+
+    fun intersects(bounds: Rect): Boolean {
+        view.getWindowVisibleDisplayFrame(visibleFrame)
+        view.getLocationOnScreen(screenLocation)
+        view.getLocationInWindow(windowLocation)
+        val offsetX = screenLocation[0] - windowLocation[0]
+        val offsetY = screenLocation[1] - windowLocation[1]
+        return avatarIntersectsViewport(bounds, Rect(
+            (visibleFrame.left - offsetX).toFloat(),
+            (visibleFrame.top - offsetY).toFloat(),
+            (visibleFrame.right - offsetX).toFloat(),
+            (visibleFrame.bottom - offsetY).toFloat(),
+        ))
+    }
+}
+
+internal fun avatarIntersectsViewport(bounds: Rect, viewport: Rect): Boolean =
+    bounds.width > 0 && bounds.height > 0 && viewport.width > 0 && viewport.height > 0 &&
+        bounds.left < viewport.right && bounds.right > viewport.left &&
+        bounds.top < viewport.bottom && bounds.bottom > viewport.top
 
 @Composable
 private fun RecoveryStatusDot(phase: RecoveryPhase, modifier: Modifier, size: Dp = 10.dp) {
