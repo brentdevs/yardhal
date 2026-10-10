@@ -176,10 +176,10 @@ class OfflineCoordinatorTests {
         val room = ConversationRef.channel(config.id, "#room")
 
         suspend fun record(ref: ConversationRef = room, msgid: String? = "message", timestampMs: Long = now.get(),
-            text: String = "hello", highlights: Boolean = false, highlightsKnown: Boolean = true): Long =
+            text: String = "hello", highlights: Boolean = false, highlightsKnown: Boolean = true, sentByUs: Boolean = false): Long =
             assertNotNull(messages.recordWithRowId(StoredMessage(networkId = config.id, conversation = ref,
-                msgid = msgid, senderNick = "alice", senderUser = "user", senderHost = "host", kind = MessageKind.PRIVMSG,
-                text = text, sentByUs = false, timestampMs = timestampMs, highlightsMe = highlights,
+                msgid = msgid, senderNick = if (sentByUs) "tester" else "alice", senderUser = "user", senderHost = "host", kind = MessageKind.PRIVMSG,
+                text = text, sentByUs = sentByUs, timestampMs = timestampMs, highlightsMe = highlights,
                 highlightsKnown = highlightsKnown)))
 
         suspend fun seedShell(ref: ConversationRef = room, roster: OfflineRoster? = null) {
@@ -995,7 +995,7 @@ class OfflineCoordinatorTests {
     fun deleteFailurePreservesContentUntilAuthoritativeInboundRedaction() = runBlocking {
         Server("server-time echo-message draft/message-redaction").use { server ->
             Harness(server).use { harness ->
-                val row = harness.record(text = "content that must survive FAIL")
+                val row = harness.record(text = "content that must survive FAIL", sentByUs = true)
                 harness.offline.select(harness.room, harness.now.get())
                 harness.coordinator.startAll()
                 await { harness.coordinator.restorationReady.value }

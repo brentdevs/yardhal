@@ -6,6 +6,14 @@ import dev.brentdevs.yardhal.core.data.MessageKind
 import dev.brentdevs.yardhal.core.data.WhoisInfo
 
 public sealed interface InboundEffect {
+    public data class NotifyInvite(
+        public val ref: ConversationRef,
+        public val sender: String,
+        public val timestampMs: Long,
+        public val msgid: String?,
+        public val playback: Boolean,
+    ) : InboundEffect
+
     public data class SendRaw(public val line: String) : InboundEffect
 
     public data class RequestHistory(public val ref: ConversationRef) : InboundEffect

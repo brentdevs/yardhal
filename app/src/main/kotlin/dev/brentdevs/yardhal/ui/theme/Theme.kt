@@ -1,5 +1,6 @@
 package dev.brentdevs.yardhal.ui.theme
 
+import android.content.Context
 import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
@@ -14,6 +15,12 @@ import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalContext
 import dev.brentdevs.yardhal.core.data.ThemeDefinition
+import dev.brentdevs.yardhal.core.data.ChatAppearancePreferences
+import dev.brentdevs.yardhal.core.data.ConversationRef
+import dev.brentdevs.yardhal.core.data.ThemeFileParser
+import dev.brentdevs.yardhal.core.data.ThemeLibraryState
+import dev.brentdevs.yardhal.core.data.ThemeLibraryStore
+import java.io.File
 
 private val LightColors = lightColorScheme(
     primary = Color(0xFF00639A),
@@ -70,10 +77,16 @@ public fun YardhalTheme(
             base.copy(
                 background = c(def.colors.background),
                 surface = c(def.colors.background),
+                onPrimary = contrastingColor(c(def.colors.primary)),
                 primary = c(def.colors.primary),
+                onSecondary = contrastingColor(c(def.colors.secondary)),
                 secondary = c(def.colors.secondary),
+                onTertiary = contrastingColor(c(def.colors.tertiary)),
                 tertiary = c(def.colors.tertiary),
                 surfaceVariant = c(def.colors.surfaceVariant),
+                onBackground = contrastingColor(c(def.colors.background)),
+                onSurface = contrastingColor(c(def.colors.background)),
+                onSurfaceVariant = contrastingColor(c(def.colors.surfaceVariant)),
             )
         }
 
@@ -86,10 +99,12 @@ public fun YardhalTheme(
             else -> LightColors
         }
 
-        if (isDark && amoledDark) {
+        if ((themeDefinition?.dark ?: isDark) && amoledDark) {
             s = s.copy(
                 background = Color.Black,
                 surface = Color.Black,
+                onBackground = Color.White,
+                onSurface = Color.White,
                 surfaceDim = Color.Black,
                 surfaceContainerLowest = Color.Black,
                 surfaceContainerLow = lerp(Color.Black, s.surfaceContainerLow, 0.4f),
@@ -105,4 +120,51 @@ public fun YardhalTheme(
         colorScheme = scheme,
         content = content,
     )
+}
+
+private fun contrastingColor(color: Color): Color =
+    if (color.luminance() > 0.179f) Color.Black else Color.White
+
+public fun createThemeLibrary(context: Context, directory: File): ThemeLibraryStore {
+    val bundled = context.assets.open("themes/night.toml").bufferedReader().use { reader ->
+        requireNotNull(ThemeFileParser.parse(reader.readText())) { "Bundled theme is invalid" }
+    }
+    return ThemeLibraryStore(directory, listOf(bundled))
+}
+
+@Composable
+public fun LibraryYardhalTheme(
+    libraryState: ThemeLibraryState,
+    appearance: ChatAppearancePreferences,
+    conversation: ConversationRef? = null,
+    content: @Composable () -> Unit,
+) {
+    val definition = libraryState.definition(isSystemInDarkTheme())
+    YardhalTheme(
+        themeDefinition = definition,
+        dynamicColor = appearance.dynamicColor,
+        amoledDark = appearance.amoledDark,
+    ) {
+        if (conversation == null) content() else ConversationAccent(libraryState, conversation, content)
+    }
+}
+
+@Composable
+public fun ConversationAccent(
+    libraryState: ThemeLibraryState,
+    conversation: ConversationRef,
+    content: @Composable () -> Unit,
+) {
+    val accent = libraryState.accent(conversation)
+    if (accent == null) {
+        content()
+    } else {
+        val color = Color(accent)
+        MaterialTheme(
+            colorScheme = MaterialTheme.colorScheme.copy(primary = color, onPrimary = contrastingColor(color)),
+            typography = MaterialTheme.typography,
+            shapes = MaterialTheme.shapes,
+            content = content,
+        )
+    }
 }

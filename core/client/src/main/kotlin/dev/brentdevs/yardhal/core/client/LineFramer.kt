@@ -1,12 +1,22 @@
 package dev.brentdevs.yardhal.core.client
 
+import dev.brentdevs.yardhal.core.protocol.IrcMessage
+
+public enum class LineRejection {
+    BASE_TOO_LONG,
+    TAGS_TOO_LONG,
+    MISSING_TAG_SEPARATOR,
+}
+
 public class LineFramer(
-    private val maxLineBytes: Int = DEFAULT_MAX_LINE_BYTES,
+    private val onRejected: (LineRejection) -> Unit = {},
     private val sink: (String) -> Unit,
 ) {
-    private var buffer = ByteArray(INITIAL_CAPACITY)
+    private val buffer = ByteArray(IrcMessage.TAGGED_CONTENT_LIMIT_BYTES)
     private var buffered = 0
-    private var truncated = false
+    private var readingTags = false
+    private var tagSectionBytes = 0
+    private var rejection: LineRejection? = null
 
     public fun feed(data: ByteArray, length: Int = data.size) {
         var offset = 0
@@ -28,9 +38,10 @@ public class LineFramer(
     }
 
     public fun finish(): List<String> {
-        val remainder = decodeBuffered()
+        if (rejection == null && readingTags) reject(LineRejection.MISSING_TAG_SEPARATOR)
+        val remainder = if (rejection == null && buffered > 0) decodeBuffered() else null
         reset()
-        return listOfNotNull(remainder.takeIf { it.isNotEmpty() })
+        return if (remainder == null) emptyList() else listOf(remainder)
     }
 
     private fun indexOfNewline(data: ByteArray, from: Int, endExclusive: Int): Int {
@@ -41,58 +52,56 @@ public class LineFramer(
     }
 
     private fun append(data: ByteArray, from: Int, count: Int) {
-        if (count == 0) return
-        val capacityLeft = maxLineBytes - buffered
-        if (capacityLeft < count) truncated = true
-        if (capacityLeft <= 0) return
-        val take = minOf(count, capacityLeft)
-        if (buffer.size < buffered + take) {
-            buffer = buffer.copyOf(maxOf(buffered + take, minOf(buffer.size * 2, maxLineBytes)))
+        if (count == 0 || rejection != null) return
+        if (buffered == 0 && data[from] == '@'.code.toByte()) readingTags = true
+        val baseBuffered = if (readingTags) 0 else buffered - tagSectionBytes
+        var baseCount = count
+        if (readingTags) {
+            val scanEnd = from + minOf(count, IrcMessage.TAG_SECTION_LIMIT_BYTES - buffered)
+            var separator = from
+            while (separator < scanEnd && data[separator] != ' '.code.toByte()) separator++
+            val foundSeparator = separator < scanEnd
+            val tagCount = if (foundSeparator) separator - from + 1 else count
+            val tagLimit = IrcMessage.TAG_SECTION_LIMIT_BYTES - if (foundSeparator) 0 else 1
+            if (tagCount > tagLimit - buffered) {
+                reject(LineRejection.TAGS_TOO_LONG)
+                return
+            }
+            if (foundSeparator) {
+                readingTags = false
+                tagSectionBytes = buffered + tagCount
+                baseCount -= tagCount
+            } else {
+                baseCount = 0
+            }
         }
-        System.arraycopy(data, from, buffer, buffered, take)
-        buffered += take
+        if (baseCount > IrcMessage.BASE_CONTENT_LIMIT_BYTES - baseBuffered) {
+            reject(LineRejection.BASE_TOO_LONG)
+            return
+        }
+        System.arraycopy(data, from, buffer, buffered, count)
+        buffered += count
+    }
+
+    private fun reject(reason: LineRejection) {
+        rejection = reason
+        buffered = 0
+        onRejected(reason)
     }
 
     private fun emitBuffered() {
-        val line = decodeBuffered()
+        if (rejection == null && readingTags) reject(LineRejection.MISSING_TAG_SEPARATOR)
+        val line = if (rejection == null && buffered > 0) decodeBuffered() else null
         reset()
-        if (line.isNotEmpty()) sink(line)
+        if (line != null) sink(line)
     }
 
     private fun reset() {
         buffered = 0
-        truncated = false
+        readingTags = false
+        tagSectionBytes = 0
+        rejection = null
     }
 
-    private fun decodeBuffered(): String {
-        val end = if (truncated) completeCodepointEnd() else buffered
-        return if (end == 0) "" else String(buffer, 0, end, Charsets.UTF_8)
-    }
-
-    private fun completeCodepointEnd(): Int {
-        var start = buffered
-        while (start > 0 && buffered - start < MAX_UTF8_SEQUENCE_BYTES && isContinuationByte(buffer[start - 1])) start--
-        if (start == 0) return buffered
-        val leadIndex = start - 1
-        val expected = utf8SequenceLength(buffer[leadIndex])
-        return if (expected > buffered - leadIndex) leadIndex else buffered
-    }
-
-    private fun isContinuationByte(byte: Byte): Boolean = byte.toInt() and 0xC0 == 0x80
-
-    private fun utf8SequenceLength(lead: Byte): Int {
-        val value = lead.toInt() and 0xFF
-        return when {
-            value >= 0xF0 -> 4
-            value >= 0xE0 -> 3
-            value >= 0xC0 -> 2
-            else -> 1
-        }
-    }
-
-    public companion object {
-        public const val DEFAULT_MAX_LINE_BYTES: Int = 8192
-        private const val INITIAL_CAPACITY = 512
-        private const val MAX_UTF8_SEQUENCE_BYTES = 3
-    }
+    private fun decodeBuffered(): String = String(buffer, 0, buffered, Charsets.UTF_8)
 }

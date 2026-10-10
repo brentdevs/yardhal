@@ -2,6 +2,7 @@ package dev.brentdevs.yardhal.coordinator
 
 import dev.brentdevs.yardhal.core.client.IrcEvent
 import dev.brentdevs.yardhal.core.client.SaslOutcome
+import dev.brentdevs.yardhal.core.client.LineRejection
 import dev.brentdevs.yardhal.core.data.BouncerNetworkStore
 import dev.brentdevs.yardhal.core.data.ChannelMember
 import dev.brentdevs.yardhal.core.data.ConversationKind
@@ -238,6 +239,28 @@ public class PerNetworkState(
 
     public val labeledResponseEnabled: Boolean get() = LABELED_RESPONSE_CAP in supportedCaps
 
+    internal fun responseLabel(message: IrcMessage): String? {
+        message.tag("label")?.let { return it }
+        var reference = message.tag("batch")
+        while (reference != null) {
+            val batch = openBatches[reference] ?: return null
+            batch.label?.let { return it }
+            reference = batch.parent
+        }
+        return null
+    }
+
+    internal fun isPlaybackFrame(message: IrcMessage): Boolean {
+        if ("draft/chathistory-context" in message.tags) return true
+        var reference = message.tag("batch")
+        while (reference != null) {
+            val batch = openBatches[reference] ?: return false
+            if (batch.type == "chathistory" || batch.type == "znc.in/playback") return true
+            reference = batch.parent
+        }
+        return false
+    }
+
     public fun pendingLabel(label: String): PendingLabel? = pendingLabels[label]
 
     public fun issueLabel(origin: ConversationRef, command: LabeledCommand, nowMs: Long): String? {
@@ -288,6 +311,11 @@ public class PerNetworkState(
             }
             is IrcEvent.Registered -> reduction.handleRegistered(event.nickname)
             is IrcEvent.MessageReceived -> reduction.handleMessage(event.message)
+            is IrcEvent.FrameRejected -> reduction.system(server, when (event.reason) {
+                LineRejection.BASE_TOO_LONG -> "Ignored IRC frame: base message exceeds 512 bytes including CRLF"
+                LineRejection.TAGS_TOO_LONG -> "Ignored IRC frame: tag section exceeds 8191 bytes"
+                LineRejection.MISSING_TAG_SEPARATOR -> "Ignored IRC frame: tag section has no separating space"
+            })
             is IrcEvent.Disconnected -> {
                 registered = false
                 connectionEpoch += 1

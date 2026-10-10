@@ -96,15 +96,28 @@ public class RemoteImageLoader(
     @Volatile private var networkAllowed = true
     private var mediaBudget = DISK_CACHE_BYTES
     private var avatarBudget = 8L * 1024 * 1024
-    private val memory = object : LruCache<String, Bitmap>(MEMORY_CACHE_BYTES) {
-        override fun sizeOf(key: String, value: Bitmap): Int = value.allocationByteCount
+    private val memory = object : LruCache<MemoryKey, Bitmap>(MEMORY_CACHE_BYTES) {
+        override fun sizeOf(key: MemoryKey, value: Bitmap): Int = value.allocationByteCount
     }
-    private val avatarMemory = object : LruCache<String, Bitmap>(MEMORY_CACHE_BYTES / 2) {
-        override fun sizeOf(key: String, value: Bitmap): Int = value.allocationByteCount
+    private val avatarRenditions = mutableMapOf<String, LinkedHashSet<MemoryKey>>()
+    private val avatarMemory = object : LruCache<MemoryKey, Bitmap>(MEMORY_CACHE_BYTES / 2) {
+        override fun sizeOf(key: MemoryKey, value: Bitmap): Int = value.allocationByteCount
+
+        override fun entryRemoved(evicted: Boolean, key: MemoryKey, oldValue: Bitmap, newValue: Bitmap?) {
+            if (newValue != null) return
+            val renditions = avatarRenditions[key.url] ?: return
+            renditions.remove(key)
+            if (renditions.isEmpty()) avatarRenditions.remove(key.url)
+        }
     }
 
     public fun cached(url: String, sizePx: Int, category: ImageCacheCategory = ImageCacheCategory.MEDIA): Bitmap? =
         synchronized(diskLock) { memory(category).get(memoryKey(url, sizePx)) }
+
+    public fun cachedAvatar(url: String?): Bitmap? = synchronized(diskLock) {
+        val key = avatarRenditions[url?.trim()]?.firstOrNull() ?: return@synchronized null
+        avatarMemory.get(key)
+    }
 
     public fun configureBudgets(mediaBytes: Long, avatarBytes: Long) {
         synchronized(diskLock) {
@@ -166,15 +179,18 @@ public class RemoteImageLoader(
 
     public suspend fun load(url: String, sizePx: Int, category: ImageCacheCategory = ImageCacheCategory.MEDIA): Bitmap? {
         val resolved = ImageUrlPolicy.resolve(url, sizePx) ?: return null
-        cached(resolved, sizePx, category)?.let { return it }
+        val key = memoryKey(if (category == ImageCacheCategory.AVATAR) url else resolved, sizePx)
+        synchronized(diskLock) { memory(category).get(key) }?.let { return it }
         val generationAtStart = generation(category).get()
         val bytes = bytes(resolved, category) ?: return null
         return withContext(Dispatchers.IO) {
             val bitmap = decode(bytes, sizePx)
             synchronized(diskLock) {
                 if (generation(category).get() != generationAtStart) return@synchronized null
-                if (bitmap != null) memory(category).put(memoryKey(resolved, sizePx), bitmap)
-                else failedAt["$category|$resolved"] = clock()
+                if (bitmap != null) {
+                    if (category == ImageCacheCategory.AVATAR) avatarRenditions.getOrPut(key.url) { linkedSetOf() }.add(key)
+                    memory(category).put(key, bitmap)
+                } else failedAt["$category|$resolved"] = clock()
                 bitmap
             }
         }
@@ -402,7 +418,7 @@ public class RemoteImageLoader(
     }
 
     private fun directory(category: ImageCacheCategory): File = if (category == ImageCacheCategory.MEDIA) directory else avatarDirectory
-    private fun memory(category: ImageCacheCategory): LruCache<String, Bitmap> = if (category == ImageCacheCategory.MEDIA) memory else avatarMemory
+    private fun memory(category: ImageCacheCategory): LruCache<MemoryKey, Bitmap> = if (category == ImageCacheCategory.MEDIA) memory else avatarMemory
     private fun maxBytes(category: ImageCacheCategory): Int = if (category == ImageCacheCategory.MEDIA) MediaPolicy.MAX_IMAGE_BYTES else ImageUrlPolicy.MAX_BYTES
     private fun generation(category: ImageCacheCategory): AtomicLong = if (category == ImageCacheCategory.MEDIA) mediaGeneration else avatarGeneration
 
@@ -411,7 +427,8 @@ public class RemoteImageLoader(
         return File(directory(category), digest.joinToString("") { "%02x".format(it) })
     }
 
-    private fun memoryKey(url: String, sizePx: Int): String = "$sizePx|$url"
+    private fun memoryKey(url: String, sizePx: Int): MemoryKey = MemoryKey(url.trim(), sizePx)
+    private data class MemoryKey(val url: String, val sizePx: Int)
     private class Flight(val pending: Deferred<ByteArray?>, val cancellation: MediaRequestCancellation, var readers: Int)
 
     private companion object {
@@ -447,15 +464,16 @@ public fun rememberRemoteImage(
     val revision by (environment?.cacheRevision ?: DefaultMediaSignals.revision).collectAsState()
     val url = ImageUrlPolicy.resolve(rawUrl, sizePx)
     val eligible = enabled && visible && active
-    val image = remember(loader, url, sizePx, category, eligible, online, revision) {
+    val image = remember(loader, rawUrl, sizePx, category, eligible, online, revision) {
         val initial = if (loader == null || url == null || !eligible) RemoteImageState.Unavailable
-        else loader.cached(url, sizePx, category)?.let { RemoteImageState.Success(it.asImageBitmap()) }
+        else loader.cached(if (category == ImageCacheCategory.AVATAR) rawUrl.orEmpty() else url, sizePx, category)
+            ?.let { RemoteImageState.Success(it.asImageBitmap()) }
             ?: if (online) RemoteImageState.Loading else RemoteImageState.Unavailable
         mutableStateOf<RemoteImageState>(initial)
     }
-    LaunchedEffect(loader, url, sizePx, category, eligible, online, revision) {
-        if (loader != null && url != null && eligible && online) {
-            val result = loader.load(url, sizePx, category)
+    LaunchedEffect(loader, rawUrl, sizePx, category, eligible, online, revision) {
+        if (loader != null && rawUrl != null && url != null && eligible && online) {
+            val result = loader.load(rawUrl, sizePx, category)
             coroutineContext.ensureActive()
             image.value = result?.let { RemoteImageState.Success(it.asImageBitmap()) } ?: RemoteImageState.Unavailable
         }

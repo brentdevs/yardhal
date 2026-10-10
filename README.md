@@ -20,9 +20,10 @@ architecture of the Halyard iOS client.
 - **IRCv3 affordances** — reactions, replies, redaction, typing indicators,
   mention highlights, `MARKREAD` mirroring, netsplit collapse
 - **Navigation** — collapsible per-network channel tree with pins, custom groups,
-  DMs, server console, last-message previews, unread sorting, swipe gestures,
-  member sheet with role sections (operators/voices/bots/users) and per-member
-  kick/ban/ignore; network collapse state survives navigation and rotation
+  DMs, server console, last-message previews, persistent manual ordering and
+  alternate unread sorting, swipe gestures, member sheet with role sections
+  (operators/voices/bots/users) and per-member kick/ban/ignore; network collapse
+  state survives navigation and rotation
 - **Search** — SQLite FTS4 index over all history with snippet results
 - **Bouncers** — tailored soju/ZNC setup, automatically bound soju upstreams with
   durable identities, network/channel management, ZNC server/settings controls,
@@ -33,8 +34,97 @@ architecture of the Halyard iOS client.
 - **Composition** — searchable/category/recent emoji, portable quotes with local
   parents, opt-in exact-nick relay attribution, binary Android share staging,
   immutable upload destinations and explicit URL insertion followed by Send
-- **Themes** — TOML theme files applied to the Material 3 scheme, opt-in Material
-  You colors, AMOLED backgrounds, and transcript font, spacing and size controls
+- **Channel settings** — permission-aware topic, modes and parameters, structured
+  ban/exception lists, confirmation prompts and server-confirmed outcomes
+- **Catch Up** — non-AI retained activity and grouped links, filters, exact message
+  jumps, explicit read-through and persistent dismissal, with coverage limits shown
+- **Themes and appearance** — durable TOML theme library, light/dark variants,
+  portable share links and conversation accents; timestamp, font, nickname
+  suggestion, avatar, unread-count, spacing, size, Material You and AMOLED controls
+- **Notifications** — per-kind mention/DM/invitation settings, Android channel
+  controls, private previews and destination-aware taps
+- **Accessibility and diagnostics** — named TalkBack message/media/reorder actions
+  and a reviewable, bounded bug report without automatic raw chat or credentials
+- **Wire safety** — independent IRC tag/base-line limits and whole-frame rejection
+  of oversized inbound messages
+
+### Everyday workflows
+
+- **Channel settings:** open a channel's overflow menu → **Channel settings**.
+  Edit its topic or advertised modes and parameters, or fetch **Bans**, **Ban
+  exceptions** and **Invite exceptions** where supported. Lists show masks and
+  available setter/date information; unfetched, empty, incomplete and failed lists
+  are distinguished. Review the confirmation before sending a change. Controls
+  respect your channel role and server policy; sent commands are not success.
+  Wait for server confirmation, refusal, timeout or disconnect before retrying.
+- **Catch Up:** open **App options → Catch Up** (also in conversation overflow).
+  **Activity** groups retained messages by network/conversation; **Links** groups
+  canonical HTTP(S) URLs with their source messages. Filter by unread, mentions,
+  DMs, replies to you or reactions to your messages. **Jump to message** opens the
+  exact retained row without directly marking it read; **Read through message**
+  explicitly advances the conversation cursor. Remote read markers are
+  timestamp-granular and include timestamp ties, not universally row-precise.
+  **Dismiss** persists independently of read state; **Restore dismissed** undoes
+  dismissal. Queries use retained history beyond the loaded transcript, in
+  200-message pages up to a 2,000-message view. Use **Query older messages** and
+  heed the coverage/time-range label: history gaps, pruning and unknown reaction
+  coverage mean this is not a complete server archive or an AI summary.
+- **Themes:** open **App options → Chat appearance → Themes, import and
+  conversation accent**. Import a TOML file through Android's document picker,
+  review/edit the draft and **Save theme**, then **Apply**; existing entries also
+  offer **Edit**, **Duplicate**, **Delete** and **Share link**. The editor can
+  **Export file** and add light/dark variants, which follow device mode (one
+  variant serves both modes). Open or paste a `yardhal://theme/v1/...` link to
+  review it before saving; the link carries the theme without an account/server.
+  Untrusted imports enforce UTF-8, schema/color validation and size limits
+  (16 KiB files, 24 KiB links), rather than executing content. With a conversation
+  open, save/reset its accent separately. A failed durable save keeps the editor
+  draft and last published library state for retry; this is not a guarantee of
+  filesystem rollback after a rename/fsync failure or a process-persistent draft.
+- **Appearance:** **App options → Chat appearance** saves timestamp format,
+  normal/muted style and inline/above/below position; system/sans/serif/monospace
+  fonts; role/alphabetical/recent-speaker nickname suggestions; avatar and unread
+  count visibility; spacing and size. Dynamic colors apply when no theme is
+  selected; black dark-theme backgrounds remain optional. Media/privacy and
+  upload controls remain separate (see below).
+- **Ordering:** **App options → Reorder networks and conversations** orders
+  networks, custom groups and conversations. Long-press a drag handle or use its
+  move menu (up/down/top/bottom); TalkBack exposes named moves too. Conversations
+  stay within their pinned/group section. Saved manual order survives relaunch
+  and stable soju upstream identities; **Unread first** is alternate sorting,
+  not a rewrite of your manual order.
+- **Notifications:** **App options → Notifications** (also in conversation
+  overflow) controls enabled, sound and priority independently for mentions,
+  DMs and invitations, plus previews and sender avatars. Grant notification
+  permission and use the app/per-kind Android settings links to inspect delivery.
+  Sound/priority combinations select distinct immutable Android channels;
+  previous channel overrides remain, and Android/DND decide actual delivery.
+  Muted, read, currently viewed, ignored and replayed messages do not alert.
+  Avatars use cached images or initials without fetching hosts; lock-screen
+  content is private unless Android overrides it. Message taps foreground the
+  actual conversation and close overlays/drawer. Invitation taps only prefill a
+  sender confirmation: joining and channel selection happen after you confirm.
+- **Safe bug report:** **App options → Bug report** (also in conversation
+  overflow) accepts reproduction details and shows the exact **Export preview**
+  used by **Copy report** and **Share report**. **Refresh context** captures
+  build/device, last attempted TLS/proxy settings, loaded/open/joined counts and
+  allowlisted recent command/parameter counts under network aliases. This is
+  bounded context (up to 32 networks, 20 recent commands each, 100 total), not a
+  complete trace. Automatic context omits raw bodies, hosts, names, tags,
+  arguments, URLs and the credential vault. Known-secret redaction and
+  best-effort description sanitization do not remove every possible personal
+  detail: review before exporting. The existing traffic console remains separate.
+- **TalkBack:** focus a message and use its named actions for **Reply**, **Copy**,
+  **Choose reaction**, link/channel/nickname opening and **Delete**, when eligible.
+  Summaries identify sender, time, message kind, replies, reactions, attachments
+  and delivery/history/deleted states; emoji and media controls have descriptive
+  names. Reply/reaction/delete availability depends on message identity and
+  negotiated server support. Delete requests server redaction and may be refused;
+  it is not a promise of local or server deletion. Reordering and channel
+  moderation have named controls and confirmation prompts.
+- **Wire framing safety:** incoming IRC tags and base messages have independent
+  size limits. An oversized frame is discarded in full, never displayed or
+  processed as a truncated command; parsing resumes at the next legal frame.
 
 ### Media, uploads and privacy
 
@@ -207,5 +297,8 @@ same key for future APK updates.
 
 ## Status
 
-Feature-complete MVP; all eight roadmap phases implemented. Work lands
-through pull requests — see open PRs on the repository.
+All eight architecture-roadmap phases are implemented, along with the user-facing
+workflows from Phase 6 of the [Halyard parity checklist](https://github.com/brentdevs/yardhal/issues/17).
+These are separate phase numberings, not a claim that every Halyard feature or
+reference-source implementation is mirrored. Work lands through pull requests —
+see open PRs on the repository.

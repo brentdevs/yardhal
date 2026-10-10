@@ -927,6 +927,153 @@ separate unread recount finishes. The regression now waits for both public-state
 transitions and retains all row, quote-parent, reaction and unread assertions;
 production retention behavior is unchanged.
 
+## Settings and polish parity
+
+[Halyard parity phase 6 / issue 17](https://github.com/brentdevs/yardhal/issues/17)
+ships application settings and polish; these parity issue phases are distinct
+from the architecture roadmap numbers below. No new IRCv3 capability is invented
+for Catch Up, themes, ordering, notifications, reports or accessibility.
+
+### Ownership and durable identity
+
+`LiveCoordinator` remains the protocol/session owner. Its per-session
+`ChannelSettingsController` publishes settings snapshots; Compose sheets retain
+editing drafts rather than treating a sent command as a saved server value.
+`core/data` owns `CatchUpController`, `CatchUpStore`, `ThemeLibraryStore`,
+`ChatAppearanceStore`, `ChannelOrderStore` and `NotificationPreferencesStore`.
+Their UI consumers use published state and explicit operations, not a second
+protocol reducer. New preferences use existing durable JSON stores; Catch Up
+queries the existing Room message/interaction/retention data, not a duplicate
+transcript database. Appearance migrates legacy `monospaceFont` to the explicit
+font preference without discarding other fields; an explicit font wins.
+
+Conversation metadata follows existing rename/casemapping migration:
+manual channel order and theme accents participate alongside pins, groups,
+mutes and reads. Catch Up dismissal anchors follow canonical row merges.
+Network removal removes its dismissal/accent/order metadata. Soju ordering uses
+stable derived upstream identity, not the editable display name.
+
+### Permission-aware moderation
+
+Channel settings derive modes/parameters from CHANMODES, PREFIX and live own
+membership, topic permission from +t, and supported b/e/I lists from advertised
+support. Modes/list mutations require operator rank; topic editing respects +t.
+Disconnected, unjoined and incomplete-mode snapshots cannot authorize edits.
+List retrieval can be attempted by ordinary members, with server refusal shown;
+client checks never replace server authority. TOPICLEN, single-parameter syntax,
+positive +l, shared MAXLIST limits and the base wire budget constrain sends.
+
+One request per session uses labels when available, channel/command correlation
+otherwise, and a six-second deadline. Confirmation comes from matching server
+state/echoes, not an optimistic toggle; errors, disconnect and timeout are finite
+unconfirmed outcomes. Unlabelled timeout or list overflow quarantines retries
+until reconnect so late replies cannot complete another request. Lists retain
+mask, setter and date, distinguish empty/complete from partial/error states, and
+cap capture at 512 entries. Access masks use IRC casemapping for confirmation;
+ordinary mode parameters such as channel keys retain exact comparison.
+Connection or joined-membership loss clears access-list authority; reconnect
+requires refetch. MAXLIST counts only fresh complete/empty list snapshots, never
+cached raw modes or partial results; unknown counts remain server-authoritative.
+
+### Retained Catch Up
+
+The non-AI Activity/Links view queries retained Room history, including messages
+outside the loaded transcript. It pages 200 candidates at a time up to a
+2,000-candidate view; retained totals, query bounds, remaining pages, known
+history gaps, pruning and unknown highlights/partial reaction history are
+reported without claiming server archive completeness. Filters cover unread,
+mentions, DMs, replies and reactions to own messages, grouped by network and
+conversation. Canonical HTTP(S) links retain every exact message source and
+meaningful query/fragment differences.
+
+Jump resolves the stored row anchor and opens that exact message without
+directly marking it read. Explicit read-through, durable dismissal and restore
+are separate operations; removed/redacted/pruned anchors fail visibly.
+Local read-through can use `(timestamp, rowId)`, but existing remote MARKREAD
+semantics are timestamp-granular and cover timestamp ties. Exact navigation is
+not a promise of universal row-precise remote reads.
+
+### Themes, appearance and ordering
+
+`ThemeLibraryStore` persists imported/edited/duplicated themes, selection and
+per-conversation accents. Validated TOML supports device light/dark variants;
+SAF import/export and `yardhal://theme/v1/…` share links feed a review/editor
+flow, including incoming intents, rather than silently applying untrusted input.
+Strict color, UTF-8 and input-size limits apply. Save publishes only after the
+durable store operation succeeds; failures retain the exact editor draft and
+last published library. This is not universal filesystem rollback after a
+rename/fsync failure.
+
+`ChatAppearanceStore` persists timestamp format/style/position, font, nickname
+suggestion ordering (role/alphabetical/recent), avatar and unread-count visibility,
+alongside compact/text-size/AMOLED/dynamic-color controls. Synchronized transforms
+preserve unrelated fields. Ordering offers long-press handles, explicit move
+menus and named accessibility moves for networks/groups/conversations; manual
+moves preserve section membership, pins and unavailable conversation slots.
+Unread-first remains an alternate sort, not a replacement identity scheme.
+
+### Notifications, reports and accessibility
+
+`NotificationPolicy` centralizes typed mention/DM/invite eligibility. Permission,
+per-kind disablement, duplicate/own/ignored/history traffic, mute, viewed and
+read state can suppress an alert. DM classification wins over mention text.
+`Notifications` selects distinct immutable Android channels by kind/sound/priority;
+Android overrides and DND remain authoritative. Preview/avatar preferences affect
+presentation; avatars use cached images or initials, with no notification-triggered
+network fetch, and lock-screen visibility is private. `NotificationRoutes`
+preserves destination identity: message taps foreground the actual conversation
+and close overlays/drawer; invitation taps only prefill sender-aware confirmation.
+JOIN and selection happen after user confirmation.
+Routing also dismisses the network editor, bouncer/WHOIS overlays and obsolete
+confirmation state. Invitation confirmation accepts the existing reducer's
+`#`/`&` channel prefixes rather than imposing a second, `#`-only restriction.
+Sender avatar provenance uses the same casefolded network profile as message
+rows. Memory lookup reuses an existing AVATAR rendition, including `{size}`
+templates, without fetching, decoding or resizing; inline-media cache entries
+cannot satisfy it, and LRU eviction/clear removes the rendition index.
+
+`BugReport`/`BugReportSheet` provide review, copy and share of description,
+build/device, last-attempted TLS/proxy flags and loaded/open/joined counts.
+Disconnected cached channels are not counted as currently joined.
+Automatic context uses aliases and allowlisted command/parameter counts, not raw
+bodies, hosts, names, tags, arguments, URLs or vault contents. Scope is at most
+32 represented networks, 20 recent commands per network and 100 total, not a
+complete trace. Known-secret redaction and best-effort prose sanitization do not
+guarantee removal of all personal context. The traffic console remains separate.
+
+`MessageAccessibility` supplies dedicated summaries for message/event kinds,
+relay source, reply/attachment context, history, unconfirmed delivery and partial
+reactions. Redacted summaries do not announce retained private content.
+Named Reply/Copy/Choose reaction/Delete and individual link/channel/nick actions
+use the same permission/capability paths as visual controls; identifiers alone
+do not authorize effects. Emoji names are descriptive, media controls identify
+their media, and reorder/moderation controls expose named actions.
+
+### Independent inbound wire budgets and evidence
+
+`LineFramer` counts bytes before UTF-8 decoding: tag section at most 8,191 bytes
+including `@` and its separating space, independently of the 512-byte base
+message including CRLF (510 content bytes, including prefix). Combined limits
+are 8,701 framed-content/8,703 wire bytes. An oversized frame is rejected whole
+until its delimiter, never truncated into a dispatchable command; the next
+legal frame recovers. Existing malformed-UTF-8 replacement behavior is retained.
+
+The full `make check` gate passed for phase 6: debug build, Android lint and unit tests.
+Native Android exercised real Ergo mode/topic/list confirmation and rejection, retained Catch Up
+beyond loaded history, durable themes/appearance/order, actual posted notification
+channels/taps/suppression and clipboard/share report payloads. Installed TalkBack
+15 and kernel hardware inputs exercised named message actions, reorder and
+moderation. Delete invoked the real request but Ergo returned REDACT_FORBIDDEN
+and left the message intact: successful deletion is not claimed. Notification
+activity recreation used Android Don't keep activities; a separate posted-DM tap
+after process death launched a new PID and restored the destination/body.
+Cached-photo and uncached-initials notification surfaces were exercised with a
+controlled metadata extension bridge around real Ergo traffic: Ergo 2.14 does
+not advertise metadata-2. The existing UI's 100px photo became the notification
+bitmap; a new uncached profile URL fell back to 96px initials while backgrounded.
+Channel sound configuration is not proof of physical audible sound. Pinned
+Halyard reference links returned 404, so source-level mirroring is unverified.
+
 ## Roadmap
 
 Phases land in order; each phase ships with tests and updated docs.
@@ -961,8 +1108,9 @@ Phases land in order; each phase ships with tests and updated docs.
   moderation, network icons, join-state machine with retry, unread divider
   with jump-to-unread, Room-FTS message search with snippet results, and
   identity-preserving network editing with credential-vault updates.
-  Remaining: moderation surfaces beyond these actions and slash verbs,
-  per-message link auto-open polish.
+  Parity phase 6 adds permission-aware mode/topic/access-list settings,
+  durable appearance/themes, ordering and named accessibility actions.
+  Remaining: per-message link auto-open polish.
 - **Phase 7 — Bouncers**: ✅ bounded ZNC playback/gap recovery and complete parity
   phase 4 account/session management: authenticated soju binding, stable derived
   identity and offline restoration; ADDNETWORK/CHANGENETWORK/DELNETWORK,
@@ -976,11 +1124,11 @@ Phases land in order; each phase ships with tests and updated docs.
   multipart retried on body-format rejections) with a composer paperclip,
   SAF document picker and attachment-tag rendering. Parity phase 5 adds configured
   providers, bounded inline media, private binary share staging and explicit
-  insertion/send (see above). Widgets and an on-device catch-up digest are future
-  work — Android has no FoundationModels equivalent, so that feature needs a
-  bundled model decision first.
+  insertion/send (see above). Parity phase 6 ships retained, non-AI Activity/Links
+  Catch Up. Widgets and an optional on-device AI digest remain future work —
+  Android has no FoundationModels equivalent, so AI needs a bundled model decision.
 
-Deferred by design: link auto-open, catch-up digest and widgets.
+Deferred by design: link auto-open, optional AI catch-up digest and widgets.
 WebSocket transport and WEBIRC do not apply to this native TCP/TLS client;
 deprecated STARTTLS is replaced by direct TLS, and client-batch production
 use waits for ratification. See `docs/ircv3-checklist.md`.

@@ -83,7 +83,7 @@ public class LiveCoordinator(
     private val channelOrder: dev.brentdevs.yardhal.core.data.ChannelOrderStore,
     private val connectionFactory: ConnectionFactory,
     private val stsPolicies: StsPolicyStore,
-    private val notifier: HighlightNotifier = HighlightNotifier { _, _, _, _ -> },
+    private val notifier: dev.brentdevs.yardhal.service.ConversationNotifier = dev.brentdevs.yardhal.service.ConversationNotifier { _, _ -> },
     private val clock: () -> Long = System::currentTimeMillis,
     private val historyElapsedClock: () -> Long = { System.nanoTime() / 1_000_000 },
     private val clientIdentityProvider: (String) -> TlsClientIdentity = {
@@ -91,10 +91,11 @@ public class LiveCoordinator(
     },
     private val offlineStore: OfflineStore? = null,
     public val relayStore: dev.brentdevs.yardhal.core.data.RelayConfigurationStore? = null,
+    private val appIsForeground: () -> Boolean = { false },
+    private val onNotificationConversationRead: (ConversationRef) -> Unit = {},
+    private val catchUpStore: dev.brentdevs.yardhal.core.data.CatchUpStore? = null,
+    private val themeLibrary: dev.brentdevs.yardhal.core.data.ThemeLibraryStore? = null,
 ) {
-    public fun interface HighlightNotifier {
-        public fun onHighlight(networkName: String, sender: String, conversationName: String, text: String)
-    }
 
     private val idGenerator = AtomicLong(1)
 
@@ -104,7 +105,11 @@ public class LiveCoordinator(
     private val _buffers = MutableStateFlow<Map<String, ConversationBuffer>>(emptyMap())
     public val buffers: StateFlow<Map<String, ConversationBuffer>> = _buffers.asStateFlow()
 
+    private val _channelSettings = MutableStateFlow<Map<String, ChannelSettingsState>>(emptyMap())
+    public val channelSettings: StateFlow<Map<String, ChannelSettingsState>> = _channelSettings.asStateFlow()
+
     private val _profiles = MutableStateFlow<Map<String, NetworkProfiles>>(emptyMap())
+    private val reportRedactors = java.util.concurrent.CopyOnWriteArraySet<(String) -> String>()
     public val profiles: StateFlow<Map<String, NetworkProfiles>> = _profiles.asStateFlow()
 
     private val _whois = MutableStateFlow<dev.brentdevs.yardhal.core.data.WhoisInfo?>(null)
@@ -249,6 +254,22 @@ public class LiveCoordinator(
         var storedMappingKnown = _buffers.value.values.any { it.ref.networkId == config.id }
         val lifecycleJob = SupervisorJob(scope.coroutineContext[Job])
         val lifecycleScope = CoroutineScope(scope.coroutineContext + lifecycleJob)
+        val channelSettingsController: ChannelSettingsController = ChannelSettingsController(
+            state = state,
+            buffer = { key -> _buffers.value[key] },
+            publish = { views ->
+                _channelSettings.update { previous -> previous.filterValues { it.storageKey.substringBefore('|') != config.id } + views }
+            },
+            send = { message -> !quitRequested && reconnector?.send(message) == true },
+            redact = { text -> redactPresentation(this, text) },
+            nowMs = clock,
+            deadline = { token ->
+                lifecycleScope.launch {
+                    delay(ChannelSettingsController.TIMEOUT_MS)
+                    synchronized(state) { channelSettingsController.timeout(token) }
+                }
+            },
+        )
         val recovery = ConnectionRecoveryPolicy(config.autoConnect && allowStartup, config.userDisconnected, networkAvailable).also {
             if (manuallyWanted) it.handle(RecoverySignal.MANUAL_CONNECT)
         }
@@ -1541,6 +1562,8 @@ public class LiveCoordinator(
     private fun retireTransport(session: Session, quitReason: String) {
         session.quitRequested = true
         sendRaw(session, "QUIT :$quitReason")
+        session.state.registered = false
+        session.channelSettingsController.disconnect()
         bouncerManagement.disconnected(session.config.id, session.managementGeneration)
         session.acceptedEpoch = null
         session.state.registered = false
@@ -1577,6 +1600,8 @@ public class LiveCoordinator(
                 messageStore.deleteNetwork(networkId)
                 offlineStore?.deleteNetwork(networkId)
                 readMarkers.deleteNetwork(networkId)
+                catchUpStore?.deleteNetwork(networkId)
+                themeLibrary?.deleteNetwork(networkId)
                 channelOrder.forgetNetwork(networkId)
                 mutes.deleteNetwork(networkId)
                 _orderState.value = channelOrder.snapshot()
@@ -1592,6 +1617,7 @@ public class LiveCoordinator(
             }
             history.removeNetwork(networkId)
             bouncerManagement.remove(networkId)
+            _channelSettings.update { views -> views.filterKeys { it.substringBefore('|') != networkId } }
             synchronized(selectionLock) {
                 if (selectedStorageKey?.substringBefore("|") == networkId) {
                     selectedStorageKey = null
@@ -1618,6 +1644,13 @@ public class LiveCoordinator(
             if (_whoisPresentation.value?.networkId == networkId) dismissWhois()
             rawLogs.remove(networkId)
             _rawLogVersion.update { it + 1 }
+    }
+
+    public fun redactReportText(text: String): String {
+        var redacted = text
+        for (redactor in reportRedactors) redacted = redactor(redacted)
+        for (session in sessions.values) redacted = redactPresentation(session, redacted)
+        return redacted
     }
 
     private fun redactPresentation(session: Session, rawText: String): String {
@@ -1701,6 +1734,7 @@ public class LiveCoordinator(
                         }
                         session.connection = connection
                         session.redactionConnection = connection
+                        reportRedactors.add(connection.presentationRedactor())
                     }
                 }
             },
@@ -1954,6 +1988,9 @@ public class LiveCoordinator(
             val previousSupport = session.state.isupport
             val previousCapabilities = session.state.supportedCaps
             val previousNick = session.state.ownNick
+            val settingsReply = (event as? IrcEvent.MessageReceived)?.message
+            val settingsLabel = settingsReply?.let(session.state::responseLabel)
+            val settingsPlayback = settingsReply?.let(session.state::isPlaybackFrame) == true
             val effects = session.state.apply(event, inboundContext(session))
             if (event is IrcEvent.MessageReceived && event.message.tags["batch"] == null) {
                 val command = event.message.command
@@ -1992,6 +2029,16 @@ public class LiveCoordinator(
                 )
             }
             for (effect in effects) processEffect(session, effect)
+            if (settingsReply != null && !settingsPlayback) {
+                session.channelSettingsController.receive(settingsReply, settingsLabel)
+            }
+            if (event is IrcEvent.ConnectionOpened || event is IrcEvent.Disconnected) {
+                session.channelSettingsController.disconnect()
+            } else if (previousSupport !== session.state.isupport || event is IrcEvent.CapabilitiesNegotiated || effects.any {
+                it is InboundEffect.SetTopic || it is InboundEffect.SetMembers || it is InboundEffect.SetModes ||
+                    it is InboundEffect.SetJoinState || it is InboundEffect.RemoveBuffer || it is InboundEffect.RenameBuffer ||
+                    it is InboundEffect.OwnNickChanged || it is InboundEffect.StatusChanged
+            }) session.channelSettingsController.refresh()
             if (event is IrcEvent.CapabilitiesNegotiated) {
                 if (session.state.registered) bouncerManagement.capabilitiesChanged(
                     session.config.id, session.managementGeneration, session.state.supportedCaps,
@@ -2260,6 +2307,21 @@ public class LiveCoordinator(
 
     private fun processEffect(session: Session, effect: InboundEffect) {
         when (effect) {
+            is InboundEffect.NotifyInvite -> notifier.notify(
+                dev.brentdevs.yardhal.service.NotificationEvent(
+                    kind = dev.brentdevs.yardhal.core.data.NotificationKind.INVITE,
+                    ref = effect.ref, networkName = session.config.name, sender = effect.sender,
+                    text = "${effect.sender} invited you to ${effect.ref.rawTarget}",
+                    timestampMs = effect.timestampMs, eventId = effect.msgid ?: "invite-${idGenerator.getAndIncrement()}",
+                    msgid = effect.msgid,
+                    avatarUrl = _profiles.value[session.config.id]?.forNick(effect.sender)?.avatarUrl,
+                ),
+                dev.brentdevs.yardhal.service.NotificationEligibility(
+                    ignored = ignoreStore?.isIgnored(effect.sender) == true, playback = effect.playback,
+                    muted = mutes.isMuted(effect.ref.storageKey),
+                    viewed = appIsForeground() && synchronized(selectionLock) { selectedStorageKey == effect.ref.storageKey },
+                ),
+            )
             is InboundEffect.SendRaw -> sendRaw(session, effect.line)
             is InboundEffect.AuthenticationFailed -> authenticationFailed(session, effect.reason)
             is InboundEffect.RequestHistory -> history.bootstrap(session.config.id, effect.ref)
@@ -2587,6 +2649,7 @@ public class LiveCoordinator(
             readMarkers.rename(fromKey, toKey)
             if (mutes.rename(fromKey, toKey)) _mutedState.value = mutes.all()
             channelOrder.rename(fromKey, toKey)
+            themeLibrary?.rename(fromKey, toKey)
             _orderState.value = channelOrder.snapshot()
             history.rename(from, to)
             enqueuePersistence {
@@ -2624,6 +2687,7 @@ public class LiveCoordinator(
         readMarkers.rename(fromKey, toKey)
         mutes.rename(fromKey, toKey)
         channelOrder.rename(fromKey, toKey)
+        themeLibrary?.rename(fromKey, toKey)
         _mutedState.value = mutes.all()
         _orderState.value = channelOrder.snapshot()
     }
@@ -2651,6 +2715,7 @@ public class LiveCoordinator(
     private suspend fun migrateMessages(from: ConversationRef, to: ConversationRef) {
         if (networkStore.byId(from.networkId) == null) return
         messageStore.renameConversation(from, to) { removed, retained ->
+            catchUpStore?.mergeRows(from.networkId, removed, retained)
             synchronized(selectionLock) {
                 for ((key, rowId) in persistedRowsByLocalId) if (rowId == removed) persistedRowsByLocalId[key] = retained
                 updateAllBuffersForNetwork(from.networkId) { buffer ->
@@ -2704,7 +2769,7 @@ public class LiveCoordinator(
             beginStorageMigration(session.config.id)
             val order = channelOrder.snapshot()
             val metadataKeys = readMarkers.all().keys + mutes.all() + order.pinnedKeys +
-                order.groups.flatMap { it.memberKeys } + order.partedKeys + refs.keys
+                order.groups.flatMap { it.memberKeys } + order.partedKeys + order.channelOrder + refs.keys + themeLibrary?.metadataKeys().orEmpty()
             for (key in metadataKeys) {
                 if (key.substringBefore("|") != session.config.id) continue
                 val raw = refs[key]?.rawTarget ?: key.substringAfter("|")
@@ -2860,9 +2925,10 @@ public class LiveCoordinator(
         val session = sessions[networkId] ?: return
         synchronized(session.state) {
             if (sessions[networkId] !== session || !session.state.registered ||
-                session.statusFlow.value != ConnectionStatus.REGISTERED
+                session.statusFlow.value != ConnectionStatus.REGISTERED || "draft/message-redaction" !in session.state.supportedCaps
             ) return
             val buffer = _buffers.value[storageKey]?.takeIf { it.ref.networkId == networkId } ?: return
+            if (buffer.messages.none { it.msgid == msgid && it.sentByUs && !it.redacted }) return
             sendLabeled(session, buffer.ref, LabeledCommand.RAW, "REDACT ${buffer.ref.rawTarget} $msgid")
         }
     }
@@ -2872,6 +2938,37 @@ public class LiveCoordinator(
             current.mapValues { (_, buffer) ->
                 if (buffer.ref.networkId == networkId) transform(buffer) else buffer
             }
+        }
+    }
+
+    public fun openChannelSettings(storageKey: String) {
+        withChannelSettings(storageKey) { session ->
+            session.channelSettingsController.open(storageKey)
+            ensureMembers(session.config.id, storageKey)
+        }
+    }
+
+    public fun setChannelMode(storageKey: String, mode: Char, enabled: Boolean, parameter: String = "") {
+        withChannelSettings(storageKey) { it.channelSettingsController.mode(storageKey, mode, enabled, parameter) }
+    }
+
+    public fun setChannelTopic(storageKey: String, topic: String) {
+        withChannelSettings(storageKey) { it.channelSettingsController.topic(storageKey, topic) }
+    }
+
+    public fun refreshChannelAccessList(storageKey: String, mode: Char) {
+        withChannelSettings(storageKey) { it.channelSettingsController.list(storageKey, mode) }
+    }
+
+    public fun editChannelAccessList(storageKey: String, mode: Char, mask: String, adding: Boolean) {
+        withChannelSettings(storageKey) { it.channelSettingsController.mode(storageKey, mode, adding, mask, list = true) }
+    }
+
+    private fun withChannelSettings(storageKey: String, action: (Session) -> Unit) {
+        synchronized(sessionLifecycleLock) {
+            val current = _buffers.value[storageKey] ?: return
+            val session = sessions[current.ref.networkId] ?: return
+            synchronized(session.state) { action(session) }
         }
     }
 
@@ -3097,6 +3194,28 @@ public class LiveCoordinator(
     private val _orderState = MutableStateFlow(channelOrder.snapshot())
     public val orderState: StateFlow<dev.brentdevs.yardhal.core.data.ChannelOrderState> = _orderState.asStateFlow()
 
+    public fun reorder(move: dev.brentdevs.yardhal.core.data.OrderMove): Boolean = saveOrder {
+        channelOrder.move(move)
+    }
+
+    public fun setUnreadSorting(enabled: Boolean): Boolean = saveOrder {
+        channelOrder.setSortUnreadFirst(enabled)
+    }
+
+    private fun saveOrder(change: () -> Unit): Boolean {
+        return try {
+            change()
+            _orderState.value = channelOrder.snapshot()
+            true
+        } catch (failure: java.io.IOException) {
+            _operationError.value = failure.message ?: "Could not save conversation order"
+            false
+        } catch (failure: IllegalArgumentException) {
+            _operationError.value = failure.message ?: "Conversation order is no longer valid"
+            false
+        }
+    }
+
     public fun togglePin(storageKey: String) {
         channelOrder.togglePin(storageKey)
         _orderState.value = channelOrder.snapshot()
@@ -3120,9 +3239,7 @@ public class LiveCoordinator(
     }
 
     public fun addToGroup(groupId: String, storageKey: String) {
-        channelOrder.removeFromEveryGroup(storageKey)
-        channelOrder.addToGroup(groupId, storageKey)
-        _orderState.value = channelOrder.snapshot()
+        saveOrder { channelOrder.moveToGroup(storageKey, groupId) }
     }
 
     public fun removeFromGroup(storageKey: String) {
@@ -3148,6 +3265,7 @@ public class LiveCoordinator(
     public fun toggleMute(storageKey: String) {
         if (!mutes.unmute(storageKey)) mutes.mute(storageKey)
         _mutedState.value = mutes.all()
+        if (mutes.isMuted(storageKey)) _buffers.value[storageKey]?.ref?.let(onNotificationConversationRead)
     }
 
     public fun leaveConversation(networkId: String, storageKey: String) {
@@ -3159,6 +3277,16 @@ public class LiveCoordinator(
         sessions[networkId]?.let { session -> synchronized(session.state) { session.state.forgetChannel(storageKey) } }
         channelOrder.markParted(storageKey)
         _orderState.value = channelOrder.snapshot()
+    }
+
+    public fun lastAttemptRequestsTls(networkId: String): Boolean? {
+        val session = sessions[networkId] ?: return null
+        return synchronized(session.state) { session.effective?.let { it.tls || session.stsUpgradePort != null } }
+    }
+
+    public fun lastAttemptUsesProxy(networkId: String): Boolean? {
+        val session = sessions[networkId] ?: return null
+        return synchronized(session.state) { session.effective?.let { it.proxy != null } }
     }
 
     public fun secureUploadTransport(networkId: String): Boolean {
@@ -3313,8 +3441,22 @@ public class LiveCoordinator(
         val snapshot = _buffers.value[ref.storageKey]?.messages?.firstOrNull { it.localId == localId }
         if (snapshot != null) persistAsync(session, ref, snapshot.copy(timestampMs = persistedTimestampMs),
             reconcilePendingEcho || sentByUs && msgid != null, quoteParent?.localId, optimistic)
-        if (appended && highlightsMe && !sentByUs && !playback && !historyContext && !muted) {
-            notifier.onHighlight(session.config.name, sender, ConversationNames.forRef(ref), presentedText)
+        if (kind == MessageKind.PRIVMSG || kind == MessageKind.NOTICE || kind == MessageKind.ACTION) {
+            dev.brentdevs.yardhal.service.NotificationPolicy.messageKind(ref, highlightsMe)?.let { notificationKind ->
+                val cursor = readMarkers.cursor(ref.storageKey)
+                notifier.notify(
+                    dev.brentdevs.yardhal.service.NotificationEvent(notificationKind, ref, session.config.name, sender,
+                        presentedText, timestampMs, msgid ?: localId.toString(), msgid,
+                        avatarUrl = _profiles.value[ref.networkId]?.forNick(sender)?.avatarUrl),
+                    dev.brentdevs.yardhal.service.NotificationEligibility(
+                        appended = appended, sentByUs = sentByUs, ignored = ignoreStore?.isIgnored(sender) == true,
+                        playback = playback, historyContext = historyContext, muted = muted,
+                        viewed = appIsForeground() && synchronized(selectionLock) { selectedStorageKey == ref.storageKey },
+                        read = timestampMs < cursor.timestampMs || timestampMs == cursor.timestampMs &&
+                            (snapshot?.storedRowId ?: Long.MAX_VALUE) <= cursor.rowId,
+                    ),
+                )
+            }
         }
     }
 
@@ -3453,8 +3595,24 @@ public class LiveCoordinator(
         created
     }
 
+    public fun historyGaps(ref: ConversationRef): List<dev.brentdevs.yardhal.core.data.StoredHistoryGap> =
+        historyCoverage.gaps(ref.storageKey)
+
+    public fun markReadThrough(ref: ConversationRef, cursor: ReadCursor) {
+        if (networkStore.byId(ref.networkId) == null) return
+        readMarkers.advance(ref.storageKey, cursor.timestampMs, cursor.rowId)
+        onNotificationConversationRead(ref)
+        updateBufferKey(ref.storageKey) { it.copy(readAtMs = readMarkers.marker(ref.storageKey)) }
+        enqueuePersistence {
+            if (networkStore.byId(ref.networkId) == null) return@enqueuePersistence
+            refreshUnread(ref)
+            sessions[ref.networkId]?.let(::replayPendingReadMarkers)
+        }
+    }
+
     public fun markRead(storageKey: String) {
         val selected = _buffers.value[storageKey] ?: return
+        onNotificationConversationRead(selected.ref)
         val latest = selected.messages.maxWithOrNull(compareBy<ChatMessage> { it.timestampMs }
             .thenBy { it.storedRowId ?: Long.MAX_VALUE })
         if (latest != null) {
@@ -3532,6 +3690,8 @@ public class LiveCoordinator(
                     iconUrl = live?.state?.networkIconUrl,
                     taggedRepliesAvailable = live?.state?.clientTagPolicy?.reply != null,
                     reactionsAvailable = live?.state?.clientTagPolicy?.reactionsAvailable == true,
+                    messageDeletionAvailable = live?.state?.registered == true &&
+                        live.statusFlow.value == ConnectionStatus.REGISTERED && "draft/message-redaction" in live.state.supportedCaps,
                     connectionPhase = when {
                         binding?.rejectionReason != null -> RecoveryPhase.AUTHENTICATION_REJECTED
                         binding?.enabled == false -> RecoveryPhase.DISCONNECTED

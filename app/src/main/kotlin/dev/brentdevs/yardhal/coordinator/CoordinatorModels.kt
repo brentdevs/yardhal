@@ -27,6 +27,7 @@ public data class UiNetwork(
     public val hasCertificatePin: Boolean = false,
     public val taggedRepliesAvailable: Boolean = false,
     public val reactionsAvailable: Boolean = false,
+    public val messageDeletionAvailable: Boolean = false,
 ) {
     public val storagePrefix: String get() = id
 }

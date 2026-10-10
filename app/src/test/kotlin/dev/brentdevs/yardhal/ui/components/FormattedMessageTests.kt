@@ -201,6 +201,17 @@ class FormattedMessageTests {
     }
 
     @Test
+    fun portableThemeLinkAcrossFormattingRemainsWholeWithoutActivatingOtherAppRoutes() {
+        val annotated = buildFormattedMessage(
+            text = "Theme (yardhal://theme/v1/QUJD\u0002REVGLV8\u0002). Other yardhal://notification/private",
+            linkColor = Color.Blue,
+            mentionColor = Color.Magenta,
+        )
+        val links = annotated.getLinkAnnotations(0, annotated.length).mapNotNull { (it.item as? LinkAnnotation.Url)?.url }
+        assertEquals(listOf("yardhal://theme/v1/QUJDREVGLV8"), links)
+    }
+
+    @Test
     fun falsePositivesAreIgnored() {
         var openedNick: String? = null
         var openedChannel: String? = null

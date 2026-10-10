@@ -32,7 +32,6 @@ public object IrcMultiline {
     public const val BATCH_TYPE: String = "draft/multiline"
     public const val CONCAT_TAG: String = "draft/multiline-concat"
 
-    private const val RELAY_LINE_LIMIT = 512
     private const val FIXED_OVERHEAD = 14
     private const val SAFETY_MARGIN = 10
     private const val WORST_CASE_USER_HOST = 20 + 63
@@ -43,7 +42,7 @@ public object IrcMultiline {
 
     public fun lineBudget(nick: String, target: String): Int {
         val variable = utf8Length(nick) + utf8Length(target) + WORST_CASE_USER_HOST
-        return maxOf(MINIMUM_LINE_BYTES, RELAY_LINE_LIMIT - FIXED_OVERHEAD - SAFETY_MARGIN - variable)
+        return maxOf(MINIMUM_LINE_BYTES, IrcMessage.BASE_MESSAGE_LIMIT_BYTES - FIXED_OVERHEAD - SAFETY_MARGIN - variable)
     }
 
     public fun combine(lines: List<MultilineLine>): String = buildString {

@@ -66,7 +66,7 @@ public class ConnectionService : Service() {
 
     public companion object {
         public const val EXTRA_NETWORK_COUNT: String = "network_count"
-        private const val NOTIFICATION_ID: Int = 1
+        private const val NOTIFICATION_ID: Int = Notifications.ONGOING_NOTIFICATION_ID
         private const val ACTION_STOP = "dev.brentdevs.yardhal.STOP_CONNECTION_SERVICE"
 
         public fun start(context: Context, networkCount: Int) {

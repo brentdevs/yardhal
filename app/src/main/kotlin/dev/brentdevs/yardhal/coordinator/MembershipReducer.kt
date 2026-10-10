@@ -114,16 +114,19 @@ internal fun Reduction.handleRename(message: IrcMessage) {
 }
 
 internal fun Reduction.handleTopicVerb(message: IrcMessage) {
+    if (isPlayback(message) || state.isPlaybackFrame(message)) return
     if (message.parameters.size < 2) return
     emit(InboundEffect.SetTopic(state.channelRef(message.parameters[0]), message.parameters.last()))
 }
 
 internal fun Reduction.handleTopicNumeric(message: IrcMessage) {
+    if (isPlayback(message) || state.isPlaybackFrame(message)) return
     if (message.parameters.size < 3) return
     emit(InboundEffect.SetTopic(state.channelRef(message.parameters[1]), message.parameters.last()))
 }
 
 internal fun Reduction.handleNoTopic(message: IrcMessage) {
+    if (isPlayback(message) || state.isPlaybackFrame(message)) return
     val channelName = message.parameters.getOrNull(1) ?: return
     emit(InboundEffect.SetTopic(state.channelRef(channelName), null))
 }
@@ -135,7 +138,7 @@ internal fun Reduction.handleMode(message: IrcMessage) {
         val ref = state.channelRef(channelName)
         if (context.hasBuffer(ref.storageKey)) {
             val channel = channelOrCreate(ref)
-            if (applyChannelModes(channel.modes, encoded, message.parameters, 2)) publishModes(channel)
+            if (applyChannelModes(channel.modes, encoded, message.parameters, 2, channel)) publishModes(channel)
         }
     }
     serverLine(message)
@@ -171,6 +174,7 @@ private fun Reduction.applyChannelModes(
     encoded: String,
     parameters: List<String>,
     parameterStart: Int,
+    channel: ChannelState? = null,
 ): Boolean {
     val classes = state.isupport.chanmodes
     var adding = true
@@ -198,7 +202,26 @@ private fun Reduction.applyChannelModes(
             else -> {
                 val prefix = mode in state.prefixModes.modes
                 val parameter = if (prefix || requiresModeParameter(mode, adding, classes)) parameters[parameterIndex++] else null
-                if (prefix) continue
+                if (prefix) {
+                    if (channel != null && parameter != null) {
+                        val folded = state.fold(parameter)
+                        val symbol = state.prefixModes.symbolFor(mode)
+                        fun update(member: ChannelMember): ChannelMember {
+                            val priorMode = member.symbol?.let(state.prefixModes::modeFor)
+                            val priorRank = priorMode?.let(state.prefixModes.modes::indexOf) ?: Int.MAX_VALUE
+                            return when {
+                                adding && state.prefixModes.modes.indexOf(mode) <= priorRank -> member.copy(symbol = symbol)
+                                !adding && member.symbol == symbol -> member.copy(symbol = null)
+                                else -> member
+                            }
+                        }
+                        channel.members[folded]?.let { channel.members[folded] = update(it) }
+                        state.pendingNames[channel.ref.storageKey]?.let { names -> names[folded]?.let { names[folded] = update(it) } }
+                        publishMembers(channel)
+                        if (!adding && state.isOwnNick(parameter)) emit(InboundEffect.SendRaw("NAMES ${channel.ref.rawTarget}"))
+                    }
+                    continue
+                }
                 val key = mode.toString()
                 when {
                     mode in classes.listA -> {

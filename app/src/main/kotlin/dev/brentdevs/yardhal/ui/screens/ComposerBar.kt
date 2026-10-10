@@ -123,6 +123,7 @@ public fun ComposerBar(
     canSendOffline: (String) -> Boolean = { false },
     members: List<String>,
     channels: List<String> = emptyList(),
+    showAvatars: Boolean = true,
     onAttach: () -> Unit = {},
     initialDraft: String? = null,
     initialDraftToken: String? = null,
@@ -295,7 +296,7 @@ public fun ComposerBar(
                                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
                                 ) {
-                                    NickAvatar(nick = candidate.nick, size = 20.dp)
+                                    if (showAvatars) NickAvatar(nick = candidate.nick, size = 20.dp)
                                     Text(
                                         text = candidate.nick,
                                         style = MaterialTheme.typography.labelMedium,

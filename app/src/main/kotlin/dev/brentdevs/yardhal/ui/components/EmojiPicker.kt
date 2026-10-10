@@ -1,11 +1,13 @@
 package dev.brentdevs.yardhal.ui.components
 
 import android.graphics.Paint
+import android.content.res.AssetManager
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyRow
@@ -30,13 +32,21 @@ import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.disabled
 import androidx.compose.ui.unit.dp
 import dev.brentdevs.yardhal.YardhalApplication
 import dev.brentdevs.yardhal.core.data.RecentEmojiStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.util.Locale
 
 public val LocalRecentEmojiStore = staticCompositionLocalOf<RecentEmojiStore?> { null }
 
@@ -53,6 +63,41 @@ internal fun parseEmojiCatalog(lines: Sequence<String>, supported: (String) -> B
         EmojiEntry(emoji, name, category).takeIf { supported(emoji) }
     }.toList()
 }
+
+private object EmojiNameCatalog {
+    val names = MutableStateFlow<Map<String, String>?>(null)
+    private val mutex = Mutex()
+
+    suspend fun load(assets: AssetManager) {
+        mutex.withLock {
+            if (names.value != null) return
+            names.value = try {
+                withContext(Dispatchers.IO) {
+                    assets.open("emoji-test-15.1.txt").bufferedReader().use { reader ->
+                        parseEmojiCatalog(reader.lineSequence()) { true }.associate { it.emoji to it.name }
+                    }
+                }
+            } catch (_: java.io.IOException) {
+                emptyMap()
+            } catch (_: SecurityException) {
+                emptyMap()
+            }
+        }
+    }
+}
+
+@Composable
+internal fun rememberEmojiNames(): Map<String, String> {
+    val assets = LocalContext.current.assets
+    val names by EmojiNameCatalog.names.collectAsState()
+    LaunchedEffect(assets) { EmojiNameCatalog.load(assets) }
+    return names.orEmpty()
+}
+
+public fun emojiAccessibilityLabel(emoji: String, names: Map<String, String> = emptyMap()): String =
+    names[emoji] ?: emoji.codePoints().toArray().filter { it != 0x200D && it !in 0xFE00..0xFE0F }
+        .mapNotNull { Character.getName(it)?.lowercase(Locale.ROOT) }
+        .joinToString(", ").ifBlank { "Emoji reaction" }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -104,8 +149,8 @@ public fun EmojiPicker(onDismiss: () -> Unit, onSelect: (String) -> Unit) {
             }
             LazyVerticalGrid(columns = GridCells.Adaptive(52.dp), modifier = Modifier.fillMaxWidth().heightIn(max = 360.dp), contentPadding = PaddingValues(4.dp)) {
                 items(results, key = { it.emoji }) { entry ->
-                    Text(entry.emoji, style = MaterialTheme.typography.headlineMedium,
-                        modifier = Modifier.semantics { contentDescription = entry.name }.clickable(enabled = !saving) {
+                    val select: () -> Unit = {
+                        if (!saving) {
                             saving = true
                             onSelect(entry.emoji)
                             scope.launch(Dispatchers.Main.immediate) {
@@ -113,13 +158,22 @@ public fun EmojiPicker(onDismiss: () -> Unit, onSelect: (String) -> Unit) {
                                     withContext(Dispatchers.IO) { store?.record(entry.emoji) }
                                 } catch (failure: java.io.IOException) {
                                     saveError = "Could not save recent emoji: ${failure.message}"
-                                } catch (failure: SecurityException) {
+                                } catch (_: SecurityException) {
                                     saveError = "Recent emoji storage is inaccessible"
                                 } finally {
                                     saving = false
                                 }
                             }
-                        }.padding(10.dp))
+                        }
+                    }
+                    Text(entry.emoji, style = MaterialTheme.typography.headlineMedium,
+                        modifier = Modifier.defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
+                            .clickable(enabled = !saving, role = Role.Button, onClick = select)
+                            .clearAndSetSemantics {
+                                contentDescription = entry.name
+                                role = Role.Button
+                                if (saving) disabled() else onClick("Select ${entry.name}") { select(); true }
+                            }.padding(10.dp))
                 }
             }
             Text("Unicode Emoji 15.1 · only emoji supported by this device", style = MaterialTheme.typography.labelSmall)

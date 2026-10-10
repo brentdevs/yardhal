@@ -16,7 +16,7 @@ import kotlinx.coroutines.runBlocking
 
 class ManualAuthenticationRedactionTests {
     @Test
-    fun manualAuthenticationWireAndIndividualEchoesUseSafePublicPresentation() = runBlocking {
+    fun manualAuthenticationWireEchoesAndRetiredExportUseSafePresentation() = runBlocking {
         val cases = listOf(
             "REGISTER * me@example.org modern-register-password" to listOf("modern-register-password"),
             "PRIVMSG NickServ@services.example.org :REGISTER service-register-password me@example.org" to listOf("service-register-password"),
@@ -64,6 +64,7 @@ class ManualAuthenticationRedactionTests {
                 ),
                 rawTap = { _, line -> tapped += line },
             )
+            val redactReport = connection.presentationRedactor()
             try {
                 val collector = EventCollector(scope, connection.events)
                 connection.start()
@@ -110,6 +111,12 @@ class ManualAuthenticationRedactionTests {
                 assertTrue(tapped.any { "REGISTER <redacted>" in it })
                 assertTrue(tapped.any { "SET PASSWORD <redacted>" in it })
                 assertEquals("account nickname operator me@example.org", connection.redactPresentation("account nickname operator me@example.org"))
+                connection.disconnect()
+                assertEquals(
+                    "Recovered: ${allPasswords.joinToString("|") { "<redacted>" }}",
+                    redactReport("Recovered: ${allPasswords.joinToString("|")}"),
+                )
+                assertEquals("account nickname operator me@example.org", redactReport("account nickname operator me@example.org"))
             } finally {
                 connection.disconnect()
                 scope.cancel()

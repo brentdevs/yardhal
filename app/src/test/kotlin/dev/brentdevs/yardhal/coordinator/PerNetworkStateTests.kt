@@ -72,6 +72,24 @@ class PerNetworkStateTests {
     }
 
     @Test
+    fun rejectedWireFramesPublishOnlyBoundedReasonDiagnostics() {
+        val expected = mapOf(
+            dev.brentdevs.yardhal.core.client.LineRejection.BASE_TOO_LONG to "Ignored IRC frame: base message exceeds 512 bytes including CRLF",
+            dev.brentdevs.yardhal.core.client.LineRejection.TAGS_TOO_LONG to "Ignored IRC frame: tag section exceeds 8191 bytes",
+            dev.brentdevs.yardhal.core.client.LineRejection.MISSING_TAG_SEPARATOR to "Ignored IRC frame: tag section has no separating space",
+        )
+        val state = state()
+        for ((reason, text) in expected) {
+            val effects = state.apply(IrcEvent.FrameRejected(reason), InboundContext(nowMs = now))
+            val diagnostic = effects.appended().single()
+            assertEquals(state.server, diagnostic.ref)
+            assertEquals(text, diagnostic.text)
+            assertEquals(now, diagnostic.timestampMs)
+            assertTrue(effects.sent().isEmpty())
+        }
+    }
+
+    @Test
     fun standardRepliesAreTaggedByVerb() {
         val state = state()
         assertEquals("[fail] CHATHISTORY INVALID_TARGET bad", state.feed(":srv FAIL CHATHISTORY INVALID_TARGET :bad").appended().single().text)

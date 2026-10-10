@@ -44,8 +44,11 @@ public data class IrcMessage(
 
     public companion object {
 
-        public const val CLASSIC_LIMIT_BYTES: Int = 510
-        public const val TAGGED_LIMIT_BYTES: Int = 8191
+        public const val BASE_MESSAGE_LIMIT_BYTES: Int = 512
+        public const val MESSAGE_TERMINATOR_BYTES: Int = 2
+        public const val BASE_CONTENT_LIMIT_BYTES: Int = BASE_MESSAGE_LIMIT_BYTES - MESSAGE_TERMINATOR_BYTES
+        public const val TAG_SECTION_LIMIT_BYTES: Int = 8191
+        public const val TAGGED_CONTENT_LIMIT_BYTES: Int = TAG_SECTION_LIMIT_BYTES + BASE_CONTENT_LIMIT_BYTES
         private const val NUMERIC_LENGTH = 3
 
         public fun parse(line: String): IrcMessage? {

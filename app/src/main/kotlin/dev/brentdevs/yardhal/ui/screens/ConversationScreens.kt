@@ -83,6 +83,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -422,6 +423,10 @@ public fun ConversationScreen(
     onSearchTargetShown: () -> Unit = {},
     appearance: ChatAppearancePreferences = ChatAppearancePreferences(),
     onOpenAppearance: () -> Unit = {},
+    onOpenChannelSettings: () -> Unit,
+    onOpenCatchUp: () -> Unit,
+    onOpenBugReport: () -> Unit,
+    onOpenNotifications: () -> Unit,
     onMemberAction: (MemberAction, String) -> Unit = { _, _ -> },
     onOpenDm: (String) -> Unit = {},
     hasBotMode: Boolean = false,
@@ -577,6 +582,10 @@ public fun ConversationScreen(
                                     metadataVisible = true
                                     onLoadMembers()
                                 })
+                                DropdownMenuItem(text = { Text("Channel settings") }, onClick = {
+                                    overflowVisible = false
+                                    onOpenChannelSettings()
+                                })
                             }
                             DropdownMenuItem(text = { Text("Join channel") }, onClick = {
                                 overflowVisible = false
@@ -593,6 +602,18 @@ public fun ConversationScreen(
                             DropdownMenuItem(text = { Text("Chat appearance") }, onClick = {
                                 overflowVisible = false
                                 onOpenAppearance()
+                            })
+                            DropdownMenuItem(text = { Text("Catch Up") }, onClick = {
+                                overflowVisible = false
+                                onOpenCatchUp()
+                            })
+                            DropdownMenuItem(text = { Text("Notifications") }, onClick = {
+                                overflowVisible = false
+                                onOpenNotifications()
+                            })
+                            DropdownMenuItem(text = { Text("Bug report") }, onClick = {
+                                overflowVisible = false
+                                onOpenBugReport()
                             })
                         }
                     }
@@ -638,8 +659,9 @@ public fun ConversationScreen(
                 ComposerBar(
                     enabled = connected,
                     canSendOffline = canSendOffline,
-                    members = buffer.members.map { it.nick },
+                    members = nicknameSuggestions(buffer, appearance.nicknameSuggestionOrder),
                     channels = channels,
+                    showAvatars = appearance.showAvatars,
                     onAttach = onPickFile,
                     initialDraft = sharedDraft,
                     initialDraftToken = sharedDraftToken,
@@ -790,6 +812,16 @@ public fun ConversationScreen(
                                     onOpenNick = onOpenDm,
                                     onOpenUrl = ::openLink,
                                     profile = message.sender.takeIf { it.isNotEmpty() && message.relayedSender == null }?.let(profiles::forNick),
+                                    accessibilityActions = dev.brentdevs.yardhal.ui.components.MessageAccessibilityActions(
+                                        onReply = if (message.redacted) null else ({ onSetReplyDraft(message) }),
+                                        onCopy = {
+                                            val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                                            clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("Message", message.text))
+                                        },
+                                        onChooseReaction = if (!message.redacted && message.msgid != null && connected && network?.reactionsAvailable == true) ({ emojiTarget = message }) else null,
+                                        onDelete = if (message.sentByUs && !message.redacted && message.msgid != null && connected && network?.messageDeletionAvailable == true) ({ onDelete(message.msgid) }) else null,
+                                        canToggleReaction = !message.redacted && message.msgid != null && connected && network?.reactionsAvailable == true,
+                                    ),
                                 )
                             }
                         }
@@ -852,7 +884,7 @@ public fun ConversationScreen(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                    NickAvatar(nick = target.sender, size = 36.dp)
+                    if (appearance.showAvatars) NickAvatar(nick = target.sender, size = 36.dp)
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = target.relayedSender?.let { "$it · via ${target.relaySource}" } ?: target.sender.ifEmpty { "Message" },
@@ -895,7 +927,8 @@ public fun ConversationScreen(
                             QUICK_REACTIONS.forEach { emoji ->
                                 Box(
                                     modifier = Modifier
-                                        .size(38.dp)
+                                        .size(48.dp)
+                                        .semantics { contentDescription = "React with ${dev.brentdevs.yardhal.ui.components.emojiAccessibilityLabel(emoji)}" }
                                         .clip(CircleShape)
                                         .clickable {
                                             target.msgid?.let { msgid -> onReact(msgid, emoji) }
@@ -983,7 +1016,7 @@ public fun ConversationScreen(
                         Text("Open link", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
                     }
                 }
-                if (target.sentByUs && target.msgid != null) {
+                if (target.sentByUs && !target.redacted && target.msgid != null && connected && network?.messageDeletionAvailable == true) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1122,12 +1155,14 @@ public fun ConversationScreen(
                                 style = MaterialTheme.typography.labelSmall,
                                 modifier = Modifier.padding(end = 8.dp),
                             )
-                            NickAvatar(
-                                nick = member.nick,
-                                size = 28.dp,
-                                avatarUrl = memberProfile?.avatarUrl,
-                                modifier = Modifier.padding(end = 8.dp),
-                            )
+                            if (appearance.showAvatars) {
+                                NickAvatar(
+                                    nick = member.nick,
+                                    size = 28.dp,
+                                    avatarUrl = memberProfile?.avatarUrl,
+                                    modifier = Modifier.padding(end = 8.dp),
+                                )
+                            }
                             if (member.symbol != null) {
                                 Text(
                                     text = member.symbol.toString(),
@@ -1195,15 +1230,22 @@ public fun ConversationScreen(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
-                    Box {
-                        NickAvatar(
-                            nick = nick,
-                            size = 54.dp,
-                            avatarUrl = memberProfile?.avatarUrl,
-                        )
+                    if (appearance.showAvatars) {
+                        Box {
+                            NickAvatar(
+                                nick = nick,
+                                size = 54.dp,
+                                avatarUrl = memberProfile?.avatarUrl,
+                            )
+                            StatusDot(
+                                status = if (staleRoster) ConnectionStatus.DISCONNECTED else if (away) ConnectionStatus.CONNECTING else ConnectionStatus.REGISTERED,
+                                modifier = Modifier.align(Alignment.BottomEnd),
+                                size = 14.dp,
+                            )
+                        }
+                    } else {
                         StatusDot(
                             status = if (staleRoster) ConnectionStatus.DISCONNECTED else if (away) ConnectionStatus.CONNECTING else ConnectionStatus.REGISTERED,
-                            modifier = Modifier.align(Alignment.BottomEnd),
                             size = 14.dp,
                         )
                     }
@@ -1380,7 +1422,12 @@ private fun CollapsedEventsRow(
             autoExpandedTarget = true
         }
     }
-    val fontFamily = if (appearance.monospaceFont) androidx.compose.ui.text.font.FontFamily.Monospace else null
+    val fontFamily = when (appearance.font) {
+        dev.brentdevs.yardhal.core.data.MessageFont.SYSTEM -> null
+        dev.brentdevs.yardhal.core.data.MessageFont.SANS -> androidx.compose.ui.text.font.FontFamily.SansSerif
+        dev.brentdevs.yardhal.core.data.MessageFont.SERIF -> androidx.compose.ui.text.font.FontFamily.Serif
+        dev.brentdevs.yardhal.core.data.MessageFont.MONOSPACE -> androidx.compose.ui.text.font.FontFamily.Monospace
+    }
     val baseStyle = MaterialTheme.typography.bodySmall.copy(
         fontSize = MaterialTheme.typography.bodySmall.fontSize * appearance.textScale,
         fontFamily = fontFamily,
@@ -1468,7 +1515,7 @@ internal sealed interface OverviewEntry {
         public val networkName: String,
     ) : OverviewEntry
 
-    public data class SectionHeader(public val label: String) : OverviewEntry
+    public data class SectionHeader(public val label: String, public val id: String = label) : OverviewEntry
 
     public data class BufferRow(
         public val buffer: ConversationBuffer,
@@ -1487,10 +1534,13 @@ internal fun buildOverviewEntries(
     collapsedNetworkIds: Set<String>,
 ): List<OverviewEntry> {
     val entries = ArrayList<OverviewEntry>()
-    val comparison = compareByDescending<ConversationBuffer> { it.hasUnread }
-        .thenBy { it.ref.kind != dev.brentdevs.yardhal.core.data.ConversationKind.CHANNEL }
-        .thenBy { it.displayName.lowercase() }
-    for (network in networks.sortedBy { it.name.lowercase() }) {
+    val channelRanks = order.channelOrder.withIndex().associate { it.value to it.index }
+    val networkRanks = order.networkOrder.withIndex().associate { it.value to it.index }
+    val manualComparison = compareBy<ConversationBuffer> { channelRanks[it.key] ?: Int.MAX_VALUE }
+        .thenBy { it.displayName.lowercase(java.util.Locale.ROOT) }.thenBy { it.key }
+    val comparison = if (order.sortUnreadFirst) compareByDescending<ConversationBuffer> { it.hasUnread }.then(manualComparison) else manualComparison
+    for (network in networks.sortedWith(compareBy<dev.brentdevs.yardhal.coordinator.UiNetwork> { networkRanks[it.id] ?: Int.MAX_VALUE }
+        .thenBy { it.name.lowercase(java.util.Locale.ROOT) }.thenBy { it.id })) {
         val own = buffers.filter {
             it.ref.networkId == network.id && it.ref.kind != dev.brentdevs.yardhal.core.data.ConversationKind.SERVER
         }
@@ -1529,20 +1579,21 @@ internal fun buildOverviewEntries(
                 inGroup = order.groupOf(buffer.key) != null,
             )
 
+        val ownByKey = own.associateBy { it.key }
         val displayedKeys = HashSet<String>()
-        val pinnedBuffers = order.pinnedKeys.mapNotNull { key -> own.firstOrNull { it.key == key } }
+        val pinnedBuffers = order.pinnedKeys.mapNotNull(ownByKey::get)
             .filter { displayedKeys.add(it.key) }
         if (pinnedBuffers.isNotEmpty()) {
             entries.add(OverviewEntry.SectionHeader("Pinned"))
             pinnedBuffers.forEach { entries.add(rowFor(it)) }
         }
 
-        for (groupId in order.groupOrder) {
+        for (groupId in (order.groupOrder + order.groups.map { it.id }).distinct()) {
             val group = order.groups.firstOrNull { it.id == groupId } ?: continue
-            val members = group.memberKeys.mapNotNull { key -> own.firstOrNull { it.key == key } }
+            val members = group.memberKeys.mapNotNull(ownByKey::get)
                 .filter { displayedKeys.add(it.key) }
             if (members.isEmpty()) continue
-            entries.add(OverviewEntry.SectionHeader(group.name))
+            entries.add(OverviewEntry.SectionHeader(group.name, "group-${group.id}"))
             members.forEach { entries.add(rowFor(it)) }
         }
 
@@ -1584,9 +1635,15 @@ public fun NetworkOverviewScreen(
     onJoinFromList: (String, String) -> Boolean,
     rawLogVersion: Int,
     rawLogProvider: (String) -> List<dev.brentdevs.yardhal.coordinator.LiveCoordinator.RawFrame>,
+    onReorder: (dev.brentdevs.yardhal.core.data.OrderMove) -> Boolean,
+    onSetUnreadSorting: (Boolean) -> Boolean,
+    appearance: ChatAppearancePreferences = ChatAppearancePreferences(),
     showBouncerButton: Boolean = false,
     onOpenBouncer: () -> Unit = {},
     onOpenAppearance: () -> Unit = {},
+    onOpenCatchUp: () -> Unit,
+    onOpenBugReport: () -> Unit,
+    onOpenNotifications: () -> Unit,
     onMarkRead: (String) -> Unit = {},
     onToggleMute: (String) -> Unit = {},
     onLeave: (String) -> Unit = {},
@@ -1609,9 +1666,22 @@ public fun NetworkOverviewScreen(
     var pendingLeave by remember { mutableStateOf<ConversationBuffer?>(null) }
     var moveTarget by remember { mutableStateOf<String?>(null) }
     var newGroupName by remember { mutableStateOf("") }
+    var orderingVisible by remember { mutableStateOf(false) }
 
     val entries = remember(networks, buffers, mutedKeys, orderState, collapsedNetworkIds) {
         buildOverviewEntries(networks, buffers, mutedKeys, orderState, collapsedNetworkIds)
+    }
+    if (orderingVisible) {
+        val expandedEntries = remember(networks, buffers, mutedKeys, orderState) {
+            buildOverviewEntries(networks, buffers, mutedKeys, orderState, emptySet())
+        }
+        OrderingSheet(
+            sections = orderingSections(expandedEntries, orderState),
+            sortUnreadFirst = orderState.sortUnreadFirst,
+            onReorder = onReorder,
+            onSetUnreadSorting = onSetUnreadSorting,
+            onDismiss = { orderingVisible = false },
+        )
     }
 
     if (debugVisible) {
@@ -1721,6 +1791,10 @@ public fun NetworkOverviewScreen(
                                     appMenuVisible = false
                                     onAddNetwork()
                                 })
+                                DropdownMenuItem(text = { Text("Reorder networks and conversations") }, onClick = {
+                                    appMenuVisible = false
+                                    orderingVisible = true
+                                })
                                 if (showBouncerButton) {
                                     DropdownMenuItem(text = { Text("Bouncer networks") }, onClick = {
                                         appMenuVisible = false
@@ -1730,6 +1804,18 @@ public fun NetworkOverviewScreen(
                                 DropdownMenuItem(text = { Text("Chat appearance") }, onClick = {
                                     appMenuVisible = false
                                     onOpenAppearance()
+                                })
+                                DropdownMenuItem(text = { Text("Catch Up") }, onClick = {
+                                    appMenuVisible = false
+                                    onOpenCatchUp()
+                                })
+                                DropdownMenuItem(text = { Text("Notifications") }, onClick = {
+                                    appMenuVisible = false
+                                    onOpenNotifications()
+                                })
+                                DropdownMenuItem(text = { Text("Bug report") }, onClick = {
+                                    appMenuVisible = false
+                                    onOpenBugReport()
                                 })
                             }
                         }
@@ -1756,7 +1842,7 @@ public fun NetworkOverviewScreen(
                 when (val entry = entries[index]) {
                     is OverviewEntry.NetworkHeader -> "net-${entry.network.id}"
                     is OverviewEntry.ServerRow -> "server-${entry.networkId}"
-                    is OverviewEntry.SectionHeader -> "section-${entry.label}-$index"
+                    is OverviewEntry.SectionHeader -> "section-${entry.id}-$index"
                     is OverviewEntry.BufferRow -> "buf-${entry.buffer.key}"
                 }
             }) { index ->
@@ -1785,9 +1871,7 @@ public fun NetworkOverviewScreen(
                                 )
                             }
                             if (entry.isCollapsed && entry.hasUnread) {
-                                val unreadLabel = if (entry.unreadCount > 99) "99+" else if (entry.unreadCount > 0) "${entry.unreadCount}" else "•"
-                                val mentionLabel = mentionBadgeLabel(entry.mentionCount, entry.mentionCountKnown)
-                                val netBadgeText = if (mentionLabel == null) unreadLabel else "$unreadLabel · $mentionLabel"
+                                val netBadgeText = overviewBadgeLabel(entry.unreadCount, entry.mentionCount, entry.mentionCountKnown, appearance.showUnreadCounts)
                                 Badge(
                                     containerColor = if (entry.mentionCount > 0) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
                                     contentColor = if (entry.mentionCount > 0) MaterialTheme.colorScheme.onError else MaterialTheme.colorScheme.onPrimary,
@@ -1971,7 +2055,7 @@ public fun NetworkOverviewScreen(
                                             )
                                         }
                                     }
-                                } else {
+                                } else if (appearance.showAvatars) {
                                     NickAvatar(
                                         nick = buffer.displayName,
                                         size = 32.dp,
@@ -2029,9 +2113,7 @@ public fun NetworkOverviewScreen(
                                 }
                                 if (buffer.hasUnread) {
                                     Spacer(modifier = Modifier.width(8.dp))
-                                    val unreadLabel = if (unreadCount > 99) "99+" else if (unreadCount > 0) "$unreadCount" else "•"
-                                    val mentionLabel = mentionBadgeLabel(mentionCount, buffer.mentionCountKnown)
-                                    val badgeText = if (mentionLabel == null) unreadLabel else "$unreadLabel · $mentionLabel"
+                                    val badgeText = overviewBadgeLabel(unreadCount, mentionCount, buffer.mentionCountKnown, appearance.showUnreadCounts)
                                     if (hasMention) {
                                         Badge(
                                             containerColor = MaterialTheme.colorScheme.error,

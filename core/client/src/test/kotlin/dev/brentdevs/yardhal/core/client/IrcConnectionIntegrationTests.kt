@@ -92,6 +92,131 @@ class IrcConnectionIntegrationTests {
         connectTimeoutMillis = 3_000,
     )
 
+    @org.junit.jupiter.api.Test
+    fun inboundBudgetsPreserveMaximumFrameAndNeverDispatchPartialMessagesOrPings() = runBlocking {
+        LoopbackIrcServer().use { server ->
+            server.lineListener = { line ->
+                when {
+                    line.startsWith("USER ") -> server.sendLine(":srv 001 yardhal-test :Welcome")
+                    line == "PONG :framing-recovery" -> server.sendLine(":srv NOTICE yardhal-test :framing-barrier")
+                }
+            }
+            server.start()
+            val scope = newScope()
+            val tapped = java.util.concurrent.CopyOnWriteArrayList<String>()
+            val connection = IrcConnection(
+                plainConfig("127.0.0.1", server.port),
+                rawTap = { outbound, line -> if (!outbound) tapped.add(line) },
+            )
+            try {
+                val collector = EventCollector(scope, connection.events)
+                connection.start()
+                collector.awaitRegistered()
+                assertEquals(1, collector.awaitInstance<IrcEvent.MessageReceived>().message.numeric)
+                tapped.clear()
+                val tags = "@server=" + "s".repeat(4087) + ";+client=" + "c".repeat(4086) + " "
+                val prefix = ":sender!u@h PRIVMSG #a :"
+                val body = "b".repeat(510 - prefix.toByteArray().size)
+                val legal = tags + prefix + body
+                assertEquals(8703, "$legal\r\n".toByteArray().size)
+                server.sendLine(legal)
+                server.sendLine(prefix + body + "x")
+                server.sendLine("@t=x " + prefix + body + "x")
+                server.sendLine(tags.dropLast(1) + "x TAGMSG #a")
+                server.sendLine("@t=missing-separator")
+                server.sendLine("PING :" + "p".repeat(511 - "PING :".length))
+                server.sendLine("PING :framing-recovery")
+                val received = mutableListOf<dev.brentdevs.yardhal.core.protocol.IrcMessage>()
+                val rejected = mutableListOf<LineRejection>()
+                while (true) {
+                    when (val event = collector.await()) {
+                        is IrcEvent.FrameRejected -> rejected += event.reason
+                        is IrcEvent.MessageReceived -> {
+                            received += event.message
+                            if (event.message.command == "NOTICE" && event.message.parameters.lastOrNull() == "framing-barrier") break
+                        }
+                        is IrcEvent.Disconnected -> error("Disconnected before recovery: ${event.cause}")
+                        else -> Unit
+                    }
+                }
+                assertEquals(listOf("PRIVMSG", "PING", "NOTICE"), received.map { it.command })
+                val message = received.first()
+                assertEquals("sender", message.prefix?.nick)
+                assertEquals(listOf("#a", body), message.parameters)
+                assertEquals(mapOf("server" to "s".repeat(4087), "+client" to "c".repeat(4086)), message.tags)
+                assertEquals(listOf(
+                    LineRejection.BASE_TOO_LONG,
+                    LineRejection.BASE_TOO_LONG,
+                    LineRejection.TAGS_TOO_LONG,
+                    LineRejection.MISSING_TAG_SEPARATOR,
+                    LineRejection.BASE_TOO_LONG,
+                ), rejected)
+                assertEquals(listOf(legal, "PING :framing-recovery", ":srv NOTICE yardhal-test :framing-barrier"), tapped.toList())
+                assertEquals(listOf("PONG :framing-recovery"), server.receivedLines.filter { it.startsWith("PONG ") })
+            } finally {
+                connection.disconnect()
+                scope.cancel()
+            }
+        }
+        Unit
+    }
+
+    @org.junit.jupiter.api.Test
+    fun fragmentedHugeTaggedFramesRecoverAndOversizedEofRemainderNeverDispatches() = runBlocking {
+        LoopbackIrcServer().use { server ->
+            server.lineListener = { line ->
+                if (line.startsWith("USER ")) server.sendLine(":srv 001 yardhal-test :Welcome")
+            }
+            server.start()
+            val scope = newScope()
+            val tapped = java.util.concurrent.CopyOnWriteArrayList<String>()
+            val connection = IrcConnection(
+                plainConfig("127.0.0.1", server.port),
+                rawTap = { outbound, line -> if (!outbound) tapped.add(line) },
+            )
+            try {
+                val collector = EventCollector(scope, connection.events)
+                connection.start()
+                collector.awaitRegistered()
+                assertEquals(1, collector.awaitInstance<IrcEvent.MessageReceived>().message.numeric)
+                tapped.clear()
+                val fragment = ByteArray(4096) { 'x'.code.toByte() }
+                server.sendBytes("@t=x :sender!u@h PRIVMSG #a :".toByteArray())
+                repeat(512) { server.sendBytes(fragment) }
+                server.sendBytes("\r".toByteArray())
+                server.sendBytes("\n".toByteArray())
+                server.sendLine(":srv NOTICE yardhal-test :framing-recovered")
+                val received = mutableListOf<dev.brentdevs.yardhal.core.protocol.IrcMessage>()
+                val rejected = mutableListOf<LineRejection>()
+                while (true) {
+                    when (val event = collector.await()) {
+                        is IrcEvent.FrameRejected -> rejected += event.reason
+                        is IrcEvent.MessageReceived -> {
+                            received += event.message
+                            if (event.message.parameters.lastOrNull() == "framing-recovered") break
+                        }
+                        is IrcEvent.Disconnected -> error("Disconnected before recovery: ${event.cause}")
+                        else -> Unit
+                    }
+                }
+                assertEquals(listOf("NOTICE"), received.map { it.command })
+                assertEquals(listOf(LineRejection.BASE_TOO_LONG), rejected)
+                server.sendBytes("@t=".toByteArray())
+                repeat(512) { server.sendBytes(fragment) }
+                server.finishSending()
+                val terminal = collector.drainUntilDisconnected()
+                assertTrue(terminal.none { it is IrcEvent.MessageReceived })
+                assertEquals(listOf(LineRejection.TAGS_TOO_LONG), terminal.filterIsInstance<IrcEvent.FrameRejected>().map { it.reason })
+                assertEquals(listOf(":srv NOTICE yardhal-test :framing-recovered"), tapped.toList())
+                assertTrue(server.receivedLines.none { it.startsWith("PONG ") })
+            } finally {
+                connection.disconnect()
+                scope.cancel()
+            }
+        }
+        Unit
+    }
+
     @kotlinx.coroutines.DelicateCoroutinesApi
     @org.junit.jupiter.api.Test
     fun registersWithoutCapabilities() = runBlocking {

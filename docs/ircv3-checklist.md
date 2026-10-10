@@ -6,9 +6,9 @@ Phase numbers refer to `docs/architecture.md`.
 
 ## Baseline
 
-- [x] Modern IRC baseline: message grammar, numerics, ISUPPORT/CASEMAPPING handling (P1)
+- [x] Modern IRC baseline: message grammar, numerics, ISUPPORT/CASEMAPPING handling; independent inbound 512-byte base wire budget (including CRLF/prefix), whole-frame rejection and recovery (P1; parity phase 6)
 - [x] capability-negotiation 302: CAP LS 302, REQ/ACK, CAP NEW/DEL at runtime (P2)
-- [x] message-tags: parse/escape tags, enlarged limits, request cap; 417 surfaced as an error (P1/P2)
+- [x] message-tags: parse/escape tags, request cap; inbound tag section up to 8,191 bytes including `@` and separating space, independent of 510-byte base content (8,701 framed-content/8,703 wire bytes combined); neither section borrows unused budget, oversized frames never dispatch truncated commands; 417 surfaced as an error (P1/P2; parity phase 6)
 - [x] Client-only tags / CLIENTTAGDENY: require negotiated message-tags; honor exact deny names and leading `*` with exact negative exceptions; unavailable dependencies disable wire actions or fall back to portable quote/plain URL (parity phase 5)
 - [x] server-time: use time tag as authoritative timestamp, especially in playback (P5)
 
@@ -107,6 +107,39 @@ exact-nick per-network relay presentation do not imply server or identity suppor
 See [media and composition parity](architecture.md#media-and-composition-parity)
 for exact bounds, format policies, settings paths and privacy/provider limits.
 
+## Settings and polish parity (phase 6)
+
+These are application features, not new negotiated capabilities. Roadmap phase
+numbers above are not parity issue numbers. See
+[settings and polish parity](architecture.md#settings-and-polish-parity) for
+ownership, durable identity, exact bounds and native evidence limits.
+
+- [x] Permission-aware channel modes/parameters/topic and structured b/e/I lists:
+  negotiated support and live rank/+t guards, correlated confirmation/refusal,
+  six-second timeout, bounded partial-list outcomes and reconnect quarantine.
+- [x] Non-AI retained Activity/Links Catch Up: 200-row pages, 2,000-candidate
+  bounded view, filters/grouping/canonical link sources, exact stored-row jumps,
+  separate explicit read/dismiss/restore and honest retained/gap/pruning coverage.
+  Existing remote reads remain timestamp-granular, including timestamp ties.
+- [x] Durable theme library: TOML import/editor/duplicate/delete/SAF export,
+  portable versioned share-link review/intake, light/dark variants and conversation
+  accents. Failed saves preserve drafts and last published state, not a universal
+  filesystem rollback guarantee.
+- [x] Durable appearance: timestamp format/style/position, fonts, nickname
+  suggestion ordering, avatars/unread counts and existing size/compact controls.
+- [x] Network/group/conversation order: long-press handles, move menus and named
+  accessible moves, alternate unread-first, preserved pins/groups/stable soju IDs.
+- [x] Per-kind mention/DM/invite enabled/sound/priority and preview/avatar choices:
+  structured eligibility, immutable Android channels, cache-only avatars/private
+  lock-screen presentation, exact tap destinations and confirmation-only invites.
+- [x] Structured bug-report preview/copy/share: bounded aliased automatic context
+  and command/parameter counts, no raw traffic/identifiers/vault; known-secret and
+  best-effort prose redaction, not guaranteed removal of all PII.
+- [x] Dedicated message accessibility summaries, permission-aware named actions,
+  descriptive emoji/media controls and accessible reorder/moderation.
+- [ ] Optional AI Catch Up digest and widgets remain deferred; the retained
+  non-AI Catch Up above is shipped.
+
 ## Coverage audit
 
 Test classes below live in their feature module's `src/test`; coordinator
@@ -180,6 +213,17 @@ Ergo and runs all real-server tests without skips.
 | Relay/emoji presentation (parity phase 5) | `RelayParserTests.ordinarySenderCannotMasqueradeAsConfiguredRelay`; `RelayParserTests.formatsRequireExactBoundariesAndRetainWireSource`; `EmojiCatalogTests.pickerFiltersUnsupportedDeviceGlyphsInsteadOfShowingBrokenChoices`; `EmojiCatalogTests.categoryTransitionsKeepMultiCodepointEmojiAndSearchableNamesIntact` |
 | Phase 5 review upload/staging boundaries | `FilehostUploaderTests`; `UploadHttpsAuthenticationTests`; `UploadSettingsStoreTests`; `AttachmentStageManagerTests`; `AttachmentSanitizerTests` |
 | Phase 5 review state and lifecycle boundaries | `PortableInteractionsTests`; `PerNetworkStateTests`; `InteractionPreferencesTests`; `MediaPreferencesStoreTests`; `MediaCacheLifecycleTests`; `RemoteVideoOwnershipTests`; `MediaEnvironmentTests`; `AvatarViewportTests` |
+| Inbound independent wire budgets (parity phase 6) | `LineFramerTests.maximumTagsAndBaseMessageSurviveIntact`; `LineFramerTests.taggedBaseCannotBorrowUnusedTagBudget`; `LineFramerTests.fragmentedHugeInputRejectsOnceAndRecoversWithoutRetainingPartialCommands`; `IrcConnectionIntegrationTests.inboundBudgetsPreserveMaximumFrameAndNeverDispatchPartialMessagesOrPings`; `IrcConnectionIntegrationTests.fragmentedHugeTaggedFramesRecoverAndOversizedEofRemainderNeverDispatches` |
+| Channel settings confirmation/permission/list bounds (parity phase 6) | `ChannelSettingsCoordinatorTests.realModeAndTopicConfirmationsDoNotOptimisticallyPublishAndRefusalsPreserveServerValues`; `ChannelSettingsCoordinatorTests.normalizedAccessMasksConfirmAndRemoveWithoutRelaxingChannelKeyMatching`; `ChannelSettingsCoordinatorTests.liveOwnRoleAndTopicLockTransitionsGateControllerAndValidationNeverEmitsInvalidCommands`; `ChannelSettingsCoordinatorTests.partialUnlabelledListTimesOutAndLateTerminationCannotBecomeCompleteOrContaminateRetry`; `ChannelSettingsCoordinatorTests.labelledNumericModeSnapshotConfirmsOnlyItsRequestAndListCaptureIsBounded` |
+| Access-list epoch/membership freshness | `ChannelSettingsCoordinatorTests.automaticReconnectDiscardsCompletedListsAndRequiresFreshRoleBeforeEditsAndRefetch`; `ChannelSettingsCoordinatorTests.partAndKickInvalidateCompletedEmptyAndPartialListsBeforeRejoin`; `ChannelSettingsCoordinatorTests.firstOpenAfterKickAndRejoinLeavesUnknownListCountsToServerInsteadOfCachedModes` |
+| Retained Catch Up (parity phase 6) | `CatchUpTests.durableQueriesPageEveryTieAndIncludeRecentReactionsOnOldParents`; `CatchUpTests.linkDedupKeepsEveryExactSourceAndDoesNotEraseMeaningfulUrlDifferences`; `CatchUpTests.coverageReportsActualQueryBoundsNotFilteredResultsOrServerCompleteness`; `CatchUpTests.dismissalsSurviveRestartAndNewReactionActivityCanReappear`; `CatchUpTests.exactActionsFollowRowPreservingRenameAndRefuseRedactedAndPrunedAnchors`; `CatchUpTests.boundedViewStopsWithExplicitRemainingCoverageRatherThanClaimingAllRetainedHistory`; `CatchUpTests.explicitReadAdvancesOnlyTheChosenTimestampTieAndPersistsWithoutJump` (local cursor fixture, not universal remote precision) |
+| Durable themes and untrusted portability (parity phase 6) | `ThemeLibraryStoreTests.editedImportedThemeSelectionVariantsAndConversationAccentSurviveRelaunch`; `ThemeLibraryStoreTests.failedEditorSaveRetainsExactDraftPublishedLibraryAndPersistedBytesThenCanRetry`; `ThemeLibraryStoreTests.accentsFollowConversationRenamesPreserveDestinationAndAreRemovedWithNetwork`; `ThemeFileParserTests.fileAndPortableLinkRoundTripBothVariantsExactly`; `ThemeFileParserTests.portableLinkRejectsDuplicateFieldsAndInvalidUtf8` |
+| Appearance migration/transactions (parity phase 6) | `ChatAppearanceStoreTests.legacyMonospaceIsMigratedOnDiskWithoutLosingExistingAppearance`; `ChatAppearanceStoreTests.fullAppearanceSurvivesRelaunchAndTransformsPreserveUnchangedFields`; `ChatAppearanceStoreTests.failedMigrationLeavesLegacyFileReadableAndLaterUpdateCompletesCleanCutover`; `ChatAppearanceStoreTests.overlappingTransformsApplyToCurrentStateWithoutLostFields` |
+| Ordering identity and durable moves (parity phase 6) | `ChannelOrderStoreTests.manualNetworkChannelAndGroupMovesSurviveRestartWithoutChangingMembership`; `ChannelOrderStoreTests.invalidCrossSectionAndCrossNetworkMovesCannotLoseGroupOrPinMetadata`; `ChannelOrderStoreTests.sojuNetworkOrderingUsesDerivedIdentityAcrossDiscoveryRenameAndRestart`; `ChannelOrderStoreTests.reorderingVisibleSubsetRetainsUnavailableConversationSlots` |
+| Notification eligibility/channels/routes (parity phase 6) | `NotificationPolicyTests.suppressionPrecedenceIsDeterministicAndEverySafetyGateCanBlockIndependently`; `NotificationsTests.changingSoundOrPrioritySelectsNewImmutableChannelsAndPreservesForegroundChannel`; `NotificationsTests.existingUserBlockedChannelIsNotRecreatedToBypassAndroidChoice`; `NotificationsTests.distinctImmutablePendingIntentsKeepExactConversationInviteNetworkAndMessageIdentity`; `NotificationsTests.routeInboxRetainsColdLaunchUntilExplicitConsumptionAndDoesNotAutojoinInvites`; `NotificationCoordinatorIntegrationTests.liveWireEventsApplyNotificationPolicyAndKeepInvitationRoutesDistinctWithoutAutojoin`; `NotificationPreferencesStoreTests.perKindAndPresentationChoicesSurviveRestartIndependently` |
+| Cached sender avatar provenance/privacy | `NotificationCoordinatorIntegrationTests.cachedSenderRenditionsReachNativeNotificationsWithoutFetchingUnknownAvatars`; `MediaCacheLifecycleTests.avatarRenditionsRetainTemplateIdentityInUiAndDisappearOnLruEvictionAndClear` |
+| Report privacy/bounds (parity phase 6) | `BugReportTests.descriptionRetainsReproductionContextButRemovesCredentialsAndPrivateUrls`; `BugReportTests.reportActivityNeverIncludesTagsNamesArgumentsOrUnknownCommands`; `BugReportTests.descriptionLimitDoesNotSplitSupplementaryCharactersOrPreserveControlInjection` |
+| Accessibility summaries and action guards (parity phase 6) | `MessageAccessibilityTests.summaryPreservesRelayQuoteAttachmentAndUnconfirmedContextWithoutIrcControls`; `MessageAccessibilityTests.redactionNeverAnnouncesRetainedPrivateBodyQuoteLinksOrReactionHistory`; `MessageAccessibilityTests.absentPermissionsExposeNoActionsAndIdentifiersAloneDoNotAuthorizeEffects`; `MessageAccessibilityTests.idlessAndPendingMessagesCannotExposeRemoteReactionOrDeletion`; `MessageAccessibilityTests.allMessageKindsAreDistinguishableIncludingHistoryAndLocalReplyContext` |
 
 Emulator smoke (`make play`) exercises rendered network icons, avatars,
 display names, verified-account/away/bot member rows, account-ban wire syntax,
@@ -302,3 +346,23 @@ without conflating ASCII-distinct brackets. See
 byte counts and the deliberate browser-like HTTPS/private-address and
 headers-only probe posture. Controlled review fixtures do not add interoperability
 claims for Ergo, soju or ZNC.
+
+Parity phase 6 passed the full `make check` gate: debug build, Android lint and unit tests.
+Native Android/Ergo evidence covers actual mode/topic/list confirmations and
+482 rejection preserving drafts, retained Catch Up beyond loaded transcript,
+durable theme/appearance/order relaunch, posted per-kind notification channels,
+real taps and suppression, and redacted clipboard/ACTION_SEND report payloads.
+Installed TalkBack 15 with actual kernel hardware inputs exercised named Reply,
+Copy, Choose reaction, Open link, Delete, reorder and moderation; the reaction
+produced actual wire TAGMSG. Delete received real REDACT_FORBIDDEN and left the
+message intact, not successful native deletion. Notification recreation used
+Don't keep activities; a separate actual process-death tap launched a new PID
+and restored the DM destination/body. Configured sound is not a physical-audibility
+claim. Historical replay after relaunch did not create alerts.
+Further native checks verified notification navigation out of the network
+editor, `&` confirmation eligibility, disconnected joined counts, and unfetched
+access lists after automatic socket recovery followed by authoritative changed
+Ergo masks. Cached-photo/uncached-initials alerts used a controlled metadata
+extension bridge around real Ergo traffic, not an Ergo metadata-2 capability
+claim; the cached 100px rendition was used without requiring 96px.
+Pinned Halyard source links returned 404; source-level mirroring remains unverified.

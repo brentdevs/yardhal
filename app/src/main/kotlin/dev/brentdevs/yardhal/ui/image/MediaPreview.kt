@@ -31,6 +31,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import dev.brentdevs.yardhal.core.data.MediaPreferencesStore
@@ -53,7 +56,13 @@ private sealed interface PreviewState {
 
 @OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
-public fun MediaPreview(descriptor: MediaDescriptor, mediaIdentity: String?, visible: Boolean, onOpen: () -> Unit) {
+public fun MediaPreview(
+    descriptor: MediaDescriptor,
+    mediaIdentity: String?,
+    visible: Boolean,
+    onOpen: (() -> Unit)?,
+    metadataInMessageSummary: Boolean = false,
+) {
     val environment = LocalMediaEnvironment.current
     val loader = environment?.loader ?: LocalRemoteImageLoader.current
     val preferences by (environment?.preferences?.preferences ?: DefaultMediaSignals.preferences).collectAsState()
@@ -140,15 +149,16 @@ public fun MediaPreview(descriptor: MediaDescriptor, mediaIdentity: String?, vis
     }
     val displayName = MediaPolicy.displayName(discovered)
     val host = runCatching { URI(descriptor.url).host }.getOrNull().orEmpty()
+    val metadataModifier = if (metadataInMessageSummary) Modifier.clearAndSetSemantics {} else Modifier
     Surface(shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.padding(vertical = 4.dp).fillMaxWidth()) {
         Column(modifier = Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text(displayName, style = MaterialTheme.typography.labelMedium)
+            Text(displayName, style = MaterialTheme.typography.labelMedium, modifier = metadataModifier)
             Text(listOfNotNull(discovered.mimeType ?: when (discovered.kind) {
                 MediaKind.IMAGE -> "Image"
                 MediaKind.VIDEO -> "Video · explicit playback only"
                 MediaKind.FILE -> "File"
                 MediaKind.UNKNOWN -> "Link · image type not yet checked"
-            }, discovered.sizeBytes?.let(::formatMediaSize), host.takeIf { it.isNotEmpty() }).joinToString(" · "), style = MaterialTheme.typography.bodySmall)
+            }, discovered.sizeBytes?.let(::formatMediaSize), host.takeIf { it.isNotEmpty() }).joinToString(" · "), style = MaterialTheme.typography.bodySmall, modifier = metadataModifier)
             when (val preview = state) {
                 is PreviewState.Image -> InlineImage(preview.drawable, displayName, animate, onOpen)
                 is PreviewState.Video -> InlineVideo(preview.video, displayName, onStop = { playRequested = false }, onError = {
@@ -156,7 +166,7 @@ public fun MediaPreview(descriptor: MediaDescriptor, mediaIdentity: String?, vis
                     error = "Video format could not be played. Open externally or try again."
                 })
                 PreviewState.Loading -> Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                    CircularProgressIndicator(modifier = Modifier.size(20.dp).clearAndSetSemantics {}, strokeWidth = 2.dp)
                     Text(if (wantsVideo) "Downloading bounded video…" else "Loading image preview…", style = MaterialTheme.typography.bodySmall)
                 }
                 PreviewState.Unavailable -> Text(if (!online) "Offline · preview will retry when connected" else "Preview unavailable · unsupported content or safety limit", style = MaterialTheme.typography.bodySmall)
@@ -165,49 +175,61 @@ public fun MediaPreview(descriptor: MediaDescriptor, mediaIdentity: String?, vis
             if (discovered.kind == MediaKind.VIDEO && !preferences.enableVideos) Text("Video playback is disabled in media settings.", style = MaterialTheme.typography.bodySmall)
             FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 if (discovered.kind == MediaKind.IMAGE || discovered.kind == MediaKind.UNKNOWN) {
-                    if (!eligible) TextButton(onClick = { setReveal(MediaRevealState.REVEALED) }) { Text(if (discovered.kind == MediaKind.UNKNOWN) "Check for image" else "Reveal image") }
-                    else TextButton(onClick = { setReveal(MediaRevealState.HIDDEN) }) { Text("Hide media") }
+                    if (!eligible) MediaActionButton(if (discovered.kind == MediaKind.UNKNOWN) "Check for image" else "Reveal image", displayName, onClick = { setReveal(MediaRevealState.REVEALED) })
+                    else MediaActionButton("Hide media", displayName, onClick = { setReveal(MediaRevealState.HIDDEN) })
                 }
                 if (descriptor.kind == MediaKind.UNKNOWN && discovered.kind == MediaKind.FILE) {
-                    TextButton(enabled = online && visible && active, onClick = {
+                    MediaActionButton("Recheck for image", displayName, enabled = online && visible && active, onClick = {
                         discovered = descriptor
                         setReveal(MediaRevealState.REVEALED)
                         loader?.retryFailures()
                         retry++
-                    }) { Text("Recheck for image") }
+                    })
                 }
                 if (discovered.kind == MediaKind.VIDEO && preferences.enableVideos && state !is PreviewState.Video) {
-                    TextButton(enabled = online && visible && active && state != PreviewState.Loading, onClick = {
+                    MediaActionButton(if (reveal == MediaRevealState.HIDDEN) "Reveal video" else "Play video", displayName, enabled = online && visible && active && state != PreviewState.Loading, onClick = {
                         if (reveal == MediaRevealState.HIDDEN) setReveal(MediaRevealState.REVEALED)
                         else {
                             if (reveal != MediaRevealState.REVEALED) setReveal(MediaRevealState.REVEALED)
                             playRequested = true
                         }
-                    }) { Text(if (reveal == MediaRevealState.HIDDEN) "Reveal video" else "Play video") }
+                    })
                 }
-                if (discovered.kind == MediaKind.VIDEO && reveal != MediaRevealState.HIDDEN) TextButton(onClick = { playRequested = false; setReveal(MediaRevealState.HIDDEN) }) { Text("Hide video") }
-                if (state == PreviewState.Unavailable && online && (eligible || wantsVideo)) TextButton(onClick = { loader?.retryFailures(); retry++ }) { Text("Retry preview") }
-                TextButton(onClick = onOpen) { Text("Open externally") }
+                if (discovered.kind == MediaKind.VIDEO && reveal != MediaRevealState.HIDDEN) MediaActionButton("Hide video", displayName, onClick = { playRequested = false; setReveal(MediaRevealState.HIDDEN) })
+                if (state == PreviewState.Unavailable && online && (eligible || wantsVideo)) MediaActionButton("Retry preview", displayName, onClick = { loader?.retryFailures(); retry++ })
+                if (onOpen != null) MediaActionButton("Open externally", displayName, onClick = onOpen)
             }
-            if (reveal != MediaRevealState.DEFAULT) TextButton(onClick = { setReveal(MediaRevealState.DEFAULT) }) { Text("Use global media setting") }
+            if (reveal != MediaRevealState.DEFAULT) MediaActionButton("Use global media setting", displayName, onClick = { setReveal(MediaRevealState.DEFAULT) })
             error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
         }
     }
 }
 
 @Composable
-private fun InlineImage(drawable: Drawable, description: String, animate: Boolean, onOpen: () -> Unit) {
+private fun MediaActionButton(label: String, description: String, enabled: Boolean = true, onClick: () -> Unit) {
+    TextButton(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = Modifier.semantics { contentDescription = "$label: $description" },
+    ) {
+        Text(label, modifier = Modifier.clearAndSetSemantics {})
+    }
+}
+
+@Composable
+private fun InlineImage(drawable: Drawable, description: String, animate: Boolean, onOpen: (() -> Unit)?) {
     DisposableEffect(drawable, animate) {
         val animated = drawable as? Animatable
         if (animate) animated?.start() else animated?.stop()
         onDispose { animated?.stop() }
     }
     AndroidView(factory = { context ->
-        ImageView(context).apply { scaleType = ImageView.ScaleType.FIT_CENTER; setOnClickListener { onOpen() } }
+        ImageView(context).apply { scaleType = ImageView.ScaleType.FIT_CENTER }
     }, update = { view ->
-        view.contentDescription = "Image preview: $description. Open externally"
+        view.contentDescription = "Image preview: $description${if (onOpen != null) ". Open externally" else ""}"
         view.setImageDrawable(drawable)
-        view.setOnClickListener { onOpen() }
+        view.setOnClickListener(if (onOpen != null) android.view.View.OnClickListener { onOpen() } else null)
+        view.isClickable = onOpen != null
     }, modifier = Modifier.fillMaxWidth().height(220.dp))
 }
 
@@ -226,5 +248,5 @@ private fun InlineVideo(video: RemoteVideo, description: String, onStop: () -> U
     }
     DisposableEffect(view) { onDispose { view.stopPlayback() } }
     AndroidView(factory = { view }, modifier = Modifier.fillMaxWidth().height(220.dp))
-    TextButton(onClick = onStop) { Text("Stop video") }
+    MediaActionButton("Stop video", description, onClick = onStop)
 }
