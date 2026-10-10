@@ -84,8 +84,8 @@ internal fun Reduction.emitChat(
             msgid = tags["msgid"],
             sentByUs = fromUs,
             highlightsMe = !fromUs && !playback && MentionMatcher.containsMessage(body, state.ownNick, state.casemapping),
-            replyToMsgid = tags["+draft/reply"],
-            attachmentUrl = tags["+draft/attachment"],
+            replyToMsgid = tags["+reply"] ?: tags["+draft/reply"],
+            attachmentUrl = tags["+attachment"] ?: tags["+draft/attachment"],
             playback = playback,
             reconcilePendingEcho = fromUs,
             echoLabel = correlation?.takeIf { fromUs && it.command == LabeledCommand.PRIVMSG }?.label,
@@ -101,10 +101,11 @@ internal fun Reduction.handleTagmsg(message: IrcMessage) {
     val targetParam = message.parameters.firstOrNull() ?: return
     val historical = playbackBatch(message.tag("batch"))?.parameters?.firstOrNull()?.let(state::targetRef)
     val ref = messageConversation(message.prefix, targetParam, historical)
-    val react = message.tag("+draft/react")
-    val unreact = message.tag("+draft/unreact")
+    val react = message.tag("+react") ?: message.tag("+draft/react")
+    val unreact = message.tag("+unreact") ?: message.tag("+draft/unreact")
     if (react != null || unreact != null) {
-        val refs = (message.tag("+draft/refs") ?: message.tag("+draft/msgids"))
+        val refs = (message.tag("+refs") ?: message.tag("+draft/refs") ?: message.tag("+draft/msgids")
+            ?: message.tag("+reply") ?: message.tag("+draft/reply"))
             ?.split(',')?.filter { it.isNotEmpty() }.orEmpty()
         if (refs.isEmpty()) return
         val emoji = react ?: unreact ?: return
@@ -112,7 +113,7 @@ internal fun Reduction.handleTagmsg(message: IrcMessage) {
         return
     }
     if (isPlayback(message)) return
-    val typing = message.tag("+typing") ?: return
+    val typing = message.tag("+typing") ?: message.tag("+draft/typing") ?: return
     val expiresAt = if (typing == "active") context.nowMs + TYPING_TTL_MS else null
     emit(InboundEffect.SetTyping(ref, sender, expiresAt))
 }

@@ -1,50 +1,36 @@
 package dev.brentdevs.yardhal.ui.components
 
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.AttachFile
-import androidx.compose.material.icons.filled.Image
-import androidx.compose.material.icons.automirrored.filled.OpenInNew
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.brentdevs.yardhal.coordinator.ChatMessage
 import dev.brentdevs.yardhal.coordinator.UserProfile
 import dev.brentdevs.yardhal.core.data.ChatAppearancePreferences
 import dev.brentdevs.yardhal.core.data.MessageKind
-import dev.brentdevs.yardhal.ui.image.LocalRemoteImageLoader
-import dev.brentdevs.yardhal.ui.image.RemoteImageState
-import dev.brentdevs.yardhal.ui.image.rememberRemoteImage
+import dev.brentdevs.yardhal.ui.image.MediaDescriptor
+import dev.brentdevs.yardhal.ui.image.MediaPolicy
+import dev.brentdevs.yardhal.ui.image.MediaPreview
 import dev.brentdevs.yardhal.ui.theme.nickColor
 import java.time.Instant
 import java.time.ZoneId
@@ -74,6 +60,8 @@ public fun MessageRow(
     onOpenUrl: (String) -> Unit = {},
     modifier: Modifier = Modifier,
     profile: UserProfile? = null,
+    mediaIdentity: String? = null,
+    mediaVisible: Boolean = true,
 ) {
     when (message.kind) {
         MessageKind.SYSTEM, MessageKind.JOIN, MessageKind.PART -> SystemLine(message, appearance, modifier)
@@ -92,6 +80,8 @@ public fun MessageRow(
             onOpenNick = onOpenNick,
             onOpenUrl = onOpenUrl,
             modifier = modifier,
+            mediaIdentity = mediaIdentity,
+            mediaVisible = mediaVisible,
         )
     }
 }
@@ -147,7 +137,13 @@ private fun ChatLine(
     onOpenNick: (String) -> Unit,
     onOpenUrl: (String) -> Unit,
     modifier: Modifier,
+    mediaIdentity: String?,
+    mediaVisible: Boolean,
 ) {
+    val sender = message.relayedSender ?: message.sender
+    val body = message.relayedBody ?: message.text
+    val trustedProfile = profile.takeIf { message.relayedSender == null }
+    val linkedMedia = remember(body, message.attachmentUrl) { MediaPolicy.linkedMedia(body, message.attachmentUrl) }
     HighlightedSurface(
         highlighted = message.highlightsMe || focused,
         modifier = modifier
@@ -170,7 +166,7 @@ private fun ChatLine(
             if (groupedWithPrevious) {
                 Spacer(modifier = Modifier.size(38.dp))
             } else {
-                NickAvatar(nick = message.sender, avatarUrl = profile?.avatarUrl)
+                NickAvatar(nick = sender, avatarUrl = trustedProfile?.avatarUrl, mediaVisible = mediaVisible)
             }
             Spacer(modifier = Modifier.width(10.dp))
             Column(modifier = Modifier.weight(1f)) {
@@ -179,23 +175,23 @@ private fun ChatLine(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        val displayName = profile?.displayName
+                        val displayName = trustedProfile?.displayName
                         Text(
-                            text = displayName ?: message.sender,
+                            text = displayName ?: sender,
                             style = MaterialTheme.typography.bodyMedium,
                             fontWeight = FontWeight.SemiBold,
-                            color = nickColor(message.sender),
+                            color = nickColor(sender),
                         )
-                        if (message.senderAccount != null) {
+                        if (message.senderAccount != null && message.relayedSender == null) {
                             Text(
                                 text = "✓",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.primary,
                             )
                         }
-                        if (displayName != null && displayName != message.sender) {
+                        if (displayName != null && displayName != sender) {
                             Text(
-                                text = message.sender,
+                                text = sender,
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -204,6 +200,13 @@ private fun ChatLine(
                             text = formatTime(message.timestampMs),
                             style = MaterialTheme.typography.labelSmall,
                             fontFamily = FontFamily.Monospace,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    if (message.relayedSender != null) {
+                        Text(
+                            text = "Relayed via ${message.relaySource ?: message.sender}",
+                            style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
@@ -239,11 +242,15 @@ private fun ChatLine(
                     )
                 }
                 if (message.attachmentUrl != null) {
-                    AttachmentPreview(
-                        url = message.attachmentUrl,
-                        name = message.attachmentName,
-                        mimeType = message.attachmentMimeType,
-                        sizeBytes = message.attachmentSizeBytes,
+                    MediaPreview(
+                        descriptor = MediaDescriptor(
+                            url = message.attachmentUrl,
+                            name = message.attachmentName,
+                            mimeType = message.attachmentMimeType,
+                            sizeBytes = message.attachmentSizeBytes,
+                        ),
+                        mediaIdentity = mediaIdentity,
+                        visible = mediaVisible,
                         onOpen = { onOpenAttachment(message.attachmentUrl) },
                     )
                 }
@@ -253,8 +260,8 @@ private fun ChatLine(
                 if (message.kind == MessageKind.ACTION) {
                     Text(
                         text = formattedMessage(
-                            text = "✦ ${message.text}",
-                            defaultColor = nickColor(message.sender),
+                            text = "✦ $body",
+                            defaultColor = nickColor(sender),
                             defaultFontStyle = FontStyle.Italic,
                             onOpenChannel = onOpenChannel,
                             onOpenNick = onOpenNick,
@@ -269,7 +276,7 @@ private fun ChatLine(
                 } else {
                     Text(
                         text = formattedMessage(
-                            text = message.text,
+                            text = body,
                             onOpenChannel = onOpenChannel,
                             onOpenNick = onOpenNick,
                             onOpenUrl = onOpenUrl,
@@ -279,6 +286,14 @@ private fun ChatLine(
                             lineHeight = scaledLineHeight,
                             fontFamily = chatFontFamily,
                         ),
+                    )
+                }
+                for (media in linkedMedia) {
+                    MediaPreview(
+                        descriptor = media,
+                        mediaIdentity = mediaIdentity,
+                        visible = mediaVisible,
+                        onOpen = { onOpenUrl(media.url) },
                     )
                 }
                 when (messageDeliveryStatus(message)) {
@@ -328,151 +343,7 @@ private fun ChatLine(
     }
 }
 
-internal fun attachmentDisplayName(url: String, name: String?, sizeBytes: Long?): String {
-    val displayName = name?.takeIf { it.isNotBlank() }
-        ?: url.substringBefore('?').substringBefore('#').substringAfterLast('/').ifEmpty { "Attachment" }
-    return if (sizeBytes == null) displayName else "$displayName · $sizeBytes B"
-}
 
-internal fun isImageAttachment(url: String, mimeType: String?): Boolean {
-    if (mimeType != null) return mimeType.startsWith("image/", ignoreCase = true)
-    val cleanUrl = url.substringBefore('?').substringBefore('#')
-    return cleanUrl.endsWith(".png", true) || cleanUrl.endsWith(".jpg", true) ||
-        cleanUrl.endsWith(".jpeg", true) || cleanUrl.endsWith(".gif", true) || cleanUrl.endsWith(".webp", true)
-}
-
-@Composable
-private fun AttachmentPreview(
-    url: String,
-    name: String?,
-    mimeType: String?,
-    sizeBytes: Long?,
-    onOpen: () -> Unit,
-) {
-    val isImage = isImageAttachment(url, mimeType)
-    val displayName = attachmentDisplayName(url, name, sizeBytes)
-
-    if (isImage) {
-        var loadPreview by rememberSaveable(url) { mutableStateOf(false) }
-        if (!loadPreview) {
-            Surface(
-                onClick = { loadPreview = true },
-                shape = RoundedCornerShape(8.dp),
-                color = MaterialTheme.colorScheme.surfaceVariant,
-                modifier = Modifier
-                    .padding(vertical = 4.dp)
-                    .defaultMinSize(minHeight = 48.dp),
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.Image,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(20.dp),
-                    )
-                    Text(
-                        text = "Load image: $displayName",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.primary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-            }
-        } else {
-            val image = rememberRemoteImage(LocalRemoteImageLoader.current, url, 512).value
-            Surface(
-                onClick = onOpen,
-                shape = RoundedCornerShape(12.dp),
-                color = MaterialTheme.colorScheme.surfaceVariant,
-                modifier = Modifier.padding(vertical = 4.dp),
-            ) {
-                if (image is RemoteImageState.Success) {
-                    Image(
-                        bitmap = image.bitmap,
-                        contentDescription = "Image attachment: $displayName",
-                        contentScale = ContentScale.Fit,
-                        modifier = Modifier
-                            .heightIn(max = 200.dp)
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(12.dp)),
-                    )
-                } else {
-                    Row(
-                        modifier = Modifier
-                            .padding(horizontal = 12.dp, vertical = 8.dp)
-                            .defaultMinSize(minHeight = 48.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        if (image == RemoteImageState.Loading) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(18.dp),
-                                strokeWidth = 2.dp,
-                            )
-                        } else {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.OpenInNew,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.size(20.dp),
-                            )
-                        }
-                        Column {
-                            Text(
-                                text = displayName,
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.primary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            if (image == RemoteImageState.Unavailable) {
-                                Text(
-                                    text = "Preview unavailable · Open externally",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.primary,
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    } else {
-        Surface(
-            onClick = onOpen,
-            shape = RoundedCornerShape(8.dp),
-            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
-            modifier = Modifier
-                .padding(vertical = 3.dp)
-                .defaultMinSize(minHeight = 48.dp),
-        ) {
-            Row(
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                Icon(
-                    imageVector = Icons.Filled.AttachFile,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.size(18.dp),
-                )
-                Text(
-                    text = displayName,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.primary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-        }
-    }
-}
 
 @Composable
 public fun DayPill(label: String, modifier: Modifier = Modifier) {

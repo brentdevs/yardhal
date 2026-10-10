@@ -25,6 +25,8 @@ public data class UiNetwork(
     public val disconnectSavePending: Boolean = false,
     public val rejectedCertificate: CertificateInspection? = null,
     public val hasCertificatePin: Boolean = false,
+    public val taggedRepliesAvailable: Boolean = false,
+    public val reactionsAvailable: Boolean = false,
 ) {
     public val storagePrefix: String get() = id
 }
@@ -63,6 +65,9 @@ public data class ChatMessage(
     public val redacted: Boolean = false,
     public val highlightsKnown: Boolean = true,
     public val reactionsTruncated: Boolean = false,
+    public val relayedSender: String? = null,
+    public val relaySource: String? = null,
+    public val relayedBody: String? = null,
 ) {
     public val countsAsUnread: Boolean
         get() = !sentByUs && !playback && !historyContext && !redacted &&

@@ -19,6 +19,18 @@ class ConversationTranscriptTests {
     private val ref = ConversationRef.channel("network", "#room")
 
     @Test
+    fun differentRelayedSendersKeepDistinctAttributionWithinOneWireBot() {
+        val first = message(1, "2026-10-05T12:00:00Z").copy(sender = "bridge", relayedSender = "alice", relaySource = "bridge")
+        val second = message(2, "2026-10-05T12:00:01Z").copy(sender = "bridge", relayedSender = "bob", relaySource = "bridge")
+        val entries = transcript(first, second).filterIsInstance<TranscriptEntry.Message>()
+        assertTrue(entries.none { it.groupedWithPrevious })
+        val same = transcript(first, second.copy(relayedSender = "alice")).filterIsInstance<TranscriptEntry.Message>()
+        assertTrue(same.last().groupedWithPrevious)
+        val ordinary = transcript(first.copy(relayedSender = null, relaySource = null), second).filterIsInstance<TranscriptEntry.Message>()
+        assertTrue(ordinary.none { it.groupedWithPrevious })
+    }
+
+    @Test
     fun addingLiveEventsPreservesTheExpandedRunIdentityAndChronologicalContents() {
         val first = message(41, "2026-10-05T12:00:00Z", MessageKind.JOIN)
         val second = message(42, "2026-10-05T12:01:00Z", MessageKind.PART)

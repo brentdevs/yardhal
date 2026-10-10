@@ -16,6 +16,22 @@ class ImageUrlPolicyTests {
     }
 
     @Test
+    fun browserLikeHttpsPolicyKeepsInternalEndpointsAndRedirectsWithoutPretendingToFilterDns() {
+        for (url in listOf(
+            "https://127.0.0.1/avatar.png",
+            "https://[::1]/avatar.png",
+            "https://10.0.2.2:8443/avatar.png",
+            "https://192.168.1.2/avatar.png",
+            "https://169.254.1.2/avatar.png",
+            "https://files.internal/avatar.png",
+            "https://files/avatar.png",
+        )) {
+            assertEquals(url, ImageUrlPolicy.resolve(url, 64))
+            assertEquals(url, MediaPolicy.redirect("https://public.example/image", url))
+        }
+    }
+
+    @Test
     fun nonHttpsSchemesAreRejected() {
         assertNull(ImageUrlPolicy.resolve("http://example.com/a.png", 64))
         assertNull(ImageUrlPolicy.resolve("file:///sdcard/a.png", 64))
@@ -33,6 +49,19 @@ class ImageUrlPolicyTests {
         assertNull(ImageUrlPolicy.resolve("https://user:pw@example.com/a.png", 64))
         assertNull(ImageUrlPolicy.resolve("https://exa mple.com/a.png", 64))
         assertNull(ImageUrlPolicy.resolve("https://example.com/" + "a".repeat(ImageUrlPolicy.MAX_URL_LENGTH), 64))
+    }
+
+    @Test
+    fun urlLengthAndPortBoundsAreEnforcedAfterTemplateAndAsciiExpansion() {
+        val prefix = "https://example.com/"
+        val boundary = prefix + "a".repeat(ImageUrlPolicy.MAX_URL_LENGTH - prefix.length)
+        assertEquals(boundary, ImageUrlPolicy.resolve(boundary, 64))
+        assertNull(ImageUrlPolicy.resolve(boundary + "a", 64))
+        assertNull(ImageUrlPolicy.resolve(prefix + "{size}".repeat((ImageUrlPolicy.MAX_URL_LENGTH - prefix.length) / 6), Int.MAX_VALUE))
+        assertNull(ImageUrlPolicy.resolve(prefix + "é".repeat(400), 64))
+        assertTrue(ImageUrlPolicy.isAllowed("https://example.com:65535/image.png"))
+        assertNull(ImageUrlPolicy.resolve("https://example.com:65536/image.png", 64))
+        assertNull(ImageUrlPolicy.resolve("https://example.com:0/image.png", 64))
     }
 
     @Test

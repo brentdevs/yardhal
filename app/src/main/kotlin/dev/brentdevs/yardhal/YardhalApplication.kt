@@ -20,14 +20,21 @@ import dev.brentdevs.yardhal.core.data.FileStsPolicyStore
 import dev.brentdevs.yardhal.core.data.IgnoreStore
 import dev.brentdevs.yardhal.core.data.MessageStore
 import dev.brentdevs.yardhal.core.data.MuteStore
+import dev.brentdevs.yardhal.core.data.MediaPreferencesStore
 import dev.brentdevs.yardhal.core.data.NetworkStore
 import dev.brentdevs.yardhal.core.data.OfflineStore
 import dev.brentdevs.yardhal.core.data.ReadMarkerStore
+import dev.brentdevs.yardhal.core.data.RecentEmojiStore
+import dev.brentdevs.yardhal.core.data.RelayConfigurationStore
+import dev.brentdevs.yardhal.core.data.UploadSettingsStore
+import dev.brentdevs.yardhal.media.AttachmentStageManager
+import dev.brentdevs.yardhal.core.data.UploadEnvironment
 import dev.brentdevs.yardhal.core.data.StorageRecovery
 import dev.brentdevs.yardhal.service.ConnectionService
 import dev.brentdevs.yardhal.service.Notifications
 import dev.brentdevs.yardhal.service.keepsRecoveryService
 import dev.brentdevs.yardhal.ui.image.RemoteImageLoader
+import dev.brentdevs.yardhal.ui.image.MediaEnvironment
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.CoroutineScope
@@ -55,6 +62,7 @@ class YardhalApplication : Application() {
     suspend fun awaitInitialization(): Boolean = startup.first { it != ApplicationStartup.LOADING } == ApplicationStartup.READY
 
     var sharedText: String? by mutableStateOf(null)
+    var sharedAttachmentError: String? by mutableStateOf(null)
 
     lateinit var networkStore: NetworkStore
         private set
@@ -69,6 +77,18 @@ class YardhalApplication : Application() {
     lateinit var coordinator: LiveCoordinator
         private set
     lateinit var chatAppearanceStore: ChatAppearanceStore
+        private set
+    lateinit var mediaPreferences: MediaPreferencesStore
+        private set
+    lateinit var mediaEnvironment: MediaEnvironment
+        private set
+    lateinit var recentEmoji: RecentEmojiStore
+        private set
+    lateinit var relayConfigurations: RelayConfigurationStore
+        private set
+    lateinit var uploadSettings: UploadSettingsStore
+        private set
+    lateinit var attachmentStages: AttachmentStageManager
         private set
 
     private lateinit var connectivityObserver: AndroidConnectivityObserver
@@ -99,6 +119,11 @@ class YardhalApplication : Application() {
         muteStore = MuteStore(dir)
         vault = AndroidCredentialVault(this)
         chatAppearanceStore = ChatAppearanceStore(dir)
+        mediaPreferences = MediaPreferencesStore(dir)
+        mediaEnvironment = MediaEnvironment(remoteImages, mediaPreferences, appScope)
+        recentEmoji = RecentEmojiStore(dir)
+        relayConfigurations = RelayConfigurationStore(dir)
+        uploadSettings = UploadSettingsStore(dir, vault)
         val stsPolicies = FileStsPolicyStore(dir)
         val tlsIdentityProvider = AndroidTlsIdentityProvider(this)
         Notifications.ensureChannels(this)
@@ -147,9 +172,23 @@ class YardhalApplication : Application() {
                 Notifications.highlight(this, networkName, sender, conversation, text)
             },
             offlineStore = OfflineStore(db.offlineDao()),
+            relayStore = relayConfigurations,
+        )
+        attachmentStages = AttachmentStageManager(
+            directory = java.io.File(noBackupFilesDir, "attachment-staging"),
+            resolver = contentResolver,
+            settings = uploadSettings,
+            scope = appScope,
+            environment = { networkId ->
+                check(networkStore.byId(networkId) != null) { "This network was removed. Choose another destination." }
+                UploadEnvironment(coordinator.negotiatedFilehost(networkId), coordinator.secureUploadTransport(networkId))
+            },
         )
         coordinator.attachIgnores(IgnoreStore(dir))
-        connectivityObserver = AndroidConnectivityObserver(this, coordinator::updateConnectivity)
+        connectivityObserver = AndroidConnectivityObserver(this) { available, networkHandle ->
+            coordinator.updateConnectivity(available, networkHandle)
+            mediaEnvironment.setOnline(available)
+        }
         connectivityObserver.start()
         coordinator.startAll()
         appScope.launch {

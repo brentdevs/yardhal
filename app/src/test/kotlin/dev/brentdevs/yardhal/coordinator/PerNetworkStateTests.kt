@@ -176,8 +176,8 @@ class PerNetworkStateTests {
     @Test
     fun tagmsgReactionsAndTypingBecomeEffects() {
         val state = state()
-        val react = state.feed("@+draft/react=👍;+draft/reply=m1 :alice!u@h TAGMSG #room").filterIsInstance<InboundEffect.ApplyReaction>()
-        assertTrue(react.isEmpty())
+        val react = state.feed("@+draft/react=👍;+reply=m1 :alice!u@h TAGMSG #room").only<InboundEffect.ApplyReaction>()
+        assertEquals(listOf("m1"), react.msgids)
         val added = state.feed("@+draft/react=👍;+draft/refs=m1,m2 :alice!u@h TAGMSG #room").only<InboundEffect.ApplyReaction>()
         assertEquals(InboundEffect.ApplyReaction(channel("#room"), "alice", "👍", listOf("m1", "m2"), added = true), added)
         val removed = state.feed("@+draft/unreact=👍;+draft/refs=m1 :alice!u@h TAGMSG #room").only<InboundEffect.ApplyReaction>()
@@ -185,6 +185,69 @@ class PerNetworkStateTests {
         val typing = state.feed("@+typing=active :alice!u@h TAGMSG me").only<InboundEffect.SetTyping>()
         assertEquals(InboundEffect.SetTyping(ConversationRef.directMessage("net", "alice"), "alice", now + TYPING_TTL_MS), typing)
         assertNull(state.feed("@+typing=done :alice!u@h TAGMSG #room").only<InboundEffect.SetTyping>().expiresAtMs)
+    }
+
+    @Test
+    fun stableInboundTagsRemainAcceptedWhenOutboundTagsAreDenied() {
+        val state = state()
+        state.feed(":srv 005 me CLIENTTAGDENY=* :are supported")
+        val chat = state.feed("@msgid=child;+reply=parent;+attachment=https://example/image :alice!u@h PRIVMSG #room :body")
+            .only<InboundEffect.AppendMessage>()
+        assertEquals("parent", chat.replyToMsgid)
+        assertEquals("https://example/image", chat.attachmentUrl)
+        assertTrue(state.feed("@+react=👍;+refs=parent :alice!u@h TAGMSG #room").only<InboundEffect.ApplyReaction>().added)
+        assertFalse(state.feed("@+unreact=👍;+refs=parent :alice!u@h TAGMSG #room").only<InboundEffect.ApplyReaction>().added)
+        assertFalse(state.clientTagPolicy.reactionsAvailable)
+    }
+
+    @Test
+    fun clientTagDenyRemovalAndCapabilityLossRefreshFeatureState() {
+        val state = state()
+        state.apply(IrcEvent.CapabilitiesNegotiated(setOf("message-tags")), InboundContext(nowMs = now))
+        assertTrue(state.clientTagPolicy.reactionsAvailable)
+        state.feed(":srv 005 me CLIENTTAGDENY=*,-draft/reply :are supported")
+        assertEquals("+draft/reply", state.clientTagPolicy.reply)
+        assertFalse(state.clientTagPolicy.reactionsAvailable)
+        state.feed(":srv 005 me -CLIENTTAGDENY :are supported")
+        assertTrue(state.clientTagPolicy.reactionsAvailable)
+        state.apply(IrcEvent.CapabilitiesNegotiated(emptySet()), InboundContext(nowMs = now))
+        assertNull(state.clientTagPolicy.reply)
+    }
+
+    @Test
+    fun attachmentTypingAndReactionPermissionsRefreshAfterNegotiationDenyRemovalAndReset() {
+        val state = state()
+        val context = InboundContext(nowMs = now)
+        state.apply(IrcEvent.CapabilitiesNegotiated(setOf("message-tags")), context)
+        assertEquals("+draft/attachment", state.clientTagPolicy.attachment)
+        assertEquals("+typing", state.clientTagPolicy.typing)
+        assertTrue(state.clientTagPolicy.reactionsAvailable)
+        state.feed(":srv 005 me CLIENTTAGDENY=* :are supported")
+        assertNull(state.clientTagPolicy.attachment)
+        assertNull(state.clientTagPolicy.typing)
+        assertFalse(state.clientTagPolicy.reactionsAvailable)
+        state.feed(":srv 005 me CLIENTTAGDENY=*,-draft/attachment :are supported")
+        assertEquals("+draft/attachment", state.clientTagPolicy.attachment)
+        assertNull(state.clientTagPolicy.typing)
+        assertFalse(state.clientTagPolicy.reactionsAvailable)
+        state.feed(":srv 005 me -CLIENTTAGDENY :are supported")
+        assertEquals("+draft/attachment", state.clientTagPolicy.attachment)
+        assertEquals("+typing", state.clientTagPolicy.typing)
+        assertTrue(state.clientTagPolicy.reactionsAvailable)
+        state.apply(IrcEvent.CapabilitiesNegotiated(emptySet()), context)
+        assertNull(state.clientTagPolicy.attachment)
+        assertNull(state.clientTagPolicy.typing)
+        assertFalse(state.clientTagPolicy.reactionsAvailable)
+        state.apply(IrcEvent.CapabilitiesNegotiated(setOf("message-tags")), context)
+        assertEquals("+draft/attachment", state.clientTagPolicy.attachment)
+        state.apply(IrcEvent.ConnectionOpened, context)
+        assertNull(state.clientTagPolicy.attachment)
+        assertNull(state.clientTagPolicy.typing)
+        assertFalse(state.clientTagPolicy.reactionsAvailable)
+        state.apply(IrcEvent.CapabilitiesNegotiated(setOf("message-tags")), context)
+        assertEquals("+draft/attachment", state.clientTagPolicy.attachment)
+        assertEquals("+typing", state.clientTagPolicy.typing)
+        assertTrue(state.clientTagPolicy.reactionsAvailable)
     }
 
     @Test

@@ -104,9 +104,9 @@ the pending state; no historical alias map is retained.
 Remote image state is remembered by loader, resolved URL and requested size,
 with explicit loading, success and unavailable outcomes. A changed identity
 starts with its matching cached image or a placeholder, never the previous
-identity's bitmap; keyed loading retains cancellation behavior. Attachment
-previews load only on tap. Rejected URLs and failed downloads or decoding show
-an unavailable state with an external-open action rather than a loading spinner.
+identity's bitmap; keyed loading retains cancellation behavior. Inline media
+defaults to explicit reveal, with persisted opt-in loading and per-message hide.
+Rejected URLs and failed downloads or decoding retain an external-open fallback.
 
 Transcript channel links preserve full punctuation and Unicode names and route
 through `LiveCoordinator.openChannel`: joined or joining buffers are reused;
@@ -365,8 +365,8 @@ pruned or presented as restored conversation history.
 Pending roster/shell snapshots and post-message durable refreshes coalesce on the
 existing persistence queue, with migration/removal barriers. Roster serialization
 waits for the flush; NICK rewrites only affected roster columns. Completed uploads
-share through the current visible session after replacement, or report the
-completed URL when sharing is unavailable rather than silently discarding it.
+retain their immutable original destination and recoverable URL; explicit
+insertion affects only the matching draft and never sends IRC automatically.
 
 ### Retention budgets
 
@@ -727,6 +727,206 @@ The live Ergo scenario covers a normalized username and NFKC-stable Unicode
 password: [Ergo 2.14.0 stores SCRAM keys without password preparation](https://github.com/ergochat/ergo/blob/v2.14.0/irc/accounts.go#L2286-L2299).
 No server-specific preparation fallback is introduced.
 
+## Media and composition parity
+
+[Halyard parity phase 5 / issue 16](https://github.com/brentdevs/yardhal/issues/16)
+extends media and composition without renumbering the roadmap.
+
+### Bounded inline media
+
+`MediaPolicy`, `MediaHttp` and `RemoteImageLoader` handle attachment metadata and
+up to four distinct ordinary HTTP(S) links per message. Inline requests use the
+HTTPS-only URL policy; invalid/insecure URLs remain external links. Recognized
+image extensions/MIME types cover JPEG, PNG, GIF, WebP, AVIF, BMP and HEIC/HEIF;
+video recognition covers MP4, WebM, M4V, 3GP and MOV. Actual decoding/playback
+depends on Android support, not just a recognized extension.
+
+Unknown/extensionless links are image-only candidates, not page scraping or video
+discovery. HEAD accepts a supported image MIME and bounded advertised size;
+unsupported HEAD (405/501) or absent/generic MIME can fall back to a range GET.
+The fallback requests bytes 0–1,023 but inspects only MIME and whole-resource
+Content-Range headers; it does not read an unused body or claim magic validation.
+Actual bounded image decoding establishes whether the content is an image.
+HTML MIME and extensionless video are not promoted.
+Requests allow at most four redirects without HTTPS downgrade. Images/GIFs have
+a 16-MiB byte limit, 8,192-pixel dimension limit and 32-Mi-pixel decoded-area
+limit; preview decoding targets 1,024 pixels. Explicit video downloads are
+bounded to 64 MiB, use temporary files removed when playback closes and never
+autoplay. Returning to a video requires Play again.
+
+Persisted settings and per-message reveal/hide are owned by
+`MediaPreferencesStore`; visibility, foreground activity and connectivity gate
+work. Offscreen/background changes cancel fetches and stop playback/animation.
+Hidden media is not fetched or probed. App and system reduced motion disable
+animation. Separate bounded avatar/icon and image/GIF caches expose usage,
+budget selection and category-specific clearing. Media bytes/playback files are
+not synced. Fetching still discloses the device's IP to the linked host: HTTPS
+does not provide anonymity.
+The HTTPS policy intentionally permits loopback, private, link-local and internal
+DNS destinations, including each redirect. It is not an SSRF boundary or
+DNS-rebinding filter. Untrusted links/avatars can make local-network requests;
+automatic image discovery and avatar loading have separate controls.
+Reveal retention normally caps at 4,096 entries; visible/foreground pins and the
+latest 128 changes are protected. Old unprotected REVEALED choices expire before
+HIDDEN ones; excess active pins permit a temporary bound of active count + 128.
+Expired choices revert to global policy, potentially auto-loading old hidden
+media. Releasing pins trims on application-owned IO, never Compose disposal.
+
+### Uploads and share staging
+
+`UploadSettingsStore` owns provider selection and vault-backed provider-specific
+Basic credentials. Precedence is explicit per-network selection, global selection,
+then advertised FILEHOST; missing explicitly selected providers fail closed.
+Configured providers never inherit IRC credentials. Advertised FILEHOST retains
+its negotiated authentication path and TLS/STS enforcement. Providers must
+implement the supported raw POST / multipart and URL-response contract; arbitrary
+vendor APIs are not implemented. Credential authentication requires HTTPS.
+The provider receives uploaded bytes and may retain them; cancelling a transfer
+or removing local staging does not guarantee deletion of remote content.
+
+`AttachmentStageManager` privately copies granted content URIs, enforces known
+and streamed size limits, sanitizes supported photos, and persists stage state.
+SEND/SEND_MULTIPLE uses typed URI extras plus ClipData, deduplicates URIs, and
+retains EXTRA_TEXT as the batch caption. Revoked grants, inaccessible files and
+oversize batches produce actionable errors rather than fake uploads.
+Intake persists its manifest before publishing stages or marking the incoming
+intent consumed; consumed shares do not replay after rotation or restart.
+Persistable SAF grants are acquired in the same serialized intake transaction
+as manifest persistence. Startup, durable source-copy completion and removal
+release unused grants; pending uncopied stages retain theirs. Partial acquisition
+and storage failures clean up without phantom stages or lost retry identity.
+Dismissed destination choosers survive rotation; superseded intents are checked
+before intake as well as before marking consumption.
+External shares copy before destination selection; assignment is immutable.
+Picker results bind to the original destination, not the newly visible session.
+Consent, byte progress, cancellation and retry remain scoped to that stage.
+Caption insertion is reserved once per batch, including separately completed
+uploads. URLs enter only the matching destination draft, and Send remains
+explicit. Interrupted stages restore as interrupted rather than success;
+completed URLs survive process recreation and **Insert URL again** recovers
+them without reupload. The ordinary composer draft is transient, not durable
+stage recovery. Private staging bytes and temporary files are excluded from
+sync/backup; provider secrets are absent from manifests/provider JSON.
+
+Default Strip removes metadata from supported JPEG/PNG/static WebP while retaining
+necessary JPEG orientation and validated Adobe color-transform markers.
+ICC-profile-bearing JPEG/PNG/WebP reject Strip rather than dropping rendering
+information and changing colors. GIF, animated PNG/WebP, unknown images and unsafe
+orientation also reject honestly; Keep requires explicit choice and warns of
+location/device/personal disclosure. No silent flattening or general video/file
+metadata sanitation is claimed.
+
+### Composition and trust
+
+The emoji picker provides searchable names, categories and persisted recent
+choices, filtering glyphs unsupported by the device. Quote selection keeps the
+local parent relationship independently of wire msgid. A nonredacted parent
+with msgid uses the permitted `+reply` or `+draft/reply`; otherwise portable
+quoted text is sent, including on servers without message-tags.
+
+Relay presentation is opt-in per network with exact nick matching under the
+network's casemapping and restrictive format parsing. Claimed author/body remain
+separate from the original wire source. This is not verified account identity;
+ordinary senders cannot gain relay attribution merely by writing relay syntax.
+
+`ClientTagPolicy` requires negotiated message-tags and honors CLIENTTAGDENY
+exact names or a leading `*` with exact negative exceptions. Reply preference
+is `+reply`, then `+draft/reply`; typing is `+typing`, then `+draft/typing`;
+attachment is `+draft/attachment`. Outbound reactions remain `+draft/react` /
+`+draft/unreact` with an allowed reply or `+draft/refs` / `+draft/msgids`
+reference. Stable reaction specification work is WIP: outbound `+react` and
+`+unreact` MUST NOT be emitted. Unavailable tags disable dependent actions or
+use portable quote/plain URL fallback rather than pretending server support.
+
+Entry points are **App options → Chat appearance → Media and privacy**,
+**Uploads and photo privacy**, and **Configured relay senders** (selected
+network). The composer exposes paperclip, emoji, quotes and staged insertion.
+
+Verification recorded for phase 5: the full `nix develop --command make check`
+gate passed. Native Android 15 used owned media, a protected external content
+provider, real TLS IRC sockets and real HTTP upload endpoints:
+
+- Static images, animated GIF frame changes, reduced-motion still frames, avatar
+  rendering and explicit video playback were observed. Offscreen and actual
+  background navigation stopped a 15-second video before natural completion.
+  Offscreen HTTP cancellation stopped at 1,671,168 of 8,388,608 bytes.
+- Separate avatar/media clearing and budget eviction were visible. Returning
+  online retried a visible failed image; hidden state survived cold launch without
+  fetching. The initial HEAD-405 smoke read exactly 1,024 range bytes before
+  loading the image; current probes inspect only headers and decode separately.
+  Extensionless video was not promoted.
+- A valid 1,451-byte JPEG retained orientation 6 while removing GPS/artist
+  metadata. FILEHOST and provider-specific Basic-auth uploads required consent
+  and explicit Send. Multiple files retained the caption once. Unsupported GIF
+  Strip failed visibly; explicit Keep preserved the original bytes.
+- Private-stage recovery allowed Insert URL again without reupload. Real
+  rotation reproduced consumed-share replay before the fix and no replay after.
+  Unknown-size rejection and actual permission revocation produced actionable
+  errors. Upload cancellation stopped at 4,333,568 of 8,388,608 bytes; retry
+  completed while another conversation was visible, but its URL entered only
+  the original destination draft. SAF picking and existing text shares worked.
+- Msgid-less quotes retained their local parent after cold launch. Denying stable
+  reply/typing tags selected permitted draft alternatives; denying all tags
+  yielded portable quotes and plain attachment URLs without prohibited tags.
+  Search selected the supported multi-codepoint astronaut emoji and Recent
+  retained it. Exact configured bridge senders rendered separate author/source
+  identity without inheriting the bridge account/avatar; ordinary text matching
+  relay syntax stayed literal.
+
+Deterministic regressions also cover failed intake persistence without phantom
+rows, CMYK JPEG color preservation while stripping metadata, and rejected action
+sends retaining the draft. These observations do not establish native phase 5
+Ergo/soju/ZNC interoperability or Halyard source-mirroring proof; pinned Halyard
+links returned 404.
+
+### Review hardening evidence
+
+The phase 5 review gate passed with `nix develop --command make check`, including
+native-graphics decoding and sanitization regressions. Native Android 15 review
+smoke used an owned plaintext IRC fixture advertising ASCII casemapping,
+message-tags and echo-message, a platform-trusted HTTPS endpoint, and an external
+DocumentsProvider with real persistable SAF grants:
+
+- Repeated Basic-auth provider edits retained usable credentials and reset
+  replacement inputs after success. An HTTP edit retaining those credentials
+  was rejected without changing the persisted HTTPS provider; failed saves
+  retained replacement inputs.
+- A 2,354,571-byte MP4 uploaded with consent and authentication. Clearing its
+  inserted URL kept the stage retryable. Explicit `/me` sent the permitted
+  `+draft/attachment` tag and retained filename/MIME/size locally after cold
+  launch; only accepted explicit Send consumed the stage. Persisted SAF read grants
+  were released after the private copy completed.
+- A published caption survived force-stop/cold-launch. Choosing Later for a
+  shared document did not reopen destination selection after real rotation.
+  An obstructed recent-emoji write did not prevent synchronous selection of
+  the multi-codepoint astronaut or sheet dismissal.
+- Strip visibly rejected a valid 556-byte ICC-profile-bearing PNG; explicit
+  Keep uploaded byte-identical contents. Rapid independent image/video setting
+  changes both persisted. Changing GIF animation during a 60-second MP4 left
+  playback running and its HTTPS GET count at one. Natural completion removed
+  the temporary playback file.
+- An extensionless endpoint initially returned text and offered Recheck for
+  image. After it changed to PNG, recheck issued a fresh HEAD and a 305-byte GET
+  and rendered the actual image. The final gated APK also rendered the current
+  ICC privacy wording and both relay formats: `Alice[` and `alice{` remained
+  distinct under ASCII, while adding `ALICE[` replaced the former format.
+  Actual inbound messages displayed separate claimed author and wire source.
+
+Deterministic regressions additionally cover Unicode and quoted filename
+boundaries, local stream failures versus transport failures, real redirect and
+upload cancellation peers, queued Keep/retry ordering and removal, partial URI
+grant rollback, failed caption persistence, orphan partial-file cleanup,
+surrogate-safe portable quotes, CLIENTTAGDENY invalidation, post-clear cache
+contents, late/timeout video ownership, clipped avatar geometry, and reveal
+retention protecting visible entries. HTTPS media fetching deliberately retains
+browser-like private/local-address access; it is not an SSRF/DNS-rebinding guard.
+Image probes use MIME/length headers only; bounded decoding validates image bytes.
+
+CI exposed an existing retention assertion race: pruned rows publish before the
+separate unread recount finishes. The regression now waits for both public-state
+transitions and retains all row, quote-parent, reaction and unread assertions;
+production retention behavior is unchanged.
+
 ## Roadmap
 
 Phases land in order; each phase ships with tests and updated docs.
@@ -747,7 +947,7 @@ Phases land in order; each phase ships with tests and updated docs.
 - **Phase 5 — IRCv3 breadth**: server-time everywhere, local tuple paging,
   anchored channel/DM chathistory LATEST/BEFORE/BETWEEN, bounded TARGETS discovery
   and retained gap coverage, labeled replies, echo-message reconciliation,
-  msgid-gated reactions/replies/redaction,
+  msgid-gated reactions/redaction and wire replies with portable quote fallback,
   typing both ways, NAMES + PREFIX and WHOX presence, account/away/host/realname
   notifications, extended MONITOR, standard replies, MARKREAD mirroring,
   netsplit/netjoin collapse, limit-aware multiline composition and reassembly,
@@ -774,8 +974,9 @@ Phases land in order; each phase ships with tests and updated docs.
   ISUPPORT extension (endpoint discovered from 005, HTTPS enforced on TLS
   connections, SASL credentials reused as HTTP Basic, 201+Location resolved,
   multipart retried on body-format rejections) with a composer paperclip,
-  SAF document picker and attachment-tag rendering. Share-target lands text
-  into the composer. Widgets and an on-device catch-up digest are future
+  SAF document picker and attachment-tag rendering. Parity phase 5 adds configured
+  providers, bounded inline media, private binary share staging and explicit
+  insertion/send (see above). Widgets and an on-device catch-up digest are future
   work — Android has no FoundationModels equivalent, so that feature needs a
   bundled model decision first.
 

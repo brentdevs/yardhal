@@ -9,6 +9,7 @@ Phase numbers refer to `docs/architecture.md`.
 - [x] Modern IRC baseline: message grammar, numerics, ISUPPORT/CASEMAPPING handling (P1)
 - [x] capability-negotiation 302: CAP LS 302, REQ/ACK, CAP NEW/DEL at runtime (P2)
 - [x] message-tags: parse/escape tags, enlarged limits, request cap; 417 surfaced as an error (P1/P2)
+- [x] Client-only tags / CLIENTTAGDENY: require negotiated message-tags; honor exact deny names and leading `*` with exact negative exceptions; unavailable dependencies disable wire actions or fall back to portable quote/plain URL (parity phase 5)
 - [x] server-time: use time tag as authoritative timestamp, especially in playback (P5)
 
 ## Identity & access
@@ -33,11 +34,12 @@ Phase numbers refer to `docs/architecture.md`.
 
 ## Messaging affordances
 
-- [x] message-ids: scoped persistence and canonical echo healing; wire reply/react/redact actions require msgid. Durable local quote-parent row IDs are separate inputs for parity phase 5 (P3/P5; parity phase 3)
+- [x] message-ids: scoped persistence and canonical echo healing; wire reaction/redaction and tagged replies require msgid, but portable quotes retain local parents without one (P3/P5; parity phases 3/5)
 - [x] echo-message: own messages reconciled against the server echo, msgid stamped; identical fresh sends retain distinct durable rows and local quotes (P5; parity phase 3)
-- [x] +draft/reply: send/receive replies with quoted preview and jump-to-source; parent relationships and off-page/deleted previews survive process death (P5; parity phase 3)
-- [x] +draft/react / +draft/unreact: durable per-sender membership, reaction pills and tap-to-toggle; bounded retention exposes partial/lower-bound history (P5; parity phase 3)
-- [x] +typing: send rate-limited active TAGMSG; inbound indicators with expiry (P5)
+- [x] Reply tags: prefer allowed `+reply`, otherwise `+draft/reply`; receive quoted previews and jump-to-source; local parent/off-page/deleted previews survive process death; missing msgid or denied tags uses portable quoted text (P5; parity phases 3/5)
+- [x] +draft/react / +draft/unreact: actual outbound reaction names; allowed reply or `+draft/refs` / `+draft/msgids` reference required; durable per-sender membership, pills and toggle with partial/lower-bound history (P5; parity phases 3/5)
+- [ ] Stable reaction specification remains WIP: outbound `+react` / `+unreact` MUST NOT be emitted; no stable-reaction interoperability claim
+- [x] +typing / +draft/typing: choose an allowed alternative, send rate-limited active TAGMSG; inbound indicators with expiry (P5; parity phase 5)
 - [x] draft/message-redaction: REDACT handling + own redacts; transactional body/FTS/attachment/reaction removal, tombstones and retired-history floors prevent replay resurrection (P5; parity phase 3)
 - [x] draft/read-marker: full-history durable unread/mention cursors; offline advances queue MARKREAD until supported accepted registration, clear on acknowledgement and reconcile monotonically; legacy unknown highlights are not guessed (P5; parity phase 3)
 - [x] draft/multiline: cap + max-bytes/max-lines parsed; inbound batches reassembled (concat, batch msgid, playback-aware, defensive limit flush); composer newlines sent as limit-respecting batches with concat splitting, echo reconciled; separate PRIVMSGs without the cap (P5)
@@ -68,7 +70,7 @@ Phase numbers refer to `docs/architecture.md`.
 - [x] bot-mode: BOT ISUPPORT letter, WHO/WHOX flag, 335 and `bot` tag drive member-sheet badge (P5)
 - [x] account-extban: ACCOUNTEXTBAN/EXTBAN "Ban account" member action (P6)
 - [x] draft/metadata-2: cap limits parsed; SUB avatar/display-name before autojoin; METADATA and 760/761/766/770/771/772/774/FAIL handled; metadata batches; SYNC retry on 774; /setavatar /setdisplayname; HTTPS-only cached avatars + display names in rows/member sheet (P5; Ergo 2.14 lacks metadata, covered by reducer + loopback tests)
-- [x] soju.im/FILEHOST ISUPPORT: endpoint discovery, TLS-policy enforcement, authenticated POST with multipart fallback, attachment-tagged messages (P8)
+- [x] soju.im/FILEHOST ISUPPORT: endpoint discovery, TLS/STS enforcement, authenticated POST with multipart fallback; private destination-bound staging and explicit URL insertion/Send, `+draft/attachment` only when allowed, plain URL fallback otherwise (P8; parity phase 5)
 - [x] UTF8ONLY: always transmit UTF-8, skip legacy encoding heuristics (P5) — strict UTF-8 inbound decoding with U+FFFD replacement, codepoint-safe truncation, `ISupport.utf8Only`
 - [x] draft/extended-isupport: full ISUPPORT set pre-registration (P5) — `ISUPPORT` sent before CAP END when acknowledged; `draft/isupport` batches pass through, `-TOKEN` removals honoured by `ISupport.mergedWith`
 - [x] draft/ICON: ISUPPORT token (with \xHH unescape, `{size}` template, `-draft/ICON`) shown on the network header via the HTTPS-only image cache (P6)
@@ -86,6 +88,24 @@ Phase numbers refer to `docs/architecture.md`.
 - [x] Historical/current management and own service echoes cannot create ordinary DMs, unread or live notifications; late generations and uncertain replies cannot acknowledge another operation (parity phase 4)
 - [x] Bouncer-aware history provider selection: forwarded ZNC upstream ISUPPORT alone is not downstream CHATHISTORY; use negotiated CHATHISTORY or actual znc.in/playback, otherwise retain local-only history (parity phase 4)
 - [x] znc.in/playback: bounded global channel/DM discovery, older six-hour PLAY windows, canonical overlap deduplication, retained gaps under clipping, finite empty/error/reconnect outcomes; no invented archive end or missing msgids (P7; parity phase 1)
+
+## Media and composition parity (phase 5)
+
+These application features are not additional negotiated IRCv3 capabilities:
+bounded inline linked images/GIFs, explicit videos, file cards, image-only
+extensionless probes, persisted opt-in settings/reveal/hide, offscreen/background
+cancellation, and independent media/avatar cache usage/budgets/clearing.
+Global/per-network configured upload providers use protected provider credentials,
+never inherited IRC secrets; missing explicit providers do not silently fall back.
+Private typed SEND/SEND_MULTIPLE content-URI staging retains captions and immutable
+destinations, supports cancellation/retry/progress and recovery, and requires
+explicit Send. Insert URL again restores completed URLs after recreation, not
+the transient ordinary composer draft. Default supported-photo stripping retains
+JPEG orientation; unsupported animation/unsafe orientation fails rather than
+flattening. Emoji search/categories/recents, portable quotes/local parents and
+exact-nick per-network relay presentation do not imply server or identity support.
+See [media and composition parity](architecture.md#media-and-composition-parity)
+for exact bounds, format policies, settings paths and privacy/provider limits.
 
 ## Coverage audit
 
@@ -154,6 +174,12 @@ Ergo and runs all real-server tests without skips.
 | znc.in/playback | `HistoryRequestTrackerTests.bareZncPlaybackRequiresTimestampBoundsAndCorrectDmIdentity`; `HistoryCoordinatorIntegrationTests.clippedNativePlaybackRetainsGapUntilClosedRangeWitnessesCachedLowerBoundary`; `HistoryCoordinatorIntegrationTests.timedOutWildcardPlaybackCannotInjectLateBatchesBareMessagesOrNotifications`; `HistoryCoordinatorIntegrationTests.invalidNativeMetadataCannotInventGapOrPersistFallbackClockMessage`; `HistoryCoordinatorIntegrationTests.repeatedBoundedPlaybackReconnectsMergeDurableGapsWithoutOpeningClosedConversations`; `HistoryCoordinatorIntegrationTests.inclusivePlaybackUpperBoundaryAdvancesFiniteEmptyWindowsWithoutInventingGapsOrArchiveEnd` |
 | Offline snapshot inputs (parity phase 3) | `OfflineStoreTests`; `OfflineSnapshotMappingTests`; `OfflineCoordinatorTests`; `OfflinePresentationTests`; `OfflineConversationPresentationTests` |
 | Migration, retention and recovery (parity phase 3) | `YardhalDatabaseMigrationTests`; `NetworkMessageRetentionTests`; `ReactionRetentionTests`; `DatabaseRecoveryTests`; `StorageRecoveryTests`; `RemoteImageMaintenanceTests` |
+| Client-only tags / CLIENTTAGDENY (parity phase 5) | `ClientTagPolicyTests.catchAllAllowsOnlyExactNegatedExceptions`; `ClientTagPolicyTests.messageTagsMustBeNegotiatedEvenWithAllowExceptions`; `ClientTagPolicyTests.workInProgressReactionsNeverInventForbiddenStableNames` |
+| Bounded image-only probes (parity phase 5) | `MediaHttpTests.unsupportedHeadFallsBackToRangeHeadersWithoutReadingAnUnusedBody`; `MediaHttpTests.contentRangeUsesWholeResourceLengthInsteadOfSmallRangeLength`; `MediaHttpTests.extensionlessVideoAndHtmlAreNotPromotedToInlineMedia`; `MediaHttpTests.redirectsHaveAnExactHopLimitAndNeverContactDowngradedTargets` |
+| Staging/recovery/draft boundaries (parity phase 5) | `AttachmentStageManagerTests.unboundShareCopiesPrivatelyBeforeSelectionAndDestinationCannotChangeLater`; `AttachmentStageManagerTests.staleInFlightStagesRestoreAsInterruptedAndCompletedUploadsRemainInsertable`; `AttachmentStageManagerTests.separatelyCompletedUploadsInOneBatchReserveCaptionOnlyOnceBeforeCapture`; `AttachmentDraftRoutingTests.completingUploadCannotInsertIntoNewlySelectedConversationOrNetwork` |
+| Relay/emoji presentation (parity phase 5) | `RelayParserTests.ordinarySenderCannotMasqueradeAsConfiguredRelay`; `RelayParserTests.formatsRequireExactBoundariesAndRetainWireSource`; `EmojiCatalogTests.pickerFiltersUnsupportedDeviceGlyphsInsteadOfShowingBrokenChoices`; `EmojiCatalogTests.categoryTransitionsKeepMultiCodepointEmojiAndSearchableNamesIntact` |
+| Phase 5 review upload/staging boundaries | `FilehostUploaderTests`; `UploadHttpsAuthenticationTests`; `UploadSettingsStoreTests`; `AttachmentStageManagerTests`; `AttachmentSanitizerTests` |
+| Phase 5 review state and lifecycle boundaries | `PortableInteractionsTests`; `PerNetworkStateTests`; `InteractionPreferencesTests`; `MediaPreferencesStoreTests`; `MediaCacheLifecycleTests`; `RemoteVideoOwnershipTests`; `MediaEnvironmentTests`; `AvatarViewportTests` |
 
 Emulator smoke (`make play`) exercises rendered network icons, avatars,
 display names, verified-account/away/bot member rows, account-ban wire syntax,
@@ -239,3 +265,40 @@ rejection was actionable. Echoed credentials were redacted in the raw console an
 in the persisted Room transcript after restart; saved config and the encrypted vault
 contained no fixture plaintext passwords. These are connection/authentication
 proofs, not new IRCv3 capabilities or iOS background-hold/MPTCP claims.
+
+Parity phase 5's full `nix develop --command make check` gate passed. Native
+Android 15 exercised real TLS IRC sockets, HTTP endpoints and an external granted
+content provider: bounded extensionless image probing, animated/reduced-motion
+GIFs, opt-in video stopped offscreen/background, isolated cache clearing/budgets,
+offline-return retry and durable hide state. Upload evidence includes sanitized
+orientation-6 JPEG without GPS/artist data, FILEHOST/provider-specific Basic
+consent, caption-once multiple shares, force-stop stage recovery without reupload,
+real grant revocation, unknown-size rejection, cancellation/retry and destination
+isolation. SAF and text shares were exercised; consumed-share rotation replay was
+reproduced before and absent after the fix.
+
+IRC wire observations show permitted draft reply/typing/reaction tags when stable
+reply/typing are denied, and portable quotes/plain attachment URLs with no client
+tags under `CLIENTTAGDENY=*`. Msgid-less local quote parents survived cold launch.
+The native picker selected a supported multi-codepoint astronaut and retained it
+in Recent; exact configured relay senders displayed separate claimed author and
+original source without bridge account/avatar inheritance, while unconfigured
+relay-looking text stayed literal. See `docs/architecture.md` for byte-count and
+sanitization evidence. These are not native phase 5 Ergo/soju/ZNC interoperability
+or Halyard source-mirroring claims (pinned source links returned 404).
+
+Phase 5 review hardening passed the full gate and a further native Android 15
+smoke against an ASCII-casemapping IRC fixture, a platform-trusted protected
+HTTPS upload/media endpoint and a real external SAF DocumentsProvider. Observed
+cases include retained-auth HTTP rejection without provider mutation, successful
+credential replacement-input reset, tagged action attachments surviving cold
+launch, grant release after private copying, published-caption durability,
+rotation-stable deferred shares, emoji selection despite recent-storage failure,
+profile-bearing PNG rejection with byte-identical explicit Keep, independent
+media preference updates, uninterrupted video across GIF setting changes,
+extensionless negative-probe recheck, and case-equivalent relay format replacement
+without conflating ASCII-distinct brackets. See
+[review hardening evidence](architecture.md#review-hardening-evidence) for exact
+byte counts and the deliberate browser-like HTTPS/private-address and
+headers-only probe posture. Controlled review fixtures do not add interoperability
+claims for Ergo, soju or ZNC.

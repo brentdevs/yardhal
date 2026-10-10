@@ -17,6 +17,7 @@ import dev.brentdevs.yardhal.core.data.NetworkStore
 import dev.brentdevs.yardhal.core.data.ReadMarkerStore
 import dev.brentdevs.yardhal.core.data.StoredMessage
 import dev.brentdevs.yardhal.core.data.YardhalDatabase
+import dev.brentdevs.yardhal.core.protocol.IrcMessage
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.InetAddress
@@ -59,6 +60,7 @@ class LiveCoordinatorIntegrationTests {
                 while (!accepted.isClosed) {
                     val line = reader.readLine() ?: break
                     received += line
+                    val message = IrcMessage.parse(line) ?: continue
                     when {
                         line.startsWith("CAP LS") -> send(":srv CAP * LS :echo-message server-time")
                         line.startsWith("CAP REQ :") -> send(":srv CAP * ACK :${line.substringAfter("CAP REQ :")}")
@@ -68,9 +70,9 @@ class LiveCoordinatorIntegrationTests {
                             send(":srv 353 tester = #room :@tester alice")
                             send(":srv 366 tester #room :End of NAMES")
                         }
-                        line == "PRIVMSG #room :hello" ->
+                        message.command == "PRIVMSG" && message.parameters == listOf("#room", "hello") ->
                             send("@msgid=echo-1;time=2024-01-01T00:00:00.000Z :tester!u@h PRIVMSG #room :hello")
-                        line == "PRIVMSG #room :after nick" ->
+                        message.command == "PRIVMSG" && message.parameters == listOf("#room", "after nick") ->
                             send("@msgid=echo-after;time=2024-01-01T00:00:00.003Z :TESTERCASE!u@h PRIVMSG #room :after nick")
                     }
                 }
@@ -156,17 +158,22 @@ class LiveCoordinatorIntegrationTests {
                 }
                 val quoteParent = coordinator.buffers.value.getValue(ref.storageKey).messages.single { it.text == "local quote parent" }
                 coordinator.setReplyDraft(config.id, ref.storageKey, quoteParent)
+                val quotedBody = "> alice: local quote parent — ok"
 
                 assertTrue(coordinator.sendText(config.id, ref.storageKey, "ok"))
                 coordinator.setReplyDraft(config.id, ref.storageKey, quoteParent)
                 assertTrue(coordinator.sendText(config.id, ref.storageKey, "ok"))
                 await {
-                    server.received.count { it == "PRIVMSG #room :ok" } == 2 &&
+                    server.received.count {
+                        IrcMessage.parse(it)?.let { message ->
+                            message.command == "PRIVMSG" && message.parameters == listOf("#room", quotedBody) && message.tags.isEmpty()
+                        } == true
+                    } == 2 &&
                         coordinator.buffers.value[ref.storageKey]?.messages
-                            ?.filter { it.text == "ok" }
+                            ?.filter { it.text == quotedBody }
                             ?.let { it.size == 2 && it.all { message -> message.storedRowId != null } } == true
                 }
-                val pending = coordinator.buffers.value.getValue(ref.storageKey).messages.filter { it.text == "ok" }
+                val pending = coordinator.buffers.value.getValue(ref.storageKey).messages.filter { it.text == quotedBody }
                 assertTrue(pending.all { it.pendingEcho && it.msgid == null })
                 assertEquals(1, pending.map { it.timestampMs }.distinct().size)
                 assertEquals(2, pending.mapNotNull { it.storedRowId }.distinct().size)
@@ -174,29 +181,29 @@ class LiveCoordinatorIntegrationTests {
                     it.replyToMsgid == null && it.localReplyParentRowId == quoteParent.storedRowId &&
                         it.replyPreview == ReplyPreview(quoteParent.sender, quoteParent.text)
                 })
-                server.send("@msgid=echo-first;time=2024-01-01T00:00:00.001Z :tester!u@h PRIVMSG #room :ok")
-                server.send("@msgid=echo-second;time=2024-01-01T00:00:00.002Z :tester!u@h PRIVMSG #room :ok")
+                server.send("@msgid=echo-first;time=2024-01-01T00:00:00.001Z :tester!u@h PRIVMSG #room :$quotedBody")
+                server.send("@msgid=echo-second;time=2024-01-01T00:00:00.002Z :tester!u@h PRIVMSG #room :$quotedBody")
                 await {
                     coordinator.buffers.value[ref.storageKey]?.messages
-                        ?.filter { it.text == "ok" }
+                        ?.filter { it.text == quotedBody }
                         ?.let { it.size == 2 && it.all { message -> message.msgid != null } } == true
                 }
                 assertEquals(
                     listOf("echo-first", "echo-second"),
                     coordinator.buffers.value[ref.storageKey]?.messages
-                        ?.filter { it.text == "ok" }?.map { it.msgid },
+                        ?.filter { it.text == quotedBody }?.map { it.msgid },
                 )
                 await {
                     coordinator.buffers.value[ref.storageKey]?.messages
-                        ?.filter { it.text == "ok" }
+                        ?.filter { it.text == quotedBody }
                         ?.let { it.size == 2 && it.all { message -> message.storedRowId != null } } == true
                 }
                 assertEquals(
                     2,
                     coordinator.buffers.value[ref.storageKey]?.messages
-                        ?.filter { it.text == "ok" }?.mapNotNull { it.storedRowId }?.distinct()?.size,
+                        ?.filter { it.text == quotedBody }?.mapNotNull { it.storedRowId }?.distinct()?.size,
                 )
-                val canonical = coordinator.buffers.value.getValue(ref.storageKey).messages.filter { it.text == "ok" }
+                val canonical = coordinator.buffers.value.getValue(ref.storageKey).messages.filter { it.text == quotedBody }
                 assertEquals(pending.map { it.localId }, canonical.map { it.localId })
                 assertEquals(pending.map { it.storedRowId }, canonical.map { it.storedRowId })
                 assertEquals(pending.map { it.localReplyParentRowId }, canonical.map { it.localReplyParentRowId })
@@ -227,8 +234,8 @@ class LiveCoordinatorIntegrationTests {
                     coordinator.buffers.value[ref.storageKey]?.messages
                         ?.any { it.msgid == "search-neighbor" } == true
                 }
-                assertEquals(2, coordinator.buffers.value[ref.storageKey]?.messages?.count { it.text == "ok" })
-                val searched = coordinator.buffers.value.getValue(ref.storageKey).messages.filter { it.text == "ok" }
+                assertEquals(2, coordinator.buffers.value[ref.storageKey]?.messages?.count { it.text == quotedBody })
+                val searched = coordinator.buffers.value.getValue(ref.storageKey).messages.filter { it.text == quotedBody }
                 assertEquals(canonical.map { it.localId }, searched.map { it.localId })
                 assertEquals(canonical.map { it.storedRowId }, searched.map { it.storedRowId })
                 assertEquals(canonical.map { it.localReplyParentRowId }, searched.map { it.localReplyParentRowId })

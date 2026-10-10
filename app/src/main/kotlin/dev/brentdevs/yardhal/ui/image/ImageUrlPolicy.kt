@@ -16,10 +16,12 @@ public object ImageUrlPolicy {
         val trimmed = rawUrl?.trim().orEmpty()
         if (trimmed.isEmpty() || trimmed.length > MAX_URL_LENGTH) return null
         val expanded = trimmed.replace(SIZE_TEMPLATE, sizePx.coerceAtLeast(1).toString())
+        if (expanded.length > MAX_URL_LENGTH) return null
         val uri = runCatching { URI(expanded) }.getOrNull() ?: return null
         if (!uri.scheme.equals("https", ignoreCase = true)) return null
         if (uri.host.isNullOrEmpty() || uri.rawUserInfo != null) return null
-        return uri.toASCIIString()
+        if (uri.port != -1 && uri.port !in 1..65535) return null
+        return uri.toASCIIString().takeIf { it.length <= MAX_URL_LENGTH }
     }
 
     public fun acceptsContentLength(length: Long): Boolean = length <= MAX_BYTES
