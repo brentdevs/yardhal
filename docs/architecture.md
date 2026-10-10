@@ -966,14 +966,23 @@ positive +l, shared MAXLIST limits and the base wire budget constrain sends.
 One request per session uses labels when available, channel/command correlation
 otherwise, and a six-second deadline. Confirmation comes from matching server
 state/echoes, not an optimistic toggle; errors, disconnect and timeout are finite
-unconfirmed outcomes. Unlabelled timeout or list overflow quarantines retries
-until reconnect so late replies cannot complete another request. Lists retain
-mask, setter and date, distinguish empty/complete from partial/error states, and
-cap capture at 512 entries. Access masks use IRC casemapping for confirmation;
-ordinary mode parameters such as channel keys retain exact comparison.
+unconfirmed outcomes. Unlabelled timeout, list overflow or cancellation on
+PART/KICK quarantines settings requests until reconnect; rejoining alone does
+not let late replies complete a replacement request. Lists retain mask, setter
+and date, distinguish empty/complete from partial/error states, and cap capture
+at 512 entries. During retrieval, live list changes update the presentation and
+retain bounded changed-mask identities so later snapshot numerics cannot undo
+removals or replace newer setter/date metadata. Overflow remains incomplete.
+Confirmation compares +l numerically and expands supported access-mask shorthand
+before IRC casemapping; channel keys retain exact, case-sensitive comparison.
 Connection or joined-membership loss clears access-list authority; reconnect
 requires refetch. MAXLIST counts only fresh complete/empty list snapshots, never
 cached raw modes or partial results; unknown counts remain server-authoritative.
+
+Since roster members retain their highest displayed prefix, losing that prefix
+requests NAMES for any affected member, not only the local nickname. Combined
+MODE changes request one refresh; removal of another member's lower prefix does
+not clear a retained higher role.
 
 ### Retained Catch Up
 
@@ -983,8 +992,8 @@ outside the loaded transcript. It pages 200 candidates at a time up to a
 history gaps, pruning and unknown highlights/partial reaction history are
 reported without claiming server archive completeness. Filters cover unread,
 mentions, DMs, replies and reactions to own messages, grouped by network and
-conversation. Canonical HTTP(S) links retain every exact message source and
-meaningful query/fragment differences.
+conversation. Canonical HTTP(S) links, including bracketed IPv6 authorities,
+retain every exact message source and meaningful query/fragment differences.
 
 Jump resolves the stored row anchor and opens that exact message without
 directly marking it read. Explicit read-through, durable dismissal and restore
@@ -1048,6 +1057,9 @@ Named Reply/Copy/Choose reaction/Delete and individual link/channel/nick actions
 use the same permission/capability paths as visual controls; identifiers alone
 do not authorize effects. Emoji names are descriptive, media controls identify
 their media, and reorder/moderation controls expose named actions.
+Standalone SYSTEM/JOIN/PART message rows retain their dedicated summary and
+expose named Copy message when a copy callback exists and the content is
+nonblank and not redacted; they do not inherit chat-only mutation actions.
 
 ### Independent inbound wire budgets and evidence
 
@@ -1073,6 +1085,17 @@ not advertise metadata-2. The existing UI's 100px photo became the notification
 bitmap; a new uncached profile URL fell back to 96px initials while backgrounded.
 Channel sound configuration is not proof of physical audible sound. Pinned
 Halyard reference links returned 404, so source-level mirroring is unverified.
+
+Phase-six review regressions reproduce list-fetch/live-delta races, leading-zero
+limits, shorthand masks, cancelled unlabelled membership-loss requests, retained
+member prefixes and IPv6 extraction. The full gate passed after fixes. A separate
+Android run against a controlled socket peer showed reconciled list metadata,
+020→20 server values, automatic NAMES restoring another member's voice, and a
+canonical IPv6 URL in Catch Up Links. With installed TalkBack enabled, native
+accessibility-node invocation of standalone SYSTEM/JOIN/PART Copy message actions
+wrote the expected platform clipboard content; the baseline PART summary lacked
+the action. This verifies exposed actions, not hardware-driven TalkBack menu
+selection or audible speech for these review scenarios.
 
 ## Roadmap
 

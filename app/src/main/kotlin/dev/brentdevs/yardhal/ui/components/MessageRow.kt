@@ -70,7 +70,7 @@ public fun MessageRow(
     accessibilityActions: MessageAccessibilityActions = MessageAccessibilityActions(),
 ) {
     when (message.kind) {
-        MessageKind.SYSTEM, MessageKind.JOIN, MessageKind.PART -> SystemLine(message, appearance, modifier)
+        MessageKind.SYSTEM, MessageKind.JOIN, MessageKind.PART -> SystemLine(message, appearance, modifier, accessibilityActions.onCopy)
         else -> ChatLine(
             message = message,
             profile = profile,
@@ -94,18 +94,33 @@ public fun MessageRow(
 }
 
 @Composable
-private fun SystemLine(message: ChatMessage, appearance: ChatAppearancePreferences, modifier: Modifier) {
+private fun SystemLine(
+    message: ChatMessage,
+    appearance: ChatAppearancePreferences,
+    modifier: Modifier,
+    onCopy: (() -> Unit)?,
+) {
     val chatFontFamily = messageFontFamily(appearance.font)
     val timestampZone = ZoneId.systemDefault()
     val timestamp = remember(message.timestampMs, appearance.timestampFormat, timestampZone) { formatTime(message.timestampMs, appearance.timestampFormat, timestampZone) }
     val summary = remember(message, timestamp) { messageAccessibilitySummary(message, timestamp, null, emptyMap()) }
+    val actions = remember(message, onCopy) {
+        if (onCopy != null && AccessibleMessageAction.COPY in eligibleMessageActions(message, setOf(AccessibleMessageAction.COPY))) {
+            listOf(CustomAccessibilityAction("Copy message") { onCopy(); true })
+        } else {
+            emptyList()
+        }
+    }
     val scaledFontSize = MaterialTheme.typography.bodySmall.fontSize * appearance.textScale
     val scaledLineHeight = MaterialTheme.typography.bodySmall.lineHeight * appearance.textScale
     Column(
         modifier = modifier
             .fillMaxWidth()
             .padding(horizontal = 16.dp, vertical = if (appearance.compact) 1.dp else 2.dp)
-            .clearAndSetSemantics { contentDescription = summary },
+            .clearAndSetSemantics {
+                contentDescription = summary
+                customActions = actions
+            },
     ) {
         if (appearance.timestampPosition == TimestampPosition.ABOVE) MessageTimestamp(timestamp, appearance)
         Row(verticalAlignment = Alignment.CenterVertically) {

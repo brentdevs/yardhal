@@ -187,8 +187,8 @@ class ChannelSettingsCoordinatorTests {
         Peer().use { peer -> Harness(peer).use { harness ->
             harness.open()
             val coordinator = harness.coordinator
-            coordinator.editChannelAccessList(harness.key, 'b', "Blocked!*@*", true)
-            await { peer.received.any { it.parameters == listOf("#room", "+b", "Blocked!*@*") } }
+            coordinator.editChannelAccessList(harness.key, 'b', "Blocked", true)
+            await { peer.received.any { it.parameters == listOf("#room", "+b", "Blocked") } }
             peer.send(":tester!u@h MODE #room +b blocked!*@*")
             await { harness.view.requestStatus == ChannelSettingsRequestStatus.CONFIRMED }
             assertEquals("blocked!*@*", harness.view.accessLists.getValue('b').entries.single().mask)
@@ -205,6 +205,77 @@ class ChannelSettingsCoordinatorTests {
             peer.send(":tester!u@h MODE #room +k SecretKey")
             await { harness.view.requestStatus == ChannelSettingsRequestStatus.CONFIRMED }
         } }
+    }
+
+    @Test
+    fun loadingListReconcilesLiveChangesBeforeAndAfterSnapshotEntriesAndDoesNotBlockMaxList() = runBlocking {
+        for (labelled in listOf(false, true)) {
+            Peer(labelled).use { peer -> Harness(peer).use { harness ->
+                harness.open()
+                val coordinator = harness.coordinator
+                coordinator.refreshChannelAccessList(harness.key, 'b')
+                await { peer.received.any { it.parameters == listOf("#room", "+b") } }
+                val label = peer.received.last { it.parameters == listOf("#room", "+b") }.tag("label")
+                val tags = label?.let { "@label=$it " }.orEmpty()
+                peer.send("${tags}:srv 367 tester #room *!*@removed-after oldsetter 1700000000")
+                peer.send(":operator!u@h MODE #room -b *!*@removed-after")
+                peer.send(":operator!u@h MODE #room -b *!*@removed-before")
+                peer.send("${tags}:srv 367 tester #room *!*@removed-before oldsetter 1700000000")
+                peer.send("@time=2026-10-10T12:00:00Z :operator!u@h MODE #room +b *!*@live")
+                peer.send("${tags}:srv 367 tester #room *!*@live stale-setter 1700000000")
+                peer.send(":operator!u@h MODE #room +b *!*@changed-twice")
+                peer.send(":operator!u@h MODE #room -b *!*@changed-twice")
+                peer.send("${tags}:srv 367 tester #room *!*@changed-twice oldsetter 1700000000")
+                peer.send("${tags}:srv 368 tester #room :End of list")
+                await { harness.view.accessLists.getValue('b').status == ChannelAccessListStatus.COMPLETE }
+                assertEquals(listOf(ChannelAccessEntry("*!*@live", "operator", 1791633600)),
+                    harness.view.accessLists.getValue('b').entries)
+                coordinator.editChannelAccessList(harness.key, 'e', "*!*@trusted", true)
+                await { peer.received.any { it.parameters == listOf("#room", "+e", "*!*@trusted") } }
+                peer.send(":tester!u@h MODE #room +e *!*@trusted")
+                await { harness.view.requestStatus == ChannelSettingsRequestStatus.CONFIRMED }
+            } }
+        }
+    }
+
+    @Test
+    fun loadingRemovalTombstonesAreBoundedAndCannotPublishAnAuthoritativeEmptyListAfterOverflow() = runBlocking {
+        Peer().use { peer -> Harness(peer).use { harness ->
+            harness.open()
+            harness.coordinator.refreshChannelAccessList(harness.key, 'b')
+            await { peer.received.any { it.parameters == listOf("#room", "+b") } }
+            repeat(ChannelSettingsController.MAX_ENTRIES + 1) {
+                peer.send(":operator!u@h MODE #room -b *!*@changed$it")
+            }
+            peer.send(":srv 368 tester #room :End")
+            peer.send(":srv PING :change-bound-barrier")
+            await { peer.received.any { it.command == "PONG" && it.parameters.lastOrNull() == "change-bound-barrier" } }
+            await { harness.view.accessLists.getValue('b').status != ChannelAccessListStatus.LOADING }
+            assertEquals(ChannelAccessListStatus.ERROR, harness.view.accessLists.getValue('b').status)
+            assertTrue(harness.view.accessLists.getValue('b').error.orEmpty().contains("incomplete"))
+            assertFalse(harness.view.busy)
+            assertFalse(harness.view.canEditModes)
+        } }
+    }
+
+    @Test
+    fun leadingZeroLimitsConfirmFromModeEchoAndLabelledSnapshotWithoutQuarantiningNextRequest() = runBlocking {
+        for (labelled in listOf(false, true)) {
+            Peer(labelled).use { peer -> Harness(peer).use { harness ->
+                harness.open()
+                harness.coordinator.setChannelMode(harness.key, 'l', true, "020")
+                await { peer.received.any { it.parameters == listOf("#room", "+l", "020") } }
+                val label = peer.received.last { it.parameters == listOf("#room", "+l", "020") }.tag("label")
+                if (label != null) peer.send("@label=$label :srv 324 tester #room +ntl 20")
+                else peer.send(":tester!u@h MODE #room +l 20")
+                await { harness.view.modes.single { it.mode == 'l' }.parameter == "20" }
+                assertEquals(ChannelSettingsRequestStatus.CONFIRMED, harness.view.requestStatus)
+                harness.coordinator.setChannelTopic(harness.key, "After canonical confirmation")
+                await { peer.received.any { it.parameters == listOf("#room", "After canonical confirmation") } }
+                peer.send(":tester!u@h TOPIC #room :After canonical confirmation")
+                await { harness.view.requestStatus == ChannelSettingsRequestStatus.CONFIRMED }
+            } }
+        }
     }
 
     @Test
@@ -451,6 +522,36 @@ class ChannelSettingsCoordinatorTests {
                 assertEquals(listOf("*!*@replacement"), harness.view.accessLists.getValue('b').entries.map { it.mask })
                 fetchAccessList(peer, harness, 'I', emptyList())
                 assertEquals(ChannelAccessListStatus.EMPTY, harness.view.accessLists.getValue('I').status)
+            } }
+        }
+    }
+
+    @Test
+    fun cancelledUnlabelledFetchStaysQuarantinedAcrossRejoinUntilReconnect() = runBlocking {
+        for (loss in listOf(":tester!u@h PART #room :Leaving", ":operator!u@h KICK #room tester :Removed")) {
+            Peer().use { peer -> Harness(peer).use { harness ->
+                harness.open()
+                harness.coordinator.refreshChannelAccessList(harness.key, 'b')
+                await { peer.received.any { it.parameters == listOf("#room", "+b") } }
+                peer.send(":srv 367 tester #room *!*@cancelled setter 1700000000")
+                await { harness.view.accessLists.getValue('b').entries.isNotEmpty() }
+                peer.send(loss)
+                await { !harness.view.available && !harness.view.busy }
+                harness.coordinator.openChannel("network", "#room")
+                await { harness.view.available }
+                harness.coordinator.refreshChannelAccessList(harness.key, 'b')
+                peer.send(":srv 368 tester #room :Late cancelled termination")
+                peer.send(":srv PING :cancelled-fetch-barrier")
+                await { peer.received.any { it.command == "PONG" && it.parameters.lastOrNull() == "cancelled-fetch-barrier" } }
+                assertEquals(1, peer.received.count { it.parameters == listOf("#room", "+b") })
+                assertEquals(ChannelAccessListStatus.DISCONNECTED, harness.view.accessLists.getValue('b').status)
+                assertTrue(harness.view.accessLists.getValue('b').entries.isEmpty())
+                assertFalse(harness.view.canEditModes)
+                assertTrue(harness.view.unavailableReason.orEmpty().contains("Reconnect"))
+                peer.disconnect()
+                await { peer.connections == 2 && harness.view.canEditModes }
+                fetchAccessList(peer, harness, 'b', listOf("*!*@fresh"))
+                assertEquals(listOf("*!*@fresh"), harness.view.accessLists.getValue('b').entries.map { it.mask })
             } }
         }
     }

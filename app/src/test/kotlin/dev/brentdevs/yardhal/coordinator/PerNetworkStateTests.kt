@@ -432,6 +432,73 @@ class PerNetworkStateTests {
     }
 
     @Test
+    fun removingOtherMembersHighestPrefixRefreshesTheirRetainedVoice() {
+        val state = state()
+        state.feed(":me!u@h JOIN #room")
+        state.feed(":srv 353 me = #room :me @+other")
+        val initial = state.feed(":srv 366 me #room :End of NAMES").only<InboundEffect.SetMembers>()
+        assertEquals(ChannelMember("other", '@'), initial.members.single { it.nick == "other" })
+
+        val removed = state.feed(":op!u@h MODE #room -o other")
+        assertEquals(listOf("NAMES #room"), removed.sent())
+        assertEquals(ChannelMember("other"), removed.only<InboundEffect.SetMembers>().members.single { it.nick == "other" })
+
+        state.feed(":srv 353 me = #room :me +other")
+        val refreshed = state.feed(":srv 366 me #room :End of NAMES").only<InboundEffect.SetMembers>()
+        assertEquals(ChannelMember("other", '+'), refreshed.members.single { it.nick == "other" })
+        assertTrue(refreshed.complete)
+    }
+
+    @Test
+    fun removingLowerPrefixesPreservesHigherRolesInLiveAndPendingNames() {
+        val state = state()
+        state.feed(":srv 005 me PREFIX=(qov)~@+ :are supported")
+        state.joinChannelWith("#room", "me", "~@+owner", "@+other")
+        state.feed(":srv 353 me = #room :me ~@+owner @+other")
+
+        val removed = state.feed(":op!u@h MODE #room -ovv owner owner other")
+        assertTrue(removed.sent().isEmpty())
+        val live = removed.filterIsInstance<InboundEffect.SetMembers>().last()
+        assertEquals(ChannelMember("owner", '~'), live.members.single { it.nick == "owner" })
+        assertEquals(ChannelMember("other", '@'), live.members.single { it.nick == "other" })
+
+        val completed = state.feed(":srv 366 me #room :End of NAMES").only<InboundEffect.SetMembers>()
+        assertEquals(live.members, completed.members)
+    }
+
+    @Test
+    fun pendingNamesHighestPrefixRemovalRequestsRefreshAndAcceptsNewVoice() {
+        val state = state()
+        state.joinChannelWith("#room", "me")
+        state.feed(":srv 353 me = #room :me @+other")
+
+        val removed = state.feed(":op!u@h MODE #room -o other")
+        assertEquals(listOf("NAMES #room"), removed.sent())
+        val pendingCompleted = state.feed(":srv 366 me #room :End of NAMES").only<InboundEffect.SetMembers>()
+        assertEquals(ChannelMember("other"), pendingCompleted.members.single { it.nick == "other" })
+
+        state.feed(":srv 353 me = #room :me +other")
+        val refreshed = state.feed(":srv 366 me #room :End of NAMES").only<InboundEffect.SetMembers>()
+        assertEquals(ChannelMember("other", '+'), refreshed.members.single { it.nick == "other" })
+    }
+
+    @Test
+    fun combinedPrefixRemovalsRequestOneRefreshIncludingOwnPrivilegeChanges() {
+        val state = state()
+        state.joinChannelWith("#room", "@+me", "@+other", "+voiced")
+
+        val removed = state.feed(":op!u@h MODE #room -oov me other voiced")
+        assertEquals(listOf("NAMES #room"), removed.sent())
+        assertTrue(removed.filterIsInstance<InboundEffect.SetMembers>().last().members.all { it.symbol == null })
+
+        state.feed(":srv 353 me = #room :@me @other voiced")
+        state.feed(":srv 366 me #room :End of NAMES")
+        val ownLowerRemoval = state.feed(":op!u@h MODE #room -v me")
+        assertEquals(listOf("NAMES #room"), ownLowerRemoval.sent())
+        assertEquals(ChannelMember("me", '@'), ownLowerRemoval.only<InboundEffect.SetMembers>().members.single { it.nick == "me" })
+    }
+
+    @Test
     fun namesForAClosedBufferAreDiscarded() {
         val state = state()
         state.feed(":srv 353 me = #gone :alice")

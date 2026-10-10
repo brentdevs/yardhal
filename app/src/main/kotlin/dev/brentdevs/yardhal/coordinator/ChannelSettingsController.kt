@@ -21,6 +21,7 @@ internal class ChannelSettingsController(
         val parameter: String = "",
         val topic: String? = null,
         val list: Boolean = false,
+        val changedMasks: MutableSet<String>? = if (list) HashSet() else null,
     )
 
     private val presentations = LinkedHashMap<String, ChannelSettingsState>()
@@ -51,6 +52,7 @@ internal class ChannelSettingsController(
         }
         val request = pending
         if (request != null && presentations[request.ref.storageKey]?.available != true) {
+            if (request.label == null) unlabelledQuarantined = true
             finish(request, ChannelSettingsRequestStatus.DISCONNECTED, "Channel is unavailable")
         }
         publish(presentations.toMap())
@@ -95,7 +97,7 @@ internal class ChannelSettingsController(
             error = prior?.error,
             unavailableReason = when {
                 !available -> "Connect and join this channel to use settings"
-                unlabelledQuarantined -> "Reconnect before retrying: an unlabelled response timed out"
+                unlabelledQuarantined -> "Reconnect before retrying: an unlabelled request did not complete"
                 channel?.modesComplete != true -> "Waiting for channel modes"
                 !operator -> "Channel operator privileges are required for modes and access lists"
                 else -> null
@@ -138,7 +140,7 @@ internal class ChannelSettingsController(
             } else 0
         }
         if (list && enabled && access != null && access.limit?.let { knownEntries >= it } == true &&
-            access.entries.none { state.casemapping.equal(it.mask, value) }
+            access.entries.none { modeParameterMatches(mode, value, it.mask) }
         ) return reject(key, "The server's access-list limit has been reached")
         begin(key, mode, enabled, value, null, false,
             IrcMessage(command = "MODE", parameters = listOf(view.channel, "${if (enabled) "+" else "-"}$mode") +
@@ -214,13 +216,15 @@ internal class ChannelSettingsController(
             when (numeric) {
                 entryNumeric -> {
                     val mask = message.parameters.getOrNull(2) ?: return
-                    if (access.entries.size >= MAX_ENTRIES) {
+                    if (request.changedMasks?.contains(state.fold(normalizeAccessMask(mask))) == true) return
+                    val prior = access.entries.filterNot { modeParameterMatches(mode, mask, it.mask) }
+                    if (prior.size >= MAX_ENTRIES) {
                         if (request.label == null) unlabelledQuarantined = true
                         finish(request, ChannelSettingsRequestStatus.ERROR, "Access list exceeds the $MAX_ENTRIES-entry display bound; result is incomplete")
                         return
                     }
                     val entry = ChannelAccessEntry(mask, message.parameters.getOrNull(3), message.parameters.getOrNull(4)?.toLongOrNull())
-                    presentations[request.ref.storageKey] = view.copy(accessLists = view.accessLists + (mode to access.copy(entries = access.entries + entry)))
+                    presentations[request.ref.storageKey] = view.copy(accessLists = view.accessLists + (mode to access.copy(entries = prior + entry)))
                     publish(presentations.toMap())
                 }
                 entryNumeric + 1 -> finish(request, ChannelSettingsRequestStatus.CONFIRMED, null)
@@ -232,9 +236,7 @@ internal class ChannelSettingsController(
         } else if (message.command == "MODE" && (state.isOwnNick(message.prefix?.nick.orEmpty()) || labelled)) {
             val confirmed = modeDeltas(message).firstOrNull { (mode, adding, value) ->
                 mode == request.mode && adding == request.enabled &&
-                    (request.parameter.isEmpty() || value == request.parameter ||
-                        mode in presentations[request.ref.storageKey]?.accessLists.orEmpty() &&
-                        value?.let { state.casemapping.equal(it, request.parameter) } == true)
+                    modeParameterMatches(mode, request.parameter, value)
             }
             if (confirmed != null) {
                 val mode = request.mode
@@ -253,10 +255,25 @@ internal class ChannelSettingsController(
         } else if (numeric == 324 && labelled && request.mode != null) {
             val modes = state.channel(request.ref.storageKey)?.modeSnapshot().orEmpty()
             val enabled = request.mode.toString() in modes
-            if (enabled == request.enabled && (!request.enabled || request.parameter.isEmpty() || modes[request.mode.toString()]?.firstOrNull() == request.parameter)) {
+            if (enabled == request.enabled && (!request.enabled || modeParameterMatches(request.mode, request.parameter, modes[request.mode.toString()]?.firstOrNull()))) {
                 finish(request, ChannelSettingsRequestStatus.CONFIRMED, null)
             }
         }
+    }
+
+    private fun modeParameterMatches(mode: Char, expected: String, actual: String?): Boolean = when {
+        expected.isEmpty() -> true
+        actual == null -> false
+        mode == 'l' -> expected.toIntOrNull()?.let { it == actual.toIntOrNull() } == true
+        mode in state.isupport.chanmodes.listA -> state.casemapping.equal(normalizeAccessMask(expected), normalizeAccessMask(actual))
+        else -> expected == actual
+    }
+
+    private fun normalizeAccessMask(mask: String): String {
+        if (mask.startsWith('$') || mask.startsWith('~')) return mask
+        if ('!' in mask) return if ('@' in mask) mask else "$mask@*"
+        if ('@' in mask) return "*!$mask"
+        return if ('.' in mask || ':' in mask) "*!*@$mask" else "$mask!*@*"
     }
 
     private fun reconcileAccessLists(message: IrcMessage) {
@@ -266,12 +283,26 @@ internal class ChannelSettingsController(
         for ((mode, adding, mask) in modeDeltas(message)) {
             if (mask == null) continue
             val access = view.accessLists[mode] ?: continue
-            if (access.status != ChannelAccessListStatus.COMPLETE && access.status != ChannelAccessListStatus.EMPTY) continue
-            val entries = access.entries.filterNot { state.casemapping.equal(it.mask, mask) } +
-                if (adding) listOf(ChannelAccessEntry(mask, message.prefix?.nick,
-                    parseServerTime(message.tag("time"))?.div(1_000))) else emptyList()
+            val loading = access.status == ChannelAccessListStatus.LOADING
+            val request = pending?.takeIf { loading && it.list && it.mode == mode && it.ref.storageKey == key }
+            if (loading && request == null || !loading &&
+                access.status != ChannelAccessListStatus.COMPLETE && access.status != ChannelAccessListStatus.EMPTY) continue
+            val entry = if (adding) ChannelAccessEntry(mask, message.prefix?.nick,
+                parseServerTime(message.tag("time"))?.div(1_000)) else null
+            val changes = request?.changedMasks
+            val prior = access.entries.filterNot { modeParameterMatches(mode, mask, it.mask) }
+            val maskKey = changes?.let { state.fold(normalizeAccessMask(mask)) }
+            if (request != null && (changes != null && maskKey !in changes && changes.size >= MAX_ENTRIES ||
+                    adding && prior.size >= MAX_ENTRIES)) {
+                if (request.label == null) unlabelledQuarantined = true
+                finish(request, ChannelSettingsRequestStatus.ERROR, "Live access-list changes exceed the $MAX_ENTRIES-entry display bound; result is incomplete")
+                refresh()
+                return
+            }
+            if (changes != null && maskKey != null) changes.add(maskKey)
+            val entries = if (entry != null) prior + entry else prior
             view = view.copy(accessLists = view.accessLists + (mode to access.copy(entries = entries,
-                status = if (entries.isEmpty()) ChannelAccessListStatus.EMPTY else ChannelAccessListStatus.COMPLETE)))
+                status = if (loading) ChannelAccessListStatus.LOADING else if (entries.isEmpty()) ChannelAccessListStatus.EMPTY else ChannelAccessListStatus.COMPLETE)))
         }
         presentations[key] = view
         publish(presentations.toMap())

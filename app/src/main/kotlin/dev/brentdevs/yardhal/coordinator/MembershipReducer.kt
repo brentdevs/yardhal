@@ -195,6 +195,7 @@ private fun Reduction.applyChannelModes(
     if (requiredParameters > parameters.size - parameterStart) return false
     adding = true
     var parameterIndex = parameterStart
+    var refreshNames = false
     for (mode in encoded) {
         when (mode) {
             '+' -> adding = true
@@ -206,19 +207,24 @@ private fun Reduction.applyChannelModes(
                     if (channel != null && parameter != null) {
                         val folded = state.fold(parameter)
                         val symbol = state.prefixModes.symbolFor(mode)
+                        val addingPrefix = adding
+                        val pendingMembers = state.pendingNames[channel.ref.storageKey]
+                        if (!addingPrefix && (state.isOwnNick(parameter) || symbol != null &&
+                                (channel.members[folded]?.symbol == symbol || pendingMembers?.get(folded)?.symbol == symbol))) {
+                            refreshNames = true
+                        }
                         fun update(member: ChannelMember): ChannelMember {
                             val priorMode = member.symbol?.let(state.prefixModes::modeFor)
                             val priorRank = priorMode?.let(state.prefixModes.modes::indexOf) ?: Int.MAX_VALUE
                             return when {
-                                adding && state.prefixModes.modes.indexOf(mode) <= priorRank -> member.copy(symbol = symbol)
-                                !adding && member.symbol == symbol -> member.copy(symbol = null)
+                                addingPrefix && state.prefixModes.modes.indexOf(mode) <= priorRank -> member.copy(symbol = symbol)
+                                !addingPrefix && member.symbol == symbol -> member.copy(symbol = null)
                                 else -> member
                             }
                         }
                         channel.members[folded]?.let { channel.members[folded] = update(it) }
-                        state.pendingNames[channel.ref.storageKey]?.let { names -> names[folded]?.let { names[folded] = update(it) } }
+                        pendingMembers?.let { names -> names[folded]?.let { names[folded] = update(it) } }
                         publishMembers(channel)
-                        if (!adding && state.isOwnNick(parameter)) emit(InboundEffect.SendRaw("NAMES ${channel.ref.rawTarget}"))
                     }
                     continue
                 }
@@ -244,6 +250,7 @@ private fun Reduction.applyChannelModes(
             }
         }
     }
+    if (refreshNames && channel != null) emit(InboundEffect.SendRaw("NAMES ${channel.ref.rawTarget}"))
     return true
 }
 

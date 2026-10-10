@@ -5,7 +5,7 @@ import java.net.URISyntaxException
 import java.util.Locale
 import dev.brentdevs.yardhal.core.protocol.IrcFormatting
 
-private val CATCH_UP_URL = Regex("""https?://[^\s<>\"{}|\\^`\[\]]+""", RegexOption.IGNORE_CASE)
+private val CATCH_UP_URL = Regex("""https?://(?:\[[^\s<>\"{}|\\^`\[\]]+\]|[^\s<>\"{}|\\^`\[\]]+)[^\s<>\"{}|\\^`\[\]]*""", RegexOption.IGNORE_CASE)
 private val CATCH_UP_ESCAPE = Regex("%[0-9a-fA-F]{2}")
 
 public fun canonicalCatchUpUrl(value: String): String? {

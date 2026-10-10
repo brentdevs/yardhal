@@ -144,6 +144,26 @@ class CatchUpTests {
     }
 
     @Test
+    fun extractedIpv6LinksCanonicalizePortsAndRetainEveryExactSource() = runBlocking {
+        withStore { store, directory ->
+            val first = assertNotNull(store.recordWithRowId(message("ipv6-first",
+                text = "Read (HTTPS://[2001:DB8::1]:443/news?q=1#item).")))
+            val second = assertNotNull(store.recordWithRowId(message("ipv6-second", 2000,
+                text = "https://[2001:db8::1]/news?q=1#item https://[2001:db8::1]:8443/news")))
+            store.record(message("invalid", 3000, text = "https://[not-an-ip]/news https://user:secret@[2001:db8::1]/news"))
+            val consumer = Consumer(store, directory)
+            consumer.controller.refresh(listOf("n"))
+            val links = consumer.controller.state.value.links
+            assertEquals(setOf("https://[2001:db8::1]/news?q=1#item", "https://[2001:db8::1]:8443/news"),
+                links.map { it.canonicalUrl }.toSet())
+            val repeated = links.single { it.canonicalUrl == "https://[2001:db8::1]/news?q=1#item" }
+            assertEquals(listOf(second, first), repeated.occurrences.map { it.anchor.rowId })
+            assertTrue(consumer.controller.jump(repeated.occurrences.last().anchor))
+            assertEquals("ipv6-first", consumer.jumps.single().msgid)
+        }
+    }
+
+    @Test
     fun coverageReportsActualQueryBoundsNotFilteredResultsOrServerCompleteness() = runBlocking {
         withStore { store, directory ->
             repeat(205) { store.record(message("item-$it", it.toLong() + 1)) }
