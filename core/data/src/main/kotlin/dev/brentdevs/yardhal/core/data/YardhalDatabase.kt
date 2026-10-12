@@ -20,6 +20,11 @@ import androidx.sqlite.db.SupportSQLiteOpenHelper
         WhoisCacheRow::class,
         LaunchSelectionRow::class,
         OfflineQuarantineRow::class,
+        SyncEntityRow::class,
+        SyncOutboxRow::class,
+        SyncInboxRow::class,
+        SyncBaselineRow::class,
+        SyncStateRow::class,
     ],
     version = YardhalDatabase.SCHEMA_VERSION,
     exportSchema = true,
@@ -28,9 +33,10 @@ public abstract class YardhalDatabase : RoomDatabase() {
 
     public abstract fun messageDao(): MessageDao
     public abstract fun offlineDao(): OfflineDao
+    public abstract fun syncDao(): SyncDao
 
     public companion object {
-        internal const val SCHEMA_VERSION: Int = 4
+        internal const val SCHEMA_VERSION: Int = 5
 
         private val migration1To2 = object : Migration(1, 2) {
             override fun migrate(db: SupportSQLiteDatabase) {
@@ -82,6 +88,18 @@ public abstract class YardhalDatabase : RoomDatabase() {
             }
         }
 
+        private val migration4To5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("CREATE TABLE IF NOT EXISTS sync_entities (accountId TEXT NOT NULL, kind TEXT NOT NULL, entityKey TEXT NOT NULL, valueJson TEXT, remoteSeq INTEGER NOT NULL, PRIMARY KEY(accountId, kind, entityKey))")
+                db.execSQL("CREATE TABLE IF NOT EXISTS sync_outbox (id TEXT NOT NULL PRIMARY KEY, accountId TEXT NOT NULL, kind TEXT NOT NULL, entityKey TEXT NOT NULL, valueJson TEXT, baseSeq INTEGER NOT NULL, ordinal INTEGER NOT NULL, failure TEXT)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_sync_outbox_accountId_kind_entityKey ON sync_outbox(accountId, kind, entityKey)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_sync_outbox_accountId_ordinal ON sync_outbox(accountId, ordinal)")
+                db.execSQL("CREATE TABLE IF NOT EXISTS sync_inbox (accountId TEXT NOT NULL, kind TEXT NOT NULL, entityKey TEXT NOT NULL, valueJson TEXT, remoteSeq INTEGER NOT NULL, preimagesJson TEXT NOT NULL, PRIMARY KEY(accountId, kind, entityKey))")
+                db.execSQL("CREATE TABLE IF NOT EXISTS sync_baselines (accountId TEXT NOT NULL, kind TEXT NOT NULL, entityKey TEXT NOT NULL, valueJson TEXT, PRIMARY KEY(accountId, kind, entityKey))")
+                db.execSQL("CREATE TABLE IF NOT EXISTS sync_state (accountId TEXT NOT NULL PRIMARY KEY, epoch TEXT, cursor INTEGER NOT NULL, refreshRequired INTEGER NOT NULL)")
+            }
+        }
+
         private fun ensureFts(db: SupportSQLiteDatabase) {
             db.execSQL("CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts4(sender, body, tokenize=unicode61)")
         }
@@ -105,7 +123,7 @@ public abstract class YardhalDatabase : RoomDatabase() {
         ): YardhalDatabase {
             val builder = Room.databaseBuilder(context, YardhalDatabase::class.java, name)
                 .addCallback(callback)
-                .addMigrations(migration1To2, migration2To3, migration3To4)
+                .addMigrations(migration1To2, migration2To3, migration3To4, migration4To5)
             if (factory != null) builder.openHelperFactory(factory)
             return builder.build()
         }

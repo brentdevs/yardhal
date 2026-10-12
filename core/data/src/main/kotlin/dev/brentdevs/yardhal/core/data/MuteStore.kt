@@ -20,14 +20,16 @@ public class MuteStore(directory: File) {
     public fun isMuted(storageKey: String): Boolean = synchronized(mutes) { storageKey in mutes }
 
     public fun mute(storageKey: String): Boolean = synchronized(mutes) {
-        if (!mutes.add(storageKey)) return false
-        store.save(mutes.toSet())
+        if (storageKey in mutes) return false
+        store.save(mutes + storageKey)
+        mutes.add(storageKey)
         true
     }
 
     public fun unmute(storageKey: String): Boolean = synchronized(mutes) {
-        if (!mutes.remove(storageKey)) return false
-        store.save(mutes.toSet())
+        if (storageKey !in mutes) return false
+        store.save(mutes - storageKey)
+        mutes.remove(storageKey)
         true
     }
 
@@ -42,9 +44,11 @@ public class MuteStore(directory: File) {
     }
 
     public fun rename(fromKey: String, toKey: String): Boolean = synchronized(mutes) {
-        if (fromKey == toKey || !mutes.remove(fromKey)) return false
-        mutes.add(toKey)
-        store.save(mutes.toSet())
+        if (fromKey == toKey || fromKey !in mutes) return false
+        val next = (mutes - fromKey) + toKey
+        store.save(next)
+        mutes.clear()
+        mutes.addAll(next)
         true
     }
 }

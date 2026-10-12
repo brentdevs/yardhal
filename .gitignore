@@ -24,6 +24,7 @@ result-*
 # Tools & caches
 .tools/
 .cache/
+__pycache__/
 ergo
 
 # OS

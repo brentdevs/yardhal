@@ -16,6 +16,7 @@ fi
 
 export ANDROID_AVD_HOME="${ANDROID_AVD_HOME:-$HOME/.android/avd}"
 mkdir -p "$ANDROID_AVD_HOME"
+mkdir -p /tmp/opencode
 
 if [ ! -d "$ANDROID_AVD_HOME/$AVD_NAME.avd" ]; then
   echo "Creating AVD $AVD_NAME ..."

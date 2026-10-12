@@ -102,7 +102,8 @@ class ChannelOrderStoreTests {
         assertEquals(listOf("social", "work"), restarted.groupOrder)
         assertEquals(listOf("n|#b", "n|#a", "other|#hidden"), restarted.groups.first { it.id == "work" }.memberKeys)
         assertEquals(listOf("n|#pin-b", "other|#pin-hidden", "n|#pin-a"), restarted.pinnedKeys)
-        assertEquals(listOf("n|#loose-c", "n|#loose-a", "n|#loose-b"), restarted.channelOrder)
+        assertEquals(listOf("n|#b", "n|#a", "n|#pin-b", "n|#pin-a",
+            "n|#loose-c", "n|#loose-a", "n|#loose-b"), restarted.channelOrder)
         assertTrue(restarted.isParted("n|#a"))
     }
 

@@ -33,6 +33,7 @@
           jdk
           pkgs.gradle
           pkgs.git
+          pkgs.python3
         ];
 
         YARDHAL_SDK_TEMPLATE = "${androidSdk.androidsdk}";

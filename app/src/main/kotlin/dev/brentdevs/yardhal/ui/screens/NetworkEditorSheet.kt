@@ -68,6 +68,7 @@ import kotlinx.coroutines.withContext
 @Composable
 public fun WelcomeScreen(
     onAddNetwork: () -> Unit,
+    onOpenSync: () -> Unit,
     presets: List<NetworkPresetUi>,
     onPickPreset: (NetworkPresetUi) -> Unit,
     modifier: Modifier = Modifier,
@@ -135,6 +136,7 @@ public fun WelcomeScreen(
             }
         }
         TextButton(onClick = onAddNetwork) { Text("Add network manually") }
+        TextButton(onClick = onOpenSync) { Text("Restore networks with account sync") }
     }
 }
 

@@ -1,8 +1,11 @@
 package dev.brentdevs.yardhal.core.data
 
+import java.io.File
+import java.io.IOException
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 import org.junit.Rule
 import org.junit.rules.TemporaryFolder
@@ -52,4 +55,16 @@ class MarkerAndMuteStoreTests {
         assertTrue(reloaded.unmute("a|b"))
         assertFalse(MuteStore(tmp.root).isMuted("a|b"))
     }
+    @Test
+    fun failedMuteFileSaveDoesNotAdvanceLiveState() {
+        val store = MuteStore(tmp.root)
+        assertTrue(store.mute("a|old"))
+        assertTrue(File(tmp.root, "mutes.json.tmp").mkdir())
+        assertFailsWith<IOException> { store.mute("a|other") }
+        assertFailsWith<IOException> { store.unmute("a|old") }
+        assertFailsWith<IOException> { store.rename("a|old", "a|new") }
+        assertEquals(setOf("a|old"), store.all())
+        assertEquals(setOf("a|old"), MuteStore(tmp.root).all())
+    }
+
 }

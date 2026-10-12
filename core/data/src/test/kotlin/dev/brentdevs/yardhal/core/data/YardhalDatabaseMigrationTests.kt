@@ -35,7 +35,7 @@ class YardhalDatabaseMigrationTests {
                 assertEquals(legacy, store.after(ref, 0))
                 assertEquals(legacy, store.before(ref, MessageCursor(3000, 0), 10))
                 assertEquals(legacy, store.around(ref, 57, 2000))
-                assertEquals(4, db.openHelper.writableDatabase.version)
+                assertEquals(5, db.openHelper.writableDatabase.version)
                 assertEquals(
                     legacy.map { it.rowId to MessageStore.contentHash(it) },
                     db.messageDao().allRows().sortedBy { it.rowId }.map { it.rowId to it.contentHash },
@@ -107,7 +107,7 @@ class YardhalDatabaseMigrationTests {
                     }
                     assertTrue(found)
                 }
-                assertEquals(4, db.openHelper.writableDatabase.version)
+                assertEquals(5, db.openHelper.writableDatabase.version)
                 assertEquals(
                     legacy.map { it.rowId to MessageStore.contentHash(it) },
                     db.messageDao().allRows().sortedBy { it.rowId }.map { it.rowId to it.contentHash },

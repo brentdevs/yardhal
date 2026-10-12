@@ -91,8 +91,11 @@ public class ReadMarkerStore internal constructor(private val store: JsonFileSto
             cursor = maxOf(current.cursor, remote),
             pending = current.pending?.takeIf { it > remote },
         )
-        if (next == current) return false
-        commit(markers + (storageKey to next))
+        if (next == current) {
+            if (mutablePersistence.value == ReadMarkerPersistence.VOLATILE) commit(markers, requireDurable = true)
+            return false
+        }
+        commit(markers + (storageKey to next), requireDurable = true)
         true
     }
 
@@ -129,6 +132,16 @@ public class ReadMarkerStore internal constructor(private val store: JsonFileSto
         val next = markers.filterKeys { !it.startsWith("$networkId|") }
         if (next != markers) commit(next)
     }
+    public fun deleteNetworkDurably(networkId: String): Boolean = synchronized(lock) {
+        val next = markers.filterKeys { !it.startsWith("$networkId|") }
+        if (next == markers) {
+            if (mutablePersistence.value == ReadMarkerPersistence.VOLATILE) commit(markers, requireDurable = true)
+            return@synchronized false
+        }
+        commit(next, requireDurable = true)
+        true
+    }
+
 
     public fun retainNetwork(networkId: String, retainedStorageKeys: Set<String>): Boolean = synchronized(lock) {
         val next = markers.filterKeys { !it.startsWith("$networkId|") || it in retainedStorageKeys }
@@ -141,11 +154,13 @@ public class ReadMarkerStore internal constructor(private val store: JsonFileSto
 
     public fun all(): Map<String, Long> = synchronized(lock) { markers.mapValues { it.value.cursor.timestampMs } }
 
-    private fun commit(next: Map<String, ReadMarkerState>) {
+    private fun commit(next: Map<String, ReadMarkerState>, requireDurable: Boolean = false) {
         try {
             store.save(next)
+            mutablePersistence.value = ReadMarkerPersistence.DURABLE
         } catch (failure: StorageWriteBlockedException) {
             mutablePersistence.value = ReadMarkerPersistence.VOLATILE
+            if (requireDurable) throw failure
         }
         markers = next
     }

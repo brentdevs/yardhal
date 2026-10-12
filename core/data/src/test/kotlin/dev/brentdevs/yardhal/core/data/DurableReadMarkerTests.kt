@@ -125,8 +125,11 @@ class DurableReadMarkerTests {
         assertEquals(ReadCursor(1000, 10), store.pending("n1")["n1|old"])
         assertTrue(store.rename("n1|old", "n1|new"))
         assertTrue(store.acknowledge("n1|new", ReadCursor(1000, 10)))
-        assertTrue(store.reconcileRemote("n1|new", 2000))
-        assertEquals(ReadCursor(2000, Long.MAX_VALUE), store.cursor("n1|new"))
+        assertFailsWith<StorageWriteBlockedException> { store.reconcileRemote("n1|new", 2000) }
+        assertEquals(ReadCursor(1000, 10), store.cursor("n1|new"))
+        assertFailsWith<StorageWriteBlockedException> { store.reconcileRemote("n1|new", 500) }
+        assertFailsWith<StorageWriteBlockedException> { store.deleteNetworkDurably("n1") }
+        assertEquals(ReadCursor(1000, 10), store.cursor("n1|new"))
         assertTrue(store.advance("n2|kept", 3000, 30))
         assertTrue(store.retainNetwork("n1", emptySet()))
         assertEquals(ReadCursor(3000, 30), store.cursor("n2|kept"))

@@ -129,6 +129,17 @@ public class ThemeLibraryStore(
         if (retained.size != current.accents.size) save(current.copy(accents = retained))
     }
 
+    @Synchronized
+    public fun applySyncState(synced: ThemeLibraryState) {
+        require(synced.themes.size <= MAX_THEMES && synced.accents.size <= MAX_ACCENTS)
+        require(synced.themes.map { it.id }.distinct().size == synced.themes.size)
+        require(synced.accents.map { it.networkId to it.normalizedTarget }.distinct().size == synced.accents.size)
+        require(synced.selectedId == null || synced.themes.any { it.id == synced.selectedId })
+        val validated = synced.copy(themes = synced.themes.map { it.copy(variants = it.variants.validated()) })
+        for (accent in validated.accents) validateThemeColor(accent.color)
+        save(validated)
+    }
+
     private fun save(next: ThemeLibraryState) {
         store.save(next)
         mutableState.value = next

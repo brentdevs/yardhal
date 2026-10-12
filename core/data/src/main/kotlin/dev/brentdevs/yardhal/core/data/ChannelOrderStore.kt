@@ -133,10 +133,11 @@ public class ChannelOrderStore(directory: File) {
                         (key in state.pinnedKeys) == pinned && (pinned || state.groupOf(key)?.id == groupId)
                 }) { "Reorder within the same network and pinned or group section." }
                 when {
-                    pinned -> state.copy(pinnedKeys = reordered(state.pinnedKeys), sortUnreadFirst = false)
+                    pinned -> state.copy(pinnedKeys = reordered(state.pinnedKeys),
+                        channelOrder = reordered(state.channelOrder), sortUnreadFirst = false)
                     groupId != null -> state.copy(groups = state.groups.map { group ->
                         if (group.id == groupId) group.copy(memberKeys = reordered(group.memberKeys)) else group
-                    }, sortUnreadFirst = false)
+                    }, channelOrder = reordered(state.channelOrder), sortUnreadFirst = false)
                     else -> state.copy(channelOrder = reordered(state.channelOrder), sortUnreadFirst = false)
                 }
             }
@@ -181,6 +182,17 @@ public class ChannelOrderStore(directory: File) {
             partedKeys = state.partedKeys.renamed(),
             channelOrder = state.channelOrder.renamed(),
         ))
+    }
+
+    @Synchronized
+    public fun applySyncState(synced: ChannelOrderState) {
+        require(synced.groups.map { it.id }.distinct().size == synced.groups.size)
+        require(synced.groups.flatMap { it.memberKeys }.distinct().size == synced.groups.sumOf { it.memberKeys.size })
+        require(synced.pinnedKeys.distinct().size == synced.pinnedKeys.size)
+        require(synced.groupOrder.distinct().size == synced.groupOrder.size)
+        require(synced.networkOrder.distinct().size == synced.networkOrder.size)
+        require(synced.channelOrder.distinct().size == synced.channelOrder.size)
+        publish(synced.copy(partedKeys = state.partedKeys, sortUnreadFirst = state.sortUnreadFirst))
     }
 
     private fun publish(next: ChannelOrderState) {

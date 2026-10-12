@@ -18,6 +18,21 @@ public interface MessageDao {
 
     @Query("SELECT * FROM messages WHERE networkId = :networkId AND conversation = :conversation AND msgid = :msgid LIMIT 1")
     public suspend fun byMsgid(networkId: String, conversation: String, msgid: String): MessageRow?
+    @Query(
+        "SELECT networkId, conversation, msgid, replyToMsgid, attachmentName, attachmentMimeType, attachmentSizeBytes, " +
+            "attachmentWidth, attachmentHeight FROM messages WHERE networkId IN (:networkIds) AND sentByUs = 1 " +
+            "AND msgid IS NOT NULL AND redacted = 0 AND (replyToMsgid IS NOT NULL OR attachmentName IS NOT NULL " +
+            "OR attachmentMimeType IS NOT NULL OR attachmentSizeBytes IS NOT NULL OR attachmentWidth IS NOT NULL " +
+            "OR attachmentHeight IS NOT NULL)",
+    )
+    public suspend fun authoredInteractionMetadata(networkIds: Set<String>): List<SyncAuthoredInteractionRow>
+
+    @Query(
+        "SELECT networkId, conversation, SUBSTR(identity, 7) AS msgid FROM message_tombstones " +
+            "WHERE networkId IN (:networkIds) AND privacyDeletion = 1 AND identity LIKE 'msgid:%'",
+    )
+    public suspend fun privateRedactions(networkIds: Set<String>): List<SyncRedactionIdentity>
+
 
     @Query(
         "SELECT * FROM messages WHERE networkId = :networkId AND conversation = :conversation AND contentHash = :hash " +
@@ -240,6 +255,15 @@ public interface MessageDao {
 
     @Query("SELECT * FROM message_reactions WHERE networkId = :networkId AND conversation = :conversation")
     public suspend fun reactions(networkId: String, conversation: String): List<MessageReactionRow>
+    @Query(
+        "SELECT r.* FROM message_reactions r LEFT JOIN messages m ON m.networkId = r.networkId " +
+            "AND m.conversation = r.conversation AND m.msgid = r.msgid " +
+            "WHERE r.networkId IN (:networkIds) AND (m.rowId IS NULL OR m.redacted = 0) " +
+            "AND NOT EXISTS (SELECT 1 FROM message_tombstones t WHERE t.networkId = r.networkId " +
+            "AND t.conversation = r.conversation AND t.identity = 'msgid:' || r.msgid AND t.privacyDeletion = 1)",
+    )
+    public suspend fun retainedSyncReactions(networkIds: Set<String>): List<MessageReactionRow>
+
 
     @Query(
         "DELETE FROM message_reactions WHERE networkId = :networkId AND conversation = :conversation " +

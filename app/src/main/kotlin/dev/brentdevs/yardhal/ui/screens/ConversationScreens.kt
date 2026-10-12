@@ -1641,6 +1641,7 @@ public fun NetworkOverviewScreen(
     showBouncerButton: Boolean = false,
     onOpenBouncer: () -> Unit = {},
     onOpenAppearance: () -> Unit = {},
+    onOpenSync: () -> Unit = {},
     onOpenCatchUp: () -> Unit,
     onOpenBugReport: () -> Unit,
     onOpenNotifications: () -> Unit,
@@ -1781,7 +1782,6 @@ public fun NetworkOverviewScreen(
             TopAppBar(
                 title = { Text("Conversations") },
                 actions = {
-                    if (networks.isNotEmpty() || showBouncerButton) {
                         Box {
                             IconButton(onClick = { appMenuVisible = true }) {
                                 Icon(Icons.Filled.MoreVert, contentDescription = "App options")
@@ -1805,6 +1805,10 @@ public fun NetworkOverviewScreen(
                                     appMenuVisible = false
                                     onOpenAppearance()
                                 })
+                                DropdownMenuItem(text = { Text("Account sync") }, onClick = {
+                                    appMenuVisible = false
+                                    onOpenSync()
+                                })
                                 DropdownMenuItem(text = { Text("Catch Up") }, onClick = {
                                     appMenuVisible = false
                                     onOpenCatchUp()
@@ -1819,7 +1823,6 @@ public fun NetworkOverviewScreen(
                                 })
                             }
                         }
-                    }
                 },
             )
         },

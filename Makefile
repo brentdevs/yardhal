@@ -14,6 +14,7 @@ build:
 
 test:
 	./gradlew $(GRADLE_FLAGS) test
+	python3 -m unittest discover -s scripts -p 'test_sync_server.py'
 
 lint:
 	./gradlew $(GRADLE_FLAGS) :app:lintDebug

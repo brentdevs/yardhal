@@ -41,6 +41,8 @@ import dev.brentdevs.yardhal.core.data.OfflineConversationShell
 import dev.brentdevs.yardhal.core.data.OfflineRoster
 import dev.brentdevs.yardhal.core.data.OfflineStore
 import dev.brentdevs.yardhal.core.data.ReadCursor
+import dev.brentdevs.yardhal.core.data.SyncLedger
+import dev.brentdevs.yardhal.core.data.SyncProjection
 import dev.brentdevs.yardhal.core.protocol.CaseMapping
 import dev.brentdevs.yardhal.core.protocol.HistoryAnchor
 import dev.brentdevs.yardhal.core.protocol.IrcCtcp
@@ -56,6 +58,7 @@ import dev.brentdevs.yardhal.ui.image.ImageUrlPolicy
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
@@ -67,6 +70,10 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 
 public fun interface ConnectionFactory {
     public fun create(config: NetworkConfig, onStsUpgrade: (Int) -> Unit): IrcConnection
@@ -95,6 +102,7 @@ public class LiveCoordinator(
     private val onNotificationConversationRead: (ConversationRef) -> Unit = {},
     private val catchUpStore: dev.brentdevs.yardhal.core.data.CatchUpStore? = null,
     private val themeLibrary: dev.brentdevs.yardhal.core.data.ThemeLibraryStore? = null,
+    private val syncLedger: () -> SyncLedger? = { null },
 ) {
 
     private val idGenerator = AtomicLong(1)
@@ -1340,7 +1348,9 @@ public class LiveCoordinator(
             removed
         }
 
-    public fun updateNetwork(config: NetworkConfig, credentialsChanged: Boolean = false): Boolean =
+    public fun updateNetwork(
+        config: NetworkConfig, credentialsChanged: Boolean = false, preserveParted: Boolean = false,
+    ): Boolean =
         synchronized(sessionLifecycleLock) update@{
             val saved = networkStore.byId(config.id) ?: return@update false
             val updated = config.copy(userDisconnected = saved.userDisconnected)
@@ -1357,18 +1367,20 @@ public class LiveCoordinator(
                 ) else child)
             }
             if (!networkStore.upsertAll(listOf(updated) + children)) return@update false
-            applyUpdatedConfig(saved, updated, credentialsChanged)
+            applyUpdatedConfig(saved, updated, credentialsChanged, preserveParted)
             for (child in children) {
                 val previous = sessions[child.id]?.config ?: continue
-                applyUpdatedConfig(previous, child, credentialsChanged)
+                applyUpdatedConfig(previous, child, credentialsChanged, preserveParted)
             }
             refreshNetworkStates()
             true
         }
 
-    private fun applyUpdatedConfig(previous: NetworkConfig, updated: NetworkConfig, credentialsChanged: Boolean) {
+    private fun applyUpdatedConfig(
+        previous: NetworkConfig, updated: NetworkConfig, credentialsChanged: Boolean, preserveParted: Boolean = false,
+    ) {
         val session = sessions[updated.id]
-        clearNewAutojoins(previous, updated, session?.state?.casemapping ?: CaseMapping.RFC1459)
+        if (!preserveParted) clearNewAutojoins(previous, updated, session?.state?.casemapping ?: CaseMapping.RFC1459)
         if (session == null) return
         synchronized(session.state) {
             if (!credentialsChanged && session.config.connectionSettingsMatch(updated)) {
@@ -1578,7 +1590,10 @@ public class LiveCoordinator(
         session.lifecycleJob.cancel()
     }
 
-    public fun removeNetwork(networkId: String): Boolean = synchronized(sessionLifecycleLock) {
+    public fun removeNetwork(networkId: String): Boolean = removeNetwork(networkId, null)
+
+    private fun removeNetwork(networkId: String, completions: MutableList<CompletableDeferred<Throwable?>>?): Boolean =
+        synchronized(sessionLifecycleLock) {
         val saved = networkStore.byId(networkId) ?: return@synchronized false
         val removed = listOf(saved) + networkStore.dependents(networkId)
         if (!networkStore.removeAll(removed.map { it.id }.toSet())) {
@@ -1586,34 +1601,62 @@ public class LiveCoordinator(
             return@synchronized false
         }
         synchronized(persistenceLock) { persistenceBatch += 1 }
-        for (config in removed) removePersistedNetwork(config)
+        for (config in removed) {
+            val completion = completions?.let { CompletableDeferred<Throwable?>().also(it::add) }
+            removePersistedNetwork(config, completion)
+        }
         refreshNetworkStates()
         true
     }
 
-    private fun removePersistedNetwork(saved: NetworkConfig) {
+    public suspend fun removeSyncedNetwork(networkId: String): Boolean {
+        if (networkStore.byId(networkId) != null) {
+            val completions = mutableListOf<CompletableDeferred<Throwable?>>()
+            if (!removeNetwork(networkId, completions)) throw java.io.IOException("Could not persist synchronized network deletion")
+            for (completion in completions) completion.await()?.let { throw it }
+        } else {
+            messageStore.deleteNetwork(networkId)
+            offlineStore?.deleteNetwork(networkId)
+            readMarkers.deleteNetworkDurably(networkId)
+            catchUpStore?.deleteNetwork(networkId)
+            themeLibrary?.deleteNetwork(networkId)
+            channelOrder.forgetNetwork(networkId)
+            mutes.deleteNetwork(networkId)
+        }
+        refreshSyncedMetadata()
+        return true
+    }
+
+    private fun removePersistedNetwork(saved: NetworkConfig, completion: CompletableDeferred<Throwable?>? = null) {
             val networkId = saved.id
             sessions[networkId]?.let { session ->
                 synchronized(session.state) { stopSession(session, "Network removed") }
             }
             enqueuePersistence {
-                messageStore.deleteNetwork(networkId)
-                offlineStore?.deleteNetwork(networkId)
-                readMarkers.deleteNetwork(networkId)
-                catchUpStore?.deleteNetwork(networkId)
-                themeLibrary?.deleteNetwork(networkId)
-                channelOrder.forgetNetwork(networkId)
-                mutes.deleteNetwork(networkId)
-                _orderState.value = channelOrder.snapshot()
-                _mutedState.value = mutes.all()
                 try {
-                    networkStore.deleteUnreferencedPasswords(
-                        listOfNotNull(saved.saslPasswordRef, saved.serverPasswordRef, saved.nickServPasswordRef, saved.proxy?.passwordRef),
-                        vault,
-                    )
-                } catch (_: java.io.IOException) {
-                    _operationError.value = "Network removed, but unused saved credentials could not be deleted. Check device storage and credential permissions."
+                    messageStore.deleteNetwork(networkId)
+                    offlineStore?.deleteNetwork(networkId)
+                    if (completion == null) readMarkers.deleteNetwork(networkId)
+                    else readMarkers.deleteNetworkDurably(networkId)
+                    catchUpStore?.deleteNetwork(networkId)
+                    themeLibrary?.deleteNetwork(networkId)
+                    channelOrder.forgetNetwork(networkId)
+                    mutes.deleteNetwork(networkId)
+                    _orderState.value = channelOrder.snapshot()
+                    _mutedState.value = mutes.all()
+                    try {
+                        networkStore.deleteUnreferencedPasswords(
+                            listOfNotNull(saved.saslPasswordRef, saved.serverPasswordRef, saved.nickServPasswordRef, saved.proxy?.passwordRef),
+                            vault,
+                        )
+                    } catch (_: java.io.IOException) {
+                        _operationError.value = "Network removed, but unused saved credentials could not be deleted. Check device storage and credential permissions."
+                    }
+                } catch (failure: Throwable) {
+                    completion?.complete(failure)
+                    throw failure
                 }
+                completion?.complete(null)
             }
             history.removeNetwork(networkId)
             bouncerManagement.remove(networkId)
@@ -2493,7 +2536,11 @@ public class LiveCoordinator(
                 updateBufferKey(effect.ref.storageKey) { current -> redactInBuffer(current, effect.msgid) }
                 enqueuePersistence {
                     if (networkStore.byId(session.config.id) == null) return@enqueuePersistence
-                    messageStore.redact(effect.ref, effect.msgid, clock())
+                    val ledger = portableInteractionLedger("redaction", {
+                        SyncLedger.messageKey(effect.ref.networkId, effect.ref.normalizedTarget, effect.msgid)
+                    }) { JsonObject(mapOf("deleted" to JsonPrimitive(true))) }
+                    if (ledger == null) messageStore.redact(effect.ref, effect.msgid, clock())
+                    else ledger.localRedaction(effect.ref, effect.msgid)
                     refreshVisibleDurableState(effect.ref)
                     refreshUnread(effect.ref)
                 }
@@ -2714,7 +2761,7 @@ public class LiveCoordinator(
 
     private suspend fun migrateMessages(from: ConversationRef, to: ConversationRef) {
         if (networkStore.byId(from.networkId) == null) return
-        messageStore.renameConversation(from, to) { removed, retained ->
+        val onRowMerged: (Long, Long) -> Unit = { removed, retained ->
             catchUpStore?.mergeRows(from.networkId, removed, retained)
             synchronized(selectionLock) {
                 for ((key, rowId) in persistedRowsByLocalId) if (rowId == removed) persistedRowsByLocalId[key] = retained
@@ -2738,6 +2785,10 @@ public class LiveCoordinator(
                 }
             }
         }
+        val ledger = syncLedger()
+        if (ledger == null) messageStore.renameConversation(from, to, onRowMerged)
+        else ledger.renameConversation(from.networkId, from.normalizedTarget, to.normalizedTarget)
+            .rows.forEach { onRowMerged(it.removedRowId, it.survivingRowId) }
         offlineStore?.renameConversation(from, to, sessions[to.networkId]?.state?.casemapping ?: CaseMapping.RFC1459)
         loadCachedShell(to)
         if (_buffers.value[to.storageKey]?.cachedRoster == true) {
@@ -3049,8 +3100,12 @@ public class LiveCoordinator(
                 var affectedRows: Set<Long> = emptySet()
                 try {
                     if (sessions[networkId] !== session || networkStore.byId(networkId) == null) return@enqueuePersistence
-                    messageStore.applyReaction(buffer.ref, msgid, own, emoji, verb == "react", clock(),
+                    val ledger = portableInteractionLedger("reaction", {
+                        SyncLedger.reactionKey(buffer.ref.networkId, buffer.ref.normalizedTarget, msgid, emoji, own)
+                    }) { JsonObject(mapOf("present" to JsonPrimitive(verb == "react"))) }
+                    if (ledger == null) messageStore.applyReaction(buffer.ref, msgid, own, emoji, verb == "react", clock(),
                         onRetentionChanged = { affectedRows = it })
+                    else affectedRows = ledger.localReaction(buffer.ref, msgid, own, emoji, verb == "react")
                 } finally {
                     reactionRevision?.let { clearReactionRevision(buffer.ref, msgid, it) }
                     refreshReactionRetention(networkId, affectedRows, currentRef(buffer.ref), setOf(msgid))
@@ -3193,6 +3248,27 @@ public class LiveCoordinator(
 
     private val _orderState = MutableStateFlow(channelOrder.snapshot())
     public val orderState: StateFlow<dev.brentdevs.yardhal.core.data.ChannelOrderState> = _orderState.asStateFlow()
+
+    public fun refreshSyncedMetadata() {
+        _orderState.value = channelOrder.snapshot()
+        _mutedState.value = mutes.all()
+        refreshNetworkStates()
+        for (buffer in _buffers.value.values) {
+            updateBufferKey(buffer.key) { it.copy(readAtMs = readMarkers.marker(buffer.key)) }
+            enqueuePersistence {
+                refreshVisibleDurableState(buffer.ref)
+                refreshUnread(buffer.ref)
+            }
+        }
+    }
+
+    private inline fun portableInteractionLedger(
+        kind: String, key: () -> String, value: () -> JsonElement,
+    ): SyncLedger? {
+        val ledger = syncLedger() ?: return null
+        val canonical = try { key() } catch (_: IllegalArgumentException) { return null }
+        return ledger.takeIf { SyncProjection.canSync(kind, canonical, value()) }
+    }
 
     public fun reorder(move: dev.brentdevs.yardhal.core.data.OrderMove): Boolean = saveOrder {
         channelOrder.move(move)
@@ -3529,6 +3605,35 @@ public class LiveCoordinator(
                     }
                 }
                 return@enqueuePersistence
+            }
+            val canonicalMsgid = stored.msgid
+            if (canonicalMsgid != null) {
+                syncLedger()?.hydrateOrphanMetadata(target, canonicalMsgid)
+                if (stored.sentByUs && !stored.redacted) {
+                    stored.replyToMsgid?.let { parent ->
+                        val ledger = portableInteractionLedger("reply", {
+                            SyncLedger.messageKey(target.networkId, target.normalizedTarget, canonicalMsgid)
+                        }) { JsonObject(mapOf("parentMsgid" to JsonPrimitive(parent))) }
+                        ledger?.localReply(target, canonicalMsgid, parent)
+                    }
+                    if (stored.attachmentName != null || stored.attachmentMimeType != null ||
+                        stored.attachmentSizeBytes != null || stored.attachmentWidth != null || stored.attachmentHeight != null
+                    ) {
+                        val ledger = portableInteractionLedger("attachment", {
+                            SyncLedger.messageKey(target.networkId, target.normalizedTarget, canonicalMsgid)
+                        }) {
+                            JsonObject(mapOf(
+                                "name" to (stored.attachmentName?.let(::JsonPrimitive) ?: JsonNull),
+                                "mimeType" to (stored.attachmentMimeType?.let(::JsonPrimitive) ?: JsonNull),
+                                "sizeBytes" to (stored.attachmentSizeBytes?.let(::JsonPrimitive) ?: JsonNull),
+                                "width" to (stored.attachmentWidth?.let(::JsonPrimitive) ?: JsonNull),
+                                "height" to (stored.attachmentHeight?.let(::JsonPrimitive) ?: JsonNull),
+                            ))
+                        }
+                        ledger?.localAttachment(target, canonicalMsgid, stored.attachmentName, stored.attachmentMimeType,
+                            stored.attachmentSizeBytes, stored.attachmentWidth, stored.attachmentHeight)
+                    }
+                }
             }
             if (message.pendingEcho) persistedRowsByLocalId["${ref.networkId}|${message.localId}"] = rowId
             else persistedRowsByLocalId.remove("${ref.networkId}|${message.localId}")

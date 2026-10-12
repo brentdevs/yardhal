@@ -92,6 +92,8 @@ import dev.brentdevs.yardhal.ui.screens.BugReportSheet
 import dev.brentdevs.yardhal.ui.screens.CatchUpSheet
 import dev.brentdevs.yardhal.ui.screens.ChannelSettingsSheet
 import dev.brentdevs.yardhal.ui.theme.ThemeSettingsSheet
+import dev.brentdevs.yardhal.sync.SyncManager
+import dev.brentdevs.yardhal.ui.sync.SyncSettingsSheet
 import dev.brentdevs.yardhal.ui.theme.ConversationAccent
 
 private val NETWORK_ID_SET_SAVER = listSaver<Set<String>, String>(
@@ -103,6 +105,7 @@ private val NETWORK_ID_SET_SAVER = listSaver<Set<String>, String>(
 @Composable
 public fun YardhalAppRoot(
     coordinator: LiveCoordinator,
+    syncManager: SyncManager,
     appearanceStore: ChatAppearanceStore,
     mediaEnvironment: MediaEnvironment,
     attachmentStages: AttachmentStageManager,
@@ -124,6 +127,7 @@ public fun YardhalAppRoot(
     modifier: Modifier = Modifier,
 ) {
     val networks by coordinator.networks.collectAsStateWithLifecycle()
+    val syncState by syncManager.state.collectAsStateWithLifecycle()
     val buffers by coordinator.buffers.collectAsStateWithLifecycle()
     val stagedAttachments by attachmentStages.attachments.collectAsStateWithLifecycle()
     val whoisPresentation by coordinator.whoisPresentation.collectAsStateWithLifecycle()
@@ -209,6 +213,7 @@ public fun YardhalAppRoot(
     var bouncerInitialId by remember { mutableStateOf<String?>(null) }
     var removingAccountId by remember { mutableStateOf<String?>(null) }
     var appearanceVisible by remember { mutableStateOf(false) }
+    var syncSettingsVisible by rememberSaveable { mutableStateOf(false) }
     var mediaSettingsVisible by rememberSaveable { mutableStateOf(false) }
     var uploadSettingsVisible by rememberSaveable { mutableStateOf(false) }
     var relaySettingsVisible by rememberSaveable { mutableStateOf(false) }
@@ -238,6 +243,7 @@ public fun YardhalAppRoot(
         catchUpVisible = false
         channelSettingsKey = null
         appearanceVisible = false
+        syncSettingsVisible = false
         mediaSettingsVisible = false
         uploadSettingsVisible = false
         relaySettingsVisible = false
@@ -428,6 +434,7 @@ public fun YardhalAppRoot(
                 bouncerAccounts.values.any { it.mode != dev.brentdevs.yardhal.core.data.NetworkMode.DIRECT },
             onOpenBouncer = { selectionSettled = true; bouncerInitialId = null; bouncerVisible = true },
             onOpenAppearance = { selectionSettled = true; appearanceVisible = true },
+            onOpenSync = { selectionSettled = true; syncSettingsVisible = true },
             onOpenCatchUp = { catchUpVisible = true },
             onOpenBugReport = { bugReportVisible = true },
             onOpenNotifications = { notificationSettingsVisible = true },
@@ -719,6 +726,7 @@ public fun YardhalAppRoot(
                     if (networks.isEmpty()) {
                         WelcomeScreen(
                             onAddNetwork = { openNetworkEditor() },
+                            onOpenSync = { syncSettingsVisible = true },
                             presets = presets,
                             onPickPreset = { picked -> openNetworkEditor(preset = picked) },
                         )
@@ -813,6 +821,13 @@ public fun YardhalAppRoot(
             onOpenUploads = { appearanceVisible = false; uploadSettingsVisible = true },
             onOpenRelays = { appearanceVisible = false; relaySettingsVisible = true },
             relaysAvailable = selectedKey?.let { buffers[it] } != null,
+        )
+    }
+    if (syncSettingsVisible) {
+        SyncSettingsSheet(
+            manager = syncManager,
+            state = syncState,
+            onDismiss = { syncSettingsVisible = false },
         )
     }
     if (themeSettingsVisible) {

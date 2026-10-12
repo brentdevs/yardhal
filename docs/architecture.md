@@ -1122,6 +1122,121 @@ client certificates/keys, diagnostic logs, message bodies or media bytes.
 Devices re-enter IRC/proxy credentials locally; encrypted credential replication
 requires a separate explicit design and approval.
 
+### Scope, identities and conflict contract
+
+The account identity is a server-issued UUID; each installation has a durable
+random device UUID. Network UUIDs are preserved during import, and soju
+upstream IDs use `DerivedNetworkIdentity.sojuNetworkId(parentId, netId)` with
+the imported parent ID. Conversation identity is the network UUID plus the
+existing casemapping-folded storage target; canonical `msgid` scoped to that
+network/conversation is required for interaction sync. Local Room row IDs and
+unmatched content hashes never become cross-device identities. A rename or
+CASEMAPPING migration moves conversation-scoped metadata to the destination
+identity before the next outbound snapshot; duplicate destinations merge
+read maxima and distinct reaction memberships.
+
+Portable configuration: sanitized network records, channel/network/group
+order, pins, group membership, mutes, saved user themes and selection,
+conversation accents, hidden-avatar preferences and IRC read timestamps.
+Portable interactions: scoped immutable reply parent IDs, per-sender emoji
+reaction membership, redaction/deletion identity and attachment metadata
+(display name, media type, dimensions and size; no attachment URL). Sync
+does **not** replicate transcript bodies, message attachments/media bytes,
+cached rosters, WHOIS, presence, diagnostic/traffic reports, temporary file
+shares, local attachment staging or local database row IDs. Device-local:
+credentials, certificate pins and aliases, proxy configuration, connection
+intent, media network policy and cache, notification channels/permission,
+display-dependent appearance such as font/text scaling and device theme.
+Connection availability and IRC history stay owned by each device.
+
+The server serializes account operations with monotonically increasing
+revisions, idempotent operation UUIDs and a retained latest entity value.
+Disjoint entity keys merge; concurrent edits to one record (including different
+fields of a network record) follow server arrival order, with acknowledged
+revisions reported to both devices.
+Read timestamps use `max` and never carry local row-ID tie-breakers. Group
+membership, pins and order use per-key changes rather than replacing an
+entire list: disjoint changes merge; conflicting moves of the same item use
+server order. Reply edges are immutable once set. Reaction add/remove uses
+the scoped parent/emoji/sender identity, with removal winning over stale
+offline additions. Network/theme/message deletions retain tombstones; a stale
+device cannot recreate a deleted identity without an explicitly new ID.
+Metadata retention has an account quota and is not cleared by a client-side
+timer that could resurrect stale offline records. Backups and full account
+deletion are operator-controlled; revoking a device does not erase its local
+IRC data. Replayed remote operations update local stores without generating
+new outbound intent. MARKREAD remains server-authoritative at timestamp
+granularity and only advances, never rewinds, the local marker or its pending
+wire acknowledgment.
+
+### Operate and connect the sync service
+
+The repository ships `scripts/sync-server.py` (Python standard library and
+SQLite). On a trusted host, initialize the database and enroll an account:
+
+```sh
+python3 scripts/sync-server.py --db /srv/yardhal/sync.sqlite create-account
+python3 scripts/sync-server.py --db /srv/yardhal/sync.sqlite serve --port 8765
+```
+
+`create-account` prints a UUID and a one-time 64-hex enrollment secret; store
+both privately. The service listens only on loopback and never provides TLS
+itself. Put it behind an operator-managed HTTPS reverse proxy with a valid
+certificate and restrict host access/backups to the operator. Configure the
+public origin (no path or embedded user credentials) in **Overview → app menu
+→ Account sync**, or **Restore networks with account sync** on a fresh install.
+Enter the same account UUID
+and enrollment secret on each device; each gets a separate revocable token
+held in Android's credential vault. Release builds refuse plain HTTP. Debug
+builds permit HTTP only for loopback (for example `adb reverse` to the
+service during local verification).
+
+The installation UUID is kept in Android's non-backed-up app directory: a
+restored copy of another installation's preferences must re-enroll instead
+of reusing the original device's revocable server identity.
+
+Android stores each device's cursor, changes awaiting upload and remote
+changes awaiting JSON materialization durably in Room. A saved local change
+remains available while the service is down; sync retries with a capped
+backoff and the settings sheet exposes pending work, last success, rejection
+and manual retry. Network connection intent and IRC credentials are entered
+per device. Disconnect and revoke this device leaves its local IRC data
+intact and requires a reachable service; deleting the cloud account revokes
+all devices and requires the enrollment secret. A server outage never blocks
+the local client. The operator must back up the SQLite database using
+SQLite's online backup mechanism rather than copying only its WAL file; after
+restoring a backup, `rotate-epoch --account UUID` forces every device to
+refetch the server state without dropping its unsent edits. Service operator
+removal or account deletion is not a substitute for deleting local Android
+data on each device.
+
+The server keeps 100,000 entity identities per account, including permanent
+tombstones; active themes and accents are additionally capped at 100 and
+1,000. Operation UUIDs are retained for delayed idempotent retries and capped
+at one million per account. Quota failures are visible and do not stop
+downloads or device/account removal. Epoch rotation does not reset quotas:
+an operator must create another account and explicitly re-enroll devices
+after preparing a migration. There is no automatic account migration and
+deleting the old account before all devices have copied their wanted local
+configuration can lose portable records.
+
+`nix develop --command make check` runs the Android suites and isolated
+SQLite/backend regressions. For a local two-install smoke test, boot two
+separate emulators, install the debug APK on each, run the loopback service,
+and reverse its port independently:
+
+```sh
+adb -s emulator-5554 reverse tcp:8765 tcp:8765
+adb -s emulator-5556 reverse tcp:8765 tcp:8765
+```
+
+Enroll both with the same account at `http://127.0.0.1:8765`. Take one
+installation offline by removing its reverse mapping, edit portable state,
+reconnect and retry; then verify convergence and local IRC operation after
+revoking a device or deleting the cloud account. The HTTP exception exists
+only in debug builds and only for loopback.
+
+
 ## Roadmap
 
 Phases land in order; each phase ships with tests and updated docs.

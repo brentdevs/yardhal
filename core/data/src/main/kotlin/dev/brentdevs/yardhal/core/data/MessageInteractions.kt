@@ -86,6 +86,24 @@ public data class MessageActivityRow(public val conversation: String, public val
 public data class MessageReactionParent(public val conversation: String, public val msgid: String)
 public data class MessageReactionVictim(public val reactionRowId: Long, public val parentRowId: Long?)
 
+public data class SyncAuthoredInteractionRow(
+    public val networkId: String,
+    public val conversation: String,
+    public val msgid: String,
+    public val replyToMsgid: String?,
+    public val attachmentName: String?,
+    public val attachmentMimeType: String?,
+    public val attachmentSizeBytes: Long?,
+    public val attachmentWidth: Int?,
+    public val attachmentHeight: Int?,
+)
+
+public data class SyncRedactionIdentity(
+    public val networkId: String,
+    public val conversation: String,
+    public val msgid: String,
+)
+
 internal fun createInteractionTables(db: androidx.sqlite.db.SupportSQLiteDatabase) {
     db.execSQL(
         "CREATE TABLE IF NOT EXISTS message_reactions (networkId TEXT NOT NULL, conversation TEXT NOT NULL, " +

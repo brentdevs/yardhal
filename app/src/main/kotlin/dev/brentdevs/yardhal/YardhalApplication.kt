@@ -38,6 +38,7 @@ import dev.brentdevs.yardhal.service.Notifications
 import dev.brentdevs.yardhal.service.keepsRecoveryService
 import dev.brentdevs.yardhal.service.ConversationNotifier
 import dev.brentdevs.yardhal.service.NotificationRouteInbox
+import dev.brentdevs.yardhal.sync.SyncManager
 import dev.brentdevs.yardhal.ui.theme.createThemeLibrary
 import dev.brentdevs.yardhal.ui.image.RemoteImageLoader
 import dev.brentdevs.yardhal.ui.image.MediaEnvironment
@@ -104,6 +105,8 @@ class YardhalApplication : Application() {
         private set
     lateinit var attachmentStages: AttachmentStageManager
         private set
+    lateinit var syncManager: SyncManager
+        private set
 
     private lateinit var connectivityObserver: AndroidConnectivityObserver
 
@@ -144,6 +147,8 @@ class YardhalApplication : Application() {
         val stsPolicies = FileStsPolicyStore(dir)
         val tlsIdentityProvider = AndroidTlsIdentityProvider(this)
         Notifications.ensureChannels(this)
+        val channelOrder = ChannelOrderStore(dir)
+        val offlineStore = OfflineStore(db.offlineDao())
         coordinator = LiveCoordinator(
             scope = appScope,
             networkStore = networkStore,
@@ -152,7 +157,7 @@ class YardhalApplication : Application() {
             historyCoverage = dev.brentdevs.yardhal.core.data.HistoryCoverageStore(dir),
             mutes = muteStore,
             vault = vault,
-            channelOrder = ChannelOrderStore(dir),
+            channelOrder = channelOrder,
             catchUpStore = catchUpStore,
             themeLibrary = themeLibrary,
             connectionFactory = ConnectionFactory { config, onStsUpgrade ->
@@ -196,9 +201,12 @@ class YardhalApplication : Application() {
             },
             appIsForeground = { mediaEnvironment.appActive.value },
             onNotificationConversationRead = { Notifications.cancelConversation(this, it) },
-            offlineStore = OfflineStore(db.offlineDao()),
+            offlineStore = offlineStore,
             relayStore = relayConfigurations,
+            syncLedger = { if (::syncManager.isInitialized) syncManager.activeLedger() else null },
         )
+        syncManager = SyncManager(this, appScope, db, networkStore, channelOrder, muteStore, readMarkerStore,
+            themeLibrary, chatAppearanceStore, coordinator, vault)
         attachmentStages = AttachmentStageManager(
             directory = java.io.File(noBackupFilesDir, "attachment-staging"),
             resolver = contentResolver,

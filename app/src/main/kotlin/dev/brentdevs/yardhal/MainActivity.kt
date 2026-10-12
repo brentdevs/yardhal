@@ -89,6 +89,7 @@ class MainActivity : ComponentActivity() {
                 MediaEnvironmentProvider(app.mediaEnvironment) {
                     YardhalAppRoot(
                         coordinator = coordinator,
+                        syncManager = app.syncManager,
                         appearanceStore = app.chatAppearanceStore,
                         themeLibrary = app.themeLibrary,
                         notificationPreferencesStore = app.notificationPreferencesStore,
