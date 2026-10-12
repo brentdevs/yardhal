@@ -1097,6 +1097,31 @@ wrote the expected platform clipboard content; the baseline PART summary lacked
 the action. This verifies exposed actions, not hardware-driven TalkBack menu
 selection or audible speech for these review scenarios.
 
+## Cross-device app-state sync backend decision
+
+[Halyard parity phase 7 / issue 18](https://github.com/brentdevs/yardhal/issues/18)
+uses a self-hosted, account-scoped HTTPS sync service shipped with Yardhal.
+The service owns a SQLite database, revisioned updates and device enrollment.
+Each Android installation explicitly enables sync, enters its server URL and
+enrollment credential, and can revoke its own device or disconnect locally.
+There is no Apple account, automatic account creation, invisible public cloud,
+or use of IRC servers as arbitrary application-state storage.
+
+| Backend | Authentication | Hosting and cost | Privacy and offline behavior | Portability |
+| --- | --- | --- | --- | --- |
+| Shipped self-hosted HTTPS service (chosen) | Account-scoped enrollment and revocable device credentials | Operator supplies TLS endpoint, uptime, backups and storage; no platform subscription | Server can read the intentionally portable fields; Android retains local changes offline and retries | Any Android installation with the URL and account credential |
+| Hosted Supabase | Email/password account and row-level security | Hosted free projects pause after inactivity; paid plans start at $25/month | Provider sees stored plaintext unless separate E2E design; client still needs an offline outbox | Android SDK available, provider/project lock-in |
+| User-supplied Nextcloud WebDAV | Existing user and app password | Existing Nextcloud server/account required | Files expose portable metadata to host; conditional per-record writes and deletion/retention need careful backend semantics | Standard DAV clients, but account availability is not assured |
+
+Self-hosting trades operational work for a backend whose account protocol,
+conflict rules and maintenance behavior are shipped and testable. TLS and server
+backups are operator requirements; local-only IRC remains the default. This is
+not end-to-end encryption: the operator can read the deliberately selected
+portable records. The server must not receive vault material, proxy passwords,
+client certificates/keys, diagnostic logs, message bodies or media bytes.
+Devices re-enter IRC/proxy credentials locally; encrypted credential replication
+requires a separate explicit design and approval.
+
 ## Roadmap
 
 Phases land in order; each phase ships with tests and updated docs.
