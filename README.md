@@ -217,6 +217,17 @@ make play              # build + boot a windowed emulator + install + launch
 Choose **soju** or **ZNC** in **Add network**, rather than treating the account
 as a direct IRC server. Use the bouncer's endpoint and verified TLS.
 
+With **TLS** enabled, **Add network** and **Edit network** include an
+unchecked-by-default **Allow insecure certificates** checkbox for Direct IRC,
+soju and ZNC. Enable it only for a server whose certificate you knowingly
+cannot verify (such as an expired or self-signed ZNC certificate). TLS still
+encrypts the connection, but certificate, hostname and fingerprint checks
+are disabled, so an attacker could impersonate the server and obtain your
+credentials. Prefer a valid certificate or the existing fingerprint-trust
+flow. The choice is saved per network; soju's bound connections inherit their
+account's choice. Unchecking and saving restores verification and reconnects.
+This setting does not relax HTTPS verification for uploads or media.
+
 - **soju:** supply the bouncer account and SASL password, or select SASL EXTERNAL
   with a TLS client identity. One account discovers its upstreams automatically.
   Each upstream receives a separate authenticated, bound connection; do not add

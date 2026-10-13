@@ -470,6 +470,7 @@ class NetworkEditLifecycleTests {
                     proxy = updated.proxy?.let { Socks5Config(it.host, it.port, it.username, updated.proxyPassword) },
                     tlsClientIdentity = updated.tlsClientIdentity,
                     trustedCertificateSha256 = updated.certificatePin?.sha256,
+                    allowInsecureCertificates = updated.allowInsecureCertificates,
                     knownSecrets = updated.knownSecrets,
                     nickServService = updated.nickServService,
                     bouncerNetId = updated.bouncerBinding?.netId,
@@ -2879,6 +2880,34 @@ class NetworkEditLifecycleTests {
                 assertEquals(inspection, coordinator.networks.value.single().rejectedCertificate)
                 assertEquals(null, NetworkStore(harness.directory).all().single().certificatePin)
                 assertEquals(1, harness.createdConfigs.size)
+            }
+        }
+    }
+
+    @Test
+    fun insecureCertificateOptInReconnectsAllConnectionModesAndDisablingRestoresRejection() = runBlocking {
+        for (mode in NetworkMode.entries) {
+            Server(tlsFixture = "expired", bouncer = mode == NetworkMode.SOJU).use { server ->
+                val config = config(server).copy(
+                    tls = true,
+                    mode = mode,
+                    saslAuthcid = if (mode == NetworkMode.DIRECT) null else "account",
+                    saslPasswordRef = if (mode == NetworkMode.SOJU) "sasl" else null,
+                    serverPasswordRef = if (mode == NetworkMode.ZNC) "znc" else null,
+                )
+                harness(config).use { harness ->
+                    harness.vault.storePassword("sasl", "secret")
+                    harness.vault.storePassword("znc", "secret")
+                    val coordinator = harness.coordinator
+                    coordinator.startAll()
+                    await { coordinator.networks.value.single().connectionPhase == RecoveryPhase.CERTIFICATE_REJECTED }
+                    assertTrue(coordinator.updateNetwork(config.copy(allowInsecureCertificates = true)))
+                    awaitRegistered(harness, server)
+                    val registered = server.clients.last { it.received.any { line -> line.startsWith("USER ") } }
+                    assertTrue(coordinator.updateNetwork(config.copy(allowInsecureCertificates = false)))
+                    await { registered.closed && coordinator.networks.value.single().connectionPhase == RecoveryPhase.CERTIFICATE_REJECTED }
+                    assertFalse(coordinator.networks.value.single().status == ConnectionStatus.REGISTERED)
+                }
             }
         }
     }

@@ -266,6 +266,27 @@ only the inspected endpoint and leaf; changed leaves fail, hostname/validity che
 and STS remain enabled, and removal restores platform trust. An expired leaf reports
 validity instead of a changed fingerprint; matching-pin hostname or validity failures
 are terminal, not another pin-replacement prompt.
+
+The network editor also exposes explicit `allowInsecureCertificates`, default
+false, whenever TLS is selected for Direct IRC, soju or ZNC. It is persisted
+per network, inherited by soju's bound connections, and changing it reconnects
+the affected transports. Enabling it accepts expired, self-signed and
+hostname-mismatched certificates and bypasses saved fingerprint checks; TLS
+encryption, SNI, endpoint-scoped socket factories, client identities and active
+STS upgrade ports remain in use. The UI warns that the server is no longer
+authenticated and recommends verified certificates or fingerprint trust.
+Preset selection clears the opt-in. Disabling it restores normal verification
+and any saved pin. An unverified TLS session cannot create, delete or refresh
+shared STS policies. HTTP upload and media verification are unchanged.
+
+Real TLS regressions exercise opt-in with expired/private certificates,
+hostname mismatches, changed pins, client identities, SNI and isolated secure
+connections. Android 15 smoke used ZNC mode against an expired TLS IRC fixture:
+the unchecked default rejected the certificate, enabling the checkbox connected,
+the saved choice survived a process restart, and disabling it restored rejection.
+This proves the Android ZNC transport path, not the fixture's production ZNC
+server behavior.
+
 Client identity import uses Android's PKCS#12 installer, a unique network/draft name
 suggestion and private-key grant flow. Activity-owned chooser state retains results
 through configuration recreation and rejects superseded editor requests. Binder
@@ -280,7 +301,7 @@ fields. Native Android 15 smoke exercised these paths against Ergo 2.14.0 and an
 authenticated microsocks relay, including changed certificates and real KeyChain
 EXTERNAL. Real TLS/mTLS JVM regressions use PKCS#12 fixtures. Robolectric's
 Conscrypt 2.5.2 needs the app test JVM's `java.base/java.net` opening on JDK 21;
-native Android and production TLS providers are not replaced or bypassed.
+tests use native Android and production TLS providers, including their secure defaults.
 
 ## Offline conversation state
 

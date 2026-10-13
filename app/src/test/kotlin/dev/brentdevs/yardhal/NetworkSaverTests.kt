@@ -15,6 +15,7 @@ import dev.brentdevs.yardhal.core.data.MessageStore
 import dev.brentdevs.yardhal.core.data.MuteStore
 import dev.brentdevs.yardhal.core.data.NetworkConfig
 import dev.brentdevs.yardhal.core.data.NetworkStore
+import dev.brentdevs.yardhal.core.data.NetworkMode
 import dev.brentdevs.yardhal.core.data.SaslMode
 import dev.brentdevs.yardhal.core.data.SocksProxyConfig
 import dev.brentdevs.yardhal.core.data.ReadMarkerStore
@@ -304,6 +305,48 @@ class NetworkSaverTests {
                 assertNull(saved.saslAuthcid)
                 assertTrue(harness.vault.storedKeys.isEmpty())
                 assertNull(server.clients.single().saslPlain())
+            }
+        }
+    }
+
+    @Test
+    fun certificateValidationChoicePersistsOnCreationPartialEditsAndSecureResetForEveryNetworkMode() {
+        for (mode in NetworkMode.entries) {
+            for (initialOptIn in listOf(false, true)) {
+                Harness().use { harness ->
+                    val input = NetworkDraft(
+                        host = "irc.example",
+                        port = 6697,
+                        tls = true,
+                        nick = "tester",
+                        saslPassword = if (mode == NetworkMode.SOJU) "soju-password" else null,
+                        autojoin = emptyList(),
+                        displayName = mode.name,
+                        saslAuthcid = "account",
+                        serverPassword = if (mode == NetworkMode.ZNC) "znc-password" else null,
+                        autoConnect = false,
+                        mode = mode,
+                        allowInsecureCertificates = true.takeIf { initialOptIn },
+                    )
+                    assertTrue(harness.saver.save(input))
+                    val created = harness.saved()
+                    assertEquals(initialOptIn, created.allowInsecureCertificates)
+                    assertTrue(created.tls)
+
+                    assertTrue(harness.saver.save(draft(created).copy(allowInsecureCertificates = true)))
+                    val enabled = harness.saved()
+                    assertTrue(enabled.allowInsecureCertificates)
+
+                    assertTrue(harness.saver.save(draft(enabled).copy(displayName = "Renamed", tls = false)))
+                    val partialEdit = harness.saved()
+                    assertTrue(partialEdit.allowInsecureCertificates)
+                    assertFalse(partialEdit.tls)
+
+                    assertTrue(harness.saver.save(draft(partialEdit).copy(tls = true, allowInsecureCertificates = false)))
+                    val reset = harness.saved()
+                    assertFalse(reset.allowInsecureCertificates)
+                    assertTrue(reset.tls)
+                }
             }
         }
     }

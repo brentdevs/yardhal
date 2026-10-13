@@ -1387,6 +1387,7 @@ public class LiveCoordinator(
             host == other.host &&
             port == other.port &&
             tls == other.tls &&
+            allowInsecureCertificates == other.allowInsecureCertificates &&
             nick == other.nick &&
             username == other.username &&
             realName == other.realName &&

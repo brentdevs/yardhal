@@ -44,6 +44,7 @@ public data class IrcConnectionConfig(
     public val knownSecrets: Set<String> = emptySet(),
     public val nickServService: String = "NickServ",
     public val bouncerNetId: String? = null,
+    public val allowInsecureCertificates: Boolean = false,
 ) {
     init {
         require(nick.isNotBlank()) { "nick must not be blank" }
@@ -210,7 +211,7 @@ public class IrcConnection(
                 validateAuthentication()
                 if (socketOverride != null) adoptSocket(socketOverride) else connect()
                 if (closed.get()) return@launch
-                trustedTlsTransport = connectedTls
+                trustedTlsTransport = connectedTls && !config.allowInsecureCertificates
                 emit(IrcEvent.ConnectionOpened)
                 beginRegistration()
                 if (closed.get()) return@launch
@@ -278,7 +279,7 @@ public class IrcConnection(
 
     private fun wrapTls(raw: Socket, host: String, port: Int): SSLSocket {
         val pin = config.trustedCertificateSha256.takeIf { port == config.port }
-        val factory = createTlsSocketFactory(host, port, config.tlsClientIdentity, pin)
+        val factory = createTlsSocketFactory(host, port, config.tlsClientIdentity, pin, config.allowInsecureCertificates)
         val ssl = factory.createSocket(raw, host, port, true) as SSLSocket
         try {
             ssl.startHandshake()
@@ -517,6 +518,7 @@ public class IrcConnection(
             disconnect()
             return true
         }
+        if (!trustedTlsTransport) return false
         val store = stsPolicyStore ?: return false
         val policy = StsResolver.parseCapValue(value, nowMillis() / 1000, connectedPort) ?: return false
         if (policy.durationSeconds == 0L) store.delete(config.host) else store.save(config.host, policy)

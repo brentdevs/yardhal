@@ -40,6 +40,7 @@ public data class NetworkConfig(
     @kotlinx.serialization.Transient public val proxyPassword: String? = null,
     @kotlinx.serialization.Transient public val tlsClientIdentity: TlsClientIdentity? = null,
     @kotlinx.serialization.Transient public val knownSecrets: Set<String> = emptySet(),
+    public val allowInsecureCertificates: Boolean = false,
 ) {
     init {
         if (id.isBlank()) throw NetworkConfigValidationException("Network ID must not be blank")

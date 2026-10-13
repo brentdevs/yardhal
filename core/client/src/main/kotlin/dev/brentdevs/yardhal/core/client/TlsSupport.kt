@@ -101,16 +101,17 @@ public fun createTlsSocketFactory(
     port: Int,
     identity: TlsClientIdentity? = null,
     pinnedFingerprintSha256: String? = null,
+    allowInsecureCertificates: Boolean = false,
 ): SSLSocketFactory {
     require(host.isNotBlank())
     require(port in 1..65535)
     require(pinnedFingerprintSha256 == null || (pinnedFingerprintSha256.length == 64 &&
         pinnedFingerprintSha256.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }))
-    val trust = EndpointTrustManager(host, port, pinnedFingerprintSha256, platformTrustManager(null))
+    val trust = EndpointTrustManager(host, port, pinnedFingerprintSha256, platformTrustManager(null), allowInsecureCertificates)
     val keys: Array<KeyManager>? = identity?.let { arrayOf(ClientIdentityKeyManager(it)) }
     val context = SSLContext.getInstance("TLS")
     context.init(keys, arrayOf(trust), null)
-    return EndpointSocketFactory(host, port, context.socketFactory, trust)
+    return EndpointSocketFactory(host, port, context.socketFactory, trust, allowInsecureCertificates)
 }
 
 private fun normalizedEndpointHost(host: String): String =
@@ -175,6 +176,7 @@ private class EndpointTrustManager(
     private val port: Int,
     private val pin: String?,
     private val platform: X509ExtendedTrustManager,
+    private val allowInsecureCertificates: Boolean,
 ) : X509ExtendedTrustManager() {
     private var layeredSocketPorts: WeakHashMap<Socket, Int>? = null
 
@@ -198,6 +200,7 @@ private class EndpointTrustManager(
             peerPort == null || (peerPort != port && peerPort != layeredTransportPort)) {
             throw CertificateException("TLS verification endpoint does not match the configured endpoint.")
         }
+        if (allowInsecureCertificates) return
         if (endpointIdentificationAlgorithm != "HTTPS") {
             throw CertificateException("Secure TLS endpoint identification is required.")
         }
@@ -287,6 +290,7 @@ private class EndpointSocketFactory(
     private val port: Int,
     private val delegate: SSLSocketFactory,
     private val trust: EndpointTrustManager,
+    private val allowInsecureCertificates: Boolean,
 ) : SSLSocketFactory() {
     private val endpointHost = normalizedEndpointHost(host)
     private val serverNames = if (':' in endpointHost || endpointHost.all { it in '0'..'9' || it == '.' }) {
@@ -303,7 +307,7 @@ private class EndpointSocketFactory(
         try {
             val tls = socket as SSLSocket
             val parameters = tls.sslParameters
-            parameters.endpointIdentificationAlgorithm = "HTTPS"
+            parameters.endpointIdentificationAlgorithm = if (allowInsecureCertificates) null else "HTTPS"
             parameters.serverNames = serverNames
             tls.sslParameters = parameters
             return tls

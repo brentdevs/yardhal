@@ -75,6 +75,7 @@ class NetworkStoreTests {
         assertEquals(NetworkConfig(id = "legacy", name = "Old", host = "irc.example", nick = "tester"), loaded)
         assertTrue(loaded.autoConnect)
         assertFalse(loaded.userDisconnected)
+        assertFalse(loaded.allowInsecureCertificates)
         assertEquals(SaslMode.AUTO, loaded.saslMode)
         assertTrue(loaded.waitForNickServ)
         assertNull(loaded.proxy)
@@ -106,6 +107,7 @@ class NetworkStoreTests {
                 proxy = SocksProxyConfig("proxy.example", 1081, "proxy-user", "proxy-ref"),
                 tlsClientAlias = "android-keychain-alias",
                 certificatePin = CertificatePin("irc.example", 6697, "ab".repeat(32)),
+                allowInsecureCertificates = true,
                 saslPassword = "resolved-sasl-secret",
                 serverPassword = "resolved-server-secret",
                 nickServPassword = "resolved-nickserv-secret",

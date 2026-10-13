@@ -11,7 +11,9 @@ import java.security.cert.CertificateExpiredException
 import java.security.cert.X509Certificate
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
+import javax.net.ssl.ExtendedSSLSession
 import javax.net.ssl.KeyManagerFactory
+import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLServerSocket
 import javax.net.ssl.SSLSocket
@@ -183,6 +185,96 @@ class TlsSupportTests {
     }
 
     @Test
+    fun optingInAcceptsSelfSignedTlsAndASeparateSecureConnectionStillRejectsIt() {
+        TlsLoopback("private").use { server ->
+            connect(server, allowInsecureCertificates = true)
+            assertTrue(server.result().isSuccess)
+        }
+        TlsLoopback("private").use { server ->
+            rejection { connect(server) }
+            assertTrue(server.result().isFailure)
+        }
+    }
+
+    @Test
+    fun optingInAcceptsExpiredTlsAndTurningItOffRestoresValidityChecks() {
+        val pin = sha256(certificate("expired"))
+        TlsLoopback("expired").use { server ->
+            connect(server, pin = pin, allowInsecureCertificates = true)
+            assertTrue(server.result().isSuccess)
+        }
+        TlsLoopback("expired").use { server ->
+            val failure = nonInspectableFailure { connect(server, pin = pin, allowInsecureCertificates = false) }
+            assertTrue(failure is CertificateExpiredException)
+            assertTrue(server.result().isFailure)
+        }
+    }
+
+    @Test
+    fun optingInDisablesHostnameChecksForBothPlatformTrustedAndPinnedTls() {
+        for (name in listOf("server", "private")) {
+            val pin = if (name == "private") sha256(certificate(name)) else null
+            TlsLoopback(name).use { server ->
+                connect(server, host = "wrong-host.invalid", pin = pin, allowInsecureCertificates = true)
+                assertTrue(server.result().isSuccess)
+            }
+            TlsLoopback(name).use { server ->
+                if (pin == null) {
+                    rejection { connect(server, host = "wrong-host.invalid") }
+                } else {
+                    nonInspectableFailure { connect(server, host = "wrong-host.invalid", pin = pin) }
+                }
+                assertTrue(server.result().isFailure)
+            }
+        }
+    }
+
+    @Test
+    fun optingInIgnoresAChangedPinAndTurningItOffRestoresPinEnforcement() {
+        val pin = sha256(certificate("private"))
+        TlsLoopback("changed").use { server ->
+            connect(server, pin = pin, allowInsecureCertificates = true)
+            assertTrue(server.result().isSuccess)
+        }
+        TlsLoopback("changed").use { server ->
+            rejection { connect(server, pin = pin, allowInsecureCertificates = false) }
+            assertTrue(server.result().isFailure)
+        }
+    }
+
+    @Test
+    fun insecureTlsStillSendsSniAndAuthenticatesWithTheConfiguredClientIdentity() {
+        val identity = identity()
+        TlsLoopback("private", requireClientCertificate = true, expectedServerName = "wrong-host.invalid").use { server ->
+            connect(server, host = "wrong-host.invalid", identity = identity, allowInsecureCertificates = true)
+            assertEquals(identity.certificates.map(::sha256), server.result().getOrThrow().map(::sha256))
+        }
+    }
+
+    @Test
+    fun ircConnectionOptInRegistersOverActualSelfSignedAndExpiredTls() {
+        for (name in listOf("private", "expired")) {
+            TlsLoopback(name, expectIrcRegistration = true).use { server ->
+                val connection = IrcConnection(
+                    IrcConnectionConfig(
+                        host = "localhost",
+                        port = server.port,
+                        nick = "insecure-test",
+                        capabilities = emptySet(),
+                        allowInsecureCertificates = true,
+                    ),
+                )
+                try {
+                    connection.start()
+                    assertTrue(server.result().isSuccess)
+                } finally {
+                    connection.disconnect()
+                }
+            }
+        }
+    }
+
+    @Test
     fun configuredClientIdentityPresentsItsActualCertificateChainToTheServer() {
         val identity = identity()
         TlsLoopback("server", requireClientCertificate = true).use { server ->
@@ -319,13 +411,69 @@ class TlsSupportTests {
         }
     }
 
-    private fun connect(server: TlsLoopback, host: String = "localhost", pin: String? = null, identity: TlsClientIdentity? = null) {
+    @Test
+    fun insecureSocketFactoryStillRejectsOtherEndpointsBeforeCreatingSockets() {
+        val factory = createTlsSocketFactory("127.0.0.1", 6697, allowInsecureCertificates = true)
+        val loopback = InetAddress.getByName("127.0.0.1")
+        val other = InetAddress.getByName("127.0.0.2")
+        assertFailsWith<java.io.IOException> { factory.createSocket("127.0.0.2", 6697) }
+        assertFailsWith<java.io.IOException> { factory.createSocket("127.0.0.1", 6698) }
+        assertFailsWith<java.io.IOException> { factory.createSocket("127.0.0.2", 6697, loopback, 0) }
+        assertFailsWith<java.io.IOException> { factory.createSocket("127.0.0.1", 6698, loopback, 0) }
+        assertFailsWith<java.io.IOException> { factory.createSocket(other, 6697) }
+        assertFailsWith<java.io.IOException> { factory.createSocket(loopback, 6698) }
+        assertFailsWith<java.io.IOException> { factory.createSocket(other, 6697, loopback, 0) }
+        assertFailsWith<java.io.IOException> { factory.createSocket(loopback, 6698, loopback, 0) }
+        Socket().use { raw ->
+            assertFailsWith<java.io.IOException> { factory.createSocket(raw, "127.0.0.2", 6697, false) }
+            assertFailsWith<java.io.IOException> { factory.createSocket(raw, "127.0.0.1", 6698, false) }
+        }
+    }
+
+    @Test
+    fun anUnconnectedInsecureSocketStillRejectsAnotherHostOrPortDuringHandshake() {
+        TlsLoopback("private").use { server ->
+            val factory = createTlsSocketFactory("127.0.0.1", server.port, allowInsecureCertificates = true)
+            (factory.createSocket() as SSLSocket).use { socket ->
+                socket.soTimeout = 5_000
+                socket.connect(java.net.InetSocketAddress("127.0.0.1", server.port), 5_000)
+                socket.startHandshake()
+                socket.getOutputStream().write(7)
+                socket.getOutputStream().flush()
+            }
+            assertTrue(server.result().isSuccess)
+        }
+        for (wrongHost in listOf(false, true)) {
+            TlsLoopback("private").use { server ->
+                val host = if (wrongHost) "127.0.0.2" else "127.0.0.1"
+                val port = if (wrongHost) server.port else if (server.port == 6697) 6698 else 6697
+                val factory = createTlsSocketFactory(host, port, allowInsecureCertificates = true)
+                val failure = nonInspectableFailure {
+                    (factory.createSocket() as SSLSocket).use { socket ->
+                        socket.soTimeout = 5_000
+                        socket.connect(java.net.InetSocketAddress("127.0.0.1", server.port), 5_000)
+                        socket.startHandshake()
+                    }
+                }
+                assertTrue(assertNotNull(failure.message).contains("endpoint does not match"))
+                assertTrue(server.result().isFailure)
+            }
+        }
+    }
+
+    private fun connect(
+        server: TlsLoopback,
+        host: String = "localhost",
+        pin: String? = null,
+        identity: TlsClientIdentity? = null,
+        allowInsecureCertificates: Boolean = false,
+    ) {
         Socket(InetAddress.getLoopbackAddress(), server.port).use { raw ->
             raw.soTimeout = 5_000
-            val factory = createTlsSocketFactory(host, server.port, identity, pin)
+            val factory = createTlsSocketFactory(host, server.port, identity, pin, allowInsecureCertificates)
             (factory.createSocket(raw, host, server.port, true) as SSLSocket).use { socket ->
                 socket.soTimeout = 5_000
-                assertEquals("HTTPS", socket.sslParameters.endpointIdentificationAlgorithm)
+                if (!allowInsecureCertificates) assertEquals("HTTPS", socket.sslParameters.endpointIdentificationAlgorithm)
                 socket.startHandshake()
                 socket.getOutputStream().write(7)
                 socket.getOutputStream().flush()
@@ -366,6 +514,8 @@ class TlsSupportTests {
         name: String,
         requireClientCertificate: Boolean = false,
         bindAddress: InetAddress = InetAddress.getLoopbackAddress(),
+        expectedServerName: String? = null,
+        expectIrcRegistration: Boolean = false,
     ) : AutoCloseable {
         private val listener: SSLServerSocket
         private val completed = CompletableFuture<Result<List<X509Certificate>>>()
@@ -391,7 +541,17 @@ class TlsSupportTests {
                     (listener.accept() as SSLSocket).use { socket ->
                         socket.soTimeout = 5_000
                         socket.startHandshake()
-                        assertEquals(7, socket.getInputStream().read())
+                        if (expectedServerName != null) {
+                            val session = socket.session as ExtendedSSLSession
+                            assertEquals(listOf(expectedServerName), session.requestedServerNames.map { (it as SNIHostName).asciiName })
+                        }
+                        if (expectIrcRegistration) {
+                            val reader = socket.getInputStream().bufferedReader()
+                            assertEquals("NICK insecure-test", reader.readLine())
+                            assertEquals("USER yardhal 0 * :Yardhal", reader.readLine())
+                        } else {
+                            assertEquals(7, socket.getInputStream().read())
+                        }
                         if (requireClientCertificate) socket.session.peerCertificates.map { it as X509Certificate } else emptyList()
                     }
                 })
