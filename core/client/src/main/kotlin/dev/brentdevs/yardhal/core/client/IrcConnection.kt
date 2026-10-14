@@ -211,7 +211,6 @@ public class IrcConnection(
                 validateAuthentication()
                 if (socketOverride != null) adoptSocket(socketOverride) else connect()
                 if (closed.get()) return@launch
-                trustedTlsTransport = connectedTls && !config.allowInsecureCertificates
                 emit(IrcEvent.ConnectionOpened)
                 beginRegistration()
                 if (closed.get()) return@launch
@@ -249,9 +248,13 @@ public class IrcConnection(
 
     private suspend fun connect() {
         withContext(Dispatchers.IO) {
+            val nowEpochSeconds = nowMillis() / 1000
             val decision = stsPolicyStore?.let { store ->
-                StsResolver.decide(store, config.host, config.port, config.tls, nowMillis() / 1000)
+                StsResolver.decide(store, config.host, config.port, config.tls, nowEpochSeconds)
             }
+            val stsRequired = decision is StsUpgradeDecision.UpgradeRequired ||
+                stsPolicyStore?.load(config.host)?.isExpired(nowEpochSeconds) == false
+            val allowInsecureCertificates = config.tls && config.allowInsecureCertificates && !stsRequired
             val port = (decision as? StsUpgradeDecision.UpgradeRequired)?.port ?: config.port
             val tls = config.tls || decision is StsUpgradeDecision.UpgradeRequired
             if (config.saslMode.equals("EXTERNAL", ignoreCase = true) && !tls) {
@@ -265,7 +268,7 @@ public class IrcConnection(
                 raw.tcpNoDelay = true
                 if (config.proxy == null) raw.connect(InetSocketAddress(config.host, port), config.connectTimeoutMillis)
                 raw.soTimeout = config.connectTimeoutMillis
-                val ready = if (tls) wrapTls(raw, config.host, port) else raw
+                val ready = if (tls) wrapTls(raw, config.host, port, allowInsecureCertificates) else raw
                 ready.soTimeout = 0
                 connectedTls = tls
                 connectedPort = port
@@ -277,12 +280,13 @@ public class IrcConnection(
         }
     }
 
-    private fun wrapTls(raw: Socket, host: String, port: Int): SSLSocket {
+    private fun wrapTls(raw: Socket, host: String, port: Int, allowInsecureCertificates: Boolean): SSLSocket {
         val pin = config.trustedCertificateSha256.takeIf { port == config.port }
-        val factory = createTlsSocketFactory(host, port, config.tlsClientIdentity, pin, config.allowInsecureCertificates)
+        val factory = createTlsSocketFactory(host, port, config.tlsClientIdentity, pin, allowInsecureCertificates)
         val ssl = factory.createSocket(raw, host, port, true) as SSLSocket
         try {
             ssl.startHandshake()
+            trustedTlsTransport = !allowInsecureCertificates
             return ssl
         } catch (error: Throwable) {
             runCatching { ssl.close() }

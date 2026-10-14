@@ -162,7 +162,7 @@ public fun NetworkEditorSheet(
         }
         var tls by rememberSaveable { mutableStateOf(initialConfig?.tls ?: initialPreset?.tls ?: true) }
         var allowInsecureCertificates by rememberSaveable {
-            mutableStateOf(initialConfig?.allowInsecureCertificates ?: false)
+            mutableStateOf(initialConfig?.let { it.tls && it.allowInsecureCertificates } ?: false)
         }
         var nick by rememberSaveable { mutableStateOf(initialConfig?.nick ?: "") }
         var account by rememberSaveable { mutableStateOf(initialConfig?.saslAuthcid ?: "") }
@@ -281,7 +281,7 @@ public fun NetworkEditorSheet(
             host = host.trim(),
             port = port.toIntOrNull() ?: 0,
             tls = tls,
-            allowInsecureCertificates = allowInsecureCertificates,
+            allowInsecureCertificates = tls && allowInsecureCertificates,
             nick = nick.trim(),
             saslPassword = if (clearPassword) null else password.takeIf(String::isNotEmpty),
             autojoin = if (networkMode == NetworkMode.DIRECT) {
@@ -390,7 +390,10 @@ public fun NetworkEditorSheet(
                 )
                 FilterChip(
                     selected = tls,
-                    onClick = { tls = !tls },
+                    onClick = {
+                        tls = !tls
+                        if (!tls) allowInsecureCertificates = false
+                    },
                     label = { Text(if (tls) "TLS" else "Plain") },
                     modifier = Modifier.padding(top = 8.dp),
                 )
@@ -402,7 +405,7 @@ public fun NetworkEditorSheet(
                 Text(
                     "Accepts expired, self-signed, or hostname-mismatched server certificates. " +
                         "Disables certificate verification and fingerprint checks; attackers may impersonate your server. " +
-                        "Use a verified certificate or trust its fingerprint instead.",
+                        "STS always requires certificate verification. Use a verified certificate or trust its fingerprint instead.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

@@ -271,13 +271,20 @@ The network editor also exposes explicit `allowInsecureCertificates`, default
 false, whenever TLS is selected for Direct IRC, soju or ZNC. It is persisted
 per network, inherited by soju's bound connections, and changing it reconnects
 the affected transports. Enabling it accepts expired, self-signed and
-hostname-mismatched certificates and bypasses saved fingerprint checks; TLS
-encryption, SNI, endpoint-scoped socket factories, client identities and active
-STS upgrade ports remain in use. The UI warns that the server is no longer
-authenticated and recommends verified certificates or fingerprint trust.
-Preset selection clears the opt-in. Disabling it restores normal verification
-and any saved pin. An unverified TLS session cannot create, delete or refresh
-shared STS policies. HTTP upload and media verification are unchanged.
+hostname-mismatched certificates and bypasses saved fingerprint checks only
+outside STS requirements. TLS encryption, SNI, endpoint-scoped socket factories
+and client identities remain in use. Active STS policies require certificate
+verification even when the configured TLS port already matches the policy;
+advertised STS upgrades also suppress the bypass. The UI warns that the server
+is no longer authenticated and recommends verified certificates or fingerprint
+trust. Preset selection and switching to Plain clear the opt-in; Plain saves
+normalize it to false. Restored Plain configurations with an older latent true
+value cannot enable the bypass when the coordinator upgrades them to TLS.
+Disabling the option restores normal verification and any saved pin.
+The transport's verified state reflects the effective handshake, not the saved
+preference: strictly verified STS sessions can update and refresh policy while
+unverified TLS sessions cannot create, delete or refresh shared STS policies.
+HTTP upload and media verification are unchanged.
 
 Real TLS regressions exercise opt-in with expired/private certificates,
 hostname mismatches, changed pins, client identities, SNI and isolated secure
@@ -286,6 +293,12 @@ the unchecked default rejected the certificate, enabling the checkbox connected,
 the saved choice survived a process restart, and disabling it restored rejection.
 This proves the Android ZNC transport path, not the fixture's production ZNC
 server behavior.
+
+STS review regressions use actual TLS to cover active matching-port policies,
+Plain/wrong-port upgrades, invalid certificates despite saved opt-in, expired
+policies and verified policy creation/removal/renewal. Native Android verification
+also checked that a previously enabled option is cleared by saving Plain and
+that an advertised upgrade to an expired-certificate endpoint is rejected.
 
 Client identity import uses Android's PKCS#12 installer, a unique network/draft name
 suggestion and private-key grant flow. Activity-owned chooser state retains results

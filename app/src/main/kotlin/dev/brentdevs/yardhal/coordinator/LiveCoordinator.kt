@@ -1807,12 +1807,14 @@ public class LiveCoordinator(
         if (saslPassword != null && config.saslAuthcid.isNullOrBlank() && config.saslMode != SaslMode.EXTERNAL) {
             throw AuthenticationRejectedException("The SASL account is missing. Correct it in network settings.")
         }
+        val nowSeconds = clock() / 1000
         val decision = StsResolver.decide(
-            stsPolicies, config.host, config.port, config.tls, clock() / 1000,
+            stsPolicies, config.host, config.port, config.tls, nowSeconds,
         )
         val securePort = (decision as? StsUpgradeDecision.UpgradeRequired)?.port ?: stsUpgradePort
         val effectiveTls = config.tls || securePort != null
         val effectivePort = securePort ?: config.port
+        val stsRequired = securePort != null || stsPolicies.load(config.host)?.let { !it.isExpired(nowSeconds) } == true
         if (!znc && config.saslMode == SaslMode.EXTERNAL && !effectiveTls) {
             throw TlsIdentityUnavailableException("SASL EXTERNAL requires TLS. Enable TLS in network security settings.")
         }
@@ -1826,6 +1828,7 @@ public class LiveCoordinator(
         return config.copy(
             port = effectivePort,
             tls = effectiveTls,
+            allowInsecureCertificates = config.tls && config.allowInsecureCertificates && !stsRequired,
             saslAuthcid = config.saslAuthcid.takeIf { !znc && (saslPassword != null || config.saslMode == SaslMode.EXTERNAL) },
             saslPassword = saslPassword,
             saslMode = if (znc) SaslMode.AUTO else config.saslMode,

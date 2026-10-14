@@ -373,69 +373,40 @@ class IrcConnectionIntegrationTests {
         Unit
     }
 
-    @kotlinx.coroutines.DelicateCoroutinesApi
     @org.junit.jupiter.api.Test
-    fun secureStsAdvertisementPersistsCurrentPort() = runBlocking {
-        LoopbackIrcServer().use { server ->
-            server.start()
-            server.lineListener = { line ->
-                when {
-                    line.startsWith("CAP LS") -> server.sendLine(":srv CAP * LS :sts=duration=3600")
-                    line.startsWith("USER") -> server.sendLine(":srv 001 yardhal-test :Welcome")
-                }
-            }
-            val scope = newScope()
-            try {
-                val store = InMemoryStsPolicyStore()
-                val config = plainConfig("127.0.0.1", server.port, capabilities = setOf("server-time"))
-                    .copy(tls = true)
-                val connection = IrcConnection(config, stsPolicyStore = store)
-                val collector = EventCollector(scope, connection.events)
-                connection.start(Socket("127.0.0.1", server.port))
-                server.awaitClient()
-                collector.awaitRegistered()
-                assertEquals(server.port, store.load("127.0.0.1")?.port)
-                assertTrue((store.load("127.0.0.1")?.expiresAtEpochSeconds ?: 0) > System.currentTimeMillis() / 1000)
-                connection.disconnect()
-            } finally {
-                scope.cancel()
-            }
-        }
-        Unit
-    }
-
-    @org.junit.jupiter.api.Test
-    fun insecureCertificateOptInDoesNotCreateDeleteOrRefreshSharedStsPolicies() = runBlocking {
-        for (duration in listOf(0, 3600)) {
-            for (existingPolicy in listOf<StsPolicy?>(null, StsPolicy(6697, 4600, 3600))) {
-                LoopbackIrcServer().use { server ->
-                    server.lineListener = { line ->
-                        when {
-                            line.startsWith("CAP LS") -> server.sendLine(":srv CAP * LS :sts=duration=$duration")
-                            line.startsWith("USER") -> server.sendLine(":srv 001 yardhal-test :Welcome")
+    fun socketOverrideDoesNotCreateDeleteOrRefreshSharedStsPolicies() = runBlocking {
+        for (allowInsecureCertificates in listOf(false, true)) {
+            for (duration in listOf(0, 3600)) {
+                for (existingPolicy in listOf<StsPolicy?>(null, StsPolicy(6697, 4600, 3600))) {
+                    LoopbackIrcServer().use { server ->
+                        server.lineListener = { line ->
+                            when {
+                                line.startsWith("CAP LS") -> server.sendLine(":srv CAP * LS :sts=duration=$duration")
+                                line.startsWith("USER") -> server.sendLine(":srv 001 yardhal-test :Welcome")
+                            }
                         }
-                    }
-                    server.start()
-                    val scope = newScope()
-                    val store = InMemoryStsPolicyStore()
-                    if (existingPolicy != null) store.save("127.0.0.1", existingPolicy)
-                    val clock = java.util.concurrent.atomic.AtomicLong(1_000_000)
-                    val config = plainConfig("127.0.0.1", server.port, capabilities = setOf("server-time"))
-                        .copy(tls = true, allowInsecureCertificates = true)
-                    val connection = IrcConnection(config, nowMillis = clock::get, stsPolicyStore = store)
-                    try {
-                        val collector = EventCollector(scope, connection.events)
-                        connection.start(Socket("127.0.0.1", server.port))
-                        server.awaitClient()
-                        collector.awaitRegistered()
-                        assertEquals(existingPolicy, store.load("127.0.0.1"))
-                        clock.set(2_000_000)
-                        connection.disconnect()
-                        collector.awaitInstance<IrcEvent.Disconnected>()
-                        assertEquals(existingPolicy, store.load("127.0.0.1"))
-                    } finally {
-                        connection.disconnect()
-                        scope.cancel()
+                        server.start()
+                        val scope = newScope()
+                        val store = InMemoryStsPolicyStore()
+                        if (existingPolicy != null) store.save("127.0.0.1", existingPolicy)
+                        val clock = java.util.concurrent.atomic.AtomicLong(1_000_000)
+                        val config = plainConfig("127.0.0.1", server.port, capabilities = setOf("server-time"))
+                            .copy(tls = true, allowInsecureCertificates = allowInsecureCertificates)
+                        val connection = IrcConnection(config, nowMillis = clock::get, stsPolicyStore = store)
+                        try {
+                            val collector = EventCollector(scope, connection.events)
+                            connection.start(Socket("127.0.0.1", server.port))
+                            server.awaitClient()
+                            collector.awaitRegistered()
+                            assertEquals(existingPolicy, store.load("127.0.0.1"))
+                            clock.set(2_000_000)
+                            connection.disconnect()
+                            collector.awaitInstance<IrcEvent.Disconnected>()
+                            assertEquals(existingPolicy, store.load("127.0.0.1"))
+                        } finally {
+                            connection.disconnect()
+                            scope.cancel()
+                        }
                     }
                 }
             }

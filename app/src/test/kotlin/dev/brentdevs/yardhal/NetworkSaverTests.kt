@@ -337,15 +337,28 @@ class NetworkSaverTests {
                     val enabled = harness.saved()
                     assertTrue(enabled.allowInsecureCertificates)
 
-                    assertTrue(harness.saver.save(draft(enabled).copy(displayName = "Renamed", tls = false)))
+                    assertTrue(harness.saver.save(draft(enabled).copy(displayName = "Renamed")))
                     val partialEdit = harness.saved()
                     assertTrue(partialEdit.allowInsecureCertificates)
-                    assertFalse(partialEdit.tls)
+                    assertTrue(partialEdit.tls)
 
-                    assertTrue(harness.saver.save(draft(partialEdit).copy(tls = true, allowInsecureCertificates = false)))
-                    val reset = harness.saved()
-                    assertFalse(reset.allowInsecureCertificates)
-                    assertTrue(reset.tls)
+                    for (plainOptIn in listOf(null, true)) {
+                        assertTrue(harness.saver.save(draft(harness.saved()).copy(tls = false, allowInsecureCertificates = plainOptIn)))
+                        val plain = harness.saved()
+                        assertFalse(plain.allowInsecureCertificates)
+                        assertFalse(plain.tls)
+
+                        assertTrue(harness.saver.save(draft(plain).copy(tls = true)))
+                        val secure = harness.saved()
+                        assertFalse(secure.allowInsecureCertificates)
+                        assertTrue(secure.tls)
+
+                        assertTrue(harness.saver.save(draft(secure).copy(allowInsecureCertificates = true)))
+                        assertTrue(harness.saved().allowInsecureCertificates)
+                    }
+
+                    assertTrue(harness.saver.save(draft(harness.saved()).copy(allowInsecureCertificates = false)))
+                    assertFalse(harness.saved().allowInsecureCertificates)
                 }
             }
         }
