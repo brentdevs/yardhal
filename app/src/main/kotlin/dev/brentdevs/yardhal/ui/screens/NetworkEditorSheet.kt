@@ -161,6 +161,9 @@ public fun NetworkEditorSheet(
             mutableStateOf((initialConfig?.port ?: initialPreset?.port ?: 6697).toString())
         }
         var tls by rememberSaveable { mutableStateOf(initialConfig?.tls ?: initialPreset?.tls ?: true) }
+        var allowInsecureCertificates by rememberSaveable {
+            mutableStateOf(initialConfig?.let { it.tls && it.allowInsecureCertificates } ?: false)
+        }
         var nick by rememberSaveable { mutableStateOf(initialConfig?.nick ?: "") }
         var account by rememberSaveable { mutableStateOf(initialConfig?.saslAuthcid ?: "") }
         var password by remember { mutableStateOf("") }
@@ -270,6 +273,7 @@ public fun NetworkEditorSheet(
             host = selected.host
             port = selected.port.toString()
             tls = selected.tls
+            allowInsecureCertificates = false
             if (name.isBlank()) name = selected.name
         }
 
@@ -277,6 +281,7 @@ public fun NetworkEditorSheet(
             host = host.trim(),
             port = port.toIntOrNull() ?: 0,
             tls = tls,
+            allowInsecureCertificates = tls && allowInsecureCertificates,
             nick = nick.trim(),
             saslPassword = if (clearPassword) null else password.takeIf(String::isNotEmpty),
             autojoin = if (networkMode == NetworkMode.DIRECT) {
@@ -385,9 +390,24 @@ public fun NetworkEditorSheet(
                 )
                 FilterChip(
                     selected = tls,
-                    onClick = { tls = !tls },
+                    onClick = {
+                        tls = !tls
+                        if (!tls) allowInsecureCertificates = false
+                    },
                     label = { Text(if (tls) "TLS" else "Plain") },
                     modifier = Modifier.padding(top = 8.dp),
+                )
+            }
+            if (tls) {
+                EditorCheckbox("Allow insecure certificates", allowInsecureCertificates) {
+                    allowInsecureCertificates = it
+                }
+                Text(
+                    "Accepts expired, self-signed, or hostname-mismatched server certificates. " +
+                        "Disables certificate verification and fingerprint checks; attackers may impersonate your server. " +
+                        "STS always requires certificate verification. Use a verified certificate or trust its fingerprint instead.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
             EditorCheckbox("Connect automatically on startup", autoConnect) { autoConnect = it }
@@ -562,6 +582,7 @@ public data class NetworkDraft(
     public val clearTlsClientAlias: Boolean = false,
     public val mode: NetworkMode? = null,
     public val zncNetwork: String? = null,
+    public val allowInsecureCertificates: Boolean? = null,
 ) {
     override fun toString(): String =
         "NetworkDraft(networkId=$networkId, host=$host, port=$port, tls=$tls, nick=$nick, saslMode=$saslMode)"

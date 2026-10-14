@@ -70,6 +70,7 @@ public class NetworkSaver(
                 host = draft.host,
                 port = draft.port,
                 tls = draft.tls,
+                allowInsecureCertificates = draft.tls && (draft.allowInsecureCertificates ?: base.allowInsecureCertificates),
                 nick = draft.nick,
                 realName = draft.realName ?: base.realName,
                 alternateNicks = draft.alternateNicks ?: base.alternateNicks,

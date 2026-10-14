@@ -470,6 +470,7 @@ class NetworkEditLifecycleTests {
                     proxy = updated.proxy?.let { Socks5Config(it.host, it.port, it.username, updated.proxyPassword) },
                     tlsClientIdentity = updated.tlsClientIdentity,
                     trustedCertificateSha256 = updated.certificatePin?.sha256,
+                    allowInsecureCertificates = updated.allowInsecureCertificates,
                     knownSecrets = updated.knownSecrets,
                     nickServService = updated.nickServService,
                     bouncerNetId = updated.bouncerBinding?.netId,
@@ -2879,6 +2880,167 @@ class NetworkEditLifecycleTests {
                 assertEquals(inspection, coordinator.networks.value.single().rejectedCertificate)
                 assertEquals(null, NetworkStore(harness.directory).all().single().certificatePin)
                 assertEquals(1, harness.createdConfigs.size)
+            }
+        }
+    }
+
+    @Test
+    fun insecureCertificateOptInReconnectsAllConnectionModesAndDisablingRestoresRejection() = runBlocking {
+        for (mode in NetworkMode.entries) {
+            Server(tlsFixture = "expired", bouncer = mode == NetworkMode.SOJU).use { server ->
+                val config = config(server).copy(
+                    tls = true,
+                    mode = mode,
+                    saslAuthcid = if (mode == NetworkMode.DIRECT) null else "account",
+                    saslPasswordRef = if (mode == NetworkMode.SOJU) "sasl" else null,
+                    serverPasswordRef = if (mode == NetworkMode.ZNC) "znc" else null,
+                )
+                harness(config).use { harness ->
+                    harness.vault.storePassword("sasl", "secret")
+                    harness.vault.storePassword("znc", "secret")
+                    val coordinator = harness.coordinator
+                    coordinator.startAll()
+                    await { coordinator.networks.value.single().connectionPhase == RecoveryPhase.CERTIFICATE_REJECTED }
+                    assertTrue(coordinator.updateNetwork(config.copy(allowInsecureCertificates = true)))
+                    awaitRegistered(harness, server)
+                    val registered = server.clients.last { it.received.any { line -> line.startsWith("USER ") } }
+                    assertTrue(coordinator.updateNetwork(config.copy(allowInsecureCertificates = false)))
+                    await { registered.closed && coordinator.networks.value.single().connectionPhase == RecoveryPhase.CERTIFICATE_REJECTED }
+                    assertFalse(coordinator.networks.value.single().status == ConnectionStatus.REGISTERED)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun restoredPlainInsecureOptInCannotBypassCertificatesDuringAdvertisedStsUpgrade() = runBlocking {
+        for (mode in NetworkMode.entries) {
+            Server(tlsFixture = "expired").use { secure ->
+                Server(stsPort = secure.port, bouncer = mode == NetworkMode.SOJU).use { plain ->
+                    val config = config(plain).copy(
+                        mode = mode,
+                        allowInsecureCertificates = true,
+                        saslAuthcid = "account",
+                        saslPasswordRef = "sasl",
+                        serverPasswordRef = "znc".takeIf { mode == NetworkMode.ZNC },
+                    )
+                    harness(config).use { harness ->
+                        harness.vault.storePassword("sasl", "sasl-secret")
+                        harness.vault.storePassword("znc", "znc-secret")
+                        harness.coordinator.startAll()
+                        await {
+                            assertNotNull(scheduler).advanceTimeBy(2_000)
+                            harness.coordinator.networks.value.single().connectionPhase == RecoveryPhase.CERTIFICATE_REJECTED &&
+                                secure.clients.isNotEmpty() && secure.clients.all { it.closed }
+                        }
+                        assertTrue(plain.clients.single().received.any { it.startsWith("CAP LS") })
+                        assertTrue(plain.clients.single().received.none {
+                            it.startsWith("AUTHENTICATE ") || it.startsWith("PASS ") ||
+                                it.startsWith("NICK ") || it.startsWith("USER ")
+                        })
+                        assertTrue(secure.clients.all { it.received.isEmpty() })
+                        assertFalse(harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED)
+                        assertEquals(config, NetworkStore(harness.directory).all().single())
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun activeStsPolicyRejectsExpiredCertificatesDespiteSavedOptInForPlainAndMatchingTlsPorts() = runBlocking {
+        for (mode in NetworkMode.entries) {
+            for (tls in listOf(false, true)) {
+                Server(tlsFixture = "expired", bouncer = mode == NetworkMode.SOJU).use { server ->
+                    val now = System.currentTimeMillis()
+                    val config = config(server).copy(
+                        tls = tls,
+                        mode = mode,
+                        allowInsecureCertificates = true,
+                        saslAuthcid = "account",
+                        saslPasswordRef = "sasl",
+                        serverPasswordRef = "znc".takeIf { mode == NetworkMode.ZNC },
+                    )
+                    harness(config, clock = { now }).use { harness ->
+                        harness.vault.storePassword("sasl", "sasl-secret")
+                        harness.vault.storePassword("znc", "znc-secret")
+                        harness.policies.save(config.host, StsPolicy(server.port, now / 1000 + 3_600))
+                        harness.coordinator.startAll()
+                        await {
+                            harness.coordinator.networks.value.single().connectionPhase == RecoveryPhase.CERTIFICATE_REJECTED &&
+                                server.clients.isNotEmpty() && server.clients.all { it.closed }
+                        }
+                        assertTrue(server.clients.all { it.received.isEmpty() })
+                        assertFalse(harness.coordinator.networks.value.single().status == ConnectionStatus.REGISTERED)
+                        assertEquals(config, NetworkStore(harness.directory).all().single())
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun restoredSojuDescendantsKeepOriginalPlainIntentWhenCachedStsRequiresTls() = runBlocking {
+        Server(tlsFixture = "expired").use { secure ->
+            Server(bouncer = true).use { plain ->
+                plain.bouncerNetworkLines.add("1 :name=Upstream")
+                val config = config(plain).copy(
+                    mode = NetworkMode.SOJU,
+                    allowInsecureCertificates = true,
+                    autojoin = emptyList(),
+                )
+                harness(config).use { harness ->
+                    harness.coordinator.startAll()
+                    await {
+                        harness.coordinator.dependentNetworks(config.id).size == 1 &&
+                            harness.coordinator.networks.value.all { it.status == ConnectionStatus.REGISTERED }
+                    }
+                    val child = harness.coordinator.dependentNetworks(config.id).single()
+                    assertFalse(child.tls)
+                    val restored = harness.reloadCoordinator()
+                    await { plain.clients.all { it.closed } }
+                    val plaintextConnections = plain.clients.size
+                    val now = System.currentTimeMillis()
+                    harness.policies.save(config.host, StsPolicy(secure.port, now / 1000 + 3_600))
+                    restored.startAll()
+                    await {
+                        restored.networks.value.size == 2 &&
+                            restored.networks.value.all { it.connectionPhase == RecoveryPhase.CERTIFICATE_REJECTED } &&
+                            secure.clients.size == 2 && secure.clients.all { it.closed }
+                    }
+                    assertEquals(plaintextConnections, plain.clients.size)
+                    assertTrue(secure.clients.all { it.received.isEmpty() })
+                    assertEquals(config, NetworkStore(harness.directory).byId(config.id))
+                    assertEquals(child, NetworkStore(harness.directory).byId(child.id))
+                }
+            }
+        }
+    }
+
+    @Test
+    fun activeStsMakesPinnedTlsEffectivelyVerifiedAndPersistsAdvertisedPolicyDespiteSavedOptIn() = runBlocking {
+        Server(tlsFixture = "private", additionalCapabilities = setOf("sts=duration=3600")).use { server ->
+            val now = System.currentTimeMillis()
+            val config = config(server).copy(
+                tls = true,
+                allowInsecureCertificates = true,
+                certificatePin = CertificatePin("127.0.0.1", server.port, tlsFingerprint("private")),
+            )
+            harness(config, clock = { now }).use { harness ->
+                val initial = StsPolicy(server.port, now / 1000 + 60)
+                harness.policies.save(config.host, initial)
+                harness.coordinator.startAll()
+                awaitRegistered(harness, server)
+                val learned = assertNotNull(harness.policies.load(config.host))
+                assertEquals(3_600L, learned.durationSeconds)
+                assertTrue(learned.expiresAtEpochSeconds > initial.expiresAtEpochSeconds)
+                assertEquals(config, NetworkStore(harness.directory).all().single())
+                harness.policies.save(config.host, learned.copy(expiresAtEpochSeconds = initial.expiresAtEpochSeconds))
+                harness.coordinator.disconnect(config.id)
+                await { server.clients.single().closed }
+                val renewed = assertNotNull(harness.policies.load(config.host))
+                assertEquals(3_600L, renewed.durationSeconds)
+                assertTrue(renewed.expiresAtEpochSeconds >= learned.expiresAtEpochSeconds)
             }
         }
     }

@@ -56,7 +56,7 @@ Phase numbers refer to `docs/architecture.md`.
 - [x] netsplit/netjoin batches: collapse into one event (P5)
 - [x] labeled-response: /raw, /whois, /who, /mode family, /topic, /monitor, LIST and PRIVMSG sends labelled when acked; single replies, labelled batches and ACK correlated in the reducer; generic replies routed to the origin buffer; echoes reconciled by label (text match fallback) (P5)
 - [x] standard-replies: FAIL/WARN/NOTE → tagged system lines (P5)
-- [x] sts: upgrade to TLS port, persist and enforce policy with expiry; no insecure bypass of active policy (P2)
+- [x] sts: upgrade to TLS port, persist and enforce policy with expiry; no insecure bypass of active policy (P2). Certificate verification is mandatory under active policies and advertised upgrades despite a saved insecure-certificate opt-in; only verified TLS can create, delete or refresh policies.
 - [x] SNI: configured hostname verified in captured ClientHello (P2)
 - n/a — STARTTLS: deprecated; use direct TLS and STS upgrade instead
 
@@ -184,7 +184,7 @@ Ergo and runs all real-server tests without skips.
 | netsplit/netjoin | `PerNetworkStateTests.netsplitBatchCollapsesQuitsIntoOneSummaryLine`; `PerNetworkStateTests.netjoinBatchSuppressesJoinLinesButTracksMembers` |
 | labeled-response / history lifecycles | `LabeledResponseReducerTests.labelledBatchIsRoutedToOriginAndClearedAtBatchEnd`; `ErgoRoundTripTest.labeledResponsesCarryLabelsFromRealServer`; `HistoryRequestTrackerTests.labeledCasefoldedHistoryPreservesNestedMultilineWireOrder`; `HistoryRequestTrackerTests.closedHistoryReferenceIsReusableWhileUnfinishedNestedBatchRemainsQuarantined`; `HistoryRequestTrackerTests.lateLabeledTimeoutErrorsAndAcksAreConsumedWhileAnotherRequestIsActive`; `HistoryRequestTrackerTests.topLevelLabeledAckFinishesEveryHistoryOperationWithoutClaimingEmptyArchive`; `HistoryCoordinatorIntegrationTests.closingUnlabelledHistoryDrainsOldReplyBeforeNextConversationWithoutReconnect`; `HistoryCoordinatorIntegrationTests.explicitReconnectRetryResumesFailedGapOnFreshSocketWithoutDiscardingCache` |
 | standard-replies | `PerNetworkStateTests.standardRepliesAreTaggedByVerb` |
-| sts | `StsTests.plainConnectionUpgradesUnderActivePolicy`; `StsTests.expiredPolicyDeletedAndIgnored`; `FileStsPolicyStoreTests.policySurvivesStoreRecreation` |
+| sts | `StsTests.plainConnectionUpgradesUnderActivePolicy`; `StsTests.expiredPolicyDeletedAndIgnored`; `FileStsPolicyStoreTests.policySurvivesStoreRecreation`; `TlsSupportTests.activeStsMatchingTlsPortRejectsInvalidCertificatesDespiteOptIn`; `TlsSupportTests.activeStsVerifiedTlsWithSavedOptInSavesDeletesAndRefreshesPolicies`; `NetworkEditLifecycleTests.restoredPlainInsecureOptInCannotBypassCertificatesDuringAdvertisedStsUpgrade` |
 | SNI | `TlsServerNameIndicationTests.clientHelloNamesTheConfiguredHost`; `TlsServerNameIndicationTests.absoluteDnsEndpointUsesNormalizedSniInTheActualClientHello`; `TlsServerNameIndicationTests.invalidSniEndpointStillSendsAClientHelloWithoutAnInvalidServerName` |
 | NAMES/353/366 | `PerNetworkStateTests.namesAccumulateUntilEndAndMarkJoined` |
 | multi-prefix | `NamesParserTests.keepsHighestRoleWhenMultiPrefixStacksPrefixes` |

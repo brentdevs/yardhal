@@ -176,6 +176,7 @@ class YardhalApplication : Application() {
                         trustedCertificateSha256 = config.certificatePin?.takeIf {
                             config.tls && it.host.equals(config.host, ignoreCase = true) && it.port == config.port
                         }?.sha256,
+                        allowInsecureCertificates = config.allowInsecureCertificates,
                         nickServService = config.nickServService,
                         bouncerNetId = config.bouncerBinding?.netId,
                         knownSecrets = config.knownSecrets,
