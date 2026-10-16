@@ -656,8 +656,11 @@ replaying it and a separately sent offline mention posts none.
 
 ## Network configuration
 
-Each network's overview and transcript expose **Edit network**, Connect and
-Disconnect. The direct IRC form edits endpoint/TLS, nickname and configured
+Each network's overview exposes **Edit network**, Connect and Disconnect.
+Non-channel transcripts retain the connection panel; channel message views omit
+it and the unsupported server catch-up notice. Other history states and retry
+controls remain visible.
+The direct IRC form edits endpoint/TLS, nickname and configured
 alternates, realname, display name, channels, startup preference, SASL
 mode/account, server password, NickServ, SOCKS5 and per-network client identity.
 Bouncer forms tailor these fields as described above. Editing retains the
