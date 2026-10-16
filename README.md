@@ -50,6 +50,11 @@ architecture of the Halyard iOS client.
 
 ### Everyday workflows
 
+- **Quit:** on the main Conversations screen, open **App options → Quit**.
+  This closes every IRC connection, stops automatic retries and the connection
+  service, and removes Yardhal from Recents. The menu is also available before
+  adding a network. Saved networks, conversations and auto-connect preferences
+  remain unchanged; reopening Yardhal follows those preferences.
 - **Channel settings:** open a channel's overflow menu → **Channel settings**.
   Edit its topic or advertised modes and parameters, or fetch **Bans**, **Ban
   exceptions** and **Invite exceptions** where supported. Lists show masks and

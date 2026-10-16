@@ -26,11 +26,15 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Sailing
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -70,71 +74,86 @@ public fun WelcomeScreen(
     onAddNetwork: () -> Unit,
     presets: List<NetworkPresetUi>,
     onPickPreset: (NetworkPresetUi) -> Unit,
+    onQuit: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Column(
-        modifier = modifier
-            .fillMaxSize()
-            .padding(24.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp, Alignment.CenterVertically),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Box(
+    var appMenuVisible by remember { mutableStateOf(false) }
+    Box(modifier = modifier.fillMaxSize()) {
+        Column(
             modifier = Modifier
-                .size(84.dp)
-                .clip(CircleShape)
-                .background(MaterialTheme.colorScheme.primaryContainer),
-            contentAlignment = Alignment.Center,
+                .fillMaxSize()
+                .padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp, Alignment.CenterVertically),
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Icon(
-                imageVector = Icons.Filled.Sailing,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onPrimaryContainer,
-                modifier = Modifier.size(44.dp),
-            )
-        }
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text("Yardhal", style = MaterialTheme.typography.headlineMedium)
+            Box(
+                modifier = Modifier
+                    .size(84.dp)
+                    .clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.primaryContainer),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Sailing,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                    modifier = Modifier.size(44.dp),
+                )
+            }
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("Yardhal", style = MaterialTheme.typography.headlineMedium)
+                Text(
+                    "Your networks sail with you.",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             Text(
-                "Your networks sail with you.",
-                style = MaterialTheme.typography.titleSmall,
+                "Add an IRC network to get started. Yardhal keeps your connection " +
+                    "alive and notifies you when your name comes up.",
+                style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-        }
-        Text(
-            "Add an IRC network to get started. Yardhal keeps your connection " +
-                "alive and notifies you when your name comes up.",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        if (presets.isNotEmpty()) {
-            Text(
-                "Quick start",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                presets.forEach { candidate ->
-                    OutlinedButton(
-                        onClick = { onPickPreset(candidate) },
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Row(
+            if (presets.isNotEmpty()) {
+                Text(
+                    "Quick start",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    presets.forEach { candidate ->
+                        OutlinedButton(
+                            onClick = { onPickPreset(candidate) },
                             modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
                         ) {
-                            Text(candidate.name)
-                            Text(
-                                "${candidate.host}:${candidate.port}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                            ) {
+                                Text(candidate.name)
+                                Text(
+                                    "${candidate.host}:${candidate.port}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
                         }
                     }
                 }
             }
+            TextButton(onClick = onAddNetwork) { Text("Add network manually") }
         }
-        TextButton(onClick = onAddNetwork) { Text("Add network manually") }
+        Box(modifier = Modifier.align(Alignment.TopEnd)) {
+            IconButton(onClick = { appMenuVisible = true }) {
+                Icon(Icons.Filled.MoreVert, contentDescription = "App options")
+            }
+            DropdownMenu(expanded = appMenuVisible, onDismissRequest = { appMenuVisible = false }) {
+                DropdownMenuItem(text = { Text("Quit") }, onClick = {
+                    appMenuVisible = false
+                    onQuit()
+                })
+            }
+        }
     }
 }
 

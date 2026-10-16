@@ -1,6 +1,14 @@
 package dev.brentdevs.yardhal.coordinator
 
 import android.content.Context
+import android.app.Instrumentation
+import android.app.Application
+import android.app.Service
+import android.content.Intent
+import dev.brentdevs.yardhal.ApplicationStartup
+import dev.brentdevs.yardhal.YardhalApplication
+import dev.brentdevs.yardhal.service.ConnectionService
+import kotlinx.coroutines.flow.MutableStateFlow
 import androidx.test.core.app.ApplicationProvider
 import dev.brentdevs.yardhal.core.client.InMemoryStsPolicyStore
 import dev.brentdevs.yardhal.core.client.IrcConnection
@@ -45,8 +53,11 @@ import java.security.PrivateKey
 import java.security.cert.X509Certificate
 import java.util.Base64
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.CoroutineContext
 import kotlin.test.Test
 import javax.net.ssl.KeyManagerFactory
@@ -74,6 +85,10 @@ import kotlinx.coroutines.test.TestDispatcher
 import kotlinx.coroutines.withTimeout
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Robolectric
+import org.robolectric.Shadows.shadowOf
+import org.robolectric.util.ReflectionHelpers
+import org.robolectric.annotation.Config
 
 @OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
@@ -449,6 +464,7 @@ class NetworkEditLifecycleTests {
         val channelOrder = ChannelOrderStore(directory)
         val offline = OfflineStore(database.offlineDao())
         val createdConfigs: MutableList<NetworkConfig> = CopyOnWriteArrayList()
+        val createdConnections: MutableList<IrcConnection> = CopyOnWriteArrayList()
         val stsCallbacks = CopyOnWriteArrayList<(Int) -> Unit>()
         private val connectionFactory: ConnectionFactory = ConnectionFactory { updated, onStsUpgrade ->
             createdConfigs.add(updated)
@@ -481,7 +497,7 @@ class NetworkEditLifecycleTests {
                 stsPolicyStore = policies,
                 rawTap = { outbound, line -> coordinator.ingestRaw(updated.id, outbound, line) },
                 onStsUpgrade = onStsUpgrade,
-            )
+            ).also { createdConnections.add(it) }
         }
         var coordinator: LiveCoordinator = LiveCoordinator(
             scope = scope,
@@ -2704,6 +2720,421 @@ class NetworkEditLifecycleTests {
                     assertFalse(harness.createdConfigs.last().tls)
                     assertTrue(staleUpgrade.clients.isEmpty())
                     assertEquals(2, harness.createdConfigs.size)
+                }
+            }
+        }
+    }
+
+    @Test
+    @Config(sdk = [35], application = Application::class)
+    fun applicationQuitClosesEveryLiveSocketStopsBackoffAndPreservesStartupIntentAndHistory() = runBlocking {
+        Server(acknowledgeProbes = false).use { server ->
+            Server(dropOnAccept = true).use { failing ->
+                harness(config(server)).use { harness ->
+                    val coordinator = harness.coordinator
+                    val second = harness.config.copy(id = "second", name = "Second network", nick = "second")
+                    val manual = harness.config.copy(id = "manual", name = "Manual network", nick = "manual", autoConnect = false)
+                    val disabled = harness.config.copy(id = "disabled", name = "Disabled network", autoConnect = false)
+                    val disconnected = harness.config.copy(id = "disconnected", name = "Disconnected network", userDisconnected = true)
+                    val retrying = config(failing).copy(id = "retrying", name = "Retrying network")
+                    assertTrue(harness.networks.upsertAll(listOf(second, manual, disabled, disconnected, retrying)))
+                    val saved = harness.networks.all().toSet()
+                    val room = ConversationRef.channel(harness.config.id, "#room")
+                    record(harness, room, "quit-anchor", "History survives application quit", 1_000)
+                    coordinator.ensureConversation(room.networkId, room.rawTarget)
+                    assertTrue(coordinator.loadPersistedHistory(room.storageKey))
+                    await { coordinator.buffers.value[room.storageKey]?.messages?.any { it.msgid == "quit-anchor" } == true }
+                    val localId = assertNotNull(coordinator.buffers.value[room.storageKey]).messages.single().localId
+                    coordinator.startAll()
+                    await {
+                        coordinator.networks.value.count { it.status == ConnectionStatus.REGISTERED } == 2 &&
+                            coordinator.networks.value.first { it.id == retrying.id }.connectionPhase == RecoveryPhase.SERVER_UNREACHABLE
+                    }
+                    coordinator.connectNetwork(manual.id)
+                    await { coordinator.networks.value.count { it.status == ConnectionStatus.REGISTERED } == 3 }
+                    coordinator.onForegroundResume()
+                    await { server.clients.all { client -> client.received.any { it.startsWith("PING ") } } }
+                    val live = server.clients.toList()
+                    live.first { it.nick == harness.config.nick }.send("@msgid=quit-pending :alice!u@h PRIVMSG #room :Queued before quit")
+                    await { coordinator.buffers.value[room.storageKey]?.messages?.any { it.msgid == "quit-pending" } == true }
+                    coordinator.quit()
+                    coordinator.quit()
+                    assertTrue(coordinator.isQuitting)
+                    assertTrue(coordinator.networks.value.all { it.status == ConnectionStatus.DISCONNECTED &&
+                        it.connectionPhase == RecoveryPhase.USER_DISCONNECTED })
+                    await { live.all { it.closed } && failing.clients.all { it.closed } }
+                    val app = Instrumentation.newApplication(
+                        YardhalApplication::class.java, ApplicationProvider.getApplicationContext(),
+                    ) as YardhalApplication
+                    ReflectionHelpers.setField(app, "coordinator", coordinator)
+                    ReflectionHelpers.getField<MutableStateFlow<ApplicationStartup>>(app, "mutableStartup").value = ApplicationStartup.READY
+                    try {
+                        for (queuedStart in listOf(false, true)) {
+                            val controller = Robolectric.buildService(ConnectionService::class.java).create()
+                            try {
+                                val service = controller.get()
+                                ReflectionHelpers.setField(service, "mApplication", app)
+                                val intent = if (queuedStart) {
+                                    Intent(service, ConnectionService::class.java).putExtra(ConnectionService.EXTRA_NETWORK_COUNT, 2)
+                                } else null
+                                assertEquals(Service.START_NOT_STICKY, service.onStartCommand(intent, 0, 1))
+                                assertTrue(shadowOf(service).isStoppedBySelf)
+                            } finally {
+                                controller.destroy()
+                            }
+                        }
+                    } finally {
+                        app.onTerminate()
+                    }
+                    val attempts = harness.createdConfigs.size
+                    for (callback in harness.stsCallbacks.toList()) callback(9)
+                    coordinator.connectNetwork(disconnected.id)
+                    coordinator.connectNetwork(disabled.id)
+                    coordinator.onForegroundResume()
+                    coordinator.updateConnectivity(false)
+                    coordinator.updateConnectivity(true, 20)
+                    coordinator.startAll()
+                    assertNotNull(scheduler).advanceTimeBy(60_000)
+                    assertNotNull(scheduler).runCurrent()
+                    assertEquals(attempts, harness.createdConfigs.size)
+                    assertEquals(3, server.clients.size)
+                    assertEquals(saved, NetworkStore(harness.directory).all().toSet())
+                    await { harness.messages.recent(room, 10).any { it.msgid == "quit-pending" } }
+                    assertEquals(localId, coordinator.buffers.value[room.storageKey]?.messages?.first { it.msgid == "quit-anchor" }?.localId)
+                    assertTrue(assertNotNull(coordinator.buffers.value[room.storageKey]).cachedRoster)
+                    coordinator.resumeAfterQuit()
+                    coordinator.resumeAfterQuit()
+                    assertFalse(coordinator.isQuitting)
+                    await { coordinator.networks.value.count { it.status == ConnectionStatus.REGISTERED } == 2 }
+                    assertEquals(5, server.clients.size)
+                    assertEquals(1, harness.createdConfigs.count { it.id == manual.id })
+                    assertTrue(harness.createdConfigs.none { it.id == disconnected.id || it.id == disabled.id })
+                    assertEquals(saved, NetworkStore(harness.directory).all().toSet())
+                    assertEquals(localId, coordinator.buffers.value[room.storageKey]?.messages?.first { it.msgid == "quit-anchor" }?.localId)
+                    val resumed = harness.createdConfigs.size
+                    coordinator.resumeAfterQuit()
+                    assertNotNull(scheduler).runCurrent()
+                    assertEquals(resumed, harness.createdConfigs.size)
+                    coordinator.quit()
+                    await { server.clients.all { it.closed } }
+                    val reloaded = harness.reloadCoordinator()
+                    reloaded.resumeAfterQuit()
+                    reloaded.startAll()
+                    await { reloaded.networks.value.count { it.status == ConnectionStatus.REGISTERED } == 2 }
+                    assertEquals(7, server.clients.size)
+                    assertTrue(harness.createdConfigs.none { it.id == disconnected.id || it.id == disabled.id })
+                    assertEquals(1, harness.createdConfigs.count { it.id == manual.id })
+                    assertEquals(saved, NetworkStore(harness.directory).all().toSet())
+                    assertEquals(setOf("quit-anchor", "quit-pending"), harness.messages.recent(room, 10).map { it.msgid }.toSet())
+                }
+            }
+        }
+    }
+
+    @Test
+    fun applicationQuitAllowsAlreadyQueuedTranscriptPersistenceToFinishAfterSocketsClose() = runBlocking {
+        Server().use { server ->
+            var holdDiscovery = false
+            val discovered = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            harness(config(server), afterDiscovery = {
+                if (holdDiscovery) {
+                    discovered.complete(Unit)
+                    release.await()
+                }
+            }).use { harness ->
+                val coordinator = harness.coordinator
+                coordinator.startAll()
+                await { coordinator.restorationReady.value && coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                holdDiscovery = true
+                val updated = harness.config.copy(nick = "current")
+                try {
+                    assertTrue(coordinator.updateNetwork(updated))
+                    await { discovered.isCompleted && server.clients.size == 2 &&
+                        coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                    val room = ConversationRef.channel(updated.id, "#room")
+                    server.clients.last().send("@msgid=pending-quit-write :alice!u@h PRIVMSG #room :Persist after quit")
+                    await { coordinator.buffers.value[room.storageKey]?.messages?.any { it.msgid == "pending-quit-write" } == true }
+                    assertTrue(harness.messages.recent(room, 10).isEmpty())
+                    coordinator.quit()
+                    await { server.clients.all { it.closed } }
+                    assertTrue(harness.messages.recent(room, 10).isEmpty())
+                    holdDiscovery = false
+                    release.complete(Unit)
+                    await { harness.messages.recent(room, 10).singleOrNull()?.msgid == "pending-quit-write" }
+                    assertTrue(coordinator.isQuitting)
+                    assertEquals("pending-quit-write", coordinator.buffers.value[room.storageKey]?.messages?.single()?.msgid)
+                    assertEquals(updated, NetworkStore(harness.directory).all().single())
+                    coordinator.updateConnectivity(true, 28)
+                    coordinator.onForegroundResume()
+                    assertNotNull(scheduler).advanceTimeBy(60_000)
+                    assertNotNull(scheduler).runCurrent()
+                    assertEquals(2, harness.createdConfigs.size)
+                    assertEquals(2, server.clients.size)
+                } finally {
+                    holdDiscovery = false
+                    release.complete(Unit)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun applicationQuitWhileOfflineCannotReconnectUntilExplicitRelaunchResume() = runBlocking {
+        Server().use { server ->
+            harness(config(server)).use { harness ->
+                val coordinator = harness.coordinator
+                coordinator.startAll()
+                await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                coordinator.updateConnectivity(false)
+                await { server.clients.single().closed }
+                assertEquals(RecoveryPhase.OFFLINE, coordinator.networks.value.single().connectionPhase)
+                coordinator.quit()
+                coordinator.updateConnectivity(true, 21)
+                coordinator.onForegroundResume()
+                assertNotNull(scheduler).advanceTimeBy(60_000)
+                assertNotNull(scheduler).runCurrent()
+                assertTrue(coordinator.isQuitting)
+                assertEquals(RecoveryPhase.USER_DISCONNECTED, coordinator.networks.value.single().connectionPhase)
+                assertEquals(1, harness.createdConfigs.size)
+                assertEquals(harness.config, NetworkStore(harness.directory).all().single())
+                coordinator.updateConnectivity(false)
+                coordinator.resumeAfterQuit()
+                coordinator.resumeAfterQuit()
+                assertEquals(RecoveryPhase.OFFLINE, coordinator.networks.value.single().connectionPhase)
+                assertNotNull(scheduler).advanceTimeBy(60_000)
+                assertNotNull(scheduler).runCurrent()
+                assertEquals(1, harness.createdConfigs.size)
+                coordinator.updateConnectivity(true, 22)
+                await { server.clients.size == 2 && coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                assertEquals(harness.config, NetworkStore(harness.directory).all().single())
+            }
+        }
+    }
+
+    @Test
+    fun applicationQuitClosesRegisteringAndIdentifyingSocketsAndRetiresAuthenticationFailures() = runBlocking {
+        Server(welcomeAutomatically = false).use { registering ->
+            Server().use { identifying ->
+                Server(rejectSasl = true).use { rejected ->
+                    harness(config(registering)).use { harness ->
+                        val coordinator = harness.coordinator
+                        val waiting = config(identifying).copy(
+                            id = "identifying", nickServPasswordRef = "nickserv", waitForNickServ = true,
+                        )
+                        val failed = config(rejected).copy(id = "rejected", saslAuthcid = "account", saslPasswordRef = "sasl")
+                        assertTrue(harness.networks.upsertAll(listOf(waiting, failed)))
+                        harness.vault.storePassword("nickserv", "identify-secret")
+                        harness.vault.storePassword("sasl", "rejected-secret")
+                        val saved = harness.networks.all().toSet()
+                        coordinator.startAll()
+                        await {
+                            registering.clients.singleOrNull()?.received?.any { it.startsWith("USER ") } == true &&
+                                identifying.clients.singleOrNull()?.received?.any { it.startsWith("PRIVMSG NickServ ") } == true &&
+                                coordinator.networks.value.first { it.id == failed.id }.connectionPhase == RecoveryPhase.AUTHENTICATION_REJECTED
+                        }
+                        coordinator.quit()
+                        assertTrue(coordinator.networks.value.all { it.status == ConnectionStatus.DISCONNECTED &&
+                            it.connectionPhase == RecoveryPhase.USER_DISCONNECTED })
+                        await { registering.clients.single().closed && identifying.clients.single().closed && rejected.clients.single().closed }
+                        coordinator.onForegroundResume()
+                        coordinator.updateConnectivity(false)
+                        coordinator.updateConnectivity(true, 23)
+                        assertNotNull(scheduler).advanceTimeBy(60_000)
+                        assertNotNull(scheduler).runCurrent()
+                        assertEquals(3, harness.createdConfigs.size)
+                        assertTrue(identifying.clients.single().received.none { it.startsWith("JOIN ") })
+                        assertTrue(coordinator.networks.value.all { it.connectionError == null })
+                        assertEquals(saved, NetworkStore(harness.directory).all().toSet())
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun applicationQuitStopsSojuParentsAndDependentsWithoutSavingDisconnectsAndResumesParentFirst() = runBlocking {
+        Server(bouncer = true).use { server ->
+            server.bouncerNetworkLines.addAll(listOf(
+                "1 :name=Enabled", "2 :name=Disconnected", "3 :name=Manual", "4 :name=Disabled;enabled=0",
+            ))
+            val account = config(server).copy(mode = NetworkMode.SOJU, autojoin = emptyList())
+            harness(account).use { harness ->
+                val coordinator = harness.coordinator
+                val enabled = SojuUpstreamConfig.reconcile(account, "1",
+                    dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.Attributes(name = "Enabled"))
+                val disconnected = SojuUpstreamConfig.reconcile(account, "2",
+                    dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.Attributes(name = "Disconnected")).copy(userDisconnected = true)
+                val manual = SojuUpstreamConfig.reconcile(account, "3",
+                    dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.Attributes(name = "Manual")).copy(autoConnect = false)
+                val disabled = SojuUpstreamConfig.reconcile(account, "4",
+                    dev.brentdevs.yardhal.core.protocol.IrcBouncerNetworks.Attributes(
+                        name = "Disabled", unknown = mapOf("enabled" to "0"),
+                    ))
+                assertTrue(harness.networks.upsertAll(listOf(enabled, disconnected, manual, disabled)))
+                coordinator.startAll()
+                await { coordinator.networks.value.count { it.status == ConnectionStatus.REGISTERED } == 2 }
+                coordinator.connectNetwork(manual.id)
+                await { coordinator.networks.value.count { it.status == ConnectionStatus.REGISTERED } == 3 }
+                val saved = harness.networks.all().toSet()
+                val room = ConversationRef.channel(enabled.id, "#retained")
+                record(harness, room, "soju-quit-anchor", "Retained bouncer history", 1_000)
+                coordinator.ensureConversation(room.networkId, room.rawTarget)
+                assertTrue(coordinator.loadPersistedHistory(room.storageKey))
+                await { coordinator.buffers.value[room.storageKey]?.messages?.any { it.msgid == "soju-quit-anchor" } == true }
+                coordinator.quit()
+                coordinator.quit()
+                await { server.clients.all { it.closed } }
+                assertTrue(coordinator.networks.value.all { it.status == ConnectionStatus.DISCONNECTED &&
+                    it.connectionPhase == RecoveryPhase.USER_DISCONNECTED })
+                val attempts = harness.createdConfigs.size
+                for (callback in harness.stsCallbacks.toList()) callback(9)
+                coordinator.onForegroundResume()
+                coordinator.updateConnectivity(false)
+                coordinator.updateConnectivity(true, 24)
+                assertNotNull(scheduler).advanceTimeBy(60_000)
+                assertNotNull(scheduler).runCurrent()
+                assertEquals(attempts, harness.createdConfigs.size)
+                assertEquals(saved, NetworkStore(harness.directory).all().toSet())
+                coordinator.resumeAfterQuit()
+                coordinator.resumeAfterQuit()
+                await { coordinator.networks.value.count { it.status == ConnectionStatus.REGISTERED } == 2 }
+                assertEquals(5, server.clients.size)
+                assertEquals(setOf(account.id, enabled.id), harness.createdConfigs.drop(attempts).map { it.id }.toSet())
+                assertEquals(1, harness.createdConfigs.count { it.id == manual.id })
+                assertTrue(harness.createdConfigs.none { it.id == disconnected.id || it.id == disabled.id })
+                assertEquals(saved, NetworkStore(harness.directory).all().toSet())
+                assertEquals("soju-quit-anchor", harness.messages.recent(room, 10).single().msgid)
+                assertEquals("soju-quit-anchor", coordinator.buffers.value[room.storageKey]?.messages?.single()?.msgid)
+                coordinator.quit()
+                await { server.clients.all { it.closed } }
+                coordinator.resumeAfterQuit()
+                await { coordinator.networks.value.count { it.status == ConnectionStatus.REGISTERED } == 2 }
+                coordinator.disconnect(account.id)
+                await { server.clients.all { it.closed } }
+                val parentDisconnected = NetworkStore(harness.directory).all().toSet()
+                val stoppedAttempts = harness.createdConfigs.size
+                coordinator.quit()
+                coordinator.resumeAfterQuit()
+                coordinator.resumeAfterQuit()
+                coordinator.updateConnectivity(true, 27)
+                coordinator.onForegroundResume()
+                assertNotNull(scheduler).advanceTimeBy(60_000)
+                assertNotNull(scheduler).runCurrent()
+                assertTrue(coordinator.networks.value.all { it.status == ConnectionStatus.DISCONNECTED })
+                assertEquals(stoppedAttempts, harness.createdConfigs.size)
+                assertEquals(parentDisconnected, NetworkStore(harness.directory).all().toSet())
+                assertTrue(assertNotNull(harness.networks.byId(account.id)).userDisconnected)
+                assertFalse(assertNotNull(harness.networks.byId(enabled.id)).userDisconnected)
+            }
+        }
+    }
+
+    @Test
+    fun applicationQuitAcrossPendingStartupRestorationNeverOpensSocketsUntilResumed() = runBlocking {
+        for (resumeBeforeRestoration in listOf(false, true)) {
+            Server().use { server ->
+                val discovered = CompletableDeferred<Unit>()
+                val release = CompletableDeferred<Unit>()
+                harness(config(server), afterDiscovery = {
+                    discovered.complete(Unit)
+                    release.await()
+                }).use { harness ->
+                    val coordinator = harness.coordinator
+                    val room = ConversationRef.channel(harness.config.id, "#room")
+                    record(harness, room, "startup-quit-anchor", "Startup history survives", 1_000)
+                    coordinator.startAll()
+                    try {
+                        await { discovered.isCompleted }
+                        assertFalse(coordinator.restorationReady.value)
+                        coordinator.quit()
+                        coordinator.quit()
+                        coordinator.onForegroundResume()
+                        coordinator.updateConnectivity(false)
+                        coordinator.updateConnectivity(true, 25)
+                        coordinator.startAll()
+                        if (resumeBeforeRestoration) {
+                            coordinator.resumeAfterQuit()
+                            coordinator.resumeAfterQuit()
+                        }
+                        assertNotNull(scheduler).runCurrent()
+                        assertTrue(harness.createdConfigs.isEmpty())
+                        assertTrue(server.clients.isEmpty())
+                        release.complete(Unit)
+                        await { coordinator.restorationReady.value }
+                        if (!resumeBeforeRestoration) {
+                            assertNotNull(scheduler).advanceTimeBy(60_000)
+                            assertNotNull(scheduler).runCurrent()
+                            assertTrue(harness.createdConfigs.isEmpty())
+                            assertTrue(server.clients.isEmpty())
+                            assertTrue(coordinator.isQuitting)
+                            assertEquals(RecoveryPhase.USER_DISCONNECTED, coordinator.networks.value.single().connectionPhase)
+                            coordinator.resumeAfterQuit()
+                            coordinator.resumeAfterQuit()
+                        }
+                        await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                        assertEquals(1, server.clients.size)
+                        assertEquals(1, harness.createdConfigs.size)
+                        assertFalse(coordinator.isQuitting)
+                        assertEquals(harness.config, NetworkStore(harness.directory).all().single())
+                        assertEquals("startup-quit-anchor", harness.messages.recent(room, 10).single().msgid)
+                        assertTrue(room.storageKey in coordinator.buffers.value)
+                    } finally {
+                        release.complete(Unit)
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun lateFactoryCompletionAndStsCallbackCannotReopenOrRetargetAQuitSessionAfterRelaunch() = runBlocking {
+        Server().use { server ->
+            val entered = CompletableDeferred<Unit>()
+            val release = CountDownLatch(1)
+            val holdFirst = AtomicBoolean(true)
+            harness(config(server), beforeCreate = {
+                if (holdFirst.getAndSet(false)) {
+                    entered.complete(Unit)
+                    check(release.await(15, TimeUnit.SECONDS))
+                }
+            }).use { harness ->
+                val coordinator = harness.coordinator
+                coordinator.startAll()
+                try {
+                    await { entered.isCompleted }
+                    val staleCallback = harness.stsCallbacks.single()
+                    coordinator.quit()
+                    coordinator.quit()
+                    assertTrue(coordinator.isQuitting)
+                    assertEquals(ConnectionStatus.DISCONNECTED, coordinator.networks.value.single().status)
+                    staleCallback(9)
+                    coordinator.updateConnectivity(false)
+                    coordinator.updateConnectivity(true, 26)
+                    coordinator.onForegroundResume()
+                    assertNotNull(scheduler).advanceTimeBy(60_000)
+                    assertNotNull(scheduler).runCurrent()
+                    assertEquals(1, harness.createdConfigs.size)
+                    assertTrue(server.clients.isEmpty())
+                    coordinator.resumeAfterQuit()
+                    coordinator.resumeAfterQuit()
+                    await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
+                    val active = server.clients.single()
+                    staleCallback(9)
+                    release.countDown()
+                    await { harness.createdConnections.size == 2 }
+                    assertNotNull(scheduler).advanceTimeBy(60_000)
+                    assertNotNull(scheduler).runCurrent()
+                    assertEquals(2, harness.createdConfigs.size)
+                    assertEquals(1, server.clients.size)
+                    assertFalse(active.closed)
+                    assertEquals(server.port, harness.createdConfigs.last().port)
+                    assertFalse(harness.createdConfigs.last().tls)
+                    assertTrue(coordinator.sendText(harness.config.id, "network|#room", "relaunched socket survived"))
+                    await { "PRIVMSG #room :relaunched socket survived" in active.received }
+                    assertEquals(harness.config, NetworkStore(harness.directory).all().single())
+                } finally {
+                    release.countDown()
                 }
             }
         }

@@ -33,6 +33,7 @@ import dev.brentdevs.yardhal.ui.screens.NetworkPresetUi
 import dev.brentdevs.yardhal.ui.theme.YardhalTheme
 import dev.brentdevs.yardhal.ui.theme.LibraryYardhalTheme
 import dev.brentdevs.yardhal.service.NotificationRoutes
+import dev.brentdevs.yardhal.service.ConnectionService
 import android.net.Uri
 import dev.brentdevs.yardhal.media.IncomingShareIntake
 import java.util.UUID
@@ -52,6 +53,7 @@ class MainActivity : ComponentActivity() {
         shareHandled = savedInstanceState?.getBoolean("share-handled") ?: false
         enableEdgeToEdge()
         val app = application as YardhalApplication
+        if (app.startup.value == ApplicationStartup.READY) app.coordinator.resumeAfterQuit()
         handledNotificationUri = savedInstanceState?.getString("notification-handled-uri")
         handledThemeLink = savedInstanceState?.getString("theme-handled-link")
         savedInstanceState?.getString("theme-pending-link")?.let { app.incomingThemeLink = it }
@@ -105,6 +107,11 @@ class MainActivity : ComponentActivity() {
                         relayConfigurations = app.relayConfigurations,
                         presets = presets,
                         onNetworkSaved = networkSaver::save,
+                        onQuit = {
+                            coordinator.quit()
+                            ConnectionService.stop(this@MainActivity)
+                            finishAndRemoveTask()
+                        },
                         sharedTextProvider = { (application as YardhalApplication).sharedText },
                         onSharedConsumed = { (application as YardhalApplication).sharedText = null },
                         incomingShareError = app.sharedAttachmentError,
