@@ -863,6 +863,11 @@ before intake as well as before marking consumption.
 External shares copy before destination selection; assignment is immutable.
 Picker results bind to the original destination, not the newly visible session.
 Consent, byte progress, cancellation and retry remain scoped to that stage.
+An upload or consent confirmation received while a Ready/Awaiting-consent
+operation is finishing waits for that operation's release, retaining its consent
+key instead of being dropped. Cancellation and removal discard queued uploads.
+The real-HTTP regression holds a provider check open while confirming consent,
+then verifies one upload, exact bytes and retained private files through insertion.
 Caption insertion is reserved once per batch, including separately completed
 uploads. URLs enter only the matching destination draft, and Send remains
 explicit. Interrupted stages restore as interrupted rather than success;

@@ -25,6 +25,7 @@ import java.net.ServerSocket
 import java.util.Base64
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.CountDownLatch
@@ -480,6 +481,9 @@ class AttachmentStageManagerTests {
         val body = AtomicReference<ByteArray>()
         val method = AtomicReference<String>()
         val contentType = AtomicReference<String>()
+        val checkStarted = CountDownLatch(1)
+        val finishCheck = CountDownLatch(1)
+        val blockNextCheck = AtomicBoolean(false)
         val peer = UploadHttpPeer(server) { request ->
             requests.incrementAndGet()
             method.set(request.method)
@@ -495,14 +499,28 @@ class AttachmentStageManagerTests {
             preferences.selectProvider(null, provider.id)
             val directory = File(temporary.root, "stages")
             val bytes = ByteArray(65537) { (it % 251).toByte() }
-            val stages = AttachmentStageManager(directory, preferences, scope, { UploadEnvironment(null, false) }, access(bytes))
+            val stages = AttachmentStageManager(directory, preferences, scope, {
+                if (blockNextCheck.compareAndSet(true, false)) {
+                    checkStarted.countDown()
+                    check(finishCheck.await(5, TimeUnit.SECONDS))
+                }
+                UploadEnvironment(null, false)
+            }, access(bytes))
             stages.stageIncoming(listOf(Uri.parse("content://owned/http")), caption = "caption", destination = destination)
             val ready = withTimeout(5000) { stages.attachments.first { it.single().status == AttachmentStageStatus.READY }.single() }
             assertEquals(0, requests.get())
+            scope.coroutineContext.job.children.toList().joinAll()
             stages.upload(ready.id)
             val consent = withTimeout(5000) { stages.attachments.first { it.single().status == AttachmentStageStatus.AWAITING_CONSENT }.single() }
             assertEquals(0, requests.get())
+            scope.coroutineContext.job.children.toList().joinAll()
+            blockNextCheck.set(true)
+            stages.upload(ready.id)
+            assertTrue(checkStarted.await(5, TimeUnit.SECONDS))
+            val checking = scope.coroutineContext.job.children.toSet()
             stages.upload(ready.id, consent.consentKey)
+            withTimeout(5000) { scope.coroutineContext.job.children.filter { it !in checking }.toList().joinAll() }
+            finishCheck.countDown()
             val uploaded = withTimeout(5000) { stages.attachments.first { it.single().status == AttachmentStageStatus.UPLOADED }.single() }
             assertEquals(1, requests.get())
             assertEquals("POST", method.get())
@@ -525,7 +543,10 @@ class AttachmentStageManagerTests {
             assertTrue(AttachmentStageStore(directory).load().isEmpty())
             assertTrue(!File(directory, "${ready.id}.source").exists())
             assertTrue(!File(directory, "${ready.id}.ready").exists())
-        } finally { peer.close() }
+        } finally {
+            finishCheck.countDown()
+            peer.close()
+        }
     }
 
     @Test
