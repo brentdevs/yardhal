@@ -7,12 +7,14 @@ import android.app.Service
 import android.content.Intent
 import dev.brentdevs.yardhal.ApplicationStartup
 import dev.brentdevs.yardhal.YardhalApplication
+import dev.brentdevs.yardhal.MainActivity
 import dev.brentdevs.yardhal.service.ConnectionService
 import kotlinx.coroutines.flow.MutableStateFlow
 import androidx.test.core.app.ApplicationProvider
 import dev.brentdevs.yardhal.core.client.InMemoryStsPolicyStore
 import dev.brentdevs.yardhal.core.client.IrcConnection
 import dev.brentdevs.yardhal.core.client.IrcConnectionConfig
+import dev.brentdevs.yardhal.core.client.IrcEvent
 import dev.brentdevs.yardhal.core.client.StsPolicy
 import dev.brentdevs.yardhal.core.client.Socks5Config
 import dev.brentdevs.yardhal.core.client.TlsClientIdentity
@@ -78,6 +80,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestCoroutineScheduler
@@ -2777,6 +2780,7 @@ class NetworkEditLifecycleTests {
                                 val intent = if (queuedStart) {
                                     Intent(service, ConnectionService::class.java).putExtra(ConnectionService.EXTRA_NETWORK_COUNT, 2)
                                 } else null
+                                assertNotNull(shadowOf(service).lastForegroundNotification)
                                 assertEquals(Service.START_NOT_STICKY, service.onStartCommand(intent, 0, 1))
                                 assertTrue(shadowOf(service).isStoppedBySelf)
                             } finally {
@@ -2787,7 +2791,6 @@ class NetworkEditLifecycleTests {
                         app.onTerminate()
                     }
                     val attempts = harness.createdConfigs.size
-                    for (callback in harness.stsCallbacks.toList()) callback(9)
                     coordinator.connectNetwork(disconnected.id)
                     coordinator.connectNetwork(disabled.id)
                     coordinator.onForegroundResume()
@@ -2818,7 +2821,6 @@ class NetworkEditLifecycleTests {
                     coordinator.quit()
                     await { server.clients.all { it.closed } }
                     val reloaded = harness.reloadCoordinator()
-                    reloaded.resumeAfterQuit()
                     reloaded.startAll()
                     await { reloaded.networks.value.count { it.status == ConnectionStatus.REGISTERED } == 2 }
                     assertEquals(7, server.clients.size)
@@ -2826,6 +2828,50 @@ class NetworkEditLifecycleTests {
                     assertEquals(1, harness.createdConfigs.count { it.id == manual.id })
                     assertEquals(saved, NetworkStore(harness.directory).all().toSet())
                     assertEquals(setOf("quit-anchor", "quit-pending"), harness.messages.recent(room, 10).map { it.msgid }.toSet())
+                }
+            }
+        }
+    }
+
+    @Test
+    @Config(sdk = [35], application = Application::class)
+    fun freshMainActivityResumesQuitConnectionsAndAllowsTheForegroundServiceToRunAgain() = runBlocking {
+        Server().use { server ->
+            harness(config(server)).use { harness ->
+                val coordinator = harness.coordinator
+                coordinator.startAll()
+                awaitRegistered(harness, server)
+                coordinator.quit()
+                await { server.clients.single().closed }
+                val app = Instrumentation.newApplication(
+                    YardhalApplication::class.java, ApplicationProvider.getApplicationContext(),
+                ) as YardhalApplication
+                ReflectionHelpers.setField(app, "coordinator", coordinator)
+                ReflectionHelpers.getField<MutableStateFlow<ApplicationStartup>>(app, "mutableStartup").value = ApplicationStartup.READY
+                val activity = Robolectric.buildActivity(MainActivity::class.java)
+                ReflectionHelpers.setField(activity.get(), "mApplication", app)
+                try {
+                    activity.create()
+                    awaitRegistered(harness, server)
+                    assertFalse(coordinator.isQuitting)
+                    assertEquals(2, server.clients.size)
+                    val controller = Robolectric.buildService(ConnectionService::class.java).create()
+                    try {
+                        val service = controller.get()
+                        ReflectionHelpers.setField(service, "mApplication", app)
+                        assertNotNull(shadowOf(service).lastForegroundNotification)
+                        val command = Intent(service, ConnectionService::class.java)
+                            .putExtra(ConnectionService.EXTRA_NETWORK_COUNT, 1)
+                        assertEquals(Service.START_STICKY, service.onStartCommand(command, 0, 1))
+                        assertFalse(shadowOf(service).isStoppedBySelf)
+                        assertNotNull(shadowOf(service).lastForegroundNotification)
+                    } finally {
+                        controller.destroy()
+                    }
+                    assertEquals(harness.config, NetworkStore(harness.directory).all().single())
+                } finally {
+                    activity.destroy()
+                    app.onTerminate()
                 }
             }
         }
@@ -2953,7 +2999,7 @@ class NetworkEditLifecycleTests {
     }
 
     @Test
-    fun applicationQuitStopsSojuParentsAndDependentsWithoutSavingDisconnectsAndResumesParentFirst() = runBlocking {
+    fun applicationQuitStopsSojuParentsAndDependentsWithoutSavingDisconnectsAndResumesOnlyEligibleNetworks() = runBlocking {
         Server(bouncer = true).use { server ->
             server.bouncerNetworkLines.addAll(listOf(
                 "1 :name=Enabled", "2 :name=Disconnected", "3 :name=Manual", "4 :name=Disabled;enabled=0",
@@ -2988,7 +3034,6 @@ class NetworkEditLifecycleTests {
                 assertTrue(coordinator.networks.value.all { it.status == ConnectionStatus.DISCONNECTED &&
                     it.connectionPhase == RecoveryPhase.USER_DISCONNECTED })
                 val attempts = harness.createdConfigs.size
-                for (callback in harness.stsCallbacks.toList()) callback(9)
                 coordinator.onForegroundResume()
                 coordinator.updateConnectivity(false)
                 coordinator.updateConnectivity(true, 24)
@@ -3088,53 +3133,59 @@ class NetworkEditLifecycleTests {
     }
 
     @Test
-    fun lateFactoryCompletionAndStsCallbackCannotReopenOrRetargetAQuitSessionAfterRelaunch() = runBlocking {
-        Server().use { server ->
-            val entered = CompletableDeferred<Unit>()
-            val release = CountDownLatch(1)
-            val holdFirst = AtomicBoolean(true)
-            harness(config(server), beforeCreate = {
-                if (holdFirst.getAndSet(false)) {
-                    entered.complete(Unit)
-                    check(release.await(15, TimeUnit.SECONDS))
-                }
-            }).use { harness ->
-                val coordinator = harness.coordinator
-                coordinator.startAll()
-                try {
-                    await { entered.isCompleted }
-                    val staleCallback = harness.stsCallbacks.single()
-                    coordinator.quit()
-                    coordinator.quit()
-                    assertTrue(coordinator.isQuitting)
-                    assertEquals(ConnectionStatus.DISCONNECTED, coordinator.networks.value.single().status)
-                    staleCallback(9)
-                    coordinator.updateConnectivity(false)
-                    coordinator.updateConnectivity(true, 26)
-                    coordinator.onForegroundResume()
-                    assertNotNull(scheduler).advanceTimeBy(60_000)
-                    assertNotNull(scheduler).runCurrent()
-                    assertEquals(1, harness.createdConfigs.size)
-                    assertTrue(server.clients.isEmpty())
-                    coordinator.resumeAfterQuit()
-                    coordinator.resumeAfterQuit()
-                    await { coordinator.networks.value.single().status == ConnectionStatus.REGISTERED }
-                    val active = server.clients.single()
-                    staleCallback(9)
-                    release.countDown()
-                    await { harness.createdConnections.size == 2 }
-                    assertNotNull(scheduler).advanceTimeBy(60_000)
-                    assertNotNull(scheduler).runCurrent()
-                    assertEquals(2, harness.createdConfigs.size)
-                    assertEquals(1, server.clients.size)
-                    assertFalse(active.closed)
-                    assertEquals(server.port, harness.createdConfigs.last().port)
-                    assertFalse(harness.createdConfigs.last().tls)
-                    assertTrue(coordinator.sendText(harness.config.id, "network|#room", "relaunched socket survived"))
-                    await { "PRIVMSG #room :relaunched socket survived" in active.received }
-                    assertEquals(harness.config, NetworkStore(harness.directory).all().single())
-                } finally {
-                    release.countDown()
+    fun lateFactoryCompletionIsClosedWhileQuittingAndAfterRelaunch() = runBlocking {
+        for (resumeBeforeCompletion in listOf(false, true)) {
+            Server().use { server ->
+                val entered = CompletableDeferred<Unit>()
+                val release = CountDownLatch(1)
+                val holdFirst = AtomicBoolean(true)
+                harness(config(server), beforeCreate = {
+                    if (holdFirst.getAndSet(false)) {
+                        entered.complete(Unit)
+                        check(release.await(15, TimeUnit.SECONDS))
+                    }
+                }).use { harness ->
+                    val coordinator = harness.coordinator
+                    coordinator.startAll()
+                    try {
+                        await { entered.isCompleted }
+                        coordinator.quit()
+                        assertTrue(coordinator.isQuitting)
+                        assertEquals(ConnectionStatus.DISCONNECTED, coordinator.networks.value.single().status)
+                        coordinator.updateConnectivity(false)
+                        coordinator.updateConnectivity(true, 26)
+                        coordinator.onForegroundResume()
+                        assertNotNull(scheduler).advanceTimeBy(60_000)
+                        assertNotNull(scheduler).runCurrent()
+                        assertEquals(1, harness.createdConfigs.size)
+                        assertTrue(server.clients.isEmpty())
+                        if (resumeBeforeCompletion) {
+                            coordinator.resumeAfterQuit()
+                            awaitRegistered(harness, server)
+                        }
+                        release.countDown()
+                        await { harness.createdConnections.size == if (resumeBeforeCompletion) 2 else 1 }
+                        val retired = harness.createdConnections.last()
+                        assertTrue(withTimeout(5_000) { retired.events.first() } is IrcEvent.Disconnected)
+                        assertFalse(retired.send(IrcMessage(command = "PING", parameters = listOf("retired"))))
+                        if (!resumeBeforeCompletion) {
+                            assertTrue(server.clients.isEmpty())
+                            assertTrue(coordinator.isQuitting)
+                            coordinator.resumeAfterQuit()
+                            awaitRegistered(harness, server)
+                        }
+                        assertNotNull(scheduler).advanceTimeBy(60_000)
+                        assertNotNull(scheduler).runCurrent()
+                        assertEquals(2, harness.createdConfigs.size)
+                        assertEquals(1, server.clients.size)
+                        val active = server.clients.single()
+                        assertFalse(active.closed)
+                        assertTrue(coordinator.sendText(harness.config.id, "network|#room", "relaunched socket survived"))
+                        await { "PRIVMSG #room :relaunched socket survived" in active.received }
+                        assertEquals(harness.config, NetworkStore(harness.directory).all().single())
+                    } finally {
+                        release.countDown()
+                    }
                 }
             }
         }

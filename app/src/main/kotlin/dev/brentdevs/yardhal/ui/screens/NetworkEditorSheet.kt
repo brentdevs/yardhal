@@ -143,7 +143,7 @@ public fun WelcomeScreen(
             }
             TextButton(onClick = onAddNetwork) { Text("Add network manually") }
         }
-        Box(modifier = Modifier.align(Alignment.TopEnd)) {
+        Box(modifier = Modifier.align(Alignment.TopEnd).padding(end = 4.dp)) {
             IconButton(onClick = { appMenuVisible = true }) {
                 Icon(Icons.Filled.MoreVert, contentDescription = "App options")
             }
