@@ -45,6 +45,7 @@ public class AttachmentStageManager(
     private val removingIds = HashSet<String>()
     private val retryAfterRelease = HashSet<String>()
     private val keepAfterRelease = HashSet<String>()
+    private val uploadAfterRelease = HashMap<String, String?>()
     private val captionRevisions = HashMap<String, Long>()
     private val mutableAttachments = MutableStateFlow(restore(store.load()))
     public val attachments: StateFlow<List<StagedAttachment>> = mutableAttachments.asStateFlow()
@@ -150,6 +151,7 @@ public class AttachmentStageManager(
             cancelledIds.add(id)
             retryAfterRelease.remove(id)
             keepAfterRelease.remove(id)
+            uploadAfterRelease.remove(id)
             operations[id]?.also { it.markCancelled() }
         }
         scope.launch(Dispatchers.IO) {
@@ -164,6 +166,7 @@ public class AttachmentStageManager(
             cancelledIds.add(id)
             retryAfterRelease.remove(id)
             keepAfterRelease.remove(id)
+            uploadAfterRelease.remove(id)
             operations[id]?.also { it.markCancelled() }
         }
         scope.launch(Dispatchers.IO) {
@@ -270,7 +273,19 @@ public class AttachmentStageManager(
     }
 
     private fun performUpload(id: String, confirmedConsentKey: String?) {
-        val cancellation = acquire(id) ?: return
+        val cancellation = synchronized(lock) {
+            val active = operations[id]
+            if (active != null) {
+                val status = mutableAttachments.value.firstOrNull { it.id == id }?.status
+                if (!active.isCancelled && id !in cancelledIds && id !in removingIds &&
+                    (status == AttachmentStageStatus.READY || status == AttachmentStageStatus.AWAITING_CONSENT)
+                ) {
+                    uploadAfterRelease[id] = confirmedConsentKey
+                }
+                return
+            }
+            acquire(id)
+        } ?: return
         try {
             val entry = entry(id) ?: return
             if (entry.uploaded != null || entry.status == AttachmentStageStatus.COPYING) return
@@ -338,16 +353,21 @@ public class AttachmentStageManager(
         if (id in operations || id in cancelledIds || mutableAttachments.value.none { it.id == id }) null else StageCancellation().also { operations[id] = it }
     }
     private fun release(id: String) {
-        val (shouldKeep, shouldRetry) = synchronized(lock) {
-            operations.remove(id)
+        val shouldKeep: Boolean
+        val shouldRetry: Boolean
+        val shouldUpload: Boolean
+        val consentKey: String?
+        synchronized(lock) {
+            val cancelled = operations.remove(id)?.isCancelled == true
             val removed = mutableAttachments.value.none { it.id == id }
             if (removed) { removingIds.remove(id); cancelledIds.remove(id); deleteFiles(id) }
-            val keep = keepAfterRelease.remove(id)
-            val retry = retryAfterRelease.remove(id)
-            (!removed && keep) to (!removed && retry)
+            shouldKeep = keepAfterRelease.remove(id) && !removed
+            shouldRetry = retryAfterRelease.remove(id) && !removed
+            shouldUpload = uploadAfterRelease.containsKey(id) && !removed && !cancelled && id !in cancelledIds
+            consentKey = uploadAfterRelease.remove(id)
         }
         persistUserChange { releaseUnusedUriGrants() }
-        if (shouldKeep) keepMetadataAndRetry(id) else if (shouldRetry) retry(id)
+        if (shouldKeep) keepMetadataAndRetry(id) else if (shouldRetry) retry(id) else if (shouldUpload) upload(id, consentKey)
     }
     private fun entry(id: String): StagedAttachment? = synchronized(lock) { mutableAttachments.value.firstOrNull { it.id == id } }
     private fun update(id: String, transform: (StagedAttachment) -> StagedAttachment) { mutate { entries -> entries.map { if (it.id == id) transform(it) else it } } }

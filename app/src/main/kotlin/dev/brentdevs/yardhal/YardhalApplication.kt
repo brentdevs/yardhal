@@ -221,7 +221,7 @@ class YardhalApplication : Application() {
             var serviceWanted = false
             var foregroundCount = 0
             coordinator.networks.collect { networks ->
-                val wanted = networks.any { it.connectionPhase.keepsRecoveryService() }
+                val wanted = !coordinator.isQuitting && networks.any { it.connectionPhase.keepsRecoveryService() }
                 val count = networks.count { it.status == ConnectionStatus.REGISTERED }
                 if (wanted) {
                     if (!serviceWanted || count != foregroundCount) {

@@ -123,6 +123,8 @@ public class LiveCoordinator(
     private val _restorationReady = MutableStateFlow(false)
     public val restorationReady: StateFlow<Boolean> = _restorationReady.asStateFlow()
     @Volatile private var startupRequested = false
+    @Volatile public var isQuitting: Boolean = false
+        private set
     private var maintenanceJob: Job? = null
     private var lastMaintenanceAtMs: Long? = null
     private val writesSinceTrim = ConcurrentHashMap<String, Int>()
@@ -494,6 +496,32 @@ public class LiveCoordinator(
                     }
                 }
             }
+        }
+    }
+
+    public fun quit() {
+        synchronized(sessionLifecycleLock) {
+            if (isQuitting) return
+            isQuitting = true
+            for (session in sessions.values) {
+                synchronized(session.state) {
+                    session.recovery.handle(RecoverySignal.USER_DISCONNECT)
+                    retireTransport(session, "Yardhal")
+                    session.connectionError = null
+                }
+            }
+            refreshNetworkStates()
+        }
+    }
+
+    public fun resumeAfterQuit() {
+        synchronized(sessionLifecycleLock) {
+            if (!isQuitting) return
+            isQuitting = false
+            for (config in networkStore.all().sortedBy { it.bouncerBinding != null }) {
+                restartSession(config, manuallyWanted = false, allowStartup = true)
+            }
+            refreshNetworkStates()
         }
     }
 
@@ -1083,7 +1111,7 @@ public class LiveCoordinator(
 
     public fun connect(config: NetworkConfig) {
         synchronized(sessionLifecycleLock) {
-            if (sessions.containsKey(config.id)) return
+            if (isQuitting || sessions.containsKey(config.id)) return
             val saved = networkStore.byId(config.id)
             startSession(config.copy(
                 autoConnect = saved?.autoConnect ?: config.autoConnect,
@@ -1094,6 +1122,7 @@ public class LiveCoordinator(
 
     public fun connectNetwork(networkId: String) {
         synchronized(sessionLifecycleLock) {
+            if (isQuitting) return
             val saved = networkStore.byId(networkId) ?: return
             val binding = saved.bouncerBinding
             if (binding != null) {
@@ -1430,6 +1459,7 @@ public class LiveCoordinator(
         manuallyWanted: Boolean = false,
         allowStartup: Boolean = true,
     ) {
+        if (isQuitting) return
         val session = Session(config, casemapping, manuallyWanted, allowStartup)
         session.recovery.handle(RecoverySignal.START)
         sessions[config.id] = session
@@ -1685,7 +1715,7 @@ public class LiveCoordinator(
     }
 
     private fun launchSession(session: Session) = synchronized(session.state) {
-        if (sessions[session.config.id] !== session || session.quitRequested || !session.lifecycleJob.isActive ||
+        if (isQuitting || sessions[session.config.id] !== session || session.quitRequested || !session.lifecycleJob.isActive ||
             !session.recovery.desiredConnection || session.reconnector != null || !upstreamEligible(session.config)
         ) return@synchronized
         if (startupRequested && !_restorationReady.value) return@synchronized
@@ -1698,7 +1728,9 @@ public class LiveCoordinator(
                 val token: Long
                 synchronized(session.state) {
                     session.lifecycleJob.ensureActive()
-                    if (sessions[session.config.id] !== session) throw kotlinx.coroutines.CancellationException()
+                    if (isQuitting || sessions[session.config.id] !== session || session.quitRequested) {
+                        throw kotlinx.coroutines.CancellationException()
+                    }
                     session.redactionConnection = null
                     token = session.reconnector?.currentEpoch ?: throw kotlinx.coroutines.CancellationException()
                     session.attemptToken = token
@@ -1713,7 +1745,9 @@ public class LiveCoordinator(
                 val effective = effectiveConfig(config, upgradePort)
                 synchronized(session.state) {
                     session.lifecycleJob.ensureActive()
-                    if (sessions[config.id] !== session || session.reconnector?.currentEpoch != token) {
+                    if (isQuitting || sessions[config.id] !== session || session.quitRequested ||
+                        session.reconnector?.currentEpoch != token
+                    ) {
                         throw kotlinx.coroutines.CancellationException()
                     }
                     session.effective = effective
@@ -1721,7 +1755,8 @@ public class LiveCoordinator(
                 }
                 connectionFactory.create(effective) { port ->
                     synchronized(session.state) {
-                        if (sessions[config.id] === session && session.reconnector?.currentEpoch == token &&
+                        if (!isQuitting && sessions[config.id] === session && !session.quitRequested &&
+                            session.lifecycleJob.isActive && session.reconnector?.currentEpoch == token &&
                             session.acceptedEpoch == token
                         ) {
                             session.stsUpgradePort = port
@@ -1729,7 +1764,9 @@ public class LiveCoordinator(
                     }
                 }.also { connection ->
                     synchronized(session.state) {
-                        if (sessions[config.id] !== session || session.reconnector?.currentEpoch != token) {
+                        if (isQuitting || sessions[config.id] !== session || session.quitRequested ||
+                            !session.lifecycleJob.isActive || session.reconnector?.currentEpoch != token
+                        ) {
                             connection.disconnect()
                             throw kotlinx.coroutines.CancellationException()
                         }
@@ -1854,7 +1891,7 @@ public class LiveCoordinator(
     }
 
     private fun recover(session: Session, signal: RecoverySignal) {
-        if (!upstreamEligible(session.config)) return
+        if (isQuitting || session.quitRequested || !upstreamEligible(session.config)) return
         when (session.recovery.handle(signal)) {
             RecoveryAction.NONE -> Unit
             RecoveryAction.START -> launchSession(session)
@@ -3697,6 +3734,7 @@ public class LiveCoordinator(
                     messageDeletionAvailable = live?.state?.registered == true &&
                         live.statusFlow.value == ConnectionStatus.REGISTERED && "draft/message-redaction" in live.state.supportedCaps,
                     connectionPhase = when {
+                        isQuitting -> RecoveryPhase.USER_DISCONNECTED
                         binding?.rejectionReason != null -> RecoveryPhase.AUTHENTICATION_REJECTED
                         binding?.enabled == false -> RecoveryPhase.DISCONNECTED
                         binding != null && !upstreamEligible(session?.config ?: config) -> RecoveryPhase.USER_DISCONNECTED

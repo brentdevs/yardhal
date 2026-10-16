@@ -1623,6 +1623,7 @@ public fun NetworkOverviewScreen(
     onSelect: (String) -> Unit,
     onSelectServer: (String) -> Unit,
     onAddNetwork: () -> Unit,
+    onQuit: () -> Unit,
     onEditNetwork: (String) -> Unit,
     onConnectNetwork: (String) -> Unit,
     onDisconnectNetwork: (String) -> Unit,
@@ -1781,43 +1782,45 @@ public fun NetworkOverviewScreen(
             TopAppBar(
                 title = { Text("Conversations") },
                 actions = {
-                    if (networks.isNotEmpty() || showBouncerButton) {
-                        Box {
-                            IconButton(onClick = { appMenuVisible = true }) {
-                                Icon(Icons.Filled.MoreVert, contentDescription = "App options")
-                            }
-                            DropdownMenu(expanded = appMenuVisible, onDismissRequest = { appMenuVisible = false }) {
-                                DropdownMenuItem(text = { Text("Add network") }, onClick = {
+                    Box {
+                        IconButton(onClick = { appMenuVisible = true }) {
+                            Icon(Icons.Filled.MoreVert, contentDescription = "App options")
+                        }
+                        DropdownMenu(expanded = appMenuVisible, onDismissRequest = { appMenuVisible = false }) {
+                            DropdownMenuItem(text = { Text("Add network") }, onClick = {
+                                appMenuVisible = false
+                                onAddNetwork()
+                            })
+                            DropdownMenuItem(text = { Text("Reorder networks and conversations") }, onClick = {
+                                appMenuVisible = false
+                                orderingVisible = true
+                            })
+                            if (showBouncerButton) {
+                                DropdownMenuItem(text = { Text("Bouncer networks") }, onClick = {
                                     appMenuVisible = false
-                                    onAddNetwork()
-                                })
-                                DropdownMenuItem(text = { Text("Reorder networks and conversations") }, onClick = {
-                                    appMenuVisible = false
-                                    orderingVisible = true
-                                })
-                                if (showBouncerButton) {
-                                    DropdownMenuItem(text = { Text("Bouncer networks") }, onClick = {
-                                        appMenuVisible = false
-                                        onOpenBouncer()
-                                    })
-                                }
-                                DropdownMenuItem(text = { Text("Chat appearance") }, onClick = {
-                                    appMenuVisible = false
-                                    onOpenAppearance()
-                                })
-                                DropdownMenuItem(text = { Text("Catch Up") }, onClick = {
-                                    appMenuVisible = false
-                                    onOpenCatchUp()
-                                })
-                                DropdownMenuItem(text = { Text("Notifications") }, onClick = {
-                                    appMenuVisible = false
-                                    onOpenNotifications()
-                                })
-                                DropdownMenuItem(text = { Text("Bug report") }, onClick = {
-                                    appMenuVisible = false
-                                    onOpenBugReport()
+                                    onOpenBouncer()
                                 })
                             }
+                            DropdownMenuItem(text = { Text("Chat appearance") }, onClick = {
+                                appMenuVisible = false
+                                onOpenAppearance()
+                            })
+                            DropdownMenuItem(text = { Text("Catch Up") }, onClick = {
+                                appMenuVisible = false
+                                onOpenCatchUp()
+                            })
+                            DropdownMenuItem(text = { Text("Notifications") }, onClick = {
+                                appMenuVisible = false
+                                onOpenNotifications()
+                            })
+                            DropdownMenuItem(text = { Text("Bug report") }, onClick = {
+                                appMenuVisible = false
+                                onOpenBugReport()
+                            })
+                            DropdownMenuItem(text = { Text("Quit") }, onClick = {
+                                appMenuVisible = false
+                                onQuit()
+                            })
                         }
                     }
                 },

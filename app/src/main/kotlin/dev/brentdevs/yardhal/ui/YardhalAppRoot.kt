@@ -117,6 +117,7 @@ public fun YardhalAppRoot(
     onThemeLinkConsumed: (String) -> Unit,
     presets: List<NetworkPresetUi>,
     onNetworkSaved: (NetworkDraft) -> Boolean,
+    onQuit: () -> Unit,
     sharedTextProvider: () -> String? = { null },
     onSharedConsumed: () -> Unit = {},
     incomingShareError: String? = null,
@@ -390,6 +391,7 @@ public fun YardhalAppRoot(
                 onSelected()
             },
             onAddNetwork = { openNetworkEditor() },
+            onQuit = onQuit,
             onEditNetwork = { networkId ->
                 val config = coordinator.networkStore.byId(networkId)
                 if (config?.bouncerBinding != null) {
@@ -721,6 +723,7 @@ public fun YardhalAppRoot(
                             onAddNetwork = { openNetworkEditor() },
                             presets = presets,
                             onPickPreset = { picked -> openNetworkEditor(preset = picked) },
+                            onQuit = onQuit,
                         )
                     } else {
                         overviewScreen(Modifier.fillMaxSize()) {}

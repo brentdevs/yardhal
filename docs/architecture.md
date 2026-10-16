@@ -236,6 +236,35 @@ without opening another transport. Foreground-service stop commands run after
 foreground promotion so an immediate authentication or certificate rejection cannot
 cancel a pending foreground start and trigger Android's startup watchdog.
 
+**App options → Quit** retires all active transports, reconnect loops, probes
+and per-session work before closing the Android task. A process-resident quit
+gate prevents deferred startup and connectivity/resume recovery from reopening
+connections. Factory results returned after teardown are disconnected; existing
+transport epochs reject stale control callbacks. The foreground-service observer
+suppresses starts while quitting, and the service rejects queued start/sticky
+restart commands as non-sticky stops after foreground promotion.
+No process kill or application-scope cancellation discards queued persistence.
+Saved `autoConnect` and `userDisconnected` values are unchanged. A new activity
+explicitly resumes configured startup while respecting soju parent eligibility;
+ordinary background callbacks do not resume a quit coordinator. Opening a share
+or theme link in a new activity is an intentional reopen with the same saved
+startup preferences. Android may retain the idle application process after its
+task and service are gone.
+
+Real-socket regressions cover multi-network shutdown, pending persistence,
+startup restoration, offline/backoff/authentication states, soju dependencies,
+factory results returned both before and after relaunch, and repeated quit/resume.
+Robolectric creates a real `MainActivity` to exercise its `onCreate` resume path
+and verifies that service starts are accepted again after relaunch. Coordinator
+fixtures do not run the application's service observer; Android 15 smoke exercises
+that application-owned collector through launcher and share-intent reopen.
+Native verification also covers the empty welcome menu and main-screen quit with
+two connected networks plus a retrying endpoint: sockets close, the task leaves
+Recents, the service and ongoing notification disappear, and relaunch reconnects
+without losing saved preferences or the transcript. These checks prove observable
+lifecycle behavior, not that every redundant defensive guard fails independently
+when removed.
+
 Initial required SASL, PASS, proxy or client-identity failures stop automatic retries;
 missing referenced secrets never fall back to guest registration. Post-registration
 OPER/PASS errors and unsuccessful SASL reauthentication do not tear down a healthy
@@ -834,6 +863,11 @@ before intake as well as before marking consumption.
 External shares copy before destination selection; assignment is immutable.
 Picker results bind to the original destination, not the newly visible session.
 Consent, byte progress, cancellation and retry remain scoped to that stage.
+An upload or consent confirmation received while a Ready/Awaiting-consent
+operation is finishing waits for that operation's release, retaining its consent
+key instead of being dropped. Cancellation and removal discard queued uploads.
+The real-HTTP regression holds a provider check open while confirming consent,
+then verifies one upload, exact bytes and retained private files through insertion.
 Caption insertion is reserved once per batch, including separately completed
 uploads. URLs enter only the matching destination draft, and Send remains
 explicit. Interrupted stages restore as interrupted rather than success;

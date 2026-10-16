@@ -7,6 +7,7 @@ import android.content.Intent
 import android.os.IBinder
 import androidx.core.content.ContextCompat
 import dev.brentdevs.yardhal.YardhalApplication
+import dev.brentdevs.yardhal.ApplicationStartup
 import dev.brentdevs.yardhal.coordinator.RecoveryPhase
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -29,7 +30,8 @@ public class ConnectionService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         restartCheck?.cancel()
         val app = application as? YardhalApplication
-        val stopping = intent?.action == ACTION_STOP || intent == null && app == null
+        val stopping = intent?.action == ACTION_STOP || intent == null && app == null ||
+            app?.let { it.startup.value == ApplicationStartup.READY && it.coordinator.isQuitting } == true
         val count = if (stopping) foregroundNetworkCount else intent?.getIntExtra(EXTRA_NETWORK_COUNT, 0) ?: 0
         val notification = if (count == foregroundNetworkCount) {
             requireNotNull(foregroundNotification)
