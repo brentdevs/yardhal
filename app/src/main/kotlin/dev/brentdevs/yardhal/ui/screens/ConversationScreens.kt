@@ -673,9 +673,9 @@ public fun ConversationScreen(
     ) { padding ->
         LaunchedEffectOnce(key = buffer.key, effect = onLoadHistory)
         Column(modifier = Modifier.padding(padding).fillMaxSize()) {
-                network?.let {
+                if (buffer.ref.kind != ConversationKind.CHANNEL && network != null) {
                     dev.brentdevs.yardhal.ui.components.NetworkConnectionPanel(
-                        network = it,
+                        network = network,
                         onConnect = onConnectNetwork,
                         onDisconnect = onDisconnectNetwork,
                         onEdit = onEditNetwork,
@@ -726,7 +726,9 @@ public fun ConversationScreen(
                             onRetry = onRetryHistory,
                         )
                     }
-                    if (buffer.history.catchUp.status != HistoryLoadStatus.IDLE) {
+                    if (buffer.history.catchUp.status != HistoryLoadStatus.IDLE &&
+                        (buffer.ref.kind != ConversationKind.CHANNEL || buffer.history.catchUp.status != HistoryLoadStatus.UNSUPPORTED)
+                    ) {
                         HistoryStateRow(
                             label = "Reconnect catch-up",
                             state = buffer.history.catchUp,
