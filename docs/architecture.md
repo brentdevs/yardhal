@@ -1141,6 +1141,10 @@ including after saved-conversation restoration. This clears that conversation's
 message notifications without cancelling the connection notification or other
 conversations' alerts. Pending notification navigation cannot mark the previous
 selection read, and targeted search jumps retain their explicit-read behavior.
+Targeted search and Catch Up navigation keep a separate saved read policy after
+their one-shot scroll target is consumed. Pause/resume, configuration recreation
+and identity renames preserve that policy; ordinary conversation navigation
+clears it and restores normal foreground reads.
 
 `BugReport`/`BugReportSheet` provide review, copy and share of description,
 build/device, last-attempted TLS/proxy flags and loaded/open/joined counts.

@@ -174,18 +174,21 @@ public fun YardhalAppRoot(
         pendingPresetId = null
     }
     var selectedKey by rememberSaveable { mutableStateOf<String?>(null) }
+    var preserveUnreadOnResume by rememberSaveable { mutableStateOf(false) }
     var collapsedNetworkIds by rememberSaveable(stateSaver = NETWORK_ID_SET_SAVER) {
         mutableStateOf(emptySet<String>())
     }
-    fun selectConversation(key: String?) {
+    fun selectConversation(key: String?, preserveUnread: Boolean = false) {
         selectionSettled = true
         coordinator.trackSelection(key)
         selectedKey = key
+        preserveUnreadOnResume = preserveUnread
     }
     LaunchedEffect(restorationReady, restoredSelection, buffers.keys) {
         if (restorationReady && !selectionSettled) {
             val restored = restoredLaunchSelection(selectedKey, selectionSettled, true, restoredSelection, buffers.keys)
             selectionSettled = true
+            if (restored != selectedKey) preserveUnreadOnResume = false
             selectedKey = restored
             if (restored != null) coordinator.trackSelection(restored)
         }
@@ -275,7 +278,7 @@ public fun YardhalAppRoot(
             onJump = { message ->
                 val hit = FtsHit(message.rowId, message.networkId, message.conversation.rawTarget,
                     message.senderNick, message.timestampMs, message.text)
-                selectConversation(coordinator.openSearchHit(hit))
+                selectConversation(coordinator.openSearchHit(hit), preserveUnread = true)
                 drawerScope.launch { drawerState.close() }
                 searchTargetRowId = message.rowId
                 returnToSearch = false
@@ -325,7 +328,7 @@ public fun YardhalAppRoot(
     }
     val renamedSelection = coordinator.followRenamedSelection(selectedKey, buffers.keys)
     if (renamedSelection != null) {
-        selectConversation(renamedSelection)
+        selectConversation(renamedSelection, preserveUnread = preserveUnreadOnResume)
     }
 
     val pickLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
@@ -460,7 +463,7 @@ public fun YardhalAppRoot(
             conversationStateHolder.SaveableStateProvider(key) {
                 ConversationAccent(themeState, buffer.ref) {
                 LifecycleResumeEffect(key) {
-                    if (selectedKey == key && notificationRoutes.pending.value.isEmpty() && searchTargetRowId == null) coordinator.markRead(key)
+                    if (selectedKey == key && notificationRoutes.pending.value.isEmpty() && !preserveUnreadOnResume) coordinator.markRead(key)
                     onPauseOrDispose {}
                 }
                 ConversationScreen(
@@ -638,7 +641,7 @@ public fun YardhalAppRoot(
                     searchRetry += 1
                 },
                 onOpenHit = { hit ->
-                    selectConversation(coordinator.openSearchHit(hit))
+                    selectConversation(coordinator.openSearchHit(hit), preserveUnread = true)
                     searchTargetRowId = hit.rowId
                     returnToSearch = true
                     searchVisible = false
