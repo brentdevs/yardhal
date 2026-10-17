@@ -238,7 +238,7 @@ private fun ChatLine(
                 Spacer(modifier = Modifier.width(10.dp))
             }
             Column(modifier = Modifier.weight(1f)) {
-                if (appearance.timestampPosition == TimestampPosition.ABOVE) MessageTimestamp(timestamp, appearance)
+                if (!groupedWithPrevious && appearance.timestampPosition == TimestampPosition.ABOVE) MessageTimestamp(timestamp, appearance)
                 if (!groupedWithPrevious) {
                     Row(
                         modifier = Modifier.clearAndSetSemantics {},
@@ -277,7 +277,6 @@ private fun ChatLine(
                         )
                     }
                 }
-                if (groupedWithPrevious && appearance.timestampPosition == TimestampPosition.INLINE) MessageTimestamp(timestamp, appearance)
                 message.channelContext?.let { channel ->
                     Surface(
                         shape = RoundedCornerShape(12.dp),
@@ -360,7 +359,7 @@ private fun ChatLine(
                         ),
                     )
                 }
-                if (appearance.timestampPosition == TimestampPosition.BELOW) MessageTimestamp(timestamp, appearance)
+                if (!groupedWithPrevious && appearance.timestampPosition == TimestampPosition.BELOW) MessageTimestamp(timestamp, appearance)
                 for (media in linkedMedia) {
                     MediaPreview(
                         descriptor = media,

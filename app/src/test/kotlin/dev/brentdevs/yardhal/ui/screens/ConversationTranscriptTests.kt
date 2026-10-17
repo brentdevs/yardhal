@@ -19,13 +19,35 @@ class ConversationTranscriptTests {
     private val ref = ConversationRef.channel("network", "#room")
 
     @Test
+    fun senderHeadersStayOnTheFirstMessageAsPlaybackAndLiveMessagesArrive() {
+        val messages = listOf(
+            message(1, "2026-10-05T12:00:00Z").copy(playback = true),
+            message(2, "2026-10-05T12:00:01Z").copy(sender = "bob", playback = true),
+            message(3, "2026-10-05T12:00:02Z").copy(sender = "bob", playback = true),
+            message(4, "2026-10-05T12:00:03Z").copy(sender = "bob"),
+            message(5, "2026-10-05T12:00:04Z"),
+            message(6, "2026-10-05T12:00:05Z"),
+            message(7, "2026-10-05T12:00:06Z").copy(sender = "bob"),
+        )
+        val expectedGrouping = listOf(false, false, true, true, false, true, false)
+
+        for (count in 2..messages.size) {
+            val visible = buildTranscript(buffer(messages.take(count)), ZoneOffset.UTC)
+                .filterIsInstance<TranscriptEntry.Message>().asReversed()
+            assertEquals(messages.take(count).map { it.localId }, visible.map { it.value.localId })
+            assertEquals(expectedGrouping.take(count), visible.map { it.groupedWithPrevious }, "After $count messages")
+        }
+    }
+
+    @Test
     fun differentRelayedSendersKeepDistinctAttributionWithinOneWireBot() {
         val first = message(1, "2026-10-05T12:00:00Z").copy(sender = "bridge", relayedSender = "alice", relaySource = "bridge")
         val second = message(2, "2026-10-05T12:00:01Z").copy(sender = "bridge", relayedSender = "bob", relaySource = "bridge")
         val entries = transcript(first, second).filterIsInstance<TranscriptEntry.Message>()
         assertTrue(entries.none { it.groupedWithPrevious })
         val same = transcript(first, second.copy(relayedSender = "alice")).filterIsInstance<TranscriptEntry.Message>()
-        assertTrue(same.last().groupedWithPrevious)
+        assertFalse(same.single { it.value.localId == first.localId }.groupedWithPrevious)
+        assertTrue(same.single { it.value.localId == second.localId }.groupedWithPrevious)
         val ordinary = transcript(first.copy(relayedSender = null, relaySource = null), second).filterIsInstance<TranscriptEntry.Message>()
         assertTrue(ordinary.none { it.groupedWithPrevious })
     }
@@ -117,6 +139,7 @@ class ConversationTranscriptTests {
             listOf(LocalDate.parse("2026-10-05"), LocalDate.parse("2026-10-04"), LocalDate.parse("2026-10-03")),
             entries.filterIsInstance<TranscriptEntry.DayHeader>().map { it.date },
         )
+        assertTrue(entries.filterIsInstance<TranscriptEntry.Message>().none { it.groupedWithPrevious })
     }
 
     @Test
@@ -137,11 +160,11 @@ class ConversationTranscriptTests {
         )
 
         val grouped = entries.filterIsInstance<TranscriptEntry.Message>().associate { it.value.localId to it.groupedWithPrevious }
-        assertTrue(grouped.getValue(1))
-        assertTrue(grouped.getValue(3))
-        assertTrue(grouped.getValue(5))
-        assertFalse(grouped.getValue(2))
-        assertFalse(grouped.getValue(4))
+        assertFalse(grouped.getValue(1))
+        assertFalse(grouped.getValue(3))
+        assertFalse(grouped.getValue(5))
+        assertTrue(grouped.getValue(2))
+        assertTrue(grouped.getValue(4))
         assertFalse(grouped.getValue(6))
         assertEquals(1, entries.filterIsInstance<TranscriptEntry.UnreadDivider>().size)
     }
@@ -186,6 +209,24 @@ class ConversationTranscriptTests {
         )
 
         assertEquals(listOf("unread-$unreadFrom", "msg-2", "day-2026-10-04", "msg-1", "day-2026-10-03"), entries.map { it.key })
+    }
+
+    @Test
+    fun historyGapStartsANewSenderHeaderOnTheNewerSide() {
+        val first = message(1, "2026-10-05T12:00:00Z")
+        val second = message(2, "2026-10-05T12:00:01Z")
+        val third = message(3, "2026-10-05T12:00:02Z")
+        val gap = HistoryGap("missing", HistoryAnchor(first.timestampMs, first.msgid), HistoryAnchor(second.timestampMs, second.msgid))
+        val entries = buildTranscript(
+            buffer(listOf(first, second, third)).copy(history = ConversationHistory(gaps = listOf(gap))),
+            ZoneOffset.UTC,
+        )
+
+        assertEquals(listOf("msg-3", "msg-2", "gap-missing", "msg-1", "day-2026-10-05"), entries.map { it.key })
+        val grouped = entries.filterIsInstance<TranscriptEntry.Message>().associate { it.value.localId to it.groupedWithPrevious }
+        assertFalse(grouped.getValue(1))
+        assertFalse(grouped.getValue(2))
+        assertTrue(grouped.getValue(3))
     }
 
     @Test

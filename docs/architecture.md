@@ -122,6 +122,14 @@ reset expansion. The transcript emits at most one unread divider, including acro
 date changes. Unread and mention scans inspect all messages: server-time timestamps
 can arrive out of order, especially during playback.
 
+Message grouping receives newest-first rows but compares each message with its
+older neighbour. The first chronological message in a sender run keeps its
+username, avatar and timestamp as more live or playback messages arrive.
+Continuation rows omit that visual attribution in every timestamp position;
+accessibility still identifies each message's sender and time. The five-minute
+grouping window and distinct relay identities remain in force. Day, unread and
+history-gap separators restart attribution on their newer side.
+
 Reducer behaviour is pinned by plain-JVM tests
 (`app/src/test/.../coordinator/*ReducerTests.kt`, `PerNetworkStateTests.kt`)
 that feed raw lines and assert on returned effects and state.
