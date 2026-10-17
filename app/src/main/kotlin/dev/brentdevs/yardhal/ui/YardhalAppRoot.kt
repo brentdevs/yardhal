@@ -52,6 +52,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import dev.brentdevs.yardhal.coordinator.ConnectionStatus
 import dev.brentdevs.yardhal.coordinator.ConversationBuffer
 import dev.brentdevs.yardhal.coordinator.LiveCoordinator
@@ -458,6 +459,10 @@ public fun YardhalAppRoot(
             }
             conversationStateHolder.SaveableStateProvider(key) {
                 ConversationAccent(themeState, buffer.ref) {
+                LifecycleResumeEffect(key) {
+                    if (selectedKey == key && notificationRoutes.pending.value.isEmpty() && searchTargetRowId == null) coordinator.markRead(key)
+                    onPauseOrDispose {}
+                }
                 ConversationScreen(
                     buffer = buffer,
                     networkName = networkName,

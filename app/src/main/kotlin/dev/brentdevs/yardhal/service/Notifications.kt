@@ -26,13 +26,31 @@ import dev.brentdevs.yardhal.core.data.NotificationPreferences
 import dev.brentdevs.yardhal.core.data.NotificationPriority
 
 public object Notifications {
-    public const val CHANNEL_ONGOING: String = "connection"
+    public const val CHANNEL_ONGOING: String = "connection-v2"
     public const val ONGOING_NOTIFICATION_ID: Int = 1
     private const val EVENT_NOTIFICATION_ID = 2
+    private const val LEGACY_CHANNEL_ONGOING = "connection"
 
     public fun ensureChannels(context: Context) {
         val manager = context.getSystemService(NotificationManager::class.java)
-        manager.createNotificationChannel(NotificationChannel(CHANNEL_ONGOING, "Connection status", NotificationManager.IMPORTANCE_MIN))
+        val legacy = manager.getNotificationChannel(LEGACY_CHANNEL_ONGOING)
+        if (manager.getNotificationChannel(CHANNEL_ONGOING) == null) {
+            val channel = NotificationChannel(CHANNEL_ONGOING, "Connection status", legacy?.importance ?: NotificationManager.IMPORTANCE_MIN)
+            channel.setShowBadge(false)
+            if (legacy != null) {
+                channel.setSound(legacy.sound, legacy.audioAttributes)
+                channel.vibrationPattern = legacy.vibrationPattern
+                channel.enableVibration(legacy.shouldVibrate())
+                channel.enableLights(legacy.shouldShowLights())
+                channel.lightColor = legacy.lightColor
+                channel.lockscreenVisibility = legacy.lockscreenVisibility
+                channel.setBypassDnd(legacy.canBypassDnd())
+            }
+            manager.createNotificationChannel(channel)
+        }
+        if (legacy != null && manager.activeNotifications.none { it.notification.channelId == LEGACY_CHANNEL_ONGOING }) {
+            manager.deleteNotificationChannel(LEGACY_CHANNEL_ONGOING)
+        }
     }
 
     public fun channelId(kind: NotificationKind, settings: NotificationKindPreferences): String =

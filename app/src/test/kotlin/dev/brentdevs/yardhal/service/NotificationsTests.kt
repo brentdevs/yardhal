@@ -2,6 +2,7 @@ package dev.brentdevs.yardhal.service
 
 import android.Manifest
 import android.app.Application
+import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Intent
@@ -60,12 +61,60 @@ class NotificationsTests {
         assertEquals(NotificationManager.IMPORTANCE_DEFAULT, normal.importance)
         assertEquals(original.id, Notifications.ensureEventChannel(app, NotificationKind.MENTION, loud).id)
         assertNotNull(manager.getNotificationChannel(original.id).sound)
-        assertEquals(NotificationManager.IMPORTANCE_MIN, manager.getNotificationChannel(Notifications.CHANNEL_ONGOING).importance)
+        assertFalse(manager.getNotificationChannel(Notifications.CHANNEL_ONGOING).canShowBadge())
         assertNotEquals(original.id, Notifications.ensureEventChannel(app, NotificationKind.DIRECT_MESSAGE, loud).id)
         val settings = Notifications.settingsIntent(app, NotificationKind.MENTION, NotificationPreferences(mentions = loud.copy(sound = false)))
         assertEquals(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS, settings.action)
         assertEquals(silent.id, settings.getStringExtra(Settings.EXTRA_CHANNEL_ID))
         assertEquals(app.packageName, settings.getStringExtra(Settings.EXTRA_APP_PACKAGE))
+    }
+
+    @Test
+    fun upgradingAnExistingConnectionChannelStopsBadgingWithoutChangingMessageChannels() {
+        manager.createNotificationChannel(NotificationChannel("connection", "Connection status", NotificationManager.IMPORTANCE_LOW))
+        val mentions = Notifications.ensureEventChannel(app, NotificationKind.MENTION, NotificationKindPreferences())
+        Notifications.ensureChannels(app)
+        manager.notify(Notifications.ONGOING_NOTIFICATION_ID, Notifications.ongoing(app, 1))
+        val active = manager.activeNotifications.single().notification
+        assertFalse(requireNotNull(manager.getNotificationChannel(active.channelId)).canShowBadge())
+        assertNull(manager.getNotificationChannel("connection"))
+        assertTrue(requireNotNull(manager.getNotificationChannel(mentions.id)).canShowBadge())
+    }
+
+    @Test
+    fun upgradingAUserBlockedConnectionChannelDoesNotEnableItAgain() {
+        manager.createNotificationChannel(NotificationChannel("connection", "Blocked connection", NotificationManager.IMPORTANCE_NONE))
+        Notifications.ensureChannels(app)
+        assertEquals(NotificationManager.IMPORTANCE_NONE, manager.getNotificationChannel(Notifications.CHANNEL_ONGOING).importance)
+        assertFalse(manager.getNotificationChannel(Notifications.CHANNEL_ONGOING).canShowBadge())
+        assertNull(manager.getNotificationChannel("connection"))
+    }
+
+    @Test
+    fun anAlreadyMigratedUserBlockedChannelIsNotResetByLegacySettings() {
+        manager.createNotificationChannel(NotificationChannel("connection", "Old connection", NotificationManager.IMPORTANCE_HIGH))
+        manager.createNotificationChannel(NotificationChannel(Notifications.CHANNEL_ONGOING, "Blocked connection", NotificationManager.IMPORTANCE_NONE).apply {
+            setShowBadge(false)
+        })
+        Notifications.ensureChannels(app)
+        assertEquals(NotificationManager.IMPORTANCE_NONE, manager.getNotificationChannel(Notifications.CHANNEL_ONGOING).importance)
+        assertFalse(manager.getNotificationChannel(Notifications.CHANNEL_ONGOING).canShowBadge())
+        assertNull(manager.getNotificationChannel("connection"))
+    }
+
+    @Test
+    fun legacyChannelRetirementWaitsUntilTheForegroundNotificationUsesItsReplacement() {
+        manager.createNotificationChannel(NotificationChannel("connection", "Old connection", NotificationManager.IMPORTANCE_LOW))
+        val legacyNotification = NotificationCompat.Builder(app, "connection").setSmallIcon(android.R.drawable.ic_dialog_info).build()
+        legacyNotification.flags = legacyNotification.flags or Notification.FLAG_FOREGROUND_SERVICE
+        manager.notify(Notifications.ONGOING_NOTIFICATION_ID, legacyNotification)
+        Notifications.ensureChannels(app)
+        assertNotNull(manager.getNotificationChannel("connection"))
+        assertEquals("connection", manager.activeNotifications.single().notification.channelId)
+        manager.notify(Notifications.ONGOING_NOTIFICATION_ID, Notifications.ongoing(app, 1))
+        Notifications.ensureChannels(app)
+        assertNull(manager.getNotificationChannel("connection"))
+        assertFalse(manager.getNotificationChannel(manager.activeNotifications.single().notification.channelId).canShowBadge())
     }
 
     @Test

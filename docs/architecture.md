@@ -1120,6 +1120,20 @@ rows. Memory lookup reuses an existing AVATAR rendition, including `{size}`
 templates, without fetching, decoding or resizing; inline-media cache entries
 cannot satisfy it, and LRU eviction/clear removes the rendition index.
 
+The connection service uses the non-badging `connection-v2` channel, so staying
+connected or reconnecting does not itself create a launcher dot. Migration uses
+a new channel because Android freezes badge configuration after creation.
+It carries legacy importance (including a blocked channel), sound, vibration
+and light settings; an existing replacement retains Android's user choices.
+The legacy channel is retired only when no active notification still uses it.
+Message notification channels keep their existing badge behavior.
+
+A normal transcript marks its conversation read when the activity resumes,
+including after saved-conversation restoration. This clears that conversation's
+message notifications without cancelling the connection notification or other
+conversations' alerts. Pending notification navigation cannot mark the previous
+selection read, and targeted search jumps retain their explicit-read behavior.
+
 `BugReport`/`BugReportSheet` provide review, copy and share of description,
 build/device, last-attempted TLS/proxy flags and loaded/open/joined counts.
 Disconnected cached channels are not counted as currently joined.
