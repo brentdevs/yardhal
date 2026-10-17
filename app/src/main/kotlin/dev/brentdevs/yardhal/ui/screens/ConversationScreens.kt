@@ -171,6 +171,13 @@ internal fun buildTranscript(
     var previousTimestamp = Long.MAX_VALUE
     var renderedUnreadDivider = false
 
+    fun breakNewerMessageGroup() {
+        val newer = entries.lastOrNull()
+        if (newer is TranscriptEntry.Message && newer.groupedWithPrevious) {
+            entries[entries.lastIndex] = newer.copy(groupedWithPrevious = false)
+        }
+    }
+
     val pendingEvents = ArrayList<Pair<Int, ChatMessage>>()
     fun flushEvents() {
         if (pendingEvents.isEmpty()) return
@@ -192,17 +199,20 @@ internal fun buildTranscript(
         val gaps = gapsAtBoundary[index].orEmpty()
         if (gaps.isNotEmpty()) {
             flushEvents()
+            breakNewerMessageGroup()
             gaps.forEach { entries.add(TranscriptEntry.Gap(it)) }
         }
         val timestamp = message.timestampMs
         val date = Instant.ofEpochMilli(timestamp).atZone(zone).toLocalDate()
         if (lastDate != null && date != lastDate) {
             flushEvents()
+            breakNewerMessageGroup()
             entries.add(TranscriptEntry.DayHeader(lastDate))
         }
         lastDate = date
         if (unreadFrom != null && !renderedUnreadDivider && timestamp < unreadFrom && previousTimestamp >= unreadFrom) {
             flushEvents()
+            breakNewerMessageGroup()
             entries.add(TranscriptEntry.UnreadDivider(unreadFrom))
             renderedUnreadDivider = true
         }
@@ -213,7 +223,7 @@ internal fun buildTranscript(
             pendingEvents.add(index to message)
         } else {
             flushEvents()
-            entries.add(TranscriptEntry.Message(message, gaps.isEmpty() && grouped[index].groupedWithPrevious))
+            entries.add(TranscriptEntry.Message(message, grouped[index].groupedWithPrevious))
         }
         previousTimestamp = timestamp
     }

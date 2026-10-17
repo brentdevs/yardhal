@@ -17,15 +17,15 @@ class MessageGrouperTests {
     @Test
     fun consecutiveSameSenderWithinWindowGroup() {
         val grouped = groupNewestFirst(60_000L, 30_000L, 0L)
-        assertFalse(grouped[0].groupedWithPrevious)
+        assertTrue(grouped[0].groupedWithPrevious)
         assertTrue(grouped[1].groupedWithPrevious)
-        assertTrue(grouped[2].groupedWithPrevious)
+        assertFalse(grouped[2].groupedWithPrevious)
     }
 
     @Test
     fun sameSenderHoursApartDoesNotGroup() {
         val grouped = groupNewestFirst(2 * 3600_000L, 0L)
-        assertFalse(grouped[1].groupedWithPrevious)
+        assertFalse(grouped[0].groupedWithPrevious)
     }
 
     @Test
@@ -35,7 +35,7 @@ class MessageGrouperTests {
             59_000L,
             senders = listOf("bob", "alice"),
         )
-        assertFalse(grouped[1].groupedWithPrevious)
+        assertTrue(grouped.none { it.groupedWithPrevious })
     }
 
     @Test
@@ -47,13 +47,19 @@ class MessageGrouperTests {
             senders = listOf("carol", "bob", "bob"),
         )
         assertFalse(grouped[0].groupedWithPrevious)
-        assertFalse(grouped[1].groupedWithPrevious)
-        assertTrue(grouped[2].groupedWithPrevious)
+        assertTrue(grouped[1].groupedWithPrevious)
+        assertFalse(grouped[2].groupedWithPrevious)
     }
 
     @Test
     fun exactlyAtWindowBoundaryDoesNotGroup() {
         val grouped = groupNewestFirst(MessageGrouper.GROUP_WINDOW_MS, 0L)
-        assertFalse(grouped[1].groupedWithPrevious)
+        assertFalse(grouped[0].groupedWithPrevious)
+    }
+
+    @Test
+    fun nonGroupableEventsSeparateSameSenderRuns() {
+        val grouped = groupNewestFirst(60_000L, 30_000L, 0L, groupable = { it != 1 })
+        assertTrue(grouped.none { it.groupedWithPrevious })
     }
 }
