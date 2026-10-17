@@ -14,6 +14,7 @@ import dev.brentdevs.yardhal.core.data.NotificationKind
 import dev.brentdevs.yardhal.core.data.NotificationKindPreferences
 import dev.brentdevs.yardhal.core.data.NotificationPreferences
 import dev.brentdevs.yardhal.core.data.NotificationPriority
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
@@ -62,6 +63,7 @@ class NotificationsTests {
         assertEquals(original.id, Notifications.ensureEventChannel(app, NotificationKind.MENTION, loud).id)
         assertNotNull(manager.getNotificationChannel(original.id).sound)
         assertFalse(manager.getNotificationChannel(Notifications.CHANNEL_ONGOING).canShowBadge())
+        assertTrue(manager.getNotificationChannel(Notifications.CHANNEL_ONGOING).importance in NotificationManager.IMPORTANCE_MIN..NotificationManager.IMPORTANCE_LOW)
         assertNotEquals(original.id, Notifications.ensureEventChannel(app, NotificationKind.DIRECT_MESSAGE, loud).id)
         val settings = Notifications.settingsIntent(app, NotificationKind.MENTION, NotificationPreferences(mentions = loud.copy(sound = false)))
         assertEquals(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS, settings.action)
@@ -82,12 +84,34 @@ class NotificationsTests {
     }
 
     @Test
-    fun upgradingAUserBlockedConnectionChannelDoesNotEnableItAgain() {
+    fun upgradingASilentVibratingChannelPreservesItsAlertPolicy() {
+        manager.createNotificationChannel(NotificationChannel("connection", "Silent connection", NotificationManager.IMPORTANCE_HIGH).apply {
+            setSound(null, null)
+            vibrationPattern = longArrayOf(0, 80, 40, 80)
+            enableVibration(true)
+            enableLights(true)
+            lightColor = android.graphics.Color.BLUE
+        })
+        manager.notify(Notifications.ONGOING_NOTIFICATION_ID, Notifications.ongoing(app, 1))
+        val notification = manager.activeNotifications.single().notification
+        val channel = requireNotNull(manager.getNotificationChannel(notification.channelId))
+        assertNotEquals("connection", channel.id)
+        assertNull(channel.sound)
+        assertTrue(channel.shouldVibrate())
+        assertContentEquals(longArrayOf(0, 80, 40, 80), channel.vibrationPattern)
+        assertTrue(channel.shouldShowLights())
+        assertEquals(android.graphics.Color.BLUE, channel.lightColor)
+        assertFalse(channel.canShowBadge())
+    }
+
+    @Test
+    fun aBlockedLegacyForegroundChannelKeepsItsIdentityAndAndroidUserState() {
         manager.createNotificationChannel(NotificationChannel("connection", "Blocked connection", NotificationManager.IMPORTANCE_NONE))
         Notifications.ensureChannels(app)
-        assertEquals(NotificationManager.IMPORTANCE_NONE, manager.getNotificationChannel(Notifications.CHANNEL_ONGOING).importance)
-        assertFalse(manager.getNotificationChannel(Notifications.CHANNEL_ONGOING).canShowBadge())
-        assertNull(manager.getNotificationChannel("connection"))
+        val notification = Notifications.ongoing(app, 1)
+        assertEquals("connection", notification.channelId)
+        assertEquals(NotificationManager.IMPORTANCE_NONE, manager.getNotificationChannel(notification.channelId).importance)
+        assertNull(manager.getNotificationChannel(Notifications.CHANNEL_ONGOING))
     }
 
     @Test

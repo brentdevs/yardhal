@@ -31,9 +31,10 @@ public object Notifications {
     private const val EVENT_NOTIFICATION_ID = 2
     private const val LEGACY_CHANNEL_ONGOING = "connection"
 
-    public fun ensureChannels(context: Context) {
+    public fun ensureChannels(context: Context): String {
         val manager = context.getSystemService(NotificationManager::class.java)
         val legacy = manager.getNotificationChannel(LEGACY_CHANNEL_ONGOING)
+        if (legacy?.importance == NotificationManager.IMPORTANCE_NONE) return LEGACY_CHANNEL_ONGOING
         if (manager.getNotificationChannel(CHANNEL_ONGOING) == null) {
             val channel = NotificationChannel(CHANNEL_ONGOING, "Connection status", legacy?.importance ?: NotificationManager.IMPORTANCE_MIN)
             channel.setShowBadge(false)
@@ -43,14 +44,13 @@ public object Notifications {
                 channel.enableVibration(legacy.shouldVibrate())
                 channel.enableLights(legacy.shouldShowLights())
                 channel.lightColor = legacy.lightColor
-                channel.lockscreenVisibility = legacy.lockscreenVisibility
-                channel.setBypassDnd(legacy.canBypassDnd())
             }
             manager.createNotificationChannel(channel)
         }
         if (legacy != null && manager.activeNotifications.none { it.notification.channelId == LEGACY_CHANNEL_ONGOING }) {
             manager.deleteNotificationChannel(LEGACY_CHANNEL_ONGOING)
         }
+        return CHANNEL_ONGOING
     }
 
     public fun channelId(kind: NotificationKind, settings: NotificationKindPreferences): String =
@@ -94,7 +94,7 @@ public object Notifications {
             1 -> "Connected to 1 network"
             else -> "Connected to $networkCount networks"
         }
-        return NotificationCompat.Builder(context, CHANNEL_ONGOING)
+        return NotificationCompat.Builder(context, ensureChannels(context))
             .setSmallIcon(R.drawable.ic_status)
             .setContentTitle("Yardhal")
             .setContentText(text)

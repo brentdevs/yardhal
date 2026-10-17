@@ -1120,12 +1120,20 @@ rows. Memory lookup reuses an existing AVATAR rendition, including `{size}`
 templates, without fetching, decoding or resizing; inline-media cache entries
 cannot satisfy it, and LRU eviction/clear removes the rendition index.
 
-The connection service uses the non-badging `connection-v2` channel, so staying
+Unblocked connections use the non-badging `connection-v2` channel, so staying
 connected or reconnecting does not itself create a launcher dot. Migration uses
 a new channel because Android freezes badge configuration after creation.
-It carries legacy importance (including a blocked channel), sound, vibration
-and light settings; an existing replacement retains Android's user choices.
-The legacy channel is retired only when no active notification still uses it.
+It carries legacy importance, sound, vibration and light settings; an existing
+replacement retains Android's user choices. App-created replacement channels
+inherit Android's app-wide lock-screen and DND policy, not the old channel's
+per-channel overrides. Those overrides may need reapplying in Android settings.
+
+A blocked legacy connection channel retains its original ID and Android user
+state. Copying `IMPORTANCE_NONE` into a fresh foreground-service channel is not
+equivalent: Android can promote it to `IMPORTANCE_LOW` when its user-lock or
+previously-shown foreground-task state is missing. If the user unblocks the old
+channel, the next connection notification build or startup can migrate normally.
+An unblocked legacy channel is retired only when no active notification uses it.
 Message notification channels keep their existing badge behavior.
 
 A normal transcript marks its conversation read when the activity resumes,
