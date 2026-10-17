@@ -1120,6 +1120,32 @@ rows. Memory lookup reuses an existing AVATAR rendition, including `{size}`
 templates, without fetching, decoding or resizing; inline-media cache entries
 cannot satisfy it, and LRU eviction/clear removes the rendition index.
 
+Unblocked connections use the non-badging `connection-v2` channel, so staying
+connected or reconnecting does not itself create a launcher dot. Migration uses
+a new channel because Android freezes badge configuration after creation.
+It carries legacy importance, sound, vibration and light settings; an existing
+replacement retains Android's user choices. App-created replacement channels
+inherit Android's app-wide lock-screen and DND policy, not the old channel's
+per-channel overrides. Those overrides may need reapplying in Android settings.
+
+A blocked legacy connection channel retains its original ID and Android user
+state. Copying `IMPORTANCE_NONE` into a fresh foreground-service channel is not
+equivalent: Android can promote it to `IMPORTANCE_LOW` when its user-lock or
+previously-shown foreground-task state is missing. If the user unblocks the old
+channel, the next connection notification build or startup can migrate normally.
+An unblocked legacy channel is retired only when no active notification uses it.
+Message notification channels keep their existing badge behavior.
+
+A normal transcript marks its conversation read when the activity resumes,
+including after saved-conversation restoration. This clears that conversation's
+message notifications without cancelling the connection notification or other
+conversations' alerts. Pending notification navigation cannot mark the previous
+selection read, and targeted search jumps retain their explicit-read behavior.
+Targeted search and Catch Up navigation keep a separate saved read policy after
+their one-shot scroll target is consumed. Pause/resume, configuration recreation
+and identity renames preserve that policy; ordinary conversation navigation
+clears it and restores normal foreground reads.
+
 `BugReport`/`BugReportSheet` provide review, copy and share of description,
 build/device, last-attempted TLS/proxy flags and loaded/open/joined counts.
 Disconnected cached channels are not counted as currently joined.

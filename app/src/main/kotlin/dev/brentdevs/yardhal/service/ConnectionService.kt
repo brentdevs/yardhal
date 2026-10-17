@@ -21,7 +21,6 @@ public class ConnectionService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        Notifications.ensureChannels(this)
         val notification = Notifications.ongoing(this, foregroundNetworkCount)
         foregroundNotification = notification
         startForeground(NOTIFICATION_ID, notification)
